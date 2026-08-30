@@ -33,7 +33,7 @@ struct PointLightRaw {
     color: [f32; 4], // rgb × intensity, w = range
 }
 
-/// 与 WGSL `Globals` 结构对齐（480 字节，POD）。
+/// 与 WGSL `Globals` 结构对齐（496 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsRaw {
@@ -46,9 +46,10 @@ struct GlobalsRaw {
     point_lights: [PointLightRaw; MAX_POINT_LIGHTS],
     light_view_proj: [[f32; 4]; 4],
     shadow_params: [f32; 4], // texel_size, bias, strength, enabled
+    env_params: [f32; 4],    // 预滤波最大 mip 级, IBL 强度, 保留
 }
 
-const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 480, "Globals 必须与 WGSL 布局一致");
+const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 496, "Globals 必须与 WGSL 布局一致");
 
 /// 阴影深度偏移（正交投影 + 正面剔除下的小常数即可抑制 acne）。
 const SHADOW_BIAS: f32 = 0.0015;
@@ -107,6 +108,10 @@ pub struct Renderer {
     #[allow(dead_code)]
     shadow_depth_buf: wgpu::Texture,
     shadow_depth_buf_view: wgpu::TextureView,
+    /// IBL 环境贴图（初始化时一次性烘焙；视图已进全局绑定组，
+    /// 此字段保持纹理存活）。
+    #[allow(dead_code)]
+    env: crate::environment::EnvironmentMaps,
     /// HDR 中间缓冲（MSAA 4x 颜色附件 + 单采样解析目标 + blit 绑定组）。
     hdr: Option<HdrTargets>,
     hdr_size: (u32, u32),
@@ -205,6 +210,18 @@ impl Renderer {
         });
         let shadow_depth_buf_view =
             shadow_depth_buf.create_view(&wgpu::TextureViewDescriptor::default());
+        // IBL 环境贴图一次性烘焙（供主 pass 的分割求和环境光采样）
+        let env = crate::environment::bake_environment(&gpu);
+        let env_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.env.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
         let shadow_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("iris.shadow.sampler"),
             // 非过滤采样：R32Float 的双线性过滤需要 float32-filterable 扩展，不依赖；
@@ -228,6 +245,22 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&env.irradiance_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&env.prefiltered_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&env.brdf_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&env_sampler),
                 },
             ],
         });
@@ -282,6 +315,7 @@ impl Renderer {
             shadow_map_view,
             shadow_depth_buf,
             shadow_depth_buf_view,
+            env,
             hdr: None,
             hdr_size: (0, 0),
             scratch: Vec::new(),
@@ -526,6 +560,10 @@ impl Renderer {
             }
         }
         let shadow_enabled = light.shadows;
+        let env_intensity = world
+            .try_resource::<crate::environment::EnvironmentSettings>()
+            .map(|e| e.intensity.max(0.0))
+            .unwrap_or(1.0);
         let globals = GlobalsRaw {
             view_proj: vp.to_cols_array_2d(),
             eye_pos: [eye.x, eye.y, eye.z, 1.0],
@@ -545,6 +583,12 @@ impl Renderer {
                 SHADOW_BIAS,
                 SHADOW_STRENGTH,
                 if shadow_enabled { 1.0 } else { 0.0 },
+            ],
+            env_params: [
+                crate::environment::ENV_MIP_COUNT as f32 - 1.0,
+                env_intensity,
+                0.0,
+                0.0,
             ],
         };
         self.gpu

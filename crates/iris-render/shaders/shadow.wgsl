@@ -15,6 +15,7 @@ struct Globals {
     point_lights: array<vec4<f32>, 16>, // 8 个 PointLight（2×vec4）平铺，保持与 standard.wgsl 同布局
     light_view_proj: mat4x4<f32>,
     shadow_params: vec4<f32>,
+    env_params: vec4<f32>, // 与 standard.wgsl 保持同布局（本 pass 不读）
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;

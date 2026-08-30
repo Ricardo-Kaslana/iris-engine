@@ -136,7 +136,11 @@ pub mod primitives {
                 let b = a + 1;
                 let c = a + stride;
                 let d = c + 1;
-                data.indices.extend_from_slice(&[a, c, d, a, d, b]);
+                // 环绕方向与 add_face 约定一致（从外侧看 CCW）：(∂φ)×(∂θ) 指向
+                // 球内，因此索引须按 [a,d,c / a,b,d] 反向——此前为 [a,c,d / a,d,b]，
+                // 正面被剔除后渲染的是内壁（法线背向相机，直接光照全为 0，
+                // 实测症状：球体在强光下仍是纯黑剪影）。
+                data.indices.extend_from_slice(&[a, d, c, a, b, d]);
             }
         }
         data

@@ -28,6 +28,8 @@ struct Globals {
     light_view_proj: mat4x4<f32>,
     // x: 阴影贴图 texel 尺寸, y: 深度偏移 bias, z: 阴影强度, w: 是否启用
     shadow_params: vec4<f32>,
+    // x: 预滤波环境最大 mip 级, y: IBL 强度
+    env_params: vec4<f32>,
 };
 
 struct MaterialParams {
@@ -40,6 +42,11 @@ struct MaterialParams {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var shadow_map: texture_2d<f32>;
 @group(0) @binding(2) var shadow_sampler: sampler;
+// IBL 分割求和：辐照度立方体贴图 / 预滤波环境立方体贴图 / BRDF LUT
+@group(0) @binding(3) var irradiance_map: texture_cube<f32>;
+@group(0) @binding(4) var env_map: texture_cube<f32>;
+@group(0) @binding(5) var brdf_lut: texture_2d<f32>;
+@group(0) @binding(6) var env_sampler: sampler;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -102,6 +109,12 @@ fn geometry_smith(nov: f32, nol: f32, roughness: f32) -> f32 {
 // 菲涅尔：Schlick 近似
 fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// 环境光专用菲涅尔：边缘反射率随粗糙度抬高（避免粗糙金属掠射角过暗）
+fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let fmax = max(vec3<f32>(1.0 - roughness), f0);
+    return f0 + (fmax - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
 // 单灯的 Cook-Torrance 贡献（radiance 已含强度与衰减）
@@ -187,9 +200,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // 环境光：Lambert 近似（无 IBL 时金属环境反射按 F0/albedo 混合近似）
+    // 环境光（IBL 分割求和）：漫反射采样辐照度贴图；镜面按粗糙度取预滤波
+    // 环境 mip，乘 BRDF LUT 的 (缩放, 偏移)。intensity 可整帧关闭 IBL。
+    let irradiance = textureSampleLevel(irradiance_map, env_sampler, n, 0.0).rgb;
+    let nov = max(dot(n, v), 0.0);
+    let f_amb = fresnel_schlick_roughness(nov, f0, roughness);
+    let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
+    let env_spec = textureSampleLevel(env_map, env_sampler, reflect(-v, n),
+                                      roughness * globals.env_params.x).rgb;
+    let brdf = textureSample(brdf_lut, env_sampler, vec2<f32>(nov, roughness)).rg;
+    let ibl = (kd_amb * albedo * irradiance + env_spec * (f_amb * brdf.x + brdf.y))
+            * globals.env_params.y;
+    // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
-    color = color + mix(albedo, f_env, metallic) * globals.ambient.rgb + material.emissive.rgb;
+    color = color + ibl + mix(albedo, f_env, metallic) * globals.ambient.rgb + material.emissive.rgb;
 
     return vec4<f32>(color, base.a);
 }

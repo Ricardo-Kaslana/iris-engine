@@ -108,7 +108,8 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   → 按 (网格, 材质) 稳定排序 → 相同 key 连续成批
   → 一次 write_buffer 上传全部实例
   → 阴影 pass（可选）：光源正交视角，深度写入 R32Float 颜色附件（2048²）
-  → 主 pass：渲染到线性 HDR 中间缓冲（Rgba16Float + 4x MSAA → resolve）
+  → 主 pass：渲染到线性 HDR 中间缓冲（Rgba16Float + 4x MSAA → resolve），
+    环境光采样初始化时烘焙好的 IBL 贴图（辐照度 / 预滤波 / BRDF LUT）
   → 泛光（可选）：亮度提取 → 高斯模糊（半分辨率三轮分离迭代）
   → blit pass：叠加泛光 + ACES 色调映射 → sRGB 目标
   → queue.submit（异步）→ present
@@ -126,7 +127,7 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   法线分布 GGX、几何遮蔽 Smith-Schlick（k = roughness²/2 直接光近似）、
   菲涅尔 Schlick（绝缘体 F0 = 0.04，金属 F0 = albedo）；
   能量守恒 `kd = (1 − F)(1 − metallic)`，金属无漫反射。
-- **照明**：环境光（Lambert 近似，金属环境反射按 F0/albedo 混合近似，无 IBL）+
+- **照明**：环境光（**IBL 分割求和**，见 §4.12；另有方向光资源上的常量补光项）+
   1 个方向光（受阴影调制）+ 最多 8 个点光。点光采用**物理平方衰减**
   `window² / d²`（`window = 1 − (d/range)²`），在有效半径处平滑归零。
 - 法线矩阵在 CPU 端取模型矩阵的**逆转置 3×3**，保证非均匀缩放下光照方向正确。
@@ -249,6 +250,30 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 - v1 不做降采样链（1/4、1/8 mip 链），三轮半分辨率迭代在质量与占用间取中；
   泛光源来自自发光（`MaterialDef.emissive`，HDR 值可 > 1）。
 
+### 4.12 IBL 环境光照（分割求和）
+
+- **零资产依赖**：环境源是**程序化天空立方体贴图**（128²，Rgba16Float）——
+  天顶蓝 → 地平线白的渐变 + 地面暖棕回弹 + HDR 太阳盘，渲染器初始化时烘焙，
+  无需外部 HDR 图片（契合低占用与开箱即用）。
+- **一次性预计算**（`environment.rs`，43 个全屏 pass、动态偏移 uniform 传参）：
+  1. 漫反射辐照度立方体贴图：围绕法线的余弦加权半球积分（128²）；
+  2. 镜面预滤波立方体贴图：GGX 重要性采样（Hammersley 序列），5 级 mip
+     对应粗糙度 0..1 均分；
+  3. BRDF LUT（512²）：分割求和的环境 BRDF 积分，uv = (NdotV, roughness)。
+- **运行时主 pass 只做三次采样**：`irradiance(n)` 漫反射 +
+  `prefiltered(reflect(-v,n), lod = roughness×(mip−1)) × (F×LUT.x + LUT.y)` 镜面，
+  金属的环境反射由 `fresnel_schlick_roughness` 抬高边缘反射率。
+- **控制**：`EnvironmentSettings { intensity }` World 资源整帧缩放（0 = 关闭，
+  集成测试用开/关差分验证：铬球应反射出成片蓝天像素）。
+- **烘焙 pass 的读写边界**：预滤波读天空立方体、写预滤波立方体——不同纹理
+  同 pass 无冲突；pass 参数（面索引/粗糙度）经 256B 步长动态偏移传入
+  （单次 submit 内多次 write_buffer 同一缓冲会在命令缓冲执行前全部完成）。
+- **图元环绕方向陷阱**：`uv_sphere` 的索引曾按 [a,c,d/a,d,b] 生成——
+  `(∂φ)×(∂θ)` 指向球内，CCW 正面判定下**所有外向面被剔除、渲染的是内壁**，
+  法线背向相机导致直接光照恒 0（实测症状：球体在 2.5 强度强光下仍是纯黑
+  剪影，仅剩微弱环境光；金属球「发暗发平」长期被误判为缺 IBL）。
+  修复为 [a,d,c/a,b,d] 并在代码注释中固化推导。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -293,8 +318,9 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 4. **无热重载**：CPU 目录句柄不可变，资产修改需重建。
 5. **Web 目标**：代码路径兼容（无平台分支），但 winit/wasm 窗口层未做端到端验证。
 6. **点光无阴影**：方向光已有阴影贴图；点光阴影（cubemap）在路线图中。
-7. **无 IBL**：金属的环境反射是「F0/albedo × ambient」的启发式近似，真实感场景
-   需要 IBL（预滤波环境贴图 + BRDF LUT）或至少 SSAO/天空盒反射。
+7. **环境源为程序化天空**：IBL 无外部 HDR 资产加载，场景背景仍是纯色清屏
+   （天空盒背景 pass 在路线图中）；太阳盘方向固定（装饰性，分析光仍来自
+   `DirectionalLight` 资源）。
 8. **阴影偏移为常数 bias**：无坡度缩放 / 法线偏移（normal offset），大入射角
    掠射表面可能有轻微 acne；PCF 9 采样在实际场景中已足够干净。
 
