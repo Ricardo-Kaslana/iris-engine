@@ -130,7 +130,7 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   uniform 结构撑到 16 字节倍数；Iris 用 3 个独立 `f32` 填充保持与 CPU 侧 48 字节一致
   （这是 GPU 编程常见坑，集成测试曾实际捕获该问题）。
 
-### 4.3 视锥剔除
+### 4.4 视锥剔除
 
 - Gribb-Hartmann 方法从 view_proj 提取 6 平面（适配 z ∈ [0,1] 的 DirectX/WebGPU 深度
   约定：near = row₄，far = row₄ − row₃）。
@@ -141,21 +141,55 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 - 渲染器通过 `FrameStats` 暴露剔除后的提交数，集成测试据此断言
   「相机背后 27 实体零提交、视锥内实体不误伤」。
 
-### 4.4 MSAA 与深度
+### 4.5 实体挂载相机
+
+- 相机有两种存在形态：全局 `Camera` 资源（简单场景）与挂在实体上的
+  `ActiveCamera` 组件（跟随层级运动，第三人称 / 载具视角）。
+- 渲染器每帧优先查询 `(&GlobalTransform, &ActiveCamera)`：eye 取实体世界位置，
+  视图朝向取实体局部 **-Z 前方、+Y 上方**（`view_from_global`）；
+  无挂载实体时回退到 `Camera` 资源，两条路径的投影参数（fov / near / far）语义一致。
+- 挂载相机会被视锥剔除与光照 uniform 复用（eye 位置同时供高光计算）。
+
+### 4.6 glTF 2.0 资产管线（`asset` 模块）
+
+**数据流**：
+
+```text
+.gltf (JSON) ──┬─ buffers：外部 .bin 文件 / data-URI base64 内嵌
+               ├─ accessors：POSITION/NORMAL/TEXCOORD_0 (FLOAT)、索引 (u16/u32)
+               ├─ materials：baseColorFactor / emissiveFactor / roughness→shininess 映射
+               ├─ textures/images：PNG/JPEG（文件或 data-URI）→ CpuTexture
+               └─ nodes TRS + children ──→ Iris 实体树（add_child 级联）
+```
+
+- **加载即场景**：`spawn_gltf(&mut world, path)` 把节点层级映射为实体树——
+  有 mesh 的节点生成父实体（携带节点 TRS），每个 primitive 挂一个子实体
+  （独立材质批次，复用父变换）；返回顶层实体列表。
+- **去重**：同一 glTF 的 mesh / material / texture 按 (索引[, primitive]) 缓存句柄，
+  多节点引用同一网格不重复上传 CPU 目录。
+- **容错与降级**：所有错误收敛为 `GltfError`（Io / Json / Image / Unsupported /
+  Missing / OutOfRange），越界引用不 panic；NORMAL 缺失时按三角形自动生成
+  平面法线；TEXCOORD 缺失填充 (0,0)。
+- **v1 不支持**（显式报错而非静默出错）：GLB 二进制容器、骨架 / 蒙皮 / 动画、
+  非三角形拓扑、非 FLOAT 顶点分量、bufferView 引用图片。
+- base64 解码为手写实现（RFC 4648 严格校验：长度 4 对齐、padding 后禁止数据、
+  残位必须为零），避免为此引入依赖。
+
+### 4.7 MSAA 与深度
 
 - 固定 4x 多重采样：MSAA 颜色附件 + `resolve_target` 解析；深度 `Depth32Float`，
   `Less` 比较 + 写入。
 - 窗口 resize 时同步重建 MSAA / 深度附件。
 - 交换链 `PresentMode::Fifo`：全平台可用、天然限流不空烧 GPU。
 
-### 4.5 GPU 资源生命周期
+### 4.8 GPU 资源生命周期
 
 - CPU 目录（`MeshStore / MaterialStore / TextureStore`，World 资源）与
   GPU 缓存（`Renderer` 内 HashMap）分离，**句柄即弱引用**。
 - 惰性上传：渲染时首次遇到的句柄才上传 GPU；重复句柄零开销。
 - 帧统计（`FrameStats`）暴露 draw call / 实例数，供性能面板与测试断言。
 
-### 4.6 离屏渲染
+### 4.9 离屏渲染
 
 `OffscreenRenderer` 与窗口渲染共享同一 `Renderer` 核心（管线、批处理、上传逻辑完全一致），
 仅目标是纹理 + 读回缓冲。用途：CI 集成测试、截图导出、无头环境。

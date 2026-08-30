@@ -14,7 +14,7 @@ use std::sync::Arc;
 use glam::Vec3;
 use iris_core::prelude::GlobalTransform;
 
-use crate::camera::Camera;
+use crate::camera::{view_from_global, ActiveCamera, Camera};
 use crate::context::Gpu;
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
@@ -189,10 +189,26 @@ impl Renderer {
         height: u32,
     ) {
         self.stats = FrameStats::default();
-        let Some(camera) = world.try_resource::<Camera>().map(|c| (*c).clone()) else {
-            log::debug!("世界中没有 Camera 资源，跳过本帧渲染");
-            return;
+        // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），
+        // 其次回退到全局 Camera 资源
+        let mut mounted: Option<(glam::Mat4, ActiveCamera, Vec3)> = None;
+        world.query::<(&GlobalTransform, &ActiveCamera)>(|(gt, ac)| {
+            if mounted.is_none() {
+                mounted = Some((view_from_global(gt), *ac, gt.position()));
+            }
+        });
+        let (view, fov, z_near, z_far, eye) = match mounted {
+            Some((view, ac, eye)) => (view, ac.fov_y_radians, ac.z_near, ac.z_far, eye),
+            None => {
+                let Some(camera) = world.try_resource::<Camera>().map(|c| (*c).clone()) else {
+                    log::debug!("世界中没有 ActiveCamera 实体也没有 Camera 资源，跳过本帧渲染");
+                    return;
+                };
+                (camera.view_matrix(), camera.fov_y_radians, camera.z_near, camera.z_far, camera.eye)
+            }
         };
+        let aspect = width as f32 / height.max(1) as f32;
+        let vp = glam::camera::rh::proj::directx::perspective(fov, aspect, z_near, z_far) * view;
         let light = world
             .try_resource::<DirectionalLight>()
             .map(|l| (*l).clone())
@@ -207,8 +223,6 @@ impl Renderer {
         let texture_store = world.try_resource::<TextureStore>();
 
         // 1. 全局 uniform：相机 + 方向光 + 点光
-        let aspect = width as f32 / height.max(1) as f32;
-        let vp = camera.view_proj(aspect);
         let light_dir = (-light.direction).normalize_or_zero();
         let mut point_lights = [PointLightRaw {
             position: [0.0; 4],
@@ -241,7 +255,7 @@ impl Renderer {
         }
         let globals = GlobalsRaw {
             view_proj: vp.to_cols_array_2d(),
-            eye_pos: [camera.eye.x, camera.eye.y, camera.eye.z, 1.0],
+            eye_pos: [eye.x, eye.y, eye.z, 1.0],
             light_dir: [light_dir.x, light_dir.y, light_dir.z, 0.0],
             light_color: [
                 light.color.x * light.intensity,

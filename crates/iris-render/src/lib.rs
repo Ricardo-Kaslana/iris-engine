@@ -5,9 +5,11 @@
 //! 特性：
 //! - 跨后端：Vulkan / DirectX 12 / Metal 由 wgpu 统一抽象，同一份 WGSL 着色器；
 //! - 自动实例化批处理：共享网格与材质的实体合并为一个 draw call；
-//! - 4x MSAA、深度测试、Blinn-Phong 光照（方向光 + 环境光 + 自发光）；
-//! - 离屏渲染（`OffscreenRenderer`）：无头环境 / 集成测试 / 截图导出。
+//! - 4x MSAA、深度测试、Blinn-Phong 光照（方向光 + 点光 + 环境光 + 自发光）；
+//! - 视锥剔除与实体挂载相机；
+//! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
+pub mod asset;
 pub mod camera;
 pub mod context;
 pub mod frustum;
@@ -22,7 +24,8 @@ pub mod surface;
 pub mod texture;
 
 pub mod prelude {
-    pub use crate::camera::Camera;
+    pub use crate::asset::{spawn_gltf, GltfError};
+    pub use crate::camera::{view_from_global, ActiveCamera, Camera};
     pub use crate::context::Gpu;
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;

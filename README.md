@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + 全局变换传播）；**多光源**（1 方向光 + 8 点光，平滑距离衰减）；derive 宏；4x MSAA；固定步长逻辑 / 可变步长渲染解耦 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + 全局变换传播）；**实体挂载相机**（跟随层级运动）；**glTF 2.0 资产管线**；**多光源**（1 方向光 + 8 点光）；derive 宏；4x MSAA；固定步长逻辑 / 可变步长渲染解耦 |
 
 ## 快速开始
 
@@ -50,6 +50,10 @@ fn gameplay(world: &mut World) {
 # 旋转立方体：纹理 + 光照 + 飞行相机（WASD / Space·Shift / 滚轮 / Esc）
 cargo run --example cube --release
 
+# glTF 资产加载：先生成示例资产，再加载渲染（外部 .bin buffer + 材质）
+cargo run --example gen_asset --release
+cargo run --example model --release
+
 # 行星系：变换层级（太阳→地球→月球级联旋转）+ 彩色点光
 cargo run --example orbit --release
 
@@ -58,6 +62,9 @@ cargo run --example instanced --release
 
 # 无窗口离屏渲染（CI 友好），双点光照明，输出 iris_offscreen.bmp
 cargo run --example offscreen --release
+
+# glTF 资产离屏快照（验收用），输出 iris_gltf_preview.bmp
+cargo run --example gltf_snapshot --release
 
 # ECS 吞吐基准
 cargo run -p iris-core --example bench_ecs --release
@@ -104,13 +111,14 @@ flowchart TB
 
 ```
 iris-engine/
+├── assets/              # 示例资产（cube.gltf + cube0.bin，gen_asset 生成）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
-│   ├── iris-core/       # ECS、调度、事件、时间、变换
-│   ├── iris-render/     # wgpu 渲染器、网格/材质/纹理、离屏渲染
+│   ├── iris-core/       # ECS、调度、变换层级、时间、事件
+│   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / instanced / offscreen
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -141,16 +149,21 @@ ls -l target/release/examples/*.exe
 
 ![离屏渲染输出](docs/offscreen_preview.png)
 
+glTF 资产管线实测（`docs/gltf_preview.png`）：从 `assets/cube.gltf`（外部 .bin
+buffer + POSITION/NORMAL/TEXCOORD + 45° 旋转节点）加载渲染，材质因子与点光正确。
+
+![glTF 资产渲染](docs/gltf_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 62 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 77 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
-着色器编译、深度测试、MSAA、实例化合批（26 实例 → 2 draw call）、
-视锥剔除（相机背后 27 实体零提交 / 视锥内实体不误伤）、
-多光源照明（背景角落与受光中心的像素值双向验证）。
+着色器编译、深度测试、MSAA、实例化合批、视锥剔除、多光源照明、
+glTF 资产管线（内嵌 data-URI 与外部 .bin buffer 两种形态、
+roughness→shininess 映射、实体挂载相机与资源相机双路径）。
 
 ## 跨平台矩阵
 
@@ -165,13 +178,14 @@ cargo test --workspace   # 62 个测试：单元 + GPU 端到端离屏渲染
 
 - [x] 变换层级（父子级联）与全局变换传播
 - [x] 多光源（点光数组）与视锥剔除
-- [ ] glTF 2.0 资产管线（网格 / 材质 / 纹理热重载）
+- [x] glTF 2.0 资产管线（网格 / 材质 / 纹理 / 节点层级）
+- [x] 实体挂载相机（层级 × 相机）
 - [ ] 阴影贴图（方向光 / 点光）
 - [ ] 多线程系统调度（rayon 风格查询并行）
 - [ ] PBR 材质模型与 HDR / 泛光后处理
+- [ ] GLB 二进制容器、骨架与动画
 - [ ] wasm32 Web 目标端到端验证
 - [ ] 音频与 2D 叠加层（UI）
-- [ ] 相机挂载到实体（层级 × 相机）
 - [ ] 实例缓冲 GPU 持久化与增量更新
 
 ## License
