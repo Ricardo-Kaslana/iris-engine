@@ -33,7 +33,7 @@ struct PointLightRaw {
     color: [f32; 4], // rgb × intensity, w = range
 }
 
-/// 与 WGSL `Globals` 结构对齐（400 字节，POD）。
+/// 与 WGSL `Globals` 结构对齐（480 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsRaw {
@@ -44,9 +44,16 @@ struct GlobalsRaw {
     ambient: [f32; 4],
     point_count: [f32; 4],
     point_lights: [PointLightRaw; MAX_POINT_LIGHTS],
+    light_view_proj: [[f32; 4]; 4],
+    shadow_params: [f32; 4], // texel_size, bias, strength, enabled
 }
 
-const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 400, "Globals 必须与 WGSL 布局一致");
+const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 480, "Globals 必须与 WGSL 布局一致");
+
+/// 阴影深度偏移（正交投影 + 正面剔除下的小常数即可抑制 acne）。
+const SHADOW_BIAS: f32 = 0.0015;
+/// 阴影暗部保留的光照比例（0 = 全黑阴影，1 = 无阴影）。
+const SHADOW_STRENGTH: f32 = 0.45;
 
 /// 与 WGSL `MaterialParams` 结构对齐（48 字节，POD）。
 #[repr(C)]
@@ -87,11 +94,16 @@ pub struct Renderer {
     bundle: crate::pipeline::PipelineBundle,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
+    shadow_globals_bg: wgpu::BindGroup,
     instance_buf: Option<wgpu::Buffer>,
     instance_capacity: usize,
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
     material_gpu: HashMap<u32, GpuMaterial>,
+    /// 持有纹理以保证 `shadow_depth_view` 在渲染器存活期间有效。
+    #[allow(dead_code)]
+    shadow_depth: wgpu::Texture,
+    shadow_depth_view: wgpu::TextureView,
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
     clear_color: wgpu::Color,
@@ -114,9 +126,54 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // 方向光阴影贴图（固定分辨率，不随窗口尺寸重建）
+        let shadow_depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.shadow.map"),
+            size: wgpu::Extent3d {
+                width: crate::pipeline::SHADOW_MAP_SIZE,
+                height: crate::pipeline::SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_view = shadow_depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.shadow.sampler"),
+            // wgpu 30 实测语义：textureSampleCompare 返回 (sampled_depth CMP depth_ref)。
+            // 遮挡判定「遮挡物深度 >= 片段参考深度 → 被遮挡(0)」需 GreaterEqual。
+            compare: Some(wgpu::CompareFunction::GreaterEqual),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("iris.globals.bg"),
             layout: &bundle.globals_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+            ],
+        });
+        let shadow_globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.shadow.globals.bg"),
+            layout: &bundle.shadow_globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: globals_buf.as_entire_binding(),
@@ -155,11 +212,14 @@ impl Renderer {
             bundle,
             globals_buf,
             globals_bg,
+            shadow_globals_bg,
             instance_buf: None,
             instance_capacity: 0,
             mesh_gpu: HashMap::new(),
             texture_gpu,
             material_gpu: HashMap::new(),
+            shadow_depth,
+            shadow_depth_view: shadow_view,
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
             clear_color: wgpu::Color { r: 0.055, g: 0.07, b: 0.10, a: 1.0 },
@@ -197,7 +257,7 @@ impl Renderer {
                 mounted = Some((view_from_global(gt), *ac, gt.position()));
             }
         });
-        let (view, fov, z_near, z_far, eye) = match mounted {
+        let (view, fov, z_near, z_far, eye) = match mounted.clone() {
             Some((view, ac, eye)) => (view, ac.fov_y_radians, ac.z_near, ac.z_far, eye),
             None => {
                 let Some(camera) = world.try_resource::<Camera>().map(|c| (*c).clone()) else {
@@ -213,6 +273,18 @@ impl Renderer {
             .try_resource::<DirectionalLight>()
             .map(|l| (*l).clone())
             .unwrap_or_default();
+        // 阴影覆盖以注视点（资源相机 target / 挂载相机跟随场景原点附近）为中心。
+        // 挂载相机没有显式 target：沿视线前方中等距离处作为覆盖中心。
+        let shadow_center = if let Some((v, _, cam_eye)) = mounted {
+            let forward = -v.z_axis.truncate().normalize_or_zero();
+            cam_eye + forward * 10.0
+        } else {
+            world
+                .try_resource::<Camera>()
+                .map(|c| (*c).target)
+                .unwrap_or(Vec3::ZERO)
+        };
+        let light_vp = light.shadow_view_proj(shadow_center, light.shadow_range);
         // 资源目录按引用借用（不复制数据），生命周期覆盖整个 draw 过程
         let Some(mesh_store) = world.try_resource::<MeshStore>() else {
             return;
@@ -253,6 +325,7 @@ impl Renderer {
                 log::warn!("点光数量 {extra} 超过上限 {MAX_POINT_LIGHTS}，多余的已被忽略");
             }
         }
+        let shadow_enabled = light.shadows;
         let globals = GlobalsRaw {
             view_proj: vp.to_cols_array_2d(),
             eye_pos: [eye.x, eye.y, eye.z, 1.0],
@@ -266,6 +339,13 @@ impl Renderer {
             ambient: [light.ambient.x, light.ambient.y, light.ambient.z, 0.0],
             point_count: [point_count as f32, 0.0, 0.0, 0.0],
             point_lights,
+            light_view_proj: light_vp.to_cols_array_2d(),
+            shadow_params: [
+                1.0 / crate::pipeline::SHADOW_MAP_SIZE as f32,
+                SHADOW_BIAS,
+                SHADOW_STRENGTH,
+                if shadow_enabled { 1.0 } else { 0.0 },
+            ],
         };
         self.gpu
             .queue
@@ -338,13 +418,51 @@ impl Renderer {
             index += count;
         }
 
-        // 5. 编码渲染通道
+        // 5. 编码渲染通道：先阴影深度 pass（光源视角），后主 pass
         let mut encoder = self
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("iris.frame") });
         let mut draw_calls = 0u32;
         let mut instances = 0u32;
+        if shadow_enabled && total > 0 {
+            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            shadow_pass.set_pipeline(&self.bundle.shadow_pipeline);
+            shadow_pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
+            shadow_pass.set_vertex_buffer(
+                1,
+                self.instance_buf.as_ref().expect("实例缓冲已就绪").slice(..),
+            );
+            index = 0;
+            while index < total {
+                let key = items[index].key;
+                let mut count = 1;
+                while index + count < total && items[index + count].key == key {
+                    count += 1;
+                }
+                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                shadow_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                let first = index as u32;
+                let last = (index + count) as u32;
+                shadow_pass.draw_indexed(0..mesh.num_indices, 0, first..last);
+                index += count;
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.main"),

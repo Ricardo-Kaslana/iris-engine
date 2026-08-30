@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + 全局变换传播）；**实体挂载相机**（跟随层级运动）；**glTF 2.0 资产管线**；**多光源**（1 方向光 + 8 点光）；derive 宏；4x MSAA；固定步长逻辑 / 可变步长渲染解耦 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**；**方向光阴影贴图**（2048 深度图 + 硬件比较采样 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -65,6 +65,9 @@ cargo run --example offscreen --release
 
 # glTF 资产离屏快照（验收用），输出 iris_gltf_preview.bmp
 cargo run --example gltf_snapshot --release
+
+# 方向光阴影离屏快照（验收用），输出 iris_shadow_preview.bmp
+cargo run --example shadow_snapshot --release
 
 # ECS 吞吐基准
 cargo run -p iris-core --example bench_ecs --release
@@ -154,16 +157,21 @@ buffer + POSITION/NORMAL/TEXCOORD + 45° 旋转节点）加载渲染，材质因
 
 ![glTF 资产渲染](docs/gltf_preview.png)
 
+方向光阴影实测（`docs/shadow_preview.png`）：立方体与球体向地面投射软阴影，
+PCF 边缘自然、无 acne 条纹；`DirectionalLight.shadows = false` 可整帧关闭。
+
+![方向光阴影](docs/shadow_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 77 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 82 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
 着色器编译、深度测试、MSAA、实例化合批、视锥剔除、多光源照明、
-glTF 资产管线（内嵌 data-URI 与外部 .bin buffer 两种形态、
-roughness→shininess 映射、实体挂载相机与资源相机双路径）。
+**方向光阴影（开/关整帧差分：成片变暗、无变亮、大部分不变）**、
+glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、roughness 映射、双相机路径）。
 
 ## 跨平台矩阵
 
@@ -180,7 +188,8 @@ roughness→shininess 映射、实体挂载相机与资源相机双路径）。
 - [x] 多光源（点光数组）与视锥剔除
 - [x] glTF 2.0 资产管线（网格 / 材质 / 纹理 / 节点层级）
 - [x] 实体挂载相机（层级 × 相机）
-- [ ] 阴影贴图（方向光 / 点光）
+- [x] 方向光阴影贴图（正交深度 pass + PCF）
+- [ ] 点光阴影（cubemap）
 - [ ] 多线程系统调度（rayon 风格查询并行）
 - [ ] PBR 材质模型与 HDR / 泛光后处理
 - [ ] GLB 二进制容器、骨架与动画

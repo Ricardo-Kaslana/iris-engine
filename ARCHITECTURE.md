@@ -175,21 +175,39 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 - base64 解码为手写实现（RFC 4648 严格校验：长度 4 对齐、padding 后禁止数据、
   残位必须为零），避免为此引入依赖。
 
-### 4.7 MSAA 与深度
+### 4.7 方向光阴影贴图
+
+- **深度 pass**：独立的 shadow pipeline（无片段输出、仅顶点变换到
+  `light_view_proj` 空间），正面剔除（cull Front）减少 acne，
+  渲染到固定 2048² 的 `Depth32Float` 纹理。
+- **覆盖范围**：以注视点为中心、`shadow_range`（默认 24）为半边长的正交盒；
+  光源相机沿光传播方向反向拉远 `2×range`，保证中心两侧 `±range` 的深度都落在 [0,1]。
+- **采样**：硬件比较采样器（`SamplerBindingType::Comparison`）+ 3×3 PCF。
+  wgpu 30 实测语义：`textureSampleCompare` 返回 `(sampled_depth CMP depth_ref)`，
+  遮挡判定需要 `CompareFunction::GreaterEqual`（与直觉的 LessEqual 相反，注释已固化）。
+- **uniform 控制流合规**：`textureSampleCompare` 要求 uniform 控制流，
+  视锥越界不做提前返回，而是 clamp 采样 + 掩码丢弃。
+- **同 pass 读写冲突**：shadow pass 使用只含 uniform 的精简绑定组
+  （`shadow_globals_bg`）——完整全局组引用了阴影贴图本身，
+  在同一 render pass 内会触发 RESOURCE / DEPTH_WRITE 互斥校验错误。
+- 阴影只调制方向光的漫反射与高光，不影响环境光 / 点光 / 自发光；
+  `DirectionalLight.shadows` 可整帧关闭（shader 内 early-out）。
+
+### 4.8 MSAA 与深度
 
 - 固定 4x 多重采样：MSAA 颜色附件 + `resolve_target` 解析；深度 `Depth32Float`，
   `Less` 比较 + 写入。
 - 窗口 resize 时同步重建 MSAA / 深度附件。
 - 交换链 `PresentMode::Fifo`：全平台可用、天然限流不空烧 GPU。
 
-### 4.8 GPU 资源生命周期
+### 4.9 GPU 资源生命周期
 
 - CPU 目录（`MeshStore / MaterialStore / TextureStore`，World 资源）与
   GPU 缓存（`Renderer` 内 HashMap）分离，**句柄即弱引用**。
 - 惰性上传：渲染时首次遇到的句柄才上传 GPU；重复句柄零开销。
 - 帧统计（`FrameStats`）暴露 draw call / 实例数，供性能面板与测试断言。
 
-### 4.9 离屏渲染
+### 4.10 离屏渲染
 
 `OffscreenRenderer` 与窗口渲染共享同一 `Renderer` 核心（管线、批处理、上传逻辑完全一致），
 仅目标是纹理 + 读回缓冲。用途：CI 集成测试、截图导出、无头环境。
@@ -238,7 +256,7 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
    半透明需额外排序，暂未处理）。
 4. **无热重载**：CPU 目录句柄不可变，资产修改需重建。
 5. **Web 目标**：代码路径兼容（无平台分支），但 winit/wasm 窗口层未做端到端验证。
-6. **点光无阴影**：多光源为无遮挡直接光照，阴影贴图在路线图中。
+6. **点光无阴影**：方向光已有阴影贴图；点光阴影（cubemap）在路线图中。
 
 ## 9. 关键设计取舍记录
 
