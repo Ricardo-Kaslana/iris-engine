@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.bmp
+*.ppm
+# 本文档产出的示例渲染结果
+iris_offscreen.bmp

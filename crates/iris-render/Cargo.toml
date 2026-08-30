@@ -1,0 +1,17 @@
+[package]
+name = "iris-render"
+description = "Iris 引擎渲染层：基于 wgpu 的现代 GPU 渲染器（MSAA、自动实例化批处理、Blinn-Phong 光照）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+iris-core = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+pollster = { workspace = true }
+log = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "iris-platform"
+description = "Iris 引擎平台层：跨平台窗口创建与键鼠输入抽象"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+iris-core = { workspace = true }
+winit = { workspace = true }
+log = { workspace = true }

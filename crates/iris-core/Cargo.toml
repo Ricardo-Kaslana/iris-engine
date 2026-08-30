@@ -1,0 +1,13 @@
+[package]
+name = "iris-core"
+description = "Iris 引擎核心：实体组件系统（ECS）、系统调度、时间管理与数学库"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+iris-macros = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }

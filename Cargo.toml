@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iris-macros",
+    "crates/iris-core",
+    "crates/iris-render",
+    "crates/iris-platform",
+    "crates/iris-engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Iris Engine Contributors"]
+
+[workspace.dependencies]
+# 内部 crate
+iris-macros = { path = "crates/iris-macros", version = "0.1.0" }
+iris-core = { path = "crates/iris-core", version = "0.1.0" }
+iris-render = { path = "crates/iris-render", version = "0.1.0" }
+iris-platform = { path = "crates/iris-platform", version = "0.1.0" }
+
+# 数学：SIMD 优化的线性代数库
+glam = "0.33"
+# 跨平台图形后端：Vulkan / DirectX 12 / Metal / WebGPU
+wgpu = "30"
+# 跨平台窗口与输入
+winit = "0.30"
+# POD 转换（GPU 缓冲安全上传）
+bytemuck = { version = "1.25", features = ["derive"] }
+# 同步阻塞执行器（wgpu 的异步 API）
+pollster = "0.4"
+# 日志门面与实现
+log = "0.4"
+env_logger = "0.11"
+
+# 发布构建：更小体积、更快运行
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

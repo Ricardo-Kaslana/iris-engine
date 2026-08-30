@@ -1,0 +1,16 @@
+[package]
+name = "iris-macros"
+description = "Iris 引擎过程宏：Component / Resource / Event 派生"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", default-features = false, features = ["derive", "parsing", "printing", "proc-macro"] }
+quote = "1"
+proc-macro2 = "1"
