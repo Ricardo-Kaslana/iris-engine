@@ -165,6 +165,12 @@ struct GltfPbr {
     base_color_texture: Option<GltfTextureInfo>,
     #[serde(default = "default_roughness")]
     roughness_factor: f32,
+    #[serde(default = "default_metallic")]
+    metallic_factor: f32,
+}
+
+fn default_metallic() -> f32 {
+    1.0
 }
 
 fn default_base_color() -> [f32; 4] {
@@ -484,12 +490,12 @@ impl GltfLoader {
                     Some(info) => self.texture(world, info.index)?,
                     None => TextureHandle(0),
                 };
-                // Blinn-Phong 近似：越粗糙高光越钝（128 光滑 → 4 哑光）
-                let shininess = 4.0 + (1.0 - pbr.roughness_factor.clamp(0.0, 1.0)) * 124.0;
                 MaterialDef {
                     base_color: pbr.base_color_factor,
                     emissive: [mat.emissive()[0], mat.emissive()[1], mat.emissive()[2], 1.0],
-                    shininess,
+                    // glTF 金属度/粗糙度工作流直通（默认 metallic 1.0 / roughness 1.0）
+                    metallic: pbr.metallic_factor.clamp(0.0, 1.0),
+                    roughness: pbr.roughness_factor.clamp(0.0, 1.0),
                     texture,
                 }
             }

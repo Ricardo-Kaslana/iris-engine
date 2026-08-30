@@ -61,8 +61,7 @@ const SHADOW_STRENGTH: f32 = 0.45;
 struct MaterialRaw {
     base_color: [f32; 4],
     emissive: [f32; 4],
-    shininess: f32,
-    pad: [f32; 3],
+    surface: [f32; 4], // metallic, roughness, reflectance(F0), 保留
 }
 
 struct GpuMesh {
@@ -100,14 +99,32 @@ pub struct Renderer {
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
     material_gpu: HashMap<u32, GpuMaterial>,
-    /// 持有纹理以保证 `shadow_depth_view` 在渲染器存活期间有效。
+    /// 持有纹理以保证对应 view 在渲染器存活期间有效。
     #[allow(dead_code)]
-    shadow_depth: wgpu::Texture,
-    shadow_depth_view: wgpu::TextureView,
+    shadow_map: wgpu::Texture,
+    shadow_map_view: wgpu::TextureView,
+    /// 阴影 pass 的深度测试附件（保证贴图存最近面深度）。
+    #[allow(dead_code)]
+    shadow_depth_buf: wgpu::Texture,
+    shadow_depth_buf_view: wgpu::TextureView,
+    /// HDR 中间缓冲（MSAA 4x 颜色附件 + 单采样解析目标 + blit 绑定组）。
+    hdr: Option<HdrTargets>,
+    hdr_size: (u32, u32),
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
     clear_color: wgpu::Color,
     pub(crate) stats: FrameStats,
+}
+
+/// HDR 中间缓冲集合（尺寸变化时整体重建）。
+struct HdrTargets {
+    #[allow(dead_code)]
+    msaa: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    resolved: wgpu::Texture,
+    resolved_view: wgpu::TextureView,
+    blit_bind_group: wgpu::BindGroup,
 }
 
 /// 单帧渲染统计。
@@ -126,8 +143,11 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // 方向光阴影贴图（固定分辨率，不随窗口尺寸重建）
-        let shadow_depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        // 方向光阴影贴图（固定分辨率，不随窗口尺寸重建）：
+        // 深度值写入颜色附件 R 通道（绕开 depth-only 管线写入异常，见 ARCHITECTURE §4.7），
+        // 同时挂真实深度附件做 Less 测试——没有它重叠表面会按绘制顺序互相覆盖，
+        // 背面深度会污染贴图（实测症状：贴图值系统性偏大、阴影整体失效）。
+        let shadow_map = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.shadow.map"),
             size: wgpu::Extent3d {
                 width: crate::pipeline::SHADOW_MAP_SIZE,
@@ -137,20 +157,33 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
+            format: wgpu::TextureFormat::R32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let shadow_view = shadow_depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_map_view = shadow_map.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_depth_buf = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.shadow.depth"),
+            size: wgpu::Extent3d {
+                width: crate::pipeline::SHADOW_MAP_SIZE,
+                height: crate::pipeline::SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let shadow_depth_buf_view =
+            shadow_depth_buf.create_view(&wgpu::TextureViewDescriptor::default());
         let shadow_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("iris.shadow.sampler"),
-            // wgpu 30 实测语义：textureSampleCompare 返回 (sampled_depth CMP depth_ref)。
-            // 遮挡判定「遮挡物深度 >= 片段参考深度 → 被遮挡(0)」需 GreaterEqual。
-            compare: Some(wgpu::CompareFunction::GreaterEqual),
+            // 非过滤采样：R32Float 的双线性过滤需要 float32-filterable 扩展，不依赖；
+            // 深度比较在 shader 内手工完成（standard.wgsl shadow_factor）
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -163,7 +196,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                    resource: wgpu::BindingResource::TextureView(&shadow_map_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -218,8 +251,12 @@ impl Renderer {
             mesh_gpu: HashMap::new(),
             texture_gpu,
             material_gpu: HashMap::new(),
-            shadow_depth,
-            shadow_depth_view: shadow_view,
+            shadow_map,
+            shadow_map_view,
+            shadow_depth_buf,
+            shadow_depth_buf_view,
+            hdr: None,
+            hdr_size: (0, 0),
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
             clear_color: wgpu::Color { r: 0.055, g: 0.07, b: 0.10, a: 1.0 },
@@ -227,27 +264,84 @@ impl Renderer {
         }
     }
 
+    /// 确保HDR 中间缓冲与当前帧尺寸一致（尺寸变化时重建）。
+    fn ensure_hdr_targets(&mut self, width: u32, height: u32) {
+        if self.hdr.is_some() && self.hdr_size == (width, height) {
+            return;
+        }
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let msaa = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.hdr.msaa"),
+            size,
+            mip_level_count: 1,
+            sample_count: SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let resolved = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.hdr.resolved"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let msaa_view = msaa.create_view(&wgpu::TextureViewDescriptor::default());
+        let resolved_view = resolved.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.blit.bg"),
+            layout: &self.bundle.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&resolved_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.gpu.device.create_sampler(
+                        &wgpu::SamplerDescriptor::default(),
+                    )),
+                },
+            ],
+        });
+        self.hdr_size = (width, height);
+        self.hdr = Some(HdrTargets {
+            msaa,
+            msaa_view,
+            resolved,
+            resolved_view,
+            blit_bind_group,
+        });
+    }
+
     pub fn set_clear_color(&mut self, color: wgpu::Color) {
         self.clear_color = color;
     }
+
 
     pub fn stats(&self) -> FrameStats {
         self.stats
     }
 
-    /// 渲染一帧。
-    ///
-    /// `color_view` 为 MSAA 附件；`resolve_target` 为解析目标（无 MSAA 时传 None）；
-    /// `depth_view` 为深度附件。
+    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），随后
+    /// ACES 色调映射 blit 到 `color_view`（通常为 sRGB 目标）。
     pub fn draw(
         &mut self,
         world: &iris_core::world::World,
         color_view: &wgpu::TextureView,
-        resolve_target: Option<&wgpu::TextureView>,
         depth_view: &wgpu::TextureView,
         width: u32,
         height: u32,
     ) {
+        self.ensure_hdr_targets(width, height);
         self.stats = FrameStats::default();
         // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），
         // 其次回退到全局 Camera 资源
@@ -418,7 +512,7 @@ impl Renderer {
             index += count;
         }
 
-        // 5. 编码渲染通道：先阴影深度 pass（光源视角），后主 pass
+        // 5. 编码渲染通道：先阴影 pass（光源视角，深度写入颜色附件），后主 pass
         let mut encoder = self
             .gpu
             .device
@@ -428,12 +522,26 @@ impl Renderer {
         if shadow_enabled && total > 0 {
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.shadow"),
-                color_attachments: &[],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.shadow_map_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // 清空为 1.0（光源远平面）：贴图空缺处视为无遮挡
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_depth_view,
+                    view: &self.shadow_depth_buf_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
                 }),
@@ -463,13 +571,15 @@ impl Renderer {
                 index += count;
             }
         }
+        // 主 pass：场景渲染到 HDR MSAA 中间缓冲，解析到单采样 HDR
+        let hdr = self.hdr.as_ref().expect("HDR 中间缓冲已就绪");
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.main"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
+                    view: &hdr.msaa_view,
                     depth_slice: None,
-                    resolve_target,
+                    resolve_target: Some(&hdr.resolved_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
@@ -517,6 +627,28 @@ impl Renderer {
                 instances += count as u32;
                 index += count;
             }
+        }
+        // 色调映射 blit：HDR -> sRGB 输出
+        {
+            let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            blit.set_pipeline(&self.bundle.blit_pipeline);
+            blit.set_bind_group(0, &hdr.blit_bind_group, &[]);
+            blit.draw(0..3, 0..1);
         }
         self.gpu.queue.submit([encoder.finish()]);
         self.stats.draw_calls = draw_calls;
@@ -627,8 +759,12 @@ impl Renderer {
         let raw = MaterialRaw {
             base_color: def.base_color,
             emissive: def.emissive,
-            shininess: def.shininess,
-            pad: [0.0; 3],
+            surface: [
+                def.metallic.clamp(0.0, 1.0),
+                def.roughness.clamp(0.0, 1.0),
+                0.04, // 绝缘体反射率基准（glTF 规范约定值）
+                0.0,
+            ],
         };
         let params_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("iris.material.params"),

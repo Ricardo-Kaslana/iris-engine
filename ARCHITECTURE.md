@@ -107,7 +107,9 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   → 实例数据 InstanceRaw（模型矩阵 + 法线矩阵，112B/实例）
   → 按 (网格, 材质) 稳定排序 → 相同 key 连续成批
   → 一次 write_buffer 上传全部实例
-  → 每批：set_bind_group(材质) + draw_indexed(first..first+count)
+  → 阴影 pass（可选）：光源正交视角，深度写入 R32Float 颜色附件（2048²）
+  → 主 pass：渲染到线性 HDR 中间缓冲（Rgba16Float + 4x MSAA → resolve）
+  → blit pass：ACES 色调映射 → sRGB 目标
   → queue.submit（异步）→ present
 ```
 
@@ -117,15 +119,19 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   渲染器无需预知场景即可把 **同网格同材质的所有实体压成一个 draw call**。
 - 实测：4096 实例 + 地面 = 2 draw call（见 `instanced` 示例与集成测试断言）。
 
-### 4.3 着色与颜色管线
+### 4.3 着色与颜色管线（PBR + HDR）
 
-- **WGSL** 单一着色源文件（`standard.wgsl`），Blinn-Phong：环境光 + 方向光漫反射 +
-  半程向量高光（背光面屏蔽）+ 自发光。
+- **Cook-Torrance PBR**（`standard.wgsl`，金属度-粗糙度工作流）：
+  法线分布 GGX、几何遮蔽 Smith-Schlick（k = roughness²/2 直接光近似）、
+  菲涅尔 Schlick（绝缘体 F0 = 0.04，金属 F0 = albedo）；
+  能量守恒 `kd = (1 − F)(1 − metallic)`，金属无漫反射。
+- **照明**：环境光（Lambert 近似，金属环境反射按 F0/albedo 混合近似，无 IBL）+
+  1 个方向光（受阴影调制）+ 最多 8 个点光。点光采用**物理平方衰减**
+  `window² / d²`（`window = 1 − (d/range)²`），在有效半径处平滑归零。
 - 法线矩阵在 CPU 端取模型矩阵的**逆转置 3×3**，保证非均匀缩放下光照方向正确。
-- 光照 = 环境光 + 1 个方向光 + 最多 8 个点光（`PointLight` 组件，位置取自
-  同实体的 `GlobalTransform`）。点光衰减采用 `saturate(1 - d/range)²`，
-  在有效半径处平滑归零，避免硬边与闪烁。
-- 表面格式优先 sRGB：着色器输出线性色，硬件完成 gamma 编码，光照运算在线性空间正确进行。
+- **HDR 管线**：主 pass 渲染到线性 `Rgba16Float` 中间缓冲（MSAA 4x 解析），
+  全屏三角形 blit pass 做 ACES 色调映射（Narkowicz 解析近似）后输出 sRGB——
+  光照在线性 HDR 空间累加，高光滚降由 ACES 完成，不会出现死白截断。
 - WGSL 结构体对齐陷阱：`vec3<f32>` 在 WGSL 中对齐 16 字节，会把只含一个 vec3 的
   uniform 结构撑到 16 字节倍数；Iris 用 3 个独立 `f32` 填充保持与 CPU 侧 48 字节一致
   （这是 GPU 编程常见坑，集成测试曾实际捕获该问题）。
@@ -157,7 +163,7 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 ```text
 .gltf (JSON) ──┬─ buffers：外部 .bin 文件 / data-URI base64 内嵌
                ├─ accessors：POSITION/NORMAL/TEXCOORD_0 (FLOAT)、索引 (u16/u32)
-               ├─ materials：baseColorFactor / emissiveFactor / roughness→shininess 映射
+               ├─ materials：baseColorFactor / emissiveFactor / metallicFactor / roughnessFactor
                ├─ textures/images：PNG/JPEG（文件或 data-URI）→ CpuTexture
                └─ nodes TRS + children ──→ Iris 实体树（add_child 级联）
 ```
@@ -177,27 +183,40 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 
 ### 4.7 方向光阴影贴图
 
-- **深度 pass**：独立的 shadow pipeline（无片段输出、仅顶点变换到
-  `light_view_proj` 空间），正面剔除（cull Front）减少 acne，
-  渲染到固定 2048² 的 `Depth32Float` 纹理。
+- **深度 pass**：独立 shadow pipeline 从光源视角把裁剪空间深度 `z/w` 写入
+  固定 2048² 的 **`R32Float` 颜色附件**（深度存 R 通道）。
+- **深度测试必须保留**：颜色附件存深度的方案曾因「省掉深度附件」而翻车——
+  没有深度测试时重叠表面按**绘制顺序**互相覆盖，球体背面深度污染贴图
+  （实测症状：采样深度系统性大于片段深度、整帧无阴影）。
+  最终形态为 **Depth32Float 深度附件（Less 测试，保证存最近面）+ R32Float 颜色附件并存**。
+- **为什么不用 depth-only 管线**：PBR/HDR 集成期间实证发现 wgpu 30 / DX12 下
+  shadow pass 的深度附件写入恒为 0（排除矩阵、buffer 回读、NaN、剔除、
+  强制 `clip.z` 后依旧），且 `textureSampleCompare` 的语义反直觉
+  （遮挡判定需 `GreaterEqual`）。改为「颜色附件存深度 + shader 手工比较」后
+  路径完全可控、行为可解释，也不再依赖 `float32-filterable` 扩展
+  （`R32Float` 采样用 `NonFiltering` 采样器，3×3 PCF 为 9 次最近邻采样）。
+- **UV 映射**：`uv = ndc * (0.5, −0.5) + 0.5`——纹理 uv(0,0) 是渲染目标的
+  左上角（NDC y 正方向 = 贴图上端），与 blit pass 的 V 翻转约定一致。
+  历史版本曾把 `xy/w` 直接当 uv 用（缺 NDC→UV 变换），弱断言的差分测试
+  没有抓住它，视觉放大后才定位到；修复已固化在 shader 注释里。
+- **比较**：遮挡判定 `d >= depth − bias`（清空值 1.0 = 远平面 = 无遮挡）；
+  bias 0.0015（正交投影 + 深度测试下的常数偏移，抑制 acne），
+  阴影暗部保留 45% 光照（`shadow_params.z`）。
 - **覆盖范围**：以注视点为中心、`shadow_range`（默认 24）为半边长的正交盒；
   光源相机沿光传播方向反向拉远 `2×range`，保证中心两侧 `±range` 的深度都落在 [0,1]。
-- **采样**：硬件比较采样器（`SamplerBindingType::Comparison`）+ 3×3 PCF。
-  wgpu 30 实测语义：`textureSampleCompare` 返回 `(sampled_depth CMP depth_ref)`，
-  遮挡判定需要 `CompareFunction::GreaterEqual`（与直觉的 LessEqual 相反，注释已固化）。
-- **uniform 控制流合规**：`textureSampleCompare` 要求 uniform 控制流，
-  视锥越界不做提前返回，而是 clamp 采样 + 掩码丢弃。
+- **uniform 控制流合规**：`textureSample` 要求 uniform 控制流，
+  越界 / 光源背后 / 阴影关闭都不做提前返回，采样照常执行、最后用掩码混向「受光」。
 - **同 pass 读写冲突**：shadow pass 使用只含 uniform 的精简绑定组
   （`shadow_globals_bg`）——完整全局组引用了阴影贴图本身，
-  在同一 render pass 内会触发 RESOURCE / DEPTH_WRITE 互斥校验错误。
-- 阴影只调制方向光的漫反射与高光，不影响环境光 / 点光 / 自发光；
-  `DirectionalLight.shadows` 可整帧关闭（shader 内 early-out）。
+  在同一 render pass 内会触发资源互斥校验错误。
+- 阴影只调制方向光的辐射度，不影响环境光 / 点光 / 自发光；
+  `DirectionalLight.shadows` 可整帧关闭（贴图 pass 跳过 + shader 掩码兜底）。
 
 ### 4.8 MSAA 与深度
 
-- 固定 4x 多重采样：MSAA 颜色附件 + `resolve_target` 解析；深度 `Depth32Float`，
-  `Less` 比较 + 写入。
-- 窗口 resize 时同步重建 MSAA / 深度附件。
+- 固定 4x 多重采样：主 pass 渲染到 **HDR（Rgba16Float）MSAA 附件** +
+  `resolve_target` 解析到单采样 HDR；深度 `Depth32Float`，`Less` 比较 + 写入。
+- HDR 中间缓冲按帧尺寸懒创建，窗口 resize 时同步重建。
 - 交换链 `PresentMode::Fifo`：全平台可用、天然限流不空烧 GPU。
 
 ### 4.9 GPU 资源生命周期
@@ -257,6 +276,10 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 4. **无热重载**：CPU 目录句柄不可变，资产修改需重建。
 5. **Web 目标**：代码路径兼容（无平台分支），但 winit/wasm 窗口层未做端到端验证。
 6. **点光无阴影**：方向光已有阴影贴图；点光阴影（cubemap）在路线图中。
+7. **无 IBL**：金属的环境反射是「F0/albedo × ambient」的启发式近似，真实感场景
+   需要 IBL（预滤波环境贴图 + BRDF LUT）或至少 SSAO/天空盒反射。
+8. **阴影偏移为常数 bias**：无坡度缩放 / 法线偏移（normal offset），大入射角
+   掠射表面可能有轻微 acne；PCF 9 采样在实际场景中已足够干净。
 
 ## 9. 关键设计取舍记录
 

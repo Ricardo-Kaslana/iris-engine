@@ -13,7 +13,6 @@ pub struct OffscreenRenderer {
     gpu: Arc<Gpu>,
     renderer: Renderer,
     color: wgpu::Texture,
-    msaa_view: wgpu::TextureView,
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     readback: wgpu::Buffer,
@@ -31,7 +30,7 @@ impl OffscreenRenderer {
         let height = height.max(1);
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
 
-        // 解析目标（COPY_SRC 用于读回）
+        // blit 输出目标（COPY_SRC 用于读回）；MSAA/HDR 由 renderer 内部管理
         let color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.offscreen.color"),
             size,
@@ -40,16 +39,6 @@ impl OffscreenRenderer {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let msaa = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("iris.offscreen.msaa"),
-            size,
-            mip_level_count: 1,
-            sample_count: SAMPLE_COUNT,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let depth = device.create_texture(&wgpu::TextureDescriptor {
@@ -77,7 +66,6 @@ impl OffscreenRenderer {
             gpu,
             renderer,
             color,
-            msaa_view: msaa.create_view(&wgpu::TextureViewDescriptor::default()),
             color_view,
             depth_view: depth.create_view(&wgpu::TextureViewDescriptor::default()),
             readback,
@@ -89,14 +77,7 @@ impl OffscreenRenderer {
 
     /// 渲染一帧到离屏纹理，并把结果拷贝到读回缓冲。
     pub fn render(&mut self, world: &iris_core::world::World) {
-        self.renderer.draw(
-            world,
-            &self.msaa_view,
-            Some(&self.color_view),
-            &self.depth_view,
-            self.width,
-            self.height,
-        );
+        self.renderer.draw(world, &self.color_view, &self.depth_view, self.width, self.height);
         // 颜色纹理 -> 读回缓冲（同一队列，顺序保证在绘制之后）
         let mut encoder = self
             .gpu

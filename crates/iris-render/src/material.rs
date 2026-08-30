@@ -1,4 +1,4 @@
-//! 材质：颜色 / 自发光 / 高光 / 纹理引用。
+//! 材质：PBR 金属度/粗糙度工作流（Cook-Torrance）+ 自发光 + 纹理引用。
 
 use crate::texture::TextureHandle;
 
@@ -9,13 +9,15 @@ pub struct MaterialHandle(pub u32);
 /// 材质定义（CPU 侧）。GPU 侧 uniform 由渲染器按需创建。
 #[derive(Clone, Debug)]
 pub struct MaterialDef {
-    /// 基础色（线性空间，RGB + 透明度）。
+    /// 基础色（线性空间，RGB + 透明度）；金属度 1 时作为 F0 反射率。
     pub base_color: [f32; 4],
-    /// 自发光（叠加在光照结果上，不受光照影响）。
+    /// 自发光（叠加在光照结果上，不受光照与阴影影响）。
     pub emissive: [f32; 4],
-    /// 高光指数（Blinn-Phong shininess）。
-    pub shininess: f32,
-    /// 基础色贴图。`TextureHandle(0)` 为白色兜底纹理。
+    /// 金属度 0（绝缘体）..1（金属），Cook-Torrance 工作流。
+    pub metallic: f32,
+    /// 粗糙度 0（镜面）..1（完全粗糙）。
+    pub roughness: f32,
+    /// 基础色贴图（线性采样，值与 base_color 相乘）。`TextureHandle(0)` 为白色兜底。
     pub texture: TextureHandle,
 }
 
@@ -24,16 +26,27 @@ impl Default for MaterialDef {
         Self {
             base_color: [1.0, 1.0, 1.0, 1.0],
             emissive: [0.0, 0.0, 0.0, 1.0],
-            shininess: 32.0,
+            metallic: 0.0,
+            roughness: 0.5,
             texture: TextureHandle(0),
         }
     }
 }
 
 impl MaterialDef {
-    /// 纯色无贴图材质的便捷构造。
+    /// 纯色无贴图材质的便捷构造（绝缘体、中等粗糙度）。
     pub fn solid(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { base_color: [r, g, b, a], ..Default::default() }
+    }
+
+    /// 金属材质的便捷构造（金属度 1，F0 取基础色）。
+    pub fn metal(r: f32, g: f32, b: f32, roughness: f32) -> Self {
+        Self {
+            base_color: [r, g, b, 1.0],
+            metallic: 1.0,
+            roughness: roughness.clamp(0.0, 1.0),
+            ..Default::default()
+        }
     }
 }
 

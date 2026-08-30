@@ -1,5 +1,7 @@
-// Iris 标准材质着色器：Blinn-Phong 光照。
-// 照明 = 环境光 + 1 个方向光 + 最多 8 个点光（平滑距离衰减）。
+// Iris 标准材质着色器：Cook-Torrance PBR（金属度/粗糙度工作流）。
+// 照明 = 环境光（Lambert 近似）+ 1 个方向光 + 最多 8 个点光（物理平方衰减）。
+// 方向光带阴影贴图（R 通道深度 + 3×3 手工比较 PCF）；渲染在线性 HDR 空间，
+// 色调映射由 blit pass 完成。
 // 实例化绘制：每个实例携带模型矩阵（4 个 vec4 列）与法线矩阵（3 个 vec4 列）。
 
 struct PointLight {
@@ -17,31 +19,27 @@ struct Globals {
     light_dir: vec4<f32>,
     // rgb * intensity
     light_color: vec4<f32>,
-    // rgb
+    // rgb（线性，乘在 albedo 上的环境项）
     ambient: vec4<f32>,
     // x: 实际点光数量
     point_count: vec4<f32>,
     point_lights: array<PointLight, 8>,
     // 方向光阴影矩阵（世界 -> 光源裁剪空间）
     light_view_proj: mat4x4<f32>,
-    // x: 阴影贴图 texel 尺寸 (1/分辨率), y: 深度偏移 bias, z: 阴影强度, w: 是否启用
+    // x: 阴影贴图 texel 尺寸, y: 深度偏移 bias, z: 阴影强度, w: 是否启用
     shadow_params: vec4<f32>,
 };
 
 struct MaterialParams {
     base_color: vec4<f32>,
     emissive: vec4<f32>,
-    // 注意：vec3<f32> 在 WGSL 中 16 字节对齐会把结构撑到 64 字节，
-    // 这里用三个独立 f32 保持与 CPU 侧 48 字节布局一致
-    shininess: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: f32,
+    // x: metallic, y: roughness, z: 绝缘体反射率基准 F0，w: 保留
+    surface: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var shadow_map: texture_depth_2d;
-@group(0) @binding(2) var shadow_sampler: sampler_comparison;
+@group(0) @binding(1) var shadow_map: texture_2d<f32>;
+@group(0) @binding(2) var shadow_sampler: sampler;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -81,53 +79,99 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-/// 3×3 PCF 百分比渐近软阴影。返回 0（全阴影）..1（全照明）。
+// ---- Cook-Torrance 项 ----
+
+// 法线分布：GGX / Trowbridge-Reitz
+fn distribution_ggx(noh: f32, roughness: f32) -> f32 {
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let d = noh * noh * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * d * d + 1e-7);
+}
+
+// 几何遮蔽：Schlick-GGX（k = roughness²/2，直接光照近似）
+fn geometry_schlick_ggx(nov: f32, roughness: f32) -> f32 {
+    let k = (roughness * roughness) * 0.5;
+    return nov / (nov * (1.0 - k) + k);
+}
+
+fn geometry_smith(nov: f32, nol: f32, roughness: f32) -> f32 {
+    return geometry_schlick_ggx(nov, roughness) * geometry_schlick_ggx(nol, roughness);
+}
+
+// 菲涅尔：Schlick 近似
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// 单灯的 Cook-Torrance 贡献（radiance 已含强度与衰减）
+fn pbr_light(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
+             albedo: vec3<f32>, f0: vec3<f32>, metallic: f32, roughness: f32) -> vec3<f32> {
+    let h = normalize(v + l);
+    let nol = max(dot(n, l), 0.0);
+    let nov = max(dot(n, v), 0.0);
+    let noh = max(dot(n, h), 0.0);
+    let voh = max(dot(v, h), 0.0);
+
+    let d = distribution_ggx(noh, roughness);
+    let g = geometry_smith(nov, nol, roughness);
+    let f = fresnel_schlick(voh, f0);
+    let specular = (d * g * f) / max(4.0 * nov * nol, 1e-4);
+    // 能量守恒：漫反射扣除菲涅尔反射占比，金属无漫反射
+    let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
+    return (kd * albedo / 3.14159265 + specular) * radiance * nol;
+}
+
+/// 3×3 PCF 百分比渐近软阴影，手工深度比较（R 通道存光源空间深度，
+/// 清空值 1.0 代表无遮挡）。返回阴影后保留的光照比例。
 ///
-/// 注意：textureSampleCompare 要求 uniform 控制流，因此不做
-/// 「越界提前返回」，而是先 clamp 采样、再用掩码丢弃越界贡献。
+/// 阴影相机覆盖范围外、光源背后或阴影关闭的片段直接视为受光。
+/// textureSample 要求 uniform 控制流，因此不做越界提前返回，
+/// 采样照常执行、最后用掩码把结果混向「受光」。
 fn shadow_factor(shadow_pos: vec4<f32>) -> f32 {
-    if (globals.shadow_params.w < 0.5) {
-        return 1.0;
-    }
-    let proj = shadow_pos.xy / shadow_pos.w;
-    let depth = shadow_pos.z / shadow_pos.w;
-    let inside = select(0.0, 1.0,
-        proj.x >= 0.0 && proj.x <= 1.0 && proj.y >= 0.0 && proj.y <= 1.0 && depth <= 1.0);
-    let uv = clamp(proj, vec2<f32>(0.001), vec2<f32>(0.999));
+    let w = max(shadow_pos.w, 1e-6);
+    let ndc = shadow_pos.xy / w;
+    let depth = shadow_pos.z / w;
+    // NDC -> UV：NDC y 正方向 = 贴图上端（与 blit 的 V 翻转约定一致）
+    let uv = ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
     let texel = globals.shadow_params.x;
-    var sum = 0.0;
+    var lit = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
-            let offset = vec2<f32>(f32(dx), f32(dy)) * texel;
-            // 硬件深度比较（LessEqual）：被遮挡为 0，可见为 1
-            sum += textureSampleCompare(shadow_map, shadow_sampler, uv + offset, depth - globals.shadow_params.y);
+            let d = textureSample(shadow_map, shadow_sampler,
+                                  uv + vec2<f32>(f32(dx), f32(dy)) * texel).r;
+            // 遮挡物深度 >= 片段参考深度 -> 未被遮挡
+            lit = lit + select(0.0, 1.0, d >= depth - globals.shadow_params.y);
         }
     }
-    let lit = sum / 9.0;
+    lit = lit / 9.0;
     let shaded = mix(1.0 - globals.shadow_params.z, 1.0, lit);
-    return mix(1.0, shaded, inside);
+    let outside = shadow_pos.w <= 0.0
+        || ndc.x < -1.0 || ndc.x > 1.0
+        || ndc.y < -1.0 || ndc.y > 1.0
+        || depth < 0.0 || depth > 1.0
+        || globals.shadow_params.w < 0.5;
+    return mix(shaded, 1.0, select(0.0, 1.0, outside));
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base = material.base_color * textureSample(base_texture, base_sampler, in.uv);
+    let albedo = base.rgb;
+    let metallic = clamp(material.surface.x, 0.0, 1.0);
+    let roughness = clamp(material.surface.y, 0.045, 1.0);
+    let f0 = mix(vec3<f32>(material.surface.z), albedo, metallic);
+
     let n = normalize(in.world_normal);
+    let v = normalize(globals.eye_pos.xyz - in.world_pos);
+
+    // 方向光（受阴影遮挡）
     let l = normalize(globals.light_dir.xyz);
-    let view_dir = normalize(globals.eye_pos.xyz - in.world_pos);
-    let half_dir = normalize(l + view_dir);
-    let diffuse = max(dot(n, l), 0.0);
-    // 背光面不产生高光；方向光漫反射与高光受阴影遮挡
-    let facing = step(0.0, dot(n, l));
-    let specular = pow(max(dot(n, half_dir), 0.0), material.shininess) * facing;
     let sun = shadow_factor(in.shadow_pos);
+    let radiance = globals.light_color.rgb * sun;
+    var color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
 
-
-    var lit = base.rgb * globals.ambient.rgb
-            + base.rgb * globals.light_color.rgb * diffuse * sun
-            + globals.light_color.rgb * specular * sun
-            + material.emissive.rgb;
-
-    // 点光：平滑二次衰减，range 处归零
+    // 点光：物理平方衰减 + range 平滑窗口
     let count = u32(globals.point_count.x);
     for (var i = 0u; i < count; i = i + 1u) {
         let light = globals.point_lights[i];
@@ -135,16 +179,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let dist = length(to_light);
         if (dist < light.color.w) {
             let lp = to_light / max(dist, 1e-4);
-            let ndotl = max(dot(n, lp), 0.0);
-            if (ndotl > 0.0) {
-                let falloff = 1.0 - dist / light.color.w;
-                let atten = falloff * falloff;
-                let radiance = light.color.rgb * atten;
-                let half_l = normalize(lp + view_dir);
-                let spec = pow(max(dot(n, half_l), 0.0), material.shininess);
-                lit = lit + base.rgb * radiance * ndotl + radiance * spec;
-            }
+            let t = dist / light.color.w;
+            let window = 1.0 - t * t;
+            let atten = (window * window) / max(dist * dist, 0.01);
+            let pl = light.color.rgb * atten;
+            color = color + pbr_light(n, v, lp, pl, albedo, f0, metallic, roughness);
         }
     }
-    return vec4<f32>(lit, base.a);
+
+    // 环境光：Lambert 近似（无 IBL 时金属环境反射按 F0/albedo 混合近似）
+    let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
+    color = color + mix(albedo, f_env, metallic) * globals.ambient.rgb + material.emissive.rgb;
+
+    return vec4<f32>(color, base.a);
 }

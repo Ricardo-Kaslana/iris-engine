@@ -46,8 +46,11 @@ fn shadow_darkens_ground_without_brightening_anything() {
     let with_shadows = renderer.read_pixels();
 
     // 关阴影
-    let mut world = scene();
-    world.resource_mut::<DirectionalLight>().shadows = false;
+    let world = scene();
+    {
+        let mut light = world.resource_mut::<DirectionalLight>();
+        light.shadows = false;
+    }
     renderer.render(&world);
     let without_shadows = renderer.read_pixels();
 

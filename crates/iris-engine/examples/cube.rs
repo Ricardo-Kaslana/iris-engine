@@ -32,7 +32,8 @@ fn setup(world: &mut World) {
         .add(CpuTexture::checkerboard(8, 16, [30, 32, 40, 255], [214, 92, 40, 255]));
     let mat_cube = world.resource_mut::<MaterialStore>().add(MaterialDef {
         texture: checker,
-        shininess: 48.0,
+        metallic: 0.0,
+        roughness: 0.25,
         ..Default::default()
     });
     world.spawn((Transform::from_xyz(0.0, 0.6, 0.0), cube, mat_cube, Spin(1.2)));

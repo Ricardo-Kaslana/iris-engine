@@ -1,10 +1,12 @@
-//! 窗口表面渲染：MSAA / 深度附件管理、窗口尺寸自适应、帧呈现。
+//! 窗口表面渲染：深度附件管理、窗口尺寸自适应、帧呈现。
+//!
+//! MSAA 与 HDR 中间缓冲由 `Renderer` 内部管理；本层只负责
+//! 表面配置、深度纹理与帧获取 / 呈现。
 
 use std::sync::Arc;
 
 use crate::context::Gpu;
 use crate::renderer::Renderer;
-use crate::SAMPLE_COUNT;
 
 /// 组合「GPU + 渲染器 + 窗口表面」的窗口渲染套件。
 pub struct SurfaceKit {
@@ -12,7 +14,6 @@ pub struct SurfaceKit {
     renderer: Renderer,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     size: (u32, u32),
 }
@@ -29,7 +30,7 @@ impl SurfaceKit {
         let gpu = Arc::new(Gpu::with_instance(instance, Some(&surface))?);
         let size = window.inner_size();
         let caps = surface.get_capabilities(&gpu.adapter);
-        // 优先 sRGB 格式：着色器输出线性色，由硬件完成 gamma 编码
+        // 优先 sRGB 格式：blit 输出线性色，由硬件完成 gamma 编码
         let format = caps
             .formats
             .iter()
@@ -49,20 +50,19 @@ impl SurfaceKit {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&gpu.device, &config);
-        let (msaa_view, depth_view) = create_msaa_depth(&gpu, size.width, size.height, format);
+        let depth_view = create_depth(&gpu, size.width, size.height);
         let renderer = Renderer::new(gpu.clone(), format);
         Some(Self {
             gpu,
             renderer,
             surface,
             config,
-            msaa_view,
             depth_view,
             size: (size.width, size.height),
         })
     }
 
-    /// 窗口尺寸变化时调用：重建表面配置与 MSAA / 深度附件。
+    /// 窗口尺寸变化时调用：重建表面配置与深度附件。
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -70,10 +70,7 @@ impl SurfaceKit {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.gpu.device, &self.config);
-        let (msaa_view, depth_view) =
-            create_msaa_depth(&self.gpu, width, height, self.config.format);
-        self.msaa_view = msaa_view;
-        self.depth_view = depth_view;
+        self.depth_view = create_depth(&self.gpu, width, height);
         self.size = (width, height);
     }
 
@@ -98,8 +95,7 @@ impl SurfaceKit {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer.draw(
             world,
-            &self.msaa_view,
-            Some(&view),
+            &view,
             &self.depth_view,
             self.config.width,
             self.config.height,
@@ -121,39 +117,20 @@ impl SurfaceKit {
     }
 }
 
-fn create_msaa_depth(
-    gpu: &Gpu,
-    width: u32,
-    height: u32,
-    color_format: wgpu::TextureFormat,
-) -> (wgpu::TextureView, wgpu::TextureView) {
-    let size = wgpu::Extent3d {
-        width: width.max(1),
-        height: height.max(1),
-        depth_or_array_layers: 1,
-    };
-    let msaa = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("iris.msaa"),
-        size,
-        mip_level_count: 1,
-        sample_count: SAMPLE_COUNT,
-        dimension: wgpu::TextureDimension::D2,
-        format: color_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
+fn create_depth(gpu: &Gpu, width: u32, height: u32) -> wgpu::TextureView {
     let depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("iris.depth"),
-        size,
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
-        sample_count: SAMPLE_COUNT,
+        sample_count: crate::SAMPLE_COUNT,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
-    (
-        msaa.create_view(&wgpu::TextureViewDescriptor::default()),
-        depth.create_view(&wgpu::TextureViewDescriptor::default()),
-    )
+    depth.create_view(&wgpu::TextureViewDescriptor::default())
 }

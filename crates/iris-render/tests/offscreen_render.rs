@@ -35,7 +35,7 @@ fn scene() -> World {
 
 /// 背景清屏色的 sRGB 编码（渲染器默认 clearColor 0.055/0.07/0.10 线性）。
 fn is_background(px: &[u8], i: usize) -> bool {
-    let clear = [66i32, 75, 89];
+    let clear = [64i32, 77, 99]; // ACES 色调映射后的背景 sRGB 值
     (0..3).all(|c| (px[i + c] as i32 - clear[c]).abs() <= 8)
 }
 

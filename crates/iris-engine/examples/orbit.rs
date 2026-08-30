@@ -30,7 +30,8 @@ fn setup(world: &mut World) {
     let mat_sun = world.resource_mut::<MaterialStore>().add(MaterialDef {
         base_color: [1.0, 0.85, 0.35, 1.0],
         emissive: [1.6, 1.2, 0.4, 1.0],
-        shininess: 8.0,
+        metallic: 0.0,
+        roughness: 0.5,
         texture: TextureHandle(0),
     });
     let mut sun_transform = Transform::IDENTITY;

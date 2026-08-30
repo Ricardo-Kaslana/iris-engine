@@ -146,7 +146,7 @@ mod tests {
     fn mounted_camera_follows_parent() {
         // 父级平移 10 单位后，挂载相机的 eye 应跟随
         use iris_core::hierarchy::propagate_transforms;
-        use iris_core::prelude::{Entity, World};
+        use iris_core::prelude::World;
         let mut world = World::new();
         let rig = world.spawn((Transform::from_xyz(10.0, 0.0, 0.0), ActiveCamera::default()));
         let cam = world.spawn((Transform::from_xyz(0.0, 2.0, 3.0), ActiveCamera::default()));

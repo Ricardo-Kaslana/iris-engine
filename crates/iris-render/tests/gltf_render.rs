@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use iris_core::hierarchy::propagate_transforms;
-use iris_core::prelude::{Quat, Transform, World};
+use iris_core::prelude::{Transform, World};
 use iris_render::asset::base64;
 use iris_render::prelude::*;
 
@@ -63,7 +63,7 @@ fn world_with_stores() -> World {
 }
 
 fn is_background(px: &[u8], i: usize) -> bool {
-    let clear = [66i32, 75, 89];
+    let clear = [64i32, 77, 99]; // ACES 色调映射后的背景 sRGB 值
     (0..3).all(|c| (px[i + c] as i32 - clear[c]).abs() <= 8)
 }
 
@@ -125,10 +125,11 @@ fn gltf_material_roughness_maps_to_shininess() {
 
     let mut world = world_with_stores();
     spawn_gltf(&mut world, &path).expect("glTF 应加载成功");
-    // quad 材质 roughness 0.5 → shininess = 4 + 0.5 * 124 = 66
+    // glTF 金属度/粗糙度直通：quad 材质 roughness 0.5、metallic 未指定（默认 1.0）
     let store = world.resource::<MaterialStore>();
     let material = store.get(MaterialHandle(1)).unwrap();
-    assert!((material.shininess - 66.0).abs() < 0.01);
+    assert!((material.roughness - 0.5).abs() < 0.01);
+    assert!((material.metallic - 1.0).abs() < 0.01, "glTF 默认金属度为 1.0");
     assert_eq!(material.base_color, [0.9, 0.1, 0.1, 1.0]);
 }
 
