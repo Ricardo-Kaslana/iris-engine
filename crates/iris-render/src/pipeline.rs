@@ -6,17 +6,20 @@ pub const SHADOW_MAP_SIZE: u32 = 2048;
 /// HDR 中间缓冲格式（线性、单采样，供色调映射 pass 采样）。
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// 主管线、阴影深度管线与色调映射管线，以及全部绑定组布局。
+/// 主管线、阴影管线、泛光管线（提取 + 模糊）与色调映射管线，以及全部绑定组布局。
 pub(crate) struct PipelineBundle {
     pub pipeline: wgpu::RenderPipeline,
     pub shadow_pipeline: wgpu::RenderPipeline,
     pub blit_pipeline: wgpu::RenderPipeline,
+    pub bloom_threshold_pipeline: wgpu::RenderPipeline,
+    pub bloom_blur_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
     /// 阴影 pass 专用的精简全局布局（只含 uniform，
     /// 不绑定阴影贴图本身——避免同 pass 内读写冲突）。
     pub shadow_globals_layout: wgpu::BindGroupLayout,
     pub material_layout: wgpu::BindGroupLayout,
     pub blit_layout: wgpu::BindGroupLayout,
+    pub bloom_layout: wgpu::BindGroupLayout,
 }
 
 pub(crate) fn create_pipeline(
@@ -210,7 +213,7 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
-    // 色调映射 blit：全屏三角形采样 HDR 中间缓冲，输出到 sRGB 目标
+    // 色调映射 blit：全屏三角形采样 HDR 中间缓冲 + 泛光叠加，输出到 sRGB 目标
     let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("iris.shader.blit"),
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
@@ -232,6 +235,26 @@ pub(crate) fn create_pipeline(
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
                 count: None,
             },
         ],
@@ -270,13 +293,92 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
+    // 泛光：半分辨率亮度提取（软阈值）+ 可分离高斯模糊（水平/垂直共用一条管线，
+    // 方向由 uniform 决定）。两个 pass 输出到同规格的 Rgba16Float 中间缓冲。
+    let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.bloom"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/bloom.wgsl").into()),
+    });
+    let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.bloom"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.bloom.pipeline.layout"),
+        bind_group_layouts: &[Some(&bloom_layout)],
+        immediate_size: 0,
+    });
+    let bloom_target = &[Some(wgpu::ColorTargetState {
+        format: HDR_FORMAT,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    })];
+    let make_bloom_pipeline = |label: &'static str, fs: &'static str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&bloom_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &bloom_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &bloom_shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: bloom_target,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let bloom_threshold_pipeline = make_bloom_pipeline("iris.pipeline.bloom_threshold", "fs_threshold");
+    let bloom_blur_pipeline = make_bloom_pipeline("iris.pipeline.bloom_blur", "fs_blur");
+
     PipelineBundle {
         pipeline,
         shadow_pipeline,
         blit_pipeline,
+        bloom_threshold_pipeline,
+        bloom_blur_pipeline,
         globals_layout,
         shadow_globals_layout,
         material_layout,
         blit_layout,
+        bloom_layout,
     }
 }

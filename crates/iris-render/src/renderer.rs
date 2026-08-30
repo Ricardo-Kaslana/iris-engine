@@ -125,7 +125,34 @@ struct HdrTargets {
     resolved: wgpu::Texture,
     resolved_view: wgpu::TextureView,
     blit_bind_group: wgpu::BindGroup,
+    /// 泛光中间缓冲（半分辨率；a 为提取/垂直模糊输出并供 blit 采样，
+    /// b 为水平模糊中转）。
+    #[allow(dead_code)]
+    bloom_a: wgpu::Texture,
+    bloom_a_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    bloom_b: wgpu::Texture,
+    bloom_b_view: wgpu::TextureView,
+    /// 三个 pass 的参数缓冲（提取 / 水平模糊 / 垂直模糊）。
+    /// 独立三份而非一份缓冲的三个插槽：绑定偏移必须满足
+    /// min_uniform_buffer_offset_alignment（典型 256），32B 插槽不合规。
+    bloom_params: [wgpu::Buffer; 3],
+    /// blit 合成的泛光强度（16B，x 分量生效；关闭泛光时写 0）。
+    bloom_strength: wgpu::Buffer,
+    bloom_threshold_bg: wgpu::BindGroup,
+    bloom_blur_h_bg: wgpu::BindGroup,
+    bloom_blur_v_bg: wgpu::BindGroup,
 }
+
+/// 与 WGSL `BlurParams` 对齐（32 字节，POD）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BloomParamsRaw {
+    a: [f32; 4], // 提取：x = 阈值, y = 软膝；模糊：z,w = texel 尺寸
+    b: [f32; 4], // 模糊方向步长
+}
+
+const _: () = assert!(std::mem::size_of::<BloomParamsRaw>() == 32, "BlurParams 必须与 WGSL 布局一致");
 
 /// 单帧渲染统计。
 #[derive(Clone, Copy, Debug, Default)]
@@ -296,6 +323,68 @@ impl Renderer {
         });
         let msaa_view = msaa.create_view(&wgpu::TextureViewDescriptor::default());
         let resolved_view = resolved.create_view(&wgpu::TextureViewDescriptor::default());
+        // 泛光目标：半分辨率，规格与 HDR 中间缓冲一致
+        let bloom_size = wgpu::Extent3d {
+            width: (width / 2).max(1),
+            height: (height / 2).max(1),
+            depth_or_array_layers: 1,
+        };
+        let make_bloom_tex = |label| {
+            self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: bloom_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::pipeline::HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let bloom_a = make_bloom_tex("iris.bloom.a");
+        let bloom_b = make_bloom_tex("iris.bloom.b");
+        let bloom_a_view = bloom_a.create_view(&wgpu::TextureViewDescriptor::default());
+        let bloom_b_view = bloom_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let make_bloom_params = || {
+            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.bloom.params"),
+                size: std::mem::size_of::<BloomParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let bloom_params: [wgpu::Buffer; 3] =
+            [make_bloom_params(), make_bloom_params(), make_bloom_params()];
+        let bloom_strength = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.bloom.strength"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bloom_sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let bloom_bg = |view: &wgpu::TextureView, params: &wgpu::Buffer| {
+            self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.bloom.bg"),
+                layout: &self.bundle.bloom_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&bloom_sampler),
+                    },
+                ],
+            })
+        };
+        let bloom_threshold_bg = bloom_bg(&resolved_view, &bloom_params[0]);
+        let bloom_blur_h_bg = bloom_bg(&bloom_a_view, &bloom_params[1]);
+        let bloom_blur_v_bg = bloom_bg(&bloom_b_view, &bloom_params[2]);
         let blit_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("iris.blit.bg"),
             layout: &self.bundle.blit_layout,
@@ -310,6 +399,14 @@ impl Renderer {
                         &wgpu::SamplerDescriptor::default(),
                     )),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&bloom_a_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bloom_strength.as_entire_binding(),
+                },
             ],
         });
         self.hdr_size = (width, height);
@@ -319,6 +416,15 @@ impl Renderer {
             resolved,
             resolved_view,
             blit_bind_group,
+            bloom_a,
+            bloom_a_view,
+            bloom_b,
+            bloom_b_view,
+            bloom_params,
+            bloom_strength,
+            bloom_threshold_bg,
+            bloom_blur_h_bg,
+            bloom_blur_v_bg,
         });
     }
 
@@ -626,6 +732,82 @@ impl Renderer {
                 draw_calls += 1;
                 instances += count as u32;
                 index += count;
+            }
+        }
+        // 泛光：提取 -> 水平模糊 -> 垂直模糊（半分辨率三个全屏 pass）。
+        // 强度经 uniform 进 blit：关闭时写 0，blit 绑定组无需重建。
+        let bloom = world
+            .try_resource::<crate::post::BloomSettings>()
+            .map(|b| *b)
+            .unwrap_or_default();
+        let strength = if bloom.enabled { bloom.strength.max(0.0) } else { 0.0 };
+        self.gpu.queue.write_buffer(
+            &hdr.bloom_strength,
+            0,
+            bytemuck::bytes_of(&[strength, 0.0, 0.0, 0.0]),
+        );
+        if bloom.enabled {
+            let bw = (width / 2).max(1) as f32;
+            let bh = (height / 2).max(1) as f32;
+            let texel = [1.0 / bw, 1.0 / bh];
+            let params = [
+                BloomParamsRaw {
+                    a: [bloom.threshold.max(0.0), 0.5, 0.0, 0.0],
+                    b: [0.0; 4],
+                },
+                BloomParamsRaw {
+                    a: [0.0, 0.0, texel[0], texel[1]],
+                    b: [texel[0], 0.0, 0.0, 0.0],
+                },
+                BloomParamsRaw {
+                    a: [0.0, 0.0, texel[0], texel[1]],
+                    b: [0.0, texel[1], 0.0, 0.0],
+                },
+            ];
+            for (buffer, raw) in hdr.bloom_params.iter().zip(params) {
+                self.gpu.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&raw));
+            }
+            let mut bloom_pass = |label, pipeline: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, view: &wgpu::TextureView| {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..3, 0..1);
+            };
+            bloom_pass(
+                "iris.pass.bloom_threshold",
+                &self.bundle.bloom_threshold_pipeline,
+                &hdr.bloom_threshold_bg,
+                &hdr.bloom_a_view,
+            );
+            // 三轮水平/垂直迭代扩展模糊半径（绑定组固定：H 读 a 写 b，V 读 b 写 a）
+            for _ in 0..3 {
+                bloom_pass(
+                    "iris.pass.bloom_blur_h",
+                    &self.bundle.bloom_blur_pipeline,
+                    &hdr.bloom_blur_h_bg,
+                    &hdr.bloom_b_view,
+                );
+                bloom_pass(
+                    "iris.pass.bloom_blur_v",
+                    &self.bundle.bloom_blur_pipeline,
+                    &hdr.bloom_blur_v_bg,
+                    &hdr.bloom_a_view,
+                );
             }
         }
         // 色调映射 blit：HDR -> sRGB 输出

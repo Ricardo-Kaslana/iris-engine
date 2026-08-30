@@ -5,7 +5,8 @@
 //! 特性：
 //! - 跨后端：Vulkan / DirectX 12 / Metal 由 wgpu 统一抽象，同一份 WGSL 着色器；
 //! - 自动实例化批处理：共享网格与材质的实体合并为一个 draw call；
-//! - 4x MSAA、深度测试、Blinn-Phong 光照（方向光 + 点光 + 环境光 + 自发光）；
+//! - 4x MSAA、深度测试、Cook-Torrance PBR（方向光 + 点光 + 环境光 + 自发光）；
+//! - HDR 中间缓冲 + ACES 色调映射 + 泛光（Bloom）后处理；
 //! - 视锥剔除与实体挂载相机；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
@@ -19,6 +20,7 @@ pub mod material;
 pub mod mesh;
 pub mod offscreen;
 pub mod pipeline;
+pub mod post;
 pub mod renderer;
 pub mod surface;
 pub mod texture;
@@ -33,6 +35,7 @@ pub mod prelude {
     pub use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{primitives, MeshData, MeshHandle, MeshStore, Vertex};
     pub use crate::offscreen::OffscreenRenderer;
+    pub use crate::post::BloomSettings;
     pub use crate::renderer::{FrameStats, Renderer};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};

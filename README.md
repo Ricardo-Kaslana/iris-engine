@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**HDR 渲染 + ACES 色调映射**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -69,6 +69,10 @@ cargo run --example gltf_snapshot --release
 # PBR / HDR / 阴影验收场景（离屏渲染），输出 iris_shadow_preview.bmp：
 # 金属球粗糙度梯度 + 绝缘体球 + 地面软阴影 + ACES 色调映射
 cargo run --example shadow_snapshot --release
+
+# 泛光验收场景（离屏渲染），输出 iris_bloom_preview.bmp：
+# 三颗自发光彩球的 HDR 光晕（阈值提取 + 半分辨率高斯模糊）
+cargo run --example bloom_snapshot --release
 
 # ECS 吞吐基准
 cargo run -p iris-core --example bench_ecs --release
@@ -122,7 +126,7 @@ iris-engine/
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / bloom_snapshot
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -169,15 +173,22 @@ PBR + HDR 实测（`docs/pbr_preview.png`）：Cook-Torrance 金属度/粗糙度
 
 ![PBR + HDR 渲染](docs/pbr_preview.png)
 
+泛光实测（`docs/bloom_preview.png`）：HDR 亮度提取（阈值 1.0，软膝）→ 半分辨率
+高斯模糊（三轮分离迭代）→ ACES 前按强度叠加。发光体溢出柔和彩色光晕，
+暗部与地面保持干净；`BloomSettings` 资源可调强度 / 阈值或整帧关闭。
+
+![泛光后处理](docs/bloom_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 82 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 83 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
 着色器编译、深度测试、MSAA、实例化合批、视锥剔除、多光源照明、
 **方向光阴影（开/关整帧差分：成片变暗、无变亮、大部分不变）**、
+**泛光（开/关整帧差分：光晕变亮、无变暗、远场不变）**、
 glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）。
 
 ## 跨平台矩阵
@@ -197,7 +208,7 @@ glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness �
 - [x] 实体挂载相机（层级 × 相机）
 - [x] 方向光阴影贴图（正交深度 pass + PCF）
 - [x] PBR 材质模型（Cook-Torrance）与 HDR / ACES 色调映射
-- [ ] 泛光（Bloom）等 HDR 后处理链
+- [x] 泛光（Bloom）后处理
 - [ ] IBL 环境光照（预滤波贴图 + BRDF LUT）
 - [ ] 点光阴影（cubemap）
 - [ ] 多线程系统调度（rayon 风格查询并行）

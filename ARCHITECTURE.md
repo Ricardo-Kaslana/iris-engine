@@ -109,7 +109,8 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   → 一次 write_buffer 上传全部实例
   → 阴影 pass（可选）：光源正交视角，深度写入 R32Float 颜色附件（2048²）
   → 主 pass：渲染到线性 HDR 中间缓冲（Rgba16Float + 4x MSAA → resolve）
-  → blit pass：ACES 色调映射 → sRGB 目标
+  → 泛光（可选）：亮度提取 → 高斯模糊（半分辨率三轮分离迭代）
+  → blit pass：叠加泛光 + ACES 色调映射 → sRGB 目标
   → queue.submit（异步）→ present
 ```
 
@@ -231,6 +232,22 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 `OffscreenRenderer` 与窗口渲染共享同一 `Renderer` 核心（管线、批处理、上传逻辑完全一致），
 仅目标是纹理 + 读回缓冲。用途：CI 集成测试、截图导出、无头环境。
 GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可跳过而非失败。
+
+### 4.11 泛光（Bloom）后处理
+
+- **三段式**：亮度提取（smoothstep 软阈值，HDR 亮度超过 `BloomSettings.threshold`
+  才参与）→ 可分离高斯模糊（9 tap 线性采样，半分辨率，水平/垂直管线共用、
+  三轮迭代扩展半径）→ blit 合成（ACES 色调映射**之前**按 `strength` 叠加，
+  保证高光泛光同样被色调映射滚降，不会死白）。
+- **纯加法不变量**：泛光只增不减（加法 + 单调速映射），集成测试据此断言
+  「开/关差分：光晕成片变亮、零像素变暗、远场不变」。
+- **uniform 对齐陷阱**：三个 pass 的参数曾放在同一缓冲的 32B 插槽里，
+  触发 `min_uniform_buffer_offset_alignment`（典型 256）校验错误——
+  绑定偏移必须 256 对齐；改为三个独立小缓冲后消除。
+- **关闭路径**：`BloomSettings` 未注册 = 默认启用；`enabled = false` 时跳过
+  三个 pass、blit 强度 uniform 写 0（绑定组无需重建，纹理照常绑定）。
+- v1 不做降采样链（1/4、1/8 mip 链），三轮半分辨率迭代在质量与占用间取中；
+  泛光源来自自发光（`MaterialDef.emissive`，HDR 值可 > 1）。
 
 ## 5. 内存安全策略总表
 

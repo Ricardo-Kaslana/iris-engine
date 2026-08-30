@@ -1,8 +1,12 @@
 // HDR → sRGB 色调映射 blit：全屏三角形，采样线性 HDR 中间缓冲，
-// ACES 近似色调映射后输出到 sRGB 目标（硬件完成最终 gamma 编码）。
+// 叠加泛光后做 ACES 近似色调映射，输出到 sRGB 目标（硬件完成最终 gamma 编码）。
 
 @group(0) @binding(0) var hdr_texture: texture_2d<f32>;
 @group(0) @binding(1) var hdr_sampler: sampler;
+// 泛光（半分辨率模糊结果，HDR 线性空间）；关闭时 strength uniform 为 0
+@group(0) @binding(2) var bloom_texture: texture_2d<f32>;
+// x: 泛光叠加强度
+@group(0) @binding(3) var<uniform> blit_params: vec4<f32>;
 
 struct BlitVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -41,8 +45,9 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: BlitVertexOutput) -> @location(0) vec4<f32> {
-    let hdr = textureSample(hdr_texture, hdr_sampler, in.uv).rgb;
-    // 轻微曝光控制 + ACES 色调映射（输出线性色，sRGB 编码由目标格式完成）
+    var hdr = textureSample(hdr_texture, hdr_sampler, in.uv).rgb;
+    // 泛光叠加（HDR 线性空间）后做 ACES 色调映射（输出线性色，sRGB 编码由目标格式完成）
+    hdr = hdr + textureSample(bloom_texture, hdr_sampler, in.uv).rgb * blit_params.x;
     let exposed = hdr * 1.0;
     return vec4<f32>(aces_tonemap(exposed), 1.0);
 }
