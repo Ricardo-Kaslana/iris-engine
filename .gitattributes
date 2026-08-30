@@ -1,0 +1,9 @@
+# 仓库内统一 LF，检出时按平台由 Git 决定；二进制不做转换
+* text=auto
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.wgsl text eol=lf
+*.sh text eol=lf
+*.png binary
+*.bmp binary
