@@ -30,4 +30,7 @@ pub use logic::{
     GameState, MoveInput, Phase, PickupState, PlayerState, GRAVITY, GROUND_Y, JUMP_SPEED,
     MOVE_SPEED, PICKUP_MAX_Y, PICKUP_RADIUS,
 };
-pub use plugin::{Coin, GameAssets, GameEntities, GamePlugin, ARENA_HALF, DURATION_SECS};
+pub use plugin::{
+    Coin, GameAssets, GameEntities, GamePlugin, BANNER_TEXT_NAME, DURATION_SECS, SCORE_TEXT_NAME,
+    TIME_TEXT_NAME,
+};

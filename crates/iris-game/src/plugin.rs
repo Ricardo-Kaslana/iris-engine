@@ -5,8 +5,11 @@
 //!   `build_scene`（地面 / 围墙 / 灯光 / 玩家 + 子实体相机 / 金币 / HUD）；
 //! - **Update**：`update_gameplay`（读 `Input` + `Time` → `GameState::step`
 //!   → 写玩家 `Transform` + 触发音效）→ `animate_coins`（金币自转浮动，
-//!   已收集者沉到 y = -100 隐藏）→ `update_hud`（SCORE / TIME / 横幅）→
-//!   `post_update_propagate`（层级传播，见下方「引擎缺口绕行」注释）。
+//!   已收集者切 `Visibility::HIDDEN`）→ `update_hud`（SCORE / TIME / 横幅，
+//!   HUD 文本实体经 `Name` 按名定位）。
+//! - **层级传播**：交给 `DefaultPlugins` 的 `HierarchyPlugin`（PostUpdate
+//!   阶段）——Update 写局部变换、PostUpdate 传播、渲染读取，本插件不再
+//!   自行补传播（引擎加入 PostUpdate 阶段前的旧绕行已删除）。
 //!
 //! 本插件**只使用引擎公开 API**（dogfooding）：不依赖引擎内部路径。
 //! 场景搭建走 `World::spawn` + `MeshStore` / `MaterialStore`，相机挂在
@@ -15,12 +18,12 @@
 //!
 //! 复用方式：窗口程序 `App::add_plugin(GamePlugin)`；headless 测试 /
 //! 离屏快照直接 `GamePlugin.build_schedule(&mut Schedule)` 后手动
-//! `schedule.run(Stage::Startup / Update, &mut world)`——与
-//! `DefaultPlugins` 的注册方式一致（资源兜底插入已并入 Startup 首系统，
-//! 两条路径无需差异配置）。
+//! `schedule.run(Stage::Startup / Update / PostUpdate, &mut world)`——
+//! 与 `DefaultPlugins` 的注册方式一致（资源兜底插入已并入 Startup 首系统，
+//! PostUpdate 由调用方注册 `HierarchyPlugin` 或等价的
+//! `propagate_transforms`，两条路径编排保持一致）。
 
-use iris_core::hierarchy::propagate_transforms;
-use iris_core::prelude::{Access, Entity, Schedule, Stage};
+use iris_core::prelude::{Access, Entity, Name, Schedule, Stage};
 use iris_engine::prelude::*;
 
 use crate::logic::{GameState, MoveInput, Phase};
@@ -42,19 +45,17 @@ pub struct GameAssets {
     pub boom_clip: AudioClip,
 }
 
-/// 场景实体索引：HUD 刷新与金币动画需要跨帧定位具体实体。
+/// 场景实体索引：金币动画等**每帧热路径**跨系统定位实体用的句柄资源。
 ///
-/// 引擎 v1 没有「按名字查实体」的组件，插件以资源登记句柄
-/// （见 ARCHITECTURE §8 本轮追加的引擎缺口清单）。
+/// HUD 文本实体已改用引擎的 `Name` 组件 + `World::entity_named` 按名
+/// 定位（低频路径，O(n) 扫描可接受），不再进入本索引——引擎补上
+/// `Name` 之前，这里曾被迫登记全部跨系统实体。
 #[derive(Clone, Resource)]
 pub struct GameEntities {
     pub player: Entity,
     pub camera: Entity,
     /// 金币实体，下标与 `GameState.pickups` 一一对应。
     pub coins: Vec<Entity>,
-    pub score_text: Entity,
-    pub time_text: Entity,
-    pub banner_text: Entity,
 }
 
 /// 金币标记组件：携带 `GameState.pickups` 下标（供下游工具/查询识别）。
@@ -76,10 +77,12 @@ const PLAYER_HALF_HEIGHT: f32 = 0.45;
 /// 金币视觉基线高度与浮动幅度。
 const COIN_BASE_Y: f32 = 0.35;
 const COIN_BOB_AMPLITUDE: f32 = 0.12;
-/// 已收集金币的隐藏高度（引擎 v1 无实体可见性开关，移出视野即隐藏）。
-const HIDDEN_Y: f32 = -100.0;
 /// HUD 布局（按 DefaultPlugins 缺省 1280×720 窗口手工排布）。
 const HUD_WIDTH: f32 = 1280.0;
+/// HUD 实体名（`Name` 组件，按名定位用）。
+pub const SCORE_TEXT_NAME: &str = "hud/score";
+pub const TIME_TEXT_NAME: &str = "hud/time";
+pub const BANNER_TEXT_NAME: &str = "hud/banner";
 
 /// 收集小游戏插件：Startup 搭场景 + Update 推进逻辑与表现。
 #[derive(Default)]
@@ -96,7 +99,8 @@ impl GamePlugin {
             .add_system(Stage::Startup, setup_resources)
             .add_system(Stage::Startup, build_scene)
             // Update 内的顺序即注册顺序（读写集冲突者分批保序）：
-            // 逻辑推进 → 金币表现 → HUD → 层级传播
+            // 逻辑推进 → 金币表现 → HUD；层级传播在 PostUpdate
+            // （窗口路径由 HierarchyPlugin 注册，headless 路径见其文档）
             .add_parallel_system(
                 Stage::Update,
                 Access::new()
@@ -115,18 +119,17 @@ impl GamePlugin {
                     .read::<GameState>()
                     .read::<Time>()
                     .read::<GameEntities>()
-                    .write::<Transform>(),
+                    .write::<Transform>()
+                    .write::<Visibility>(),
                 animate_coins,
             )
             .add_parallel_system(
                 Stage::Update,
                 Access::new()
                     .read::<GameState>()
-                    .read::<GameEntities>()
                     .write::<UiText>(),
                 update_hud,
-            )
-            .add_system(Stage::Update, post_update_propagate);
+            );
     }
 }
 
@@ -141,8 +144,9 @@ impl Plugin for GamePlugin {
 /// 引擎资源（Store / 相机 / 灯光 / 泛光 / 音频）按 DefaultPlugins 的
 /// ResourcePlugin 语义**缺席才插入**——窗口程序里 RenderPlugin /
 /// AudioPlugin 已就位，不得覆盖（音频设备句柄是独占的）；headless /
-/// 离屏路径则由这里补齐。游戏资源（`GameState` / `GameAssets`）由本插件
-/// 独占，直接插入。
+/// 离屏路径则由这里补齐。headless 测试请预插入 `Audio::headless()`（同样
+/// 不会被这里覆盖），避免 `cargo test` 间歇性打开真实设备。游戏资源
+/// （`GameState` / `GameAssets`）由本插件独占，直接插入。
 fn setup_resources(world: &mut World) {
     if !world.contains_resource::<MeshStore>() {
         world.insert_resource(MeshStore::new());
@@ -261,6 +265,8 @@ fn build_scene(world: &mut World) {
     world.add_child(player, camera);
 
     // ---- 金币：压扁金球（scale (0.45, 0.15, 0.45)）----
+    // 挂 Visibility（初始 VISIBLE）：收集后切 HIDDEN 隐藏——并行系统
+    // 只能经 get_mut 翻转已有组件，故组件必须在 spawn 时就位
     let coins: Vec<Entity> = GameState::spawn_positions()
         .into_iter()
         .enumerate()
@@ -270,45 +276,50 @@ fn build_scene(world: &mut World) {
                 coin_mesh,
                 coin_mat,
                 Coin(i),
+                Visibility::VISIBLE,
             ))
         })
         .collect();
 
     // ---- HUD（屏幕像素坐标，文本实体的 UiRect 仅作定位载体）----
+    // 文本实体挂 Name：刷新系统按名定位（引擎补上 Name 前，这些实体
+    // 只能全部登记进 GameEntities 句柄资源）
     world.spawn((
+        Name("hud/title".into()),
         UiRect { position: [24.0, 20.0], size: [0.0, 0.0] },
         UiText { string: "IRIS COLLECT".into(), scale: 3.0 },
         UiColor::default(),
     ));
-    let score_text = world.spawn((
+    world.spawn((
+        Name(SCORE_TEXT_NAME.into()),
         UiRect { position: [24.0, 60.0], size: [0.0, 0.0] },
         UiText { string: format!("SCORE 0/{}", GameState::spawn_positions().len()), scale: 3.0 },
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
-    let time_width = format!("TIME {}", DURATION_SECS as i32).len() as f32 * 8.0 * 3.0;
-    let time_text = world.spawn((
+    // TIME 右对齐：宽度经 text_width 测量（等宽布局盒宽），不再手算
+    // 8 × scale × 字符数
+    let time_string = format!("TIME {}", DURATION_SECS as i32);
+    let time_width = text_width(&UiText { string: time_string.clone(), scale: 3.0 });
+    world.spawn((
+        Name(TIME_TEXT_NAME.into()),
         UiRect { position: [HUD_WIDTH - time_width - 24.0, 20.0], size: [0.0, 0.0] },
-        UiText { string: format!("TIME {}", DURATION_SECS as i32), scale: 3.0 },
+        UiText { string: time_string, scale: 3.0 },
         UiColor::default(),
     ));
-    // 横幅：空串时不产生顶点（开局不可见），胜负时居中显示
-    let banner_text = world.spawn((
+    // 横幅：空串时不产生顶点（开局不可见），胜负时居中显示。
+    // 居中偏移按最终显示文本（YOU WIN!）的测量宽度计算。
+    let banner_width = text_width(&UiText { string: "YOU WIN!".into(), scale: 5.0 });
+    world.spawn((
+        Name(BANNER_TEXT_NAME.into()),
         UiRect {
-            position: [(HUD_WIDTH - 8.0 * 8.0 * 5.0) * 0.5, 290.0],
+            position: [(HUD_WIDTH - banner_width) * 0.5, 290.0],
             size: [0.0, 0.0],
         },
         UiText { string: String::new(), scale: 5.0 },
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
 
-    world.insert_resource(GameEntities {
-        player,
-        camera,
-        coins,
-        score_text,
-        time_text,
-        banner_text,
-    });
+    world.insert_resource(GameEntities { player, camera, coins });
 }
 
 /// Update 1：读输入与时间 → 推进纯逻辑 → 写玩家实体 → 触发音效。
@@ -347,8 +358,9 @@ fn update_gameplay(world: &World) {
     }
     drop(ents);
 
-    // 音效：拾取 blip / 终局 boom（引擎 v1 事件只能从独占系统发送，
-    // 并行系统直接调用 Audio 资源，见 ARCHITECTURE §8 缺口清单）
+    // 音效：拾取 blip / 终局 boom。并行系统可直接调用 Audio 资源播放；
+    // 若需要解耦（如录音统计、成就系统监听），引擎的 try_send_event
+    // 现已支持并行系统发送已注册类型的事件（无需独占世界）
     if picked || finished {
         if let (Some(assets), Some(audio)) =
             (world.try_resource::<GameAssets>(), world.try_resource::<Audio>())
@@ -363,7 +375,9 @@ fn update_gameplay(world: &World) {
     }
 }
 
-/// Update 2：金币表现——绕 Y 自转 + 正弦浮动；已收集者沉底隐藏。
+/// Update 2：金币表现——绕 Y 自转 + 正弦浮动；已收集者切
+/// `Visibility::HIDDEN` 隐藏（引擎加入 Visibility 组件前，唯一的隐藏
+/// 手段是把实体钉出视野：每帧把 y 写成 -100）。
 fn animate_coins(world: &World) {
     let Some(game) = world.try_resource::<GameState>() else {
         return;
@@ -379,14 +393,16 @@ fn animate_coins(world: &World) {
         let Some(pickup) = game.pickups.get(i) else {
             continue;
         };
+        // 可见性开关幂等翻转：已收集 = 隐藏，未收集 = 可见（重生支持）
+        if let Some(mut visibility) = world.get_mut::<Visibility>(entity) {
+            *visibility = if pickup.collected { Visibility::HIDDEN } else { Visibility::VISIBLE };
+        }
+        if pickup.collected {
+            continue;
+        }
         let Some(mut transform) = world.get_mut::<Transform>(entity) else {
             continue;
         };
-        if pickup.collected {
-            // 无可见性开关：把实体移出场景（每帧幂等地钉在 -100）
-            transform.position.y = HIDDEN_Y;
-            continue;
-        }
         let phase = i as f32 * 0.7;
         transform.rotation = Quat::from_rotation_y(elapsed * 2.0 + phase);
         transform.position.y = COIN_BASE_Y + (elapsed * 2.5 + phase).sin() * COIN_BOB_AMPLITUDE;
@@ -394,36 +410,30 @@ fn animate_coins(world: &World) {
 }
 
 /// Update 3：HUD 刷新——SCORE / TIME 每帧重写，终局横幅。
+///
+/// 文本实体经 `Name` 按名定位（`entity_named` 为 O(n) 线性扫描，本场景
+/// n ≈ 20 可忽略；每帧高频访问大量实体时仍应使用句柄资源）。
 fn update_hud(world: &World) {
     let Some(game) = world.try_resource::<GameState>() else {
         return;
     };
-    let Some(ents) = world.try_resource::<GameEntities>() else {
-        return;
-    };
-    if let Some(mut text) = world.get_mut::<UiText>(ents.score_text) {
-        text.string = format!("SCORE {}/{}", game.score, game.pickups.len());
+    if let Some(score_text) = world.entity_named(SCORE_TEXT_NAME) {
+        if let Some(mut text) = world.get_mut::<UiText>(score_text) {
+            text.string = format!("SCORE {}/{}", game.score, game.pickups.len());
+        }
     }
-    if let Some(mut text) = world.get_mut::<UiText>(ents.time_text) {
-        text.string = format!("TIME {}", game.time_left.ceil().max(0.0) as i32);
+    if let Some(time_text) = world.entity_named(TIME_TEXT_NAME) {
+        if let Some(mut text) = world.get_mut::<UiText>(time_text) {
+            text.string = format!("TIME {}", game.time_left.ceil().max(0.0) as i32);
+        }
     }
-    if let Some(mut text) = world.get_mut::<UiText>(ents.banner_text) {
-        text.string = match game.phase {
-            Phase::Won => "YOU WIN!".into(),
-            Phase::Lost => "TIME UP".into(),
-            Phase::Playing => String::new(),
-        };
+    if let Some(banner_text) = world.entity_named(BANNER_TEXT_NAME) {
+        if let Some(mut text) = world.get_mut::<UiText>(banner_text) {
+            text.string = match game.phase {
+                Phase::Won => "YOU WIN!".into(),
+                Phase::Lost => "TIME UP".into(),
+                Phase::Playing => String::new(),
+            };
+        }
     }
-}
-
-/// Update 4（引擎缺口绕行）：层级传播。
-///
-/// `DefaultPlugins` 的 `HierarchyPlugin` 把传播系统注册在本插件**之前**
-/// （插件注册顺序即执行顺序），而引擎没有系统排序 API（无 before/after
-/// 约束）——本插件写完玩家 `Transform` 后当帧已无传播可依赖，相机
-/// （玩家子实体）会滞后一帧。这里在系统链末尾补一次幂等的
-/// `propagate_transforms`：传播是纯函数重建，同帧跑两次结果一致，
-/// 代价只是约 20 个实体的一次多余矩阵复合。
-fn post_update_propagate(world: &mut World) {
-    propagate_transforms(world);
 }

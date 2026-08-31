@@ -441,19 +441,42 @@ pub fn push_text_vertices(
     }
 }
 
+/// 测量文本宽度（像素）：8 × scale × 最长行的字符数（`\n` 分行取最大）。
+///
+/// 与 [`push_text_vertices`] 的等宽步进同源——空格与非 ASCII 字符
+/// （跳过绘制但前进步进）同样计入宽度，因此测量结果与实际墨迹包围盒
+/// 对单行纯 ASCII 精确一致、对含不可绘制字符的行是保守上界。
+/// 供右对齐 / 居中等手工排版使用（HUD 布局不必再手算 8 × scale × 字符数）。
+pub fn text_width(text: &UiText) -> f32 {
+    let step = GLYPH_SIZE as f32 * text.scale;
+    text.string
+        .split('\n')
+        .map(|line| line.chars().count() as f32 * step)
+        .fold(0.0, f32::max)
+}
+
 /// 从 World 只读收集全部 UI 顶点（渲染器每帧调用）。
 /// 矩形先收集、文本后收集：alpha 混合下文本叠于矩形之上（血条底/前景
 /// 这类多层矩形由实体生成顺序决定层叠）。
+/// [`crate::visibility::Visibility`] 过滤：挂 `HIDDEN` 的实体（无论矩形
+/// 还是文本）不产生顶点；组件缺席视为可见（默认行为零变化）。
 pub(crate) fn collect_ui_vertices(world: &iris_core::world::World, out: &mut Vec<UiVertex>) {
-    world.query::<(Entity, &UiRect, &UiColor)>(|(entity, rect, color)| {
+    use crate::visibility::Visibility;
+    world.query::<(Entity, &UiRect, &UiColor, Option<&Visibility>)>(|(entity, rect, color, visibility)| {
         // 挂有 UiText 的实体上，UiRect 仅充当文本排版原点（定位载体），
         // 不绘制矩形——否则缺省白矩形会盖住文字；需要面板背景时单独
         // 生成一个矩形实体（与文本实体解耦）。
+        if visibility.is_some_and(|v| !v.visible) {
+            return;
+        }
         if world.get::<UiText>(entity).is_none() {
             push_rect_vertices(out, rect, *color);
         }
     });
-    world.query::<(Entity, &UiText, &UiColor)>(|(entity, text, color)| {
+    world.query::<(Entity, &UiText, &UiColor, Option<&Visibility>)>(|(entity, text, color, visibility)| {
+        if visibility.is_some_and(|v| !v.visible) {
+            return;
+        }
         let origin = world
             .get::<UiRect>(entity)
             .map(|rect| rect.position)
@@ -639,6 +662,73 @@ mod tests {
         let min_x = moved.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
         let min_y = moved.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
         assert_eq!((min_x, min_y), (5.0, 7.0));
+    }
+
+    #[test]
+    fn hidden_ui_entities_produce_no_vertices() {
+        // Visibility::HIDDEN 的矩形与文本均不进入收集结果；
+        // 组件缺席 = 可见（默认行为零变化）
+        let mut world = iris_core::world::World::new();
+        use crate::visibility::Visibility;
+        world.spawn((
+            UiRect { position: [0.0, 0.0], size: [10.0, 10.0] },
+            UiColor::default(),
+            Visibility::HIDDEN,
+        ));
+        world.spawn((
+            UiRect { position: [20.0, 0.0], size: [0.0, 0.0] },
+            UiText { string: "HIDE".into(), scale: 1.0 },
+            UiColor::default(),
+            Visibility::HIDDEN,
+        ));
+        let visible_rect = world.spawn((
+            UiRect { position: [40.0, 0.0], size: [8.0, 8.0] },
+            UiColor::default(),
+        ));
+        let _visible_text = world.spawn((
+            UiRect { position: [60.0, 0.0], size: [0.0, 0.0] },
+            UiText { string: "A".into(), scale: 1.0 },
+            UiColor::default(),
+        ));
+        // 显式 VISIBLE 与缺席等价
+        world.insert(visible_rect, Visibility::VISIBLE);
+
+        let mut out = Vec::new();
+        collect_ui_vertices(&world, &mut out);
+        let text_verts = popcount(glyph_bits(b'A').unwrap()) as usize * 6;
+        assert_eq!(
+            out.len(),
+            6 + text_verts,
+            "只有可见矩形（6 顶点）+ 可见文本；隐藏的矩形与文本不应产生顶点"
+        );
+        let min_x = out.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
+        assert!(min_x >= 40.0, "隐藏实体（x=0/20）不应出现，最小 x 应为 40，实际 {min_x}");
+    }
+
+    #[test]
+    fn text_width_matches_monospace_layout() {
+        let measure = |string: &str, scale: f32| {
+            text_width(&UiText { string: string.into(), scale })
+        };
+        // 单行：8 × scale × 字符数
+        assert_eq!(measure("TIME 60", 3.0), 7.0 * 8.0 * 3.0);
+        assert_eq!(measure("", 3.0), 0.0, "空文本宽度为 0");
+        // 多行取最长行
+        assert_eq!(measure("AB\nABCD", 1.0), 4.0 * 8.0);
+        assert_eq!(measure("ABCDE\nAB", 2.0), 5.0 * 8.0 * 2.0);
+        // 不可绘制字符（空格 / 非 ASCII）同样前进步进，计入宽度
+        assert_eq!(measure("  A", 1.0), 3.0 * 8.0);
+        assert_eq!(measure("éA", 1.0), 2.0 * 8.0);
+        // 右对齐用例：x = 屏宽 - 宽度 - 边距后，布局盒右缘恰好落在
+        // 右边距上，且全部墨迹都在布局盒内（等宽步进 ≥ 墨迹包围盒）
+        let text = UiText { string: "TIME 59".into(), scale: 3.0 };
+        let width = text_width(&text);
+        let origin_x = 1280.0 - width - 24.0;
+        assert_eq!(origin_x + width, 1280.0 - 24.0, "布局盒右缘应落在右边距");
+        let mut out = Vec::new();
+        push_text_vertices(&mut out, &text, [origin_x, 0.0], UiColor::default());
+        let max_x = out.iter().map(|v| v.pos[0]).fold(f32::MIN, f32::max);
+        assert!(max_x <= 1280.0 - 24.0, "墨迹不得越过布局盒右缘（实际 {max_x}）");
     }
 
     #[test]

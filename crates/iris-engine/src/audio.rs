@@ -37,9 +37,20 @@ impl Audio {
                     "无可用音频输出设备，音频降级为纯混音器模式（play / stop / set_volume \
                      正常工作，但不会发声）"
                 );
-                Self { mixer: Arc::new(Mutex::new(AudioMixer::new())), device: None }
+                Self::headless()
             }
         }
+    }
+
+    /// 强制纯混音器模式：**绝不打开输出设备**（headless 测试 / CI 专用）。
+    ///
+    /// `Audio::new()` 在有声卡的机器上会短暂占用真实设备——`cargo test`
+    /// 并发跑多个测试时可能触发设备争抢或无人值守的出声。headless 测试
+    /// 预插入本构造的资源后，`AudioPlugin` / 资源兜底逻辑遇到已存在的
+    /// `Audio` 不会覆盖（设备句柄独占，覆盖即泄漏），即可保证测试全程
+    /// 零设备访问；`play / stop / set_volume / mixer` 语义与有设备时一致。
+    pub fn headless() -> Self {
+        Self { mixer: Arc::new(Mutex::new(AudioMixer::new())), device: None }
     }
 
     /// 是否接有真实输出设备。
@@ -82,5 +93,29 @@ impl Audio {
 impl Default for Audio {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iris_audio::sine;
+
+    /// headless 构造：绝不触碰设备（`has_device` 为 false、协商参数为 0），
+    /// 混音器照常可用、play 不 panic。
+    #[test]
+    fn headless_never_touches_device_and_mixer_still_works() {
+        let audio = Audio::headless();
+        assert!(!audio.has_device(), "headless 模式不得持有设备会话");
+        assert_eq!(audio.channels(), 0, "无设备时协商声道数为 0");
+        assert_eq!(audio.sample_rate(), 0, "无设备时协商采样率为 0");
+
+        let clip = sine(440.0, 0.05, 48_000);
+        let id = audio.play(clip, 0.5, false);
+        assert_eq!(audio.mixer().active_count(), 1, "纯混音器模式下 play 照常入表");
+        assert!(audio.set_volume(id, 0.2), "句柄在活跃表内，调整音量应成功");
+        assert!(audio.stop(id), "停止应成功");
+        assert_eq!(audio.mixer().active_count(), 0);
+        assert!(!audio.stop(id), "旧世代句柄安全返回 false");
     }
 }

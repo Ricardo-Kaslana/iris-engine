@@ -70,24 +70,29 @@ impl Plugin for AudioPlugin {
     }
 }
 
-/// 层级插件：每帧在用户 Update 系统之前执行全局变换传播。
+/// 层级插件：每帧在 **PostUpdate** 阶段执行全局变换传播。
 ///
-/// 已包含在 [`DefaultPlugins`] 中；自建 App（不用 DefaultPlugins）时需要
-/// 手动添加，否则渲染器读取的 `GlobalTransform` 不会被更新。
+/// 编排语义：用户 Update 系统写局部 `Transform` → PostUpdate 传播 →
+/// 渲染读取 `GlobalTransform`——用户系统写入的变换当帧即完成全局传播，
+/// 无须关心本插件与自己的注册顺序（此前传播在 Update 内、先于一切用户
+/// 系统，后写的变换要滞后一帧，下游插件被迫在系统链末尾补一次幂等传播
+/// 绕行）。已包含在 [`DefaultPlugins`] 中；自建 App（不用 DefaultPlugins）
+/// 时需要手动添加，否则渲染器读取的 `GlobalTransform` 不会被更新。
 #[derive(Default)]
 pub struct HierarchyPlugin;
 
 impl Plugin for HierarchyPlugin {
     fn build(&self, app: &mut App) {
         app.schedule
-            .add_system(iris_core::prelude::Stage::Update, iris_core::hierarchy::propagate_transforms);
+            .add_system(iris_core::prelude::Stage::PostUpdate, iris_core::hierarchy::propagate_transforms);
     }
 }
 
-/// 动画插件：在层级传播之前推进所有 [`iris_render::animation::AnimationPlayer`]。
+/// 动画插件：在 Update 阶段推进所有 [`iris_render::animation::AnimationPlayer`]。
 ///
-/// 已包含在 [`DefaultPlugins`] 中（先于 [`HierarchyPlugin`] 执行，
-/// 动画写入的局部变换当帧即完成全局传播）。
+/// 已包含在 [`DefaultPlugins`] 中。动画在 Update 写局部变换，随后的
+/// PostUpdate（[`HierarchyPlugin`]）当帧即完成全局传播——「动画写入的
+/// 变换当帧可见」的语义不变。
 /// 注册为**并行系统**：只读世界 + 组件写访问走尝试型锁，
 /// 调度器据其访问集（写 AnimationPlayer / Transform，读 Time）分批。
 #[derive(Default)]

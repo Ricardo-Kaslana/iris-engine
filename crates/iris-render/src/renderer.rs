@@ -363,6 +363,95 @@ fn build_globals_bind_group(
     })
 }
 
+/// 收集本帧待绘制实例：普通批处理项 + 蒙皮项（每实体一项，不参与批处理）。
+///
+/// [`crate::visibility::Visibility`] 过滤在全部收集路径生效（主 pass、
+/// 方向光阴影与点光阴影 pass 共用同一份实例区间）：挂 `HIDDEN` 的实体
+/// 跳过，组件缺席视为可见（默认行为零变化）。普通实体做包围球视锥剔除；
+/// 蒙皮实体不剔除（关节可把顶点移出绑定姿势包围盒，保守全收）。
+/// 返回被视锥剔除的普通实体数（日志用）；排序由调用方在 `items` 上完成。
+fn collect_instances(
+    world: &iris_core::world::World,
+    mesh_store: &MeshStore,
+    frustum: &Frustum,
+    items: &mut Vec<DrawItem>,
+    skinned: &mut Vec<SkinnedItem>,
+) -> u32 {
+    use crate::visibility::Visibility;
+    items.clear();
+    skinned.clear();
+    let mut culled = 0u32;
+
+    // 蒙皮实体独立收集：不参与视锥剔除（关节可把顶点移出绑定姿势
+    // 包围盒，v1 保守全画）；关节矩阵在此即时计算（J = inv(mesh) ×
+    // global(joint) × ibm，蒙皮定义在网格局部空间，随父级整体移动）
+    world.query::<(
+        iris_core::prelude::Entity,
+        &GlobalTransform,
+        &MeshHandle,
+        &MaterialHandle,
+        &Skin,
+        Option<&Visibility>,
+    )>(|(e, gt, m, mat, skin, visibility)| {
+        if visibility.is_some_and(|v| !v.visible) {
+            return;
+        }
+        let mut joint_matrices = Vec::with_capacity(skin.joints.len());
+        skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
+        skinned.push(SkinnedItem {
+            skin_entity: e.to_bits(),
+            mesh: m.0,
+            material: mat.0,
+            instance: InstanceRaw::from_matrix(gt.matrix()),
+            joint_matrices,
+        });
+    });
+    let skinned_entities: std::collections::HashSet<u64> =
+        skinned.iter().map(|s| s.skin_entity).collect();
+
+    world.query::<(
+        iris_core::prelude::Entity,
+        &GlobalTransform,
+        &MeshHandle,
+        &MaterialHandle,
+        Option<&Visibility>,
+    )>(|(e, gt, m, mat, visibility)| {
+        if visibility.is_some_and(|v| !v.visible) {
+            return;
+        }
+        // 蒙皮实体走独立路径，避免同网格重复绘制
+        if skinned_entities.contains(&e.to_bits()) {
+            return;
+        }
+        let model = gt.matrix();
+        // 包围球剔除：局部球心经模型矩阵变换，半径按最大列缩放保守放大
+        let culled_now = mesh_store
+            .get(*m)
+            .and_then(|data| data.bounds())
+            .is_some_and(|(min, max)| {
+                let min = Vec3::from(min);
+                let max = Vec3::from(max);
+                let center_local = (min + max) * 0.5;
+                let radius_local = (max - min).length() * 0.5;
+                let center_world = model.transform_point3(center_local);
+                let scale = model
+                    .x_axis
+                    .truncate()
+                    .length()
+                    .max(model.y_axis.truncate().length())
+                    .max(model.z_axis.truncate().length());
+                !frustum.intersects_sphere(center_world, radius_local * scale)
+            });
+        if culled_now {
+            culled += 1;
+            return;
+        }
+        let key = ((m.0 as u64) << 32) | mat.0 as u64;
+        items.push(DrawItem { key, instance: InstanceRaw::from_matrix(model) });
+    });
+    culled
+}
+
 impl Renderer {
     pub fn new(gpu: Arc<Gpu>, color_format: wgpu::TextureFormat) -> Self {
         let bundle = create_pipeline(&gpu, color_format, SAMPLE_COUNT);
@@ -973,73 +1062,11 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        // 2. 收集实例（ECS 查询 -> 视锥剔除 -> 排序成批）
+        // 2. 收集实例（ECS 查询 -> Visibility 过滤 + 视锥剔除 -> 排序成批）
         let frustum = Frustum::from_view_proj(&vp);
         let mut items = std::mem::take(&mut self.scratch);
-        items.clear();
-        let mut culled = 0u32;
-
-        // 2a. 蒙皮实体独立收集：不参与视锥剔除（关节可把顶点移出绑定姿势
-        // 包围盒，v1 保守全画）；关节矩阵在此即时计算（J = inv(mesh) ×
-        // global(joint) × ibm，蒙皮定义在网格局部空间，随父级整体移动）
         let mut skinned = std::mem::take(&mut self.skinned_scratch);
-        skinned.clear();
-        world.query::<(
-            iris_core::prelude::Entity,
-            &GlobalTransform,
-            &MeshHandle,
-            &MaterialHandle,
-            &Skin,
-        )>(|(e, gt, m, mat, skin)| {
-            let mut joint_matrices = Vec::with_capacity(skin.joints.len());
-            skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
-            skinned.push(SkinnedItem {
-                skin_entity: e.to_bits(),
-                mesh: m.0,
-                material: mat.0,
-                instance: InstanceRaw::from_matrix(gt.matrix()),
-                joint_matrices,
-            });
-        });
-        let skinned_entities: std::collections::HashSet<u64> =
-            skinned.iter().map(|s| s.skin_entity).collect();
-
-        world.query::<(
-            iris_core::prelude::Entity,
-            &GlobalTransform,
-            &MeshHandle,
-            &MaterialHandle,
-        )>(|(e, gt, m, mat)| {
-            // 蒙皮实体走独立路径，避免同网格重复绘制
-            if skinned_entities.contains(&e.to_bits()) {
-                return;
-            }
-            let model = gt.matrix();
-            // 包围球剔除：局部球心经模型矩阵变换，半径按最大列缩放保守放大
-            let culled_now = mesh_store
-                .get(*m)
-                .and_then(|data| data.bounds())
-                .is_some_and(|(min, max)| {
-                    let min = Vec3::from(min);
-                    let max = Vec3::from(max);
-                    let center_local = (min + max) * 0.5;
-                    let radius_local = (max - min).length() * 0.5;
-                    let center_world = model.transform_point3(center_local);
-                    let scale = model
-                        .x_axis
-                        .truncate()
-                        .length()
-                        .max(model.y_axis.truncate().length())
-                        .max(model.z_axis.truncate().length());
-                    !frustum.intersects_sphere(center_world, radius_local * scale)
-                });
-            if culled_now {
-                culled += 1;
-                return;
-            }
-            let key = ((m.0 as u64) << 32) | mat.0 as u64;
-            items.push(DrawItem { key, instance: InstanceRaw::from_matrix(model) });
-        });
+        let culled = collect_instances(world, &mesh_store, &frustum, &mut items, &mut skinned);
         items.sort_unstable_by_key(|item| item.key);
         let total = items.len();
         if culled > 0 {
@@ -1783,6 +1810,71 @@ mod tests {
         let mut r = InstanceRaw::from_matrix(glam::Mat4::IDENTITY);
         r.model[3][0] = x;
         r
+    }
+
+    /// Visibility 过滤：隐藏实体不出现在实例收集结果（主 pass 与全部
+    /// 阴影 pass 共用这份收集，故一条测试覆盖三个 pass 的过滤语义）。
+    /// 组件缺席 = 可见；蒙皮路径同样生效。
+    #[test]
+    fn hidden_entities_are_skipped_in_instance_collection() {
+        use crate::mesh::primitives;
+        use crate::visibility::Visibility;
+        use iris_core::world::World;
+
+        let mut mesh_store = MeshStore::new();
+        let mesh = mesh_store.add(primitives::cube()); // MeshHandle(0)
+        let mut world = World::new();
+
+        let spawn_plain = |world: &mut World, material: u32, visibility: Option<Visibility>| {
+            let entity = world.spawn((
+                iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),
+                mesh,
+                MaterialHandle(material),
+            ));
+            if let Some(v) = visibility {
+                world.insert(entity, v);
+            }
+            entity
+        };
+        // 普通实体：缺席 / 显式 VISIBLE / HIDDEN（按材质编号区分收集结果）
+        spawn_plain(&mut world, 1, None);
+        spawn_plain(&mut world, 2, Some(Visibility::VISIBLE));
+        spawn_plain(&mut world, 3, Some(Visibility::HIDDEN));
+
+        // 蒙皮实体一对：可见 + 隐藏（关节实体需带 GlobalTransform）
+        let joint =
+            world.spawn((iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),));
+        let skin = Skin::new(vec![joint], vec![glam::Mat4::IDENTITY]);
+        let spawn_skinned =
+            |world: &mut World, material: u32, visibility: Option<Visibility>| {
+                let entity = world.spawn((
+                    iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),
+                    mesh,
+                    MaterialHandle(material),
+                    skin.clone(),
+                ));
+                if let Some(v) = visibility {
+                    world.insert(entity, v);
+                }
+                entity
+            };
+        spawn_skinned(&mut world, 5, None);
+        spawn_skinned(&mut world, 6, Some(Visibility::HIDDEN));
+
+        // 恒等矩阵提取的视锥包含原点附近的全部包围球（不产生额外剔除，
+        // 测试只观察 Visibility 过滤）
+        let frustum = Frustum::from_view_proj(&glam::Mat4::IDENTITY);
+        let mut items = Vec::new();
+        let mut skinned = Vec::new();
+        let culled = collect_instances(&world, &mesh_store, &frustum, &mut items, &mut skinned);
+
+        assert_eq!(culled, 0);
+        let keys: std::collections::HashSet<u64> = items.iter().map(|i| i.key).collect();
+        assert!(keys.contains(&(1u64)), "缺席 Visibility 的实体应可见");
+        assert!(keys.contains(&(2u64)), "显式 VISIBLE 应可见");
+        assert!(!keys.contains(&(3u64)), "HIDDEN 不应被收集");
+        assert_eq!(skinned.len(), 1, "隐藏的蒙皮实体不应被收集");
+        assert_eq!(skinned[0].material, 5);
     }
 
     fn slice(xs: &[f32]) -> Vec<InstanceRaw> {

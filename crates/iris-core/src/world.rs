@@ -202,10 +202,37 @@ impl World {
             .or_insert_with(|| RwLock::new(Box::new(Events::<E>::default())));
     }
 
-    /// 发送事件（当帧内有效，帧尾清空）。
+    /// 发送事件（当帧内有效，帧尾清空）。事件类型未注册时自动注册
+    /// （需要 `&mut World`，故本方法仅供独占系统使用）。
     pub fn send_event<E: Event>(&mut self, event: E) {
         self.register_event::<E>();
-        let cell = self.events.get(&TypeId::of::<E>()).expect("事件刚刚注册");
+        self.write_event(event);
+    }
+
+    /// 发送事件而不自动注册：类型已注册则写入并返回 `true`；未注册则
+    /// `log::warn` 并返回 `false`（**不**代为注册——注册是结构性修改，
+    /// 需要 `&mut World`）。
+    ///
+    /// 写路径本就是 `&self` + 写锁，因此并行系统（`fn(&World)`）可以
+    /// 直接发送已注册类型的事件——这是 `send_event` 无法覆盖的场景
+    /// （dogfooding：iris-game 的拾取音效被迫旁路事件，见 §8.12）。
+    pub fn try_send_event<E: Event>(&self, event: E) -> bool {
+        if self.events.contains_key(&TypeId::of::<E>()) {
+            self.write_event(event);
+            true
+        } else {
+            log::warn!(
+                "事件 {} 未注册，try_send_event 已丢弃该事件；请先 send_event 或 \
+                 register_event 注册（注册需要 &mut World）",
+                std::any::type_name::<E>()
+            );
+            false
+        }
+    }
+
+    /// 事件写入的公共尾路径（假定类型已注册）。
+    fn write_event<E: Event>(&self, event: E) {
+        let cell = self.events.get(&TypeId::of::<E>()).expect("事件应已注册");
         write_lock(cell, &format!("事件 {}", std::any::type_name::<E>()))
             .as_any_mut()
             .downcast_mut::<Events<E>>()
@@ -314,6 +341,39 @@ mod tests {
         assert_eq!(collected, vec![Message("hello"), Message("world")]);
         world.clear_all_events();
         assert_eq!(world.events::<Message>().len(), 0);
+    }
+
+    #[test]
+    fn try_send_event_writes_registered_type() {
+        let mut world = World::new();
+        // 未注册：返回 false 且不可读出
+        assert!(!world.try_send_event(Message("lost")));
+        assert!(world.try_events::<Message>().is_none(), "未注册类型不应被自动注册");
+
+        // 注册后：返回 true 且可读出
+        world.register_event::<Message>();
+        assert!(world.try_send_event(Message("kept")));
+        let collected: Vec<_> = world.events::<Message>().iter().copied().collect();
+        assert_eq!(collected, vec![Message("kept")]);
+    }
+
+    /// 并行系统场景：`fn(&World)` 拿不到 `&mut World`，仍应能发送
+    /// 已注册类型的事件（写路径 = `&self` + 写锁）。
+    #[test]
+    fn try_send_event_works_from_shared_world() {
+        use crate::schedule::{Schedule, Stage};
+
+        let mut world = World::new();
+        world.register_event::<Message>();
+
+        fn parallel_sender(world: &World) {
+            assert!(world.try_send_event(Message("from parallel")));
+        }
+
+        let mut schedule = Schedule::new();
+        schedule.add_parallel_system(Stage::Update, crate::prelude::Access::new(), parallel_sender);
+        schedule.run(Stage::Update, &mut world);
+        assert_eq!(world.events::<Message>().len(), 1);
     }
 
     #[test]

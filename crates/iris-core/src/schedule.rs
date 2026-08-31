@@ -1,4 +1,4 @@
-//! 系统调度：按阶段（Startup / FixedUpdate / Update）执行系统。
+//! 系统调度：按阶段（Startup / FixedUpdate / Update / PostUpdate）执行系统。
 //!
 //! 同一阶段内系统按注册顺序组织为**批次**：
 //! - 独占系统（`fn(&mut World)`）与一切冲突，独占一个批次（屏障语义）；
@@ -24,6 +24,12 @@ pub enum Stage {
     FixedUpdate,
     /// 可变步长更新（输入、AI、动画），每帧一次。
     Update,
+    /// 后更新（层级传播等收尾系统），每帧一次且**不在 FixedUpdate
+    /// 循环内**。编排：Update 写局部变换 → PostUpdate 传播 → 渲染读取
+    /// ——用户 Update 系统写入的变换当帧即完成全局传播，无须关心
+    /// 自己与 HierarchyPlugin 的注册顺序（dogfooding 缺口：无系统排序
+    /// API 时插件无法排到传播之前，见 §8.12）。
+    PostUpdate,
 }
 
 /// 系统：消费整个世界的一次性闭包或函数（独占访问，串行执行）。
@@ -149,6 +155,7 @@ pub struct Schedule {
     startup: Vec<Entry>,
     fixed: Vec<Entry>,
     update: Vec<Entry>,
+    post_update: Vec<Entry>,
 }
 
 impl Schedule {
@@ -192,6 +199,7 @@ impl Schedule {
             Stage::Startup => &mut self.startup,
             Stage::FixedUpdate => &mut self.fixed,
             Stage::Update => &mut self.update,
+            Stage::PostUpdate => &mut self.post_update,
         }
     }
 
@@ -257,6 +265,7 @@ impl Schedule {
             Stage::Startup => self.startup.len(),
             Stage::FixedUpdate => self.fixed.len(),
             Stage::Update => self.update.len(),
+            Stage::PostUpdate => self.post_update.len(),
         }
     }
 
@@ -281,6 +290,7 @@ impl Schedule {
             Stage::Startup => &self.startup,
             Stage::FixedUpdate => &self.fixed,
             Stage::Update => &self.update,
+            Stage::PostUpdate => &self.post_update,
         }
     }
 
@@ -388,6 +398,35 @@ mod tests {
         });
         schedule.run(Stage::Startup, &mut world);
         assert_eq!(world.resource::<Stamp>().0, 0);
+    }
+
+    /// 阶段编排契约：PostUpdate 在 Update 之后执行（App 主循环按
+    /// FixedUpdate × N → Update → PostUpdate 推进，见 app.rs）。
+    /// Update 写局部状态，PostUpdate 收尾读取——层级传播的新家。
+    #[test]
+    fn post_update_runs_after_update() {
+        let mut world = World::new();
+        let entity = world.spawn((Counter(0), Observed(-1)));
+
+        let mut schedule = Schedule::new();
+        schedule
+            .add_system(Stage::Update, |world: &mut World| {
+                let e = world.entities().next().unwrap();
+                world.get_mut::<Counter>(e).unwrap().0 = 7;
+            })
+            .add_system(Stage::PostUpdate, |world: &mut World| {
+                let e = world.entities().next().unwrap();
+                let value = world.get::<Counter>(e).unwrap().0;
+                world.get_mut::<Observed>(e).unwrap().0 = value;
+            });
+
+        assert_eq!(schedule.system_count(Stage::PostUpdate), 1);
+        schedule.run(Stage::PostUpdate, &mut world);
+        // 单独跑 PostUpdate 时 Update 未执行：观察到的是 Counter 初值（先决条件）
+        assert_eq!(world.get::<Observed>(entity).unwrap().0, 0);
+        schedule.run(Stage::Update, &mut world);
+        schedule.run(Stage::PostUpdate, &mut world);
+        assert_eq!(world.get::<Observed>(entity).unwrap().0, 7, "PostUpdate 应读到 Update 的结果");
     }
 
     fn spawn_two_markers(world: &mut World) {

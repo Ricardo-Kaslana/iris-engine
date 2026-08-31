@@ -78,6 +78,19 @@ impl Input {
 
     // ---- 事件注入（由平台事件循环调用） ----
 
+    /// 便捷注入：按下键。等价 `on_key(key.into(), ElementState::Pressed)`，
+    /// 测试与工具脚本无须手构 winit 事件类型（`KeyCode` 可直接传入，
+    /// 经 `Into<PhysicalKey>` 转换）。
+    pub fn press(&mut self, key: impl Into<PhysicalKey>) {
+        self.on_key(key.into(), ElementState::Pressed);
+    }
+
+    /// 便捷注入：释放键。等价 `on_key(key.into(), ElementState::Released)`。
+    /// 「按住」状态跨帧保持，换向必须显式释放（脚本化驱动时勿忘）。
+    pub fn release(&mut self, key: impl Into<PhysicalKey>) {
+        self.on_key(key.into(), ElementState::Released);
+    }
+
     pub fn on_key(&mut self, physical: PhysicalKey, state: ElementState) {
         let PhysicalKey::Code(code) = physical else {
             return;
@@ -188,6 +201,29 @@ mod tests {
         input.on_key(key(KeyCode::Space), ElementState::Pressed);
         assert!(!input.key_pressed(KeyCode::Space));
         assert!(input.key(KeyCode::Space));
+    }
+
+    /// press / release 便捷注入：与 on_key 语义一致，但无须手构
+    /// ElementState / PhysicalKey（KeyCode 经 Into<PhysicalKey> 直通）。
+    #[test]
+    fn press_and_release_drive_key_state() {
+        let mut input = Input::new();
+        input.press(KeyCode::KeyD);
+        assert!(input.key(KeyCode::KeyD), "press 后应处于按住状态");
+        assert!(input.key_pressed(KeyCode::KeyD), "press 当帧视为刚按下");
+
+        input.end_frame();
+        assert!(input.key(KeyCode::KeyD), "按住状态跨帧保持");
+        assert!(!input.key_pressed(KeyCode::KeyD));
+
+        // 换向必须显式释放（按住状态不会自行消失）
+        input.release(KeyCode::KeyD);
+        assert!(!input.key(KeyCode::KeyD), "release 后不应再按住");
+        assert!(input.key_released(KeyCode::KeyD));
+
+        // 也接受显式 PhysicalKey（与 on_key 的参数形态互通）
+        input.press(PhysicalKey::Code(KeyCode::KeyA));
+        assert!(input.key(KeyCode::KeyA));
     }
 
     #[test]

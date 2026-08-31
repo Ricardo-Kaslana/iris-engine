@@ -110,7 +110,9 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   需要级联销毁用 `despawn_recursive`。
 - 查询迭代基准需要实体本身时，`Entity` 直接实现了 `QueryPart`
   （`query::<(Entity, &Transform)>(...)`），守卫为分配器的共享借用。
-- 传播在用户 Update 系统之前执行（`HierarchyPlugin`，包含于 `DefaultPlugins`）。
+- 传播在 **PostUpdate 阶段**执行（`HierarchyPlugin`，包含于 `DefaultPlugins`；
+  每帧一次、不在 FixedUpdate 循环内）——编排：Update 写局部变换 →
+  PostUpdate 传播 → 渲染读取，用户系统当帧写入的变换当帧即完成全局传播。
 
 ### 3.6 时间管理
 
@@ -130,8 +132,11 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 - **执行**：`std::thread::scope` + 原子计数器自取任务，线程数取
   `min(系统数, 可用核数)`；`&World` 跨线程共享依赖 `World: Sync`（§3.3）。
 - **引擎自身的并行系统**：`update_animations`（写 AnimationPlayer /
-  Transform，读 Time）——DefaultPlugins 每帧真实走并行路径；
-  独占的层级传播紧随其后形成屏障。
+  Transform，读 Time）——DefaultPlugins 每帧真实走并行路径；Update 后的
+  PostUpdate 阶段执行独占的层级传播（跨阶段天然屏障）。
+- **阶段编排**：每帧 `FixedUpdate × N → Update → PostUpdate`（PostUpdate
+  每帧一次、不在固定步长循环内），由 `App` 主循环驱动；Startup 在首帧前
+  执行一次。
 - **实测**：16 核上 8 个互不冲突分量系统 3.27× 加速
   （`cargo run -p iris-core --example bench_parallel --release`）。
   未达线性是每系统内部仍为单线程遍历 + 线程启动开销 + 内存带宽上限。
@@ -486,7 +491,9 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
   网格精确对齐，无 MSAA（目标是 blit 后的单采样 sRGB）、cull None
   （UI 面向屏幕）、标准 alpha 混合（`BlendState::ALPHA_BLENDING`）。
 - **单批单 draw 的合批策略**：每帧两阶段只读查询（先矩形后文本，
-  alpha 混合下文本叠于矩形之上）直接组装 `Vec<UiVertex>`（像素位置 +
+  alpha 混合下文本叠于矩形之上；查询带 `Option<&Visibility>`，挂
+  `Visibility::HIDDEN` 的实体不产生顶点、组件缺席 = 可见）直接组装
+  `Vec<UiVertex>`（像素位置 +
   图集 UV + 线性 RGBA 顶点色，32B POD），矩形与文本全部 UI 内容合并为
   **一次 draw call**（`stats.draw_calls` 计入）。矩形 = 6 顶点、UV 取
   图集 0 号格纯白块（带半纹素内缩）；文本逐字形扫描行位码，每个亮位
@@ -666,10 +673,16 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
     会引入混叠）；软限幅为硬钳制（叠加爆表段有可闻削底）；cpal `Stream`
     非 `Send`，设备会话托管在专属后台线程（§4.14）。
 12. **dogfooding 发现的引擎缺口（iris-game 实践反馈）**——以下均为用引擎拼
-    一个完整游戏时实际撞到的摩擦与绕行方式：
+    一个完整游戏时实际撞到的摩擦与绕行方式。（更新：**七项已全部修复于
+    「引擎 API 打磨」轮**，iris-game 的绕行代码已同步删除并改用新 API 作
+    闭合证明；条目按原文保留作为 dogfooding 记录。）
     - **无实体可见性开关**：隐藏实体的唯一办法是移出视野（游戏把已收集
       金币每帧钉在 y = -100）或销毁重建（丢失句柄语义）。建议 `Visibility`
       组件在批处理阶段过滤。
+      → **已修复**：`iris_render::Visibility` 组件（`VISIBLE` / `HIDDEN`
+      常量）+ 渲染收集查询带 `Option<&Visibility>`，主 pass / 方向光阴影 /
+      点光阴影 / UI 四条收集路径统一过滤；组件缺席 = 可见（默认行为零变化）。
+      游戏侧：已收集金币改切 `Visibility::HIDDEN`（钉 y = -100 的绕行已删）。
     - **无系统排序 API**：同阶段系统按注册顺序分批，DefaultPlugins 之后的
       插件无法把自己的系统排到层级传播**之前**（也无 before/after 约束）——
       iris-game 在系统链末尾补一次幂等的 `propagate_transforms` 绕行（同帧
@@ -677,23 +690,52 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
       读写集冲突「涌现」（逻辑系统写 `GameState` / HUD 系统读之，恰好分批
       保序）：声明漂移即静默破坏顺序（运行期借用检查兜底 panic，不会数据
       竞争）。建议显式排序约束或增加 PostUpdate 阶段。
+      → **已修复**：`Stage::PostUpdate` 阶段（每帧一次、不在 FixedUpdate
+      循环内），编排 Update 写局部变换 → PostUpdate 传播 → 渲染读取；
+      `HierarchyPlugin` 的 `propagate_transforms` 迁址 PostUpdate，用户系统
+      当帧写入当帧传播，插件不再关心与传播的注册顺序（游戏侧幂等补传播
+      的绕行已删；显式 before/after 排序约束仍不在路线图内）。
     - **并行系统无法发送事件**：`send_event` 需要 `&mut World`（独占系统
       专属），并行系统（`&World`）只能旁路——拾取音效改为在系统内直接调用
       `Audio::play` 而非「拾取事件」。建议资源形态的事件写入器。
+      → **已修复**：`World::try_send_event<E>(&self, event) -> bool`——写
+      路径本就是 `&self` + 写锁，已注册类型即可从并行系统发送；未注册返回
+      `false` 并告警（不自动注册：注册是结构性修改需 `&mut`，`send_event`
+      保留自动注册语义）。游戏侧保留直接调用 `Audio::play`（更简单直白），
+      注释改指新 API 作为解耦选项。
     - **无按名查实体**：跨系统定位实体（HUD 刷新、金币动画）只能自建
       「实体句柄索引」资源（`GameEntities`）。建议 `Name` 组件 + 查询辅助。
+      → **已修复**：`iris_core::Name` 组件 + `World::entity_named(&str)
+      -> Option<Entity>`（线性扫描，O(n) 适用低频查找，同名取首个）。
+      游戏侧：HUD 文本实体改挂 `Name` 并按名定位，`GameEntities` 精简为
+      玩家 / 相机 / 金币三个每帧热路径句柄。
     - **Input 注入侧类型未重导出**：查询侧 `KeyCode` 在 prelude，脚本化
       注入所需的 `PhysicalKey` / `ElementState` 不在——下游 headless 测试
       被迫直接依赖 winit。且「按住」状态跨帧保持、换向必须显式 `Released`
       （快照脚本忘发释放事件导致两键叠加相消，实测踩坑）。建议补重导出与
       `press / release` 便捷方法。
+      → **已修复**：prelude 重导出 `PhysicalKey` / `ElementState`（查询侧
+      `KeyCode` / `MouseButton` 原有），`Input::press(impl Into<PhysicalKey>)`
+      / `Input::release(...)` 包装 `on_key`（`KeyCode` 经 winit 的
+      `From` 直通，无须手构事件类型）。游戏侧：headless 测试与
+      `game_snapshot` 示例已删除 winit 直接依赖（dev-dependency 移除）。
     - **Audio 无法强制纯混音器模式**：`Audio::new()` 优先建设备且字段私有，
       有声卡的开发机上 `cargo test` 会短暂打开真实设备（无声卡 CI 自动
       降级）。建议 `Audio::headless()` 构造器。
+      → **已修复**：`Audio::headless()`——绝不打开设备（纯混音器），
+      `play / stop / set_volume / mixer` 语义与有设备时一致；资源兜底逻辑
+      遇已存在的 `Audio` 不覆盖，headless 测试预插入即全程零设备访问。
     - **小项**：`Time` 的确定性推进需手工构造单调 `Instant`（`advance`
       便捷方法会更直白，首帧 delta = 0 也需测试知晓）；`UiText` 无文本
       测量（右对齐 HUD 需手算 8×scale×字符数）；图元库无圆柱 / 胶囊
       （金币以压扁球体替代）。
+      → **已修复**：`Time::advance(Duration)`（delta = min(dt, max_delta)，
+      elapsed / ticks / accumulator 同步，首帧即有效 delta，时钟基准归位
+      不与 `begin_frame` 二次差分）；`iris_render::ui::text_width(&UiText)
+      -> f32`（8 × scale × 最长行字符数，与渲染步进同源，游戏侧 TIME
+      右对齐与横幅居中改用）；`primitives::cylinder(radius, height,
+      segments)`（侧面 quad 环 + 上下三角扇圆帽，外侧 CCW 环绕与既有
+      图元一致）。胶囊仍不在（金币仍为压扁球体，视觉等价）。
 
 ## 9. 关键设计取舍记录
 

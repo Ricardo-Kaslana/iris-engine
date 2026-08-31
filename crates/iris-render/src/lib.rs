@@ -34,6 +34,7 @@ pub mod skin;
 pub mod surface;
 pub mod texture;
 pub mod ui;
+pub mod visibility;
 
 pub mod prelude {
     pub use crate::animation::{
@@ -60,7 +61,8 @@ pub mod prelude {
     pub use crate::skin::{skin_vertex, Skin};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
-    pub use crate::ui::{glyph_bits, UiColor, UiRect, UiText};
+    pub use crate::ui::{glyph_bits, text_width, UiColor, UiRect, UiText};
+    pub use crate::visibility::Visibility;
 }
 
 /// 全引擎固定的多重采样倍率（4x MSAA）。

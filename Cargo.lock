@@ -924,7 +924,6 @@ dependencies = [
  "glam",
  "iris-core",
  "iris-engine",
- "winit",
 ]
 
 [[package]]

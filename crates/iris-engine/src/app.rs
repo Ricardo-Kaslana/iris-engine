@@ -5,8 +5,9 @@
 //! 窗口事件泵（输入写入 Input 资源）
 //!   -> Time.begin_frame（可变 delta + 固定步长累积）
 //!   -> FixedUpdate × N（确定性逻辑，最多 5 步防死亡螺旋）
-//!   -> Update（可变步长逻辑）
-//!   -> 渲染 + 呈现
+//!   -> Update（可变步长逻辑，写局部变换）
+//!   -> PostUpdate（收尾系统：层级传播等，每帧一次，不在 FixedUpdate 循环内）
+//!   -> 渲染 + 呈现（读取传播后的 GlobalTransform）
 //!   -> 事件清空 / 输入一次性状态清零 / 检查 AppExit
 //! ```
 
@@ -126,6 +127,27 @@ struct Runner {
     surface_init: Option<Pin<Box<dyn std::future::Future<Output = Option<SurfaceKit>>>>>,
 }
 
+/// 驱动一帧的全部更新阶段：FixedUpdate × N（时间累积器决定步数）→
+/// Update → PostUpdate。PostUpdate 每帧执行一次且不在 FixedUpdate
+/// 循环内——层级传播（HierarchyPlugin）栖身于此：Update 写局部变换 →
+/// PostUpdate 传播 → 渲染读取。独立成函数便于编排单测。
+fn run_update_stages(schedule: &mut Schedule, world: &mut World) {
+    // 固定步长逻辑
+    let fixed_steps = world
+        .try_resource_mut::<Time>()
+        .map(|mut t| t.fixed_steps())
+        .unwrap_or(0);
+    for _ in 0..fixed_steps {
+        schedule.run(Stage::FixedUpdate, world);
+    }
+
+    // 可变更新
+    schedule.run(Stage::Update, world);
+
+    // 后更新（每帧一次）：层级传播等收尾系统
+    schedule.run(Stage::PostUpdate, world);
+}
+
 impl Runner {
     /// 每帧逻辑：更新 -> 渲染 -> 收尾。
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
@@ -144,28 +166,19 @@ impl Runner {
             time.begin_frame(Instant::now());
         }
 
-        // 2. 固定步长逻辑
-        let fixed_steps = world
-            .try_resource_mut::<Time>()
-            .map(|mut t| t.fixed_steps())
-            .unwrap_or(0);
-        for _ in 0..fixed_steps {
-            self.app.schedule.run(Stage::FixedUpdate, world);
-        }
+        // 2. FixedUpdate × N -> Update -> PostUpdate（见 run_update_stages）
+        run_update_stages(&mut self.app.schedule, world);
 
-        // 3. 可变更新
-        self.app.schedule.run(Stage::Update, world);
-
-        // 4. 渲染 + 呈现
+        // 3. 渲染 + 呈现
         surface.render(world);
 
-        // 5. 帧收尾：事件清空、输入一次性状态清零
+        // 4. 帧收尾：事件清空、输入一次性状态清零
         world.clear_all_events();
         if let Some(mut input) = world.try_resource_mut::<Input>() {
             input.end_frame();
         }
 
-        // 6. 退出检查
+        // 5. 退出检查
         if world.try_events::<AppExit>().is_some_and(|e| e.len() > 0) {
             event_loop.exit();
         }
@@ -310,5 +323,84 @@ impl ApplicationHandler for Runner {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iris_core::prelude::{GlobalTransform, Transform, Vec3};
+    use iris_core::Component;
+    use std::time::Duration;
+
+    #[derive(Component)] struct Ticks(u32);
+
+    /// 阶段编排：Update 先于 PostUpdate，且 PostUpdate 每帧恰好一次
+    /// （即便 FixedUpdate 跑了多步——收尾系统不在固定步长循环内）。
+    #[test]
+    fn post_update_runs_once_after_update_outside_fixed_loop() {
+        let mut world = World::new();
+        world.insert_resource(Time::default());
+        world.spawn((Ticks(0),));
+        let entity = world.entities().next().unwrap();
+
+        let mut schedule = Schedule::new();
+        schedule
+            .add_system(Stage::FixedUpdate, |world: &mut World| {
+                let e = world.entities().next().unwrap();
+                world.get_mut::<Ticks>(e).unwrap().0 += 1;
+            })
+            .add_system(Stage::Update, |world: &mut World| {
+                let e = world.entities().next().unwrap();
+                world.get_mut::<Ticks>(e).unwrap().0 += 10;
+            })
+            .add_system(Stage::PostUpdate, |world: &mut World| {
+                let e = world.entities().next().unwrap();
+                world.get_mut::<Ticks>(e).unwrap().0 += 100;
+            });
+
+        // 累积恰好 2 个固定步长的预算（Time::advance：确定性推进）
+        world.resource_mut::<Time>().set_fixed_hz(60.0);
+        world
+            .resource_mut::<Time>()
+            .advance(Duration::from_secs_f64(2.0 / 60.0));
+
+        run_update_stages(&mut schedule, &mut world);
+
+        assert_eq!(
+            world.get::<Ticks>(entity).unwrap().0,
+            2 + 10 + 100,
+            "FixedUpdate ×2 + Update ×1 + PostUpdate ×1"
+        );
+    }
+
+    /// 层级传播迁址 PostUpdate 后的端到端编排：Update 写父级局部变换 →
+    /// PostUpdate（HierarchyPlugin 注册的 propagate_transforms）传播 →
+    /// 子实体 GlobalTransform 当帧即反映新位置（不再滞后一帧）。
+    #[test]
+    fn hierarchy_propagation_in_post_update_sees_same_frame_writes() {
+        let mut world = World::new();
+        let parent = world.spawn((Transform::IDENTITY,));
+        let child = world.spawn((Transform::from_xyz(1.0, 0.0, 0.0),));
+        world.add_child(parent, child);
+
+        let mut schedule = Schedule::new();
+        schedule
+            .add_system(Stage::Update, move |world: &mut World| {
+                // 用户系统在 Update 内移动父级
+                world.get_mut::<Transform>(parent).unwrap().position = Vec3::new(5.0, 0.0, 0.0);
+            })
+            .add_system(Stage::PostUpdate, iris_core::hierarchy::propagate_transforms);
+
+        run_update_stages(&mut schedule, &mut world);
+
+        let child_global = world
+            .get::<GlobalTransform>(child)
+            .expect("传播应已为子实体建立 GlobalTransform")
+            .position();
+        assert!(
+            (child_global - Vec3::new(6.0, 0.0, 0.0)).length() < 1e-5,
+            "子实体应随父级当帧移动到 (6,0,0)，实际 {child_global:?}"
+        );
     }
 }

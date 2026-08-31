@@ -76,6 +76,11 @@ impl MeshData {
         primitives::uv_sphere(radius, segments, rings)
     }
 
+    /// 圆柱体。见 [`primitives::cylinder`]。
+    pub fn cylinder(radius: f32, height: f32, segments: u32) -> Self {
+        primitives::cylinder(radius, height, segments)
+    }
+
     /// 计算包围盒（用于将来视锥剔除）。
     pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         let mut iter = self.vertices.iter().map(|v| v.position);
@@ -167,6 +172,84 @@ pub mod primitives {
                 // 实测症状：球体在强光下仍是纯黑剪影）。
                 data.indices.extend_from_slice(&[a, d, c, a, b, d]);
             }
+        }
+        data
+    }
+
+    /// 圆柱体（中心在原点，轴沿 +Y）：侧面 quad 环 + 上下圆帽（三角扇）。
+    ///
+    /// 侧面法线径向朝外、帽面法线 ±Y；环绕方向与 `add_face` / `uv_sphere`
+    /// 的约定一致（从外侧看 CCW，正面朝外）。首尾重复顶点闭合侧环（UV
+    /// 无缝），帽面独立携带 ±Y 法线的顶点（与侧面的径向法线分离，
+    /// 顶点不共享——受光方向不同，共享会产生插值瑕疵）。
+    pub fn cylinder(radius: f32, height: f32, segments: u32) -> MeshData {
+        assert!(segments >= 3, "圆柱分段数过低");
+        let mut data = MeshData::default();
+        let half = height * 0.5;
+
+        // ---- 侧面：两行顶点（0 = 底 -Y，1 = 顶 +Y）× segments 个 quad ----
+        for ring in 0..=1u32 {
+            let y = if ring == 0 { -half } else { half };
+            for seg in 0..=segments {
+                let theta = std::f32::consts::TAU * seg as f32 / segments as f32;
+                let (sin_theta, cos_theta) = theta.sin_cos();
+                let normal = [cos_theta, 0.0, sin_theta];
+                data.vertices.push(Vertex {
+                    position: [cos_theta * radius, y, sin_theta * radius],
+                    normal,
+                    uv: [seg as f32 / segments as f32, ring as f32],
+                });
+            }
+        }
+        let stride = segments + 1;
+        for seg in 0..segments {
+            let a = seg; // 底环当前
+            let b = a + 1; // 底环下一点（θ 增大）
+            let c = a + stride; // 顶环当前
+            let d = c + 1; // 顶环下一点
+            // 从外侧看 CCW（正面朝外）：a→c 沿 +Y 上升、c→d 沿 θ 增大方向，
+            // (c−a)×(d−c) 指向外侧（环绕方向教训见 uv_sphere 的索引注释）
+            data.indices.extend_from_slice(&[a, c, d, a, d, b]);
+        }
+
+        // ---- 圆帽：中心 + 闭合环（法线 ±Y），三角扇 ----
+        let cap_rim = |data: &mut MeshData, y: f32| {
+            let base = data.vertices.len() as u32;
+            for seg in 0..=segments {
+                let theta = std::f32::consts::TAU * seg as f32 / segments as f32;
+                let (sin_theta, cos_theta) = theta.sin_cos();
+                data.vertices.push(Vertex {
+                    position: [cos_theta * radius, y, sin_theta * radius],
+                    normal: [0.0, y.signum(), 0.0],
+                    uv: [cos_theta * 0.5 + 0.5, sin_theta * 0.5 + 0.5],
+                });
+            }
+            base
+        };
+        // 顶帽（+Y）：中心在轴上，扇面从上方看须为 CCW——θ 增大方向自上方
+        // 看是顺时针，故索引按 (中心, seg+1, seg) 逆排
+        let top_center = data.vertices.len() as u32;
+        data.vertices.push(Vertex {
+            position: [0.0, half, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.5, 0.5],
+        });
+        let top_base = cap_rim(&mut data, half);
+        // 底帽（-Y）：θ 增大方向自下方看恰为 CCW，索引按 (中心, seg, seg+1)
+        let bottom_center = data.vertices.len() as u32;
+        data.vertices.push(Vertex {
+            position: [0.0, -half, 0.0],
+            normal: [0.0, -1.0, 0.0],
+            uv: [0.5, 0.5],
+        });
+        let bottom_base = cap_rim(&mut data, -half);
+        for seg in 0..segments {
+            let t0 = top_base + seg;
+            let t1 = t0 + 1;
+            data.indices.extend_from_slice(&[top_center, t1, t0]);
+            let b0 = bottom_base + seg;
+            let b1 = b0 + 1;
+            data.indices.extend_from_slice(&[bottom_center, b0, b1]);
         }
         data
     }
@@ -301,6 +384,79 @@ mod tests {
                 + v.position[2] * v.position[2])
                 .sqrt();
             assert!((len - 1.0).abs() < 1e-4, "球面顶点应位于半径 1 上");
+        }
+    }
+
+    const CYL_SEGMENTS: u32 = 8;
+
+    #[test]
+    fn cylinder_topology() {
+        let (radius, height) = (1.5, 2.0);
+        let cyl = primitives::cylinder(radius, height, CYL_SEGMENTS);
+        // 侧面 2 行 × (segments+1) 闭合环 + 两个帽面各 (segments+1) 环 + 各 1 中心
+        assert_eq!(cyl.vertices.len(), 2 * 9 + 2 * 9 + 2);
+        // 侧面 segments 个 quad（6 索引）+ 两帽各 segments 个三角（3 索引）
+        assert_eq!(cyl.indices.len(), (CYL_SEGMENTS * 6 + CYL_SEGMENTS * 3 * 2) as usize);
+        // 索引全部在顶点范围内
+        assert!(cyl.indices.iter().all(|&i| (i as usize) < cyl.vertices.len()));
+        // 包围盒：XZ 压在 ±radius、Y 压在 ±height/2
+        let (min, max) = cyl.bounds().unwrap();
+        for i in 0..3 {
+            let limit = if i == 1 { height * 0.5 } else { radius };
+            assert!(min[i] >= -limit - 1e-5 && max[i] <= limit + 1e-5, "轴 {i} 超界");
+        }
+    }
+
+    #[test]
+    fn cylinder_normals_and_positions_match_surface() {
+        let (radius, height) = (1.5, 2.0);
+        let cyl = primitives::cylinder(radius, height, CYL_SEGMENTS);
+        let half = height * 0.5;
+        let mut cap_centers = 0;
+        for v in &cyl.vertices {
+            let n = v.normal;
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-5, "法线必须归一化：{n:?}");
+            let horizontal = (v.position[0] * v.position[0] + v.position[2] * v.position[2]).sqrt();
+            if n[1].abs() > 0.99 {
+                // 帽面：中心在轴上（半径 0）、缘点恰在 radius 上，法线纯 ±Y
+                if horizontal < 1e-6 {
+                    cap_centers += 1;
+                    assert_eq!(v.position[1], if n[1] > 0.0 { half } else { -half });
+                } else {
+                    assert!((horizontal - radius).abs() < 1e-5, "帽缘应在半径 {radius} 上");
+                }
+            } else {
+                // 侧面：法线径向（无 Y 分量）且位置在柱面上
+                assert!(n[1].abs() < 1e-6, "侧面法线不应有 Y 分量：{n:?}");
+                assert!((horizontal - radius).abs() < 1e-5, "侧面顶点应在柱面上");
+                assert!(v.position[1].abs() <= half + 1e-6);
+            }
+        }
+        assert_eq!(cap_centers, 2, "应有上下两个帽心");
+    }
+
+    #[test]
+    fn cylinder_faces_cull_correctly() {
+        // 环绕方向与既有约定一致（从外侧看 CCW）：每个三角形的几何法线
+        // （边叉积）必须与顶点法线同向——与 uv_sphere 的索引方向教训同源
+        let cyl = primitives::cylinder(1.0, 2.0, CYL_SEGMENTS);
+        for tri in cyl.indices.chunks(3) {
+            let (a, b, c) = (
+                cyl.vertices[tri[0] as usize].position,
+                cyl.vertices[tri[1] as usize].position,
+                cyl.vertices[tri[2] as usize].position,
+            );
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+            let cross = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let normal = cyl.vertices[tri[0] as usize].normal;
+            let dot = cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2];
+            assert!(dot > 0.0, "三角形应从外侧看为 CCW（法线 {normal:?}，叉积 {cross:?}）");
         }
     }
 

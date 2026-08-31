@@ -14,8 +14,6 @@ iris-core = { workspace = true }
 iris-engine = { workspace = true }
 glam = { workspace = true }
 
-# headless 测试需要脚本化注入按键：Input::on_key 的参数类型
-# （PhysicalKey / ElementState）定义在 winit 中，iris-platform 的 prelude
-# 只重导出了查询侧的 KeyCode，注入侧类型须直接引用 winit。
-[dev-dependencies]
-winit = { workspace = true }
+# headless 测试需要脚本化注入按键：此前 Input::on_key 的参数类型
+# （PhysicalKey / ElementState）不在引擎 prelude，测试被迫依赖 winit；
+# 引擎补齐 `Input::press / release` 并重导出注入侧类型后已移除该依赖。

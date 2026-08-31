@@ -4,7 +4,8 @@
 //! 每个组件存储的 RwLock 尝试型守卫保存在查询守卫元组中，
 //! 生命周期在类型系统内闭合；同一组件类型的重复可变借用
 //! 触发明确的 panic 而非未定义行为（借用检查跨线程生效，
-//! 见 [`crate::sync`]）。
+//! 见 [`crate::sync`]）。`Option<&T>` / `Option<&mut T>` 为可选访问：
+//! 缺组件时产出 `None` 而非跳过实体。
 
 use crate::component::{Component, StoreRef, StoreRefMut};
 use crate::entity::Entity;
@@ -71,6 +72,58 @@ impl<T: Component> QueryPart for &mut T {
 
     fn get<'a>(guard: &'a mut Self::Guard<'_>, entity: Entity) -> Option<Self::Item<'a>> {
         guard.get_mut(entity)
+    }
+}
+
+/// 可选只读访问：`Option<&T>`——实体缺少组件时产出 `None` 而非跳过
+/// （与必需访问 `&T` 的「缺即跳过」相对）。组件类型从未注册时同样
+/// 对每个实体产出 `None`（等价于所有实体都没有该组件）。典型用法：
+/// 渲染收集中的 `Visibility` 过滤——组件缺席 = 可见（默认行为零变化）。
+impl<T: Component> QueryPart for Option<&T> {
+    type Guard<'w> = Option<StoreRef<'w, T>>;
+    type Item<'a> = Option<&'a T>;
+
+    fn guard<'w>(world: &'w World) -> Option<Self::Guard<'w>> {
+        // 存储缺席不是查询失败：守卫恒为 Some，内层按实体逐个判缺
+        Some(world.components.borrow::<T>())
+    }
+
+    fn len(guard: &Self::Guard<'_>) -> usize {
+        guard.as_ref().map_or(0, |store| store.len())
+    }
+
+    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+        guard
+            .as_ref()
+            .and_then(|store| store.entities().get(index).copied())
+    }
+
+    fn get<'a>(guard: &'a mut Self::Guard<'_>, entity: Entity) -> Option<Self::Item<'a>> {
+        Some(guard.as_ref().and_then(|store| store.get(entity)))
+    }
+}
+
+/// 可选可写访问：`Option<&mut T>`（语义同 [`QueryPart for Option<&T>`]，多出写权限）。
+impl<T: Component> QueryPart for Option<&mut T> {
+    type Guard<'w> = Option<StoreRefMut<'w, T>>;
+    type Item<'a> = Option<&'a mut T>;
+
+    fn guard<'w>(world: &'w World) -> Option<Self::Guard<'w>> {
+        Some(world.components.borrow_mut::<T>())
+    }
+
+    fn len(guard: &Self::Guard<'_>) -> usize {
+        guard.as_ref().map_or(0, |store| store.len())
+    }
+
+    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+        guard
+            .as_ref()
+            .and_then(|store| store.entities().get(index).copied())
+    }
+
+    fn get<'a>(guard: &'a mut Self::Guard<'_>, entity: Entity) -> Option<Self::Item<'a>> {
+        Some(guard.as_mut().and_then(|store| store.get_mut(entity)))
     }
 }
 
@@ -184,6 +237,52 @@ mod tests {
         let mut count = 0;
         world.query::<&Tag>(|_| count += 1);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn optional_query_yields_none_instead_of_skipping() {
+        let mut world = World::new();
+        world.spawn((Position(1.0), Velocity(10.0)));
+        world.spawn((Position(2.0),)); // 缺 Velocity：Option 应产出 None 而非跳过
+
+        let mut seen = vec![];
+        world.query::<(&Position, Option<&Velocity>)>(|(p, v)| {
+            seen.push((p.0, v.map(|vel| vel.0)))
+        });
+        assert_eq!(seen, vec![(1.0, Some(10.0)), (2.0, None)]);
+    }
+
+    #[test]
+    fn optional_query_on_unregistered_type_yields_all_none() {
+        let mut world = World::new();
+        world.spawn((Position(1.0),));
+        world.spawn((Position(2.0),));
+        // Tag 从未注册：守卫不失败，所有实体产出 None
+        let mut count = 0;
+        world.query::<(&Position, Option<&Tag>)>(|(_, v)| {
+            count += 1;
+            assert!(v.is_none(), "实体不应有 Tag");
+        });
+        assert_eq!(count, 2, "实体不应被跳过");
+    }
+
+    #[test]
+    fn optional_mut_query_writes_only_present_components() {
+        let mut world = World::new();
+        world.spawn((Position(0.0), Velocity(1.0)));
+        world.spawn((Position(0.0),)); // 缺 Velocity
+
+        world.query::<(&mut Position, Option<&mut Velocity>)>(|(p, v)| {
+            p.0 = 1.0;
+            if let Some(v) = v {
+                v.0 += 10.0;
+            }
+        });
+        let mut velocities = vec![];
+        world.query::<(&Position, Option<&Velocity>)>(|(p, v)| {
+            velocities.push((p.0, v.map(|vel| vel.0)));
+        });
+        assert_eq!(velocities, vec![(1.0, Some(11.0)), (1.0, None)]);
     }
 
     #[test]

@@ -53,6 +53,25 @@ impl Time {
         self.accumulator += self.delta;
     }
 
+    /// 确定性推进一帧（测试 / 回放 / headless 驱动）：语义与 `begin_frame`
+    /// 完全一致，只是步长显式给定、不取自单调时钟——调用方无须再手工
+    /// 构造 `Instant` 序列（dogfooding：headless 测试的时间基准样板）。
+    ///
+    /// `delta = min(dt, max_delta)`，elapsed / ticks / accumulator 同步累加；
+    /// 与 `begin_frame` 不同，首帧 delta 即为 `min(dt, max_delta)` 而非 0
+    /// （确定性驱动没有「第一次采样无差分」的问题）。
+    ///
+    /// 调用后单调时钟基准归位：与 `begin_frame` 混用时，下一次
+    /// `begin_frame` 重新建立基准（delta = 0），不会把 advance 的时长
+    /// 二次计入真实时钟差分。
+    pub fn advance(&mut self, dt: Duration) {
+        self.last_instant = None;
+        self.delta = dt.min(self.max_delta);
+        self.elapsed += self.delta;
+        self.ticks += 1;
+        self.accumulator += self.delta;
+    }
+
     /// 上一帧到本帧的可变时长（已钳制，防止后台切回时的巨大步长）。
     pub fn delta(&self) -> Duration {
         self.delta
@@ -159,5 +178,41 @@ mod tests {
         time.begin_frame(at(3600));
         assert!(time.delta() <= time.max_delta(), "大间隔应被钳制");
         assert_eq!(time.fixed_steps(), 5, "最多 5 步防死亡螺旋");
+    }
+
+    #[test]
+    fn advance_drives_deterministic_frames() {
+        let mut time = Time::default();
+        let step = Duration::from_secs_f64(1.0 / 60.0);
+        // 首帧 delta 即为步长（不依赖 Instant，测试无须手构单调时间点）
+        time.advance(step);
+        assert_eq!(time.delta(), step);
+        assert_eq!(time.delta_secs(), 1.0 / 60.0);
+        assert_eq!(time.tick(), 1);
+        time.advance(step);
+        assert_eq!(time.tick(), 2);
+        assert!((time.elapsed_secs() - 2.0 / 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn advance_is_clamped_and_feeds_accumulator() {
+        let mut time = Time::default();
+        time.set_fixed_hz(60.0);
+        time.advance(Duration::from_secs(3600));
+        assert_eq!(time.delta(), time.max_delta(), "advance 与 begin_frame 同受钳制");
+        assert_eq!(time.fixed_steps(), 5, "钳制后的预算进入固定步长累积器");
+        assert_eq!(time.fixed_steps(), 0);
+    }
+
+    #[test]
+    fn advance_rebases_monotonic_clock() {
+        let mut time = Time::default();
+        let t0 = at(0);
+        time.begin_frame(t0);
+        time.advance(Duration::from_millis(100));
+        // 混用：advance 之后 begin_frame 重新建立基准（不把 advance 计入差分）
+        time.begin_frame(at(10));
+        assert_eq!(time.delta(), Duration::ZERO);
+        assert_eq!(time.tick(), 3);
     }
 }
