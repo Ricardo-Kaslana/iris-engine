@@ -188,7 +188,10 @@ impl AnimationPlayer {
 /// 每帧动画系统：推进所有 [`AnimationPlayer`]，把采样结果覆写到目标实体的
 /// `Transform`。必须在 `propagate_transforms` 之前执行（DefaultPlugins 已保证）；
 /// `Time` 资源缺席时 dt 视为 0（可手动设置 `player.time` 后调用以定位到指定时刻）。
-pub fn update_animations(world: &mut iris_core::world::World) {
+///
+/// 只读世界签名（`&World`）：组件写访问走世界内部的尝试型锁，
+/// 因此可注册为**并行系统**（访问集：写 AnimationPlayer / Transform，读 Time）。
+pub fn update_animations(world: &iris_core::world::World) {
     let dt = world.try_resource::<Time>().map(|t| t.delta_secs()).unwrap_or(0.0);
 
     // 阶段一（只读采样）：推进时间并把每条通道的采样值收集为覆写任务

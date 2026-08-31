@@ -1,15 +1,20 @@
 //! 世界：实体 + 组件 + 资源 + 事件的统一容器，引擎一切状态的家。
+//!
+//! `World` 是 `Send + Sync` 的：组件 / 资源 / 事件存储都在
+//! `std::sync::RwLock` 之后（尝试型获取、冲突即 panic，见 [`crate::sync`]），
+//! 因此 `&World` 可以安全地跨线程共享——这是并行系统调度的地基。
 
 use std::any::TypeId;
-use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::RwLock;
 
-use crate::component::{Component, Components};
+use crate::component::{Component, Components, Ref, RefMut};
 use crate::entity::{Entities, Entity};
-use crate::event::{ErasedEvents, Event, Events};
+use crate::event::{ErasedEvents, Event, EventRef, Events};
 use crate::query::QueryPart;
-use crate::resource::{Resource, Resources};
+use crate::resource::{Resource, ResourceRef, ResourceRefMut, Resources};
+use crate::sync::{read_lock, write_lock};
 
 /// 组件包：可一次性 spawn 的一组组件。元组形式 `(A, B, C)`；
 /// 单个组件请写成一元组 `(A,)`。
@@ -43,7 +48,7 @@ pub struct World {
     pub(crate) entities: Entities,
     pub(crate) components: Components,
     resources: Resources,
-    events: HashMap<TypeId, RefCell<Box<dyn ErasedEvents>>>,
+    events: HashMap<TypeId, RwLock<Box<dyn ErasedEvents>>>,
 }
 
 impl Default for World {
@@ -114,16 +119,14 @@ impl World {
 
     /// 只读访问实体的组件。
     pub fn get<C: Component>(&self, entity: Entity) -> Option<Ref<'_, C>> {
-        self.components
-            .borrow::<C>()
-            .and_then(|set| Ref::filter_map(set, |s| s.get(entity)).ok())
+        let store = self.components.borrow::<C>()?;
+        store.get(entity).is_some().then(|| Ref::new(store, entity))
     }
 
-    /// 可变访问实体的组件（`RefCell` 运行期借用检查）。
+    /// 可变访问实体的组件（尝试型 RwLock 借用检查，冲突即 panic）。
     pub fn get_mut<C: Component>(&self, entity: Entity) -> Option<RefMut<'_, C>> {
-        self.components
-            .borrow_mut::<C>()
-            .and_then(|set| RefMut::filter_map(set, |s| s.get_mut(entity)).ok())
+        let store = self.components.borrow_mut::<C>()?;
+        store.get(entity).is_some().then(|| RefMut::new(store, entity))
     }
 
     pub fn remove_component<C: Component>(&mut self, entity: Entity) -> Option<C> {
@@ -162,23 +165,23 @@ impl World {
     }
 
     /// 读取资源；未注册时 panic 并给出类型名。
-    pub fn resource<R: Resource>(&self) -> Ref<'_, R> {
+    pub fn resource<R: Resource>(&self) -> ResourceRef<'_, R> {
         self.try_resource().unwrap_or_else(|| {
             panic!("资源 {} 未注册，请先 insert_resource", std::any::type_name::<R>())
         })
     }
 
-    pub fn try_resource<R: Resource>(&self) -> Option<Ref<'_, R>> {
+    pub fn try_resource<R: Resource>(&self) -> Option<ResourceRef<'_, R>> {
         self.resources.borrow::<R>()
     }
 
-    pub fn resource_mut<R: Resource>(&self) -> RefMut<'_, R> {
+    pub fn resource_mut<R: Resource>(&self) -> ResourceRefMut<'_, R> {
         self.try_resource_mut().unwrap_or_else(|| {
             panic!("资源 {} 未注册，请先 insert_resource", std::any::type_name::<R>())
         })
     }
 
-    pub fn try_resource_mut<R: Resource>(&self) -> Option<RefMut<'_, R>> {
+    pub fn try_resource_mut<R: Resource>(&self) -> Option<ResourceRefMut<'_, R>> {
         self.resources.borrow_mut::<R>()
     }
 
@@ -196,14 +199,14 @@ impl World {
     pub fn register_event<E: Event>(&mut self) {
         self.events
             .entry(TypeId::of::<E>())
-            .or_insert_with(|| RefCell::new(Box::new(Events::<E>::default())));
+            .or_insert_with(|| RwLock::new(Box::new(Events::<E>::default())));
     }
 
     /// 发送事件（当帧内有效，帧尾清空）。
     pub fn send_event<E: Event>(&mut self, event: E) {
         self.register_event::<E>();
         let cell = self.events.get(&TypeId::of::<E>()).expect("事件刚刚注册");
-        cell.borrow_mut()
+        write_lock(cell, &format!("事件 {}", std::any::type_name::<E>()))
             .as_any_mut()
             .downcast_mut::<Events<E>>()
             .expect("事件存储类型与注册类型一致")
@@ -211,14 +214,15 @@ impl World {
     }
 
     /// 读取事件缓冲；类型从未注册时返回 `None`。
-    pub fn try_events<E: Event>(&self) -> Option<Ref<'_, Events<E>>> {
+    pub fn try_events<E: Event>(&self) -> Option<EventRef<'_, E>> {
         let cell = self.events.get(&TypeId::of::<E>())?;
-        Some(Ref::map(cell.borrow(), |events| {
-            events.as_any().downcast_ref::<Events<E>>().expect("事件存储类型与注册类型一致")
-        }))
+        Some(EventRef::new(read_lock(
+            cell,
+            &format!("事件 {}", std::any::type_name::<E>()),
+        )))
     }
 
-    pub fn events<E: Event>(&self) -> Ref<'_, Events<E>> {
+    pub fn events<E: Event>(&self) -> EventRef<'_, E> {
         self.try_events()
             .unwrap_or_else(|| panic!("事件 {} 未注册", std::any::type_name::<E>()))
     }
@@ -226,7 +230,7 @@ impl World {
     /// 帧尾清空全部事件缓冲（由引擎主循环调用）。
     pub fn clear_all_events(&mut self) {
         for cell in self.events.values() {
-            cell.borrow_mut().clear();
+            write_lock(cell, "事件缓冲（帧尾清理）").clear();
         }
     }
 }
@@ -318,5 +322,28 @@ mod tests {
         struct Missing;
         let world = World::new();
         let _ = world.resource::<Missing>();
+    }
+
+    /// `&World` 可跨线程共享（并行系统调度的类型层地基）；
+    /// 借用守卫可被多线程共享（Sync），但自身不跨线程移动（无需 Send）。
+    #[test]
+    fn world_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send_sync::<World>();
+        assert_sync::<crate::component::Ref<'static, Position>>();
+        assert_sync::<crate::component::StoreRef<'static, Position>>();
+    }
+
+    /// 同线程递归读合法（查询守卫存活期间再次读取同类型组件——
+    /// 渲染器收集闭包内的既有模式）。
+    #[test]
+    fn recursive_read_is_allowed() {
+        let mut world = World::new();
+        let e = world.spawn((Position(7.0),));
+        world.query::<&Position>(|_| {
+            let p = world.get::<Position>(e).unwrap();
+            assert_eq!(p.0, 7.0);
+        });
     }
 }

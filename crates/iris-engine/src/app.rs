@@ -62,6 +62,17 @@ impl App {
         self
     }
 
+    /// 注册并行系统（声明组件读写集，与无冲突系统并发执行）。
+    pub fn add_parallel_system(
+        mut self,
+        stage: Stage,
+        access: iris_core::prelude::Access,
+        system: impl Fn(&World) + Send + Sync + 'static,
+    ) -> Self {
+        self.schedule.add_parallel_system(stage, access, system);
+        self
+    }
+
     /// 设置窗口配置（优先级低于 WindowPlugin / DefaultPlugins）。
     pub fn with_window(mut self, config: WindowConfig) -> Self {
         self.window_config = config;

@@ -33,7 +33,7 @@ fn gameplay(world: &mut World) {
 |------|----------|
 | **跨平台** | wgpu 统一封装 Vulkan / DirectX 12 / Metal（WebGPU 标准 API），winit 跨平台窗口；同一份代码编译 Windows / macOS / Linux，并可交叉编译至 ARM64 与 wasm32 |
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
-| **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；wgpu 流水线异步提交 |
+| **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
 | **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 + 分割求和，零资产依赖）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
 
@@ -82,6 +82,9 @@ cargo run --example anim_snapshot --release
 # 骨骼蒙皮验收场景（同用 gen_asset 资产），输出两个时刻的位图：
 # 两段臂绑髋/肘关节，肘关节挥舞 90°（GPU LBS 蒙皮 + 蒙皮阴影）
 cargo run --example skin_snapshot --release
+
+# 并行调度基准：8 个互不冲突系统 串行 vs 并行加速比
+cargo run -p iris-core --example bench_parallel --release
 
 # ECS 吞吐基准
 cargo run -p iris-core --example bench_ecs --release
@@ -207,7 +210,7 @@ glTF 动画实测（`docs/anim_preview.png`，左 t=0 / 右 t=1）：`anim_cube.
 ## 测试
 
 ```sh
-cargo test --workspace   # 107 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 113 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -217,6 +220,7 @@ cargo test --workspace   # 107 个测试：单元 + GPU 端到端离屏渲染
 **IBL（铬球反射蓝天：蓝主导像素对比 + 整帧变亮）**、
 **glTF 动画（旋转方块离屏渲染：正对 → 侧对红色像素锐减）**、
 **骨骼蒙皮（肘关节动画驱动顶点位移：最左像素左移 ≥30px + 蒙皮阴影成片变暗）**、
+**并行调度（原子计数观测真并发 / 读写冲突分批保序 / 独占系统屏障）**、
 glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）。
 
 ## 跨平台矩阵
@@ -243,7 +247,7 @@ glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness �
 - [x] 骨骼蒙皮动画（GPU LBS + 蒙皮阴影）
 - [ ] 外部 HDR 资产加载（equirectangular）
 - [ ] 点光阴影（cubemap）
-- [ ] 多线程系统调度（查询并行）
+- [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
 - [ ] wasm32 Web 目标端到端验证
 - [ ] 音频与 2D 叠加层（UI）
 - [ ] 实例缓冲 GPU 持久化与增量更新

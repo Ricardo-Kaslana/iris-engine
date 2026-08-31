@@ -71,6 +71,30 @@ impl<E: Event> ErasedEvents for Events<E> {
     }
 }
 
+/// 事件缓冲只读守卫：解引用为 [`Events<E>`]。
+pub struct EventRef<'a, E> {
+    guard: std::sync::RwLockReadGuard<'a, Box<dyn ErasedEvents>>,
+    _marker: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<'a, E: Event> EventRef<'a, E> {
+    pub(crate) fn new(
+        guard: std::sync::RwLockReadGuard<'a, Box<dyn ErasedEvents>>,
+    ) -> Self {
+        Self { guard, _marker: std::marker::PhantomData }
+    }
+}
+
+impl<E: Event> std::ops::Deref for EventRef<'_, E> {
+    type Target = Events<E>;
+    fn deref(&self) -> &Events<E> {
+        self.guard
+            .as_any()
+            .downcast_ref::<Events<E>>()
+            .expect("事件存储类型与注册类型一致")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::event::Events;

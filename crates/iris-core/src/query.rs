@@ -1,12 +1,12 @@
 //! 组件查询：`( &A, &mut B, ... )` 形式的元组查询。
 //!
 //! 通过 GAT（泛型关联类型）实现 **零 unsafe** 的多组件访问：
-//! 每个组件存储的 `RefCell` 借用守卫保存在查询守卫元组中，
-//! 生命周期在类型系统内闭合，重复可变借用会触发明确的 panic 而非未定义行为。
+//! 每个组件存储的 RwLock 尝试型守卫保存在查询守卫元组中，
+//! 生命周期在类型系统内闭合；同一组件类型的重复可变借用
+//! 触发明确的 panic 而非未定义行为（借用检查跨线程生效，
+//! 见 [`crate::sync`]）。
 
-use std::cell::{Ref, RefMut};
-
-use crate::component::{Component, SparseSet};
+use crate::component::{Component, StoreRef, StoreRefMut};
 use crate::entity::Entity;
 use crate::world::World;
 
@@ -33,7 +33,7 @@ pub trait QueryPart {
 }
 
 impl<T: Component> QueryPart for &T {
-    type Guard<'w> = Ref<'w, SparseSet<T>>;
+    type Guard<'w> = StoreRef<'w, T>;
     type Item<'a> = &'a T;
 
     fn guard<'w>(world: &'w World) -> Option<Self::Guard<'w>> {
@@ -54,7 +54,7 @@ impl<T: Component> QueryPart for &T {
 }
 
 impl<T: Component> QueryPart for &mut T {
-    type Guard<'w> = RefMut<'w, SparseSet<T>>;
+    type Guard<'w> = StoreRefMut<'w, T>;
     type Item<'a> = &'a mut T;
 
     fn guard<'w>(world: &'w World) -> Option<Self::Guard<'w>> {

@@ -8,17 +8,24 @@
 //! ```
 //!
 //! 删除采用 swap_remove，`dense` 始终紧凑，无空洞、无碎片。
+//!
+//! 借用模型：每个组件类型的存储在 `std::sync::RwLock` 之后，获取全部为
+//! 尝试型（见 [`crate::sync`]）——多读者并存（跨线程并发 + 同线程递归），
+//! 任何读/写冲突立即 panic。守卫 [`StoreRef`] / [`StoreRefMut`] / [`Ref`] /
+//! [`RefMut`] 均为安全代码（Deref 时 downcast）。
 
 use std::any::{Any, TypeId};
-use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::entity::Entity;
+use crate::sync::{read_lock, write_lock};
 
 /// 组件：附加到实体上的数据。
 ///
 /// 显式实现（推荐 `#[derive(Component)]`），约束 `Send + Sync + 'static`
-/// 保证未来多线程调度时的数据竞争安全。
+/// 保证多线程调度时的数据竞争安全。
 pub trait Component: 'static + Send + Sync {}
 
 const EMPTY: u32 = u32::MAX;
@@ -141,36 +148,39 @@ impl<T: Component> ErasedStore for SparseSet<T> {
     }
 }
 
-/// 全部组件存储的注册表。`RefCell` 提供运行期借用检查：
-/// 同一组件类型被两次可变借用时会立刻 panic（而非产生数据竞争）。
+/// 全部组件存储的注册表。每个存储位于独立的 `RwLock` 之后，
+/// 获取为尝试型：多读者并存（跨线程并发 + 同线程递归），
+/// 任何读/写冲突立即 panic（见 [`crate::sync`]）。
 #[derive(Default)]
 pub(crate) struct Components {
-    stores: HashMap<TypeId, RefCell<Box<dyn ErasedStore>>>,
+    stores: HashMap<TypeId, RwLock<Box<dyn ErasedStore>>>,
 }
 
 impl Components {
     pub fn register<C: Component>(&mut self) {
         self.stores
             .entry(TypeId::of::<C>())
-            .or_insert_with(|| RefCell::new(Box::new(SparseSet::<C>::new())));
+            .or_insert_with(|| RwLock::new(Box::new(SparseSet::<C>::new())));
     }
 
-    fn cell<C: Component>(&self) -> Option<&RefCell<Box<dyn ErasedStore>>> {
+    fn cell<C: Component>(&self) -> Option<&RwLock<Box<dyn ErasedStore>>> {
         self.stores.get(&TypeId::of::<C>())
     }
 
-    pub fn borrow<C: Component>(&self) -> Option<Ref<'_, SparseSet<C>>> {
+    pub fn borrow<C: Component>(&self) -> Option<StoreRef<'_, C>> {
         let cell = self.cell::<C>()?;
-        Some(Ref::map(cell.borrow(), |store| {
-            store.as_any().downcast_ref::<SparseSet<C>>().expect("存储类型与注册类型一致")
-        }))
+        Some(StoreRef {
+            guard: read_lock(cell, &format!("组件 {}", std::any::type_name::<C>())),
+            _marker: std::marker::PhantomData,
+        })
     }
 
-    pub fn borrow_mut<C: Component>(&self) -> Option<RefMut<'_, SparseSet<C>>> {
+    pub fn borrow_mut<C: Component>(&self) -> Option<StoreRefMut<'_, C>> {
         let cell = self.cell::<C>()?;
-        Some(RefMut::map(cell.borrow_mut(), |store| {
-            store.as_any_mut().downcast_mut::<SparseSet<C>>().expect("存储类型与注册类型一致")
-        }))
+        Some(StoreRefMut {
+            guard: write_lock(cell, &format!("组件 {}", std::any::type_name::<C>())),
+            _marker: std::marker::PhantomData,
+        })
     }
 
     pub fn insert<C: Component>(&mut self, entity: Entity, value: C) -> Option<C> {
@@ -184,9 +194,97 @@ impl Components {
 
     /// 实体销毁时移除其全部组件。
     pub fn remove_all_for(&mut self, entity: Entity) {
-        for cell in self.stores.values() {
-            cell.borrow_mut().remove_entity(entity);
+        for (ty, cell) in &self.stores {
+            write_lock(cell, &format!("组件 {ty:?}（销毁清理）")).remove_entity(entity);
         }
+    }
+}
+
+/// 组件存储级只读守卫：解引用为整个 [`SparseSet<C>`]（查询守卫）。
+pub struct StoreRef<'a, C> {
+    guard: RwLockReadGuard<'a, Box<dyn ErasedStore>>,
+    _marker: std::marker::PhantomData<fn() -> C>,
+}
+
+impl<C: Component> Deref for StoreRef<'_, C> {
+    type Target = SparseSet<C>;
+    fn deref(&self) -> &SparseSet<C> {
+        self.guard
+            .as_any()
+            .downcast_ref::<SparseSet<C>>()
+            .expect("存储类型与注册类型一致")
+    }
+}
+
+/// 组件存储级可变守卫：解引用为整个 [`SparseSet<C>`]（查询守卫）。
+pub struct StoreRefMut<'a, C> {
+    guard: RwLockWriteGuard<'a, Box<dyn ErasedStore>>,
+    _marker: std::marker::PhantomData<fn() -> C>,
+}
+
+impl<C: Component> Deref for StoreRefMut<'_, C> {
+    type Target = SparseSet<C>;
+    fn deref(&self) -> &SparseSet<C> {
+        self.guard
+            .as_any()
+            .downcast_ref::<SparseSet<C>>()
+            .expect("存储类型与注册类型一致")
+    }
+}
+
+impl<C: Component> DerefMut for StoreRefMut<'_, C> {
+    fn deref_mut(&mut self) -> &mut SparseSet<C> {
+        self.guard
+            .as_any_mut()
+            .downcast_mut::<SparseSet<C>>()
+            .expect("存储类型与注册类型一致")
+    }
+}
+
+/// 单组件只读守卫（`World::get` 返回值）：解引用为组件值。
+pub struct Ref<'a, C> {
+    store: StoreRef<'a, C>,
+    entity: Entity,
+}
+
+impl<'a, C: Component> Ref<'a, C> {
+    pub(crate) fn new(store: StoreRef<'a, C>, entity: Entity) -> Self {
+        Self { store, entity }
+    }
+}
+
+impl<C: Component> Deref for Ref<'_, C> {
+    type Target = C;
+    fn deref(&self) -> &C {
+        // 守卫存续期间组件不可能被移除（移除需要写锁或 &mut World）
+        self.store.get(self.entity).expect("组件在守卫存续期间有效")
+    }
+}
+
+/// 单组件可变守卫（`World::get_mut` 返回值）：解引用为组件值。
+pub struct RefMut<'a, C> {
+    store: StoreRefMut<'a, C>,
+    entity: Entity,
+}
+
+impl<'a, C: Component> RefMut<'a, C> {
+    pub(crate) fn new(store: StoreRefMut<'a, C>, entity: Entity) -> Self {
+        Self { store, entity }
+    }
+}
+
+impl<C: Component> Deref for RefMut<'_, C> {
+    type Target = C;
+    fn deref(&self) -> &C {
+        self.store.get(self.entity).expect("组件在守卫存续期间有效")
+    }
+}
+
+impl<C: Component> DerefMut for RefMut<'_, C> {
+    fn deref_mut(&mut self) -> &mut C {
+        self.store
+            .get_mut(self.entity)
+            .expect("组件在守卫存续期间有效")
     }
 }
 

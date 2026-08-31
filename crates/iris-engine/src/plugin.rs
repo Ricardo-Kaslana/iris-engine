@@ -76,13 +76,23 @@ impl Plugin for HierarchyPlugin {
 ///
 /// 已包含在 [`DefaultPlugins`] 中（先于 [`HierarchyPlugin`] 执行，
 /// 动画写入的局部变换当帧即完成全局传播）。
+/// 注册为**并行系统**：只读世界 + 组件写访问走尝试型锁，
+/// 调度器据其访问集（写 AnimationPlayer / Transform，读 Time）分批。
 #[derive(Default)]
 pub struct AnimationPlugin;
 
 impl Plugin for AnimationPlugin {
     fn build(&self, app: &mut App) {
-        app.schedule
-            .add_system(iris_core::prelude::Stage::Update, iris_render::animation::update_animations);
+        use iris_core::prelude::{Access, Stage, Transform};
+        use iris_render::prelude::AnimationPlayer;
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<AnimationPlayer>()
+                .write::<Transform>()
+                .read::<Time>(),
+            iris_render::animation::update_animations,
+        );
     }
 }
 
