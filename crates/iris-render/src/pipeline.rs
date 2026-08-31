@@ -6,11 +6,16 @@ pub const SHADOW_MAP_SIZE: u32 = 2048;
 /// HDR 中间缓冲格式（线性、单采样，供色调映射 pass 采样）。
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// 主管线、阴影管线、天空盒、泛光管线（提取 + 模糊）与色调映射管线，以及全部绑定组布局。
+/// 主管线、蒙皮管线、阴影管线（常规 + 蒙皮变体）、天空盒、泛光管线
+/// （提取 + 模糊）与色调映射管线，以及全部绑定组布局。
 pub(crate) struct PipelineBundle {
     pub pipeline: wgpu::RenderPipeline,
+    /// 蒙皮变体：顶点多一路蒙皮缓冲，组 2 绑定关节矩阵 storage。
+    pub skinned_pipeline: wgpu::RenderPipeline,
     pub sky_pipeline: wgpu::RenderPipeline,
     pub shadow_pipeline: wgpu::RenderPipeline,
+    /// 阴影蒙皮变体（组 1 绑定关节矩阵，保证阴影随骨骼变形）。
+    pub skinned_shadow_pipeline: wgpu::RenderPipeline,
     pub blit_pipeline: wgpu::RenderPipeline,
     pub bloom_threshold_pipeline: wgpu::RenderPipeline,
     pub bloom_blur_pipeline: wgpu::RenderPipeline,
@@ -19,6 +24,8 @@ pub(crate) struct PipelineBundle {
     /// 不绑定阴影贴图本身——避免同 pass 内读写冲突）。
     pub shadow_globals_layout: wgpu::BindGroupLayout,
     pub material_layout: wgpu::BindGroupLayout,
+    /// 关节矩阵只读 storage（蒙皮管线专用）。
+    pub joints_layout: wgpu::BindGroupLayout,
     pub blit_layout: wgpu::BindGroupLayout,
     pub bloom_layout: wgpu::BindGroupLayout,
 }
@@ -141,6 +148,22 @@ pub(crate) fn create_pipeline(
         ],
     });
 
+    // 关节矩阵只读 storage：蒙皮管线在顶点阶段读取（只读 storage 允许出现在
+    // 顶点阶段；每具蒙皮一个缓冲，动画关节矩阵每帧整体覆写）
+    let joints_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.joints"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("iris.pipeline.layout"),
         bind_group_layouts: &[Some(&globals_layout), Some(&material_layout)],
@@ -161,6 +184,57 @@ pub(crate) fn create_pipeline(
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             // 场景渲染到线性 HDR 中间缓冲（色调映射在 blit 完成）
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 蒙皮主管线：顶点输入 = [常规顶点, 蒙皮属性, 实例]，
+    // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
+    let skinned_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.skinned.pipeline.layout"),
+        bind_group_layouts: &[Some(&globals_layout), Some(&material_layout), Some(&joints_layout)],
+        immediate_size: 0,
+    });
+    let skinned_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.skinned"),
+        layout: Some(&skinned_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_skinned"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::mesh::SkinVertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: HDR_FORMAT,
                 blend: Some(wgpu::BlendState::REPLACE),
@@ -292,6 +366,53 @@ pub(crate) fn create_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             // 深度测试保证颜色附件存最近面深度（无测试时背面深度会覆盖正面）
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 阴影蒙皮变体：组 1 绑定关节矩阵，蒙皮几何体的阴影随骨骼变形。
+    let skinned_shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.skinned.shadow.pipeline.layout"),
+        bind_group_layouts: &[Some(&shadow_globals_layout), Some(&joints_layout)],
+        immediate_size: 0,
+    });
+    let skinned_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.skinned_shadow"),
+        layout: Some(&skinned_shadow_layout),
+        vertex: wgpu::VertexState {
+            module: &shadow_shader,
+            entry_point: Some("vs_skinned"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::mesh::SkinVertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shadow_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
             depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: Default::default(),
@@ -460,14 +581,17 @@ pub(crate) fn create_pipeline(
 
     PipelineBundle {
         pipeline,
+        skinned_pipeline,
         sky_pipeline,
         shadow_pipeline,
+        skinned_shadow_pipeline,
         blit_pipeline,
         bloom_threshold_pipeline,
         bloom_blur_pipeline,
         globals_layout,
         shadow_globals_layout,
         material_layout,
+        joints_layout,
         blit_layout,
         bloom_layout,
     }

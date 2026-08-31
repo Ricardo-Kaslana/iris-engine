@@ -52,6 +52,9 @@ struct MaterialParams {
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
+// 蒙皮：关节矩阵（vs_skinned 专用；vs_main 静态不使用，
+// 因此常规管线的 layout 无需 group 2）
+@group(2) @binding(0) var<storage, read> joint_mats: array<mat4x4<f32>>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -85,6 +88,46 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.world_normal = normal_mat * in.normal;
     out.uv = in.uv;
     out.shadow_pos = globals.light_view_proj * world_pos;
+    return out;
+}
+
+// 蒙皮顶点输入：在常规属性之外多一路顶点缓冲（loc10 关节索引 / loc11 权重）。
+struct SkinnedVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) model0: vec4<f32>,
+    @location(4) model1: vec4<f32>,
+    @location(5) model2: vec4<f32>,
+    @location(6) model3: vec4<f32>,
+    @location(7) normal0: vec4<f32>,
+    @location(8) normal1: vec4<f32>,
+    @location(9) normal2: vec4<f32>,
+    @location(10) joints: vec4<u32>,
+    @location(11) weights: vec4<f32>,
+};
+
+// 线性混合蒙皮（LBS）：skin = Σ w_i · J_i，再叠加实例模型矩阵。
+// 关节矩阵已在 CPU 侧乘过蒙皮实体全局逆（见 skin.rs），
+// 因此 skin × position 处于蒙皮实体局部空间，随父级移动整体跟随。
+// 法线按刚性变换处理（关节矩阵的 3x3 部分）；蒙皮实体自身的
+// 非均匀缩放仍由实例法线矩阵承担。
+@vertex
+fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
+    let j = in.joints;
+    let w = in.weights;
+    let skin_mat = joint_mats[j.x] * w.x + joint_mats[j.y] * w.y
+                 + joint_mats[j.z] * w.z + joint_mats[j.w] * w.w;
+    let model = mat4x4<f32>(in.model0, in.model1, in.model2, in.model3);
+    let normal_mat = mat3x3<f32>(in.normal0.xyz, in.normal1.xyz, in.normal2.xyz);
+    let skinned_pos = model * (skin_mat * vec4<f32>(in.position, 1.0));
+    let skin_nrm = mat3x3<f32>(skin_mat[0].xyz, skin_mat[1].xyz, skin_mat[2].xyz);
+    var out: VertexOutput;
+    out.clip_position = globals.view_proj * skinned_pos;
+    out.world_pos = skinned_pos.xyz;
+    out.world_normal = normal_mat * (skin_nrm * in.normal);
+    out.uv = in.uv;
+    out.shadow_pos = globals.light_view_proj * skinned_pos;
     return out;
 }
 

@@ -28,7 +28,8 @@ use serde::Deserialize;
 use super::base64;
 use crate::animation::{AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath};
 use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
-use crate::mesh::{MeshData, MeshHandle, MeshStore, Vertex};
+use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex};
+use crate::skin::{mat4_list_from_flat, Skin};
 use crate::texture::{CpuTexture, TextureHandle, TextureStore};
 
 /// glTF 加载错误。
@@ -103,6 +104,8 @@ struct GltfJson {
     buffers: Vec<GltfBuffer>,
     #[serde(default)]
     animations: Vec<GltfAnimation>,
+    #[serde(default)]
+    skins: Vec<GltfSkin>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +119,9 @@ struct GltfScene {
 struct GltfNode {
     #[serde(default)]
     mesh: Option<usize>,
+    /// 本节点网格引用的蒙皮索引（glTF skins）。
+    #[serde(default)]
+    skin: Option<usize>,
     #[serde(default)]
     children: Vec<usize>,
     #[serde(default)]
@@ -245,6 +251,17 @@ struct GltfAnimation {
     samplers: Vec<GltfAnimationSampler>,
 }
 
+/// glTF skin：关节节点列表 + 逆绑定矩阵 accessor。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GltfSkin {
+    #[serde(default)]
+    joints: Vec<usize>,
+    /// 可选；缺省时各矩阵为恒等（关节已处于网格空间）。
+    #[serde(default)]
+    inverse_bind_matrices: Option<usize>,
+}
+
 #[derive(Deserialize)]
 struct GltfChannel {
     sampler: usize,
@@ -267,6 +284,7 @@ struct GltfAnimationSampler {
     interpolation: Option<String>,
 }
 
+const COMPONENT_UNSIGNED_BYTE: u32 = 5120;
 const COMPONENT_FLOAT: u32 = 5126;
 const COMPONENT_UNSIGNED_SHORT: u32 = 5123;
 const COMPONENT_UNSIGNED_INT: u32 = 5125;
@@ -356,6 +374,8 @@ struct GltfLoader {
     texture_handles: RefCell<HashMap<usize, TextureHandle>>,
     /// 节点索引 → 已生成实体（动画目标解析用）。
     node_entities: RefCell<Vec<Option<iris_core::prelude::Entity>>>,
+    /// 节点索引 → 其网格 primitive 子实体（蒙皮组件挂载用）。
+    node_parts: RefCell<Vec<Vec<iris_core::prelude::Entity>>>,
 }
 
 impl GltfLoader {
@@ -416,6 +436,8 @@ impl GltfLoader {
             "VEC2" => 2,
             "VEC3" => 3,
             "VEC4" => 4,
+            // 逆绑定矩阵（inverseBindMatrices）为列主序 4x4
+            "MAT4" => 16,
             other => return Err(GltfError::Unsupported(format!("分量类型 {other}"))),
         };
         let view_index = acc.buffer_view.ok_or_else(|| {
@@ -484,6 +506,54 @@ impl GltfLoader {
         Ok(indices)
     }
 
+    /// 关节索引（JOINTS_0：u8 / u16 的 VEC4，以 u32 返回）。
+    fn read_joints(&self, accessor: usize) -> Result<Vec<[u32; 4]>, GltfError> {
+        let acc = self
+            .doc
+            .accessors
+            .get(accessor)
+            .ok_or_else(|| GltfError::OutOfRange(format!("accessor #{accessor}")))?;
+        if acc.attribute_type != "VEC4" {
+            return Err(GltfError::OutOfRange("JOINTS_0 必须是 VEC4".into()));
+        }
+        let view_index = acc.buffer_view.ok_or_else(|| {
+            GltfError::Unsupported("无 bufferView 的 accessor（稀疏存取）".into())
+        })?;
+        let view = self
+            .doc
+            .buffer_views
+            .get(view_index)
+            .ok_or_else(|| GltfError::OutOfRange(format!("bufferView #{view_index}")))?;
+        let data = self.buffer(view.buffer)?;
+        let start = view.byte_offset;
+        let stride = match acc.component_type {
+            COMPONENT_UNSIGNED_BYTE => 1,
+            COMPONENT_UNSIGNED_SHORT => 2,
+            other => {
+                return Err(GltfError::Unsupported(format!(
+                    "JOINTS_0 分量类型 {other:#x}（仅支持 u8 / u16）"
+                )))
+            }
+        };
+        let end = start + view.byte_length;
+        if end > data.len() || (end - start) < acc.count * 4 * stride {
+            return Err(GltfError::OutOfRange(format!("JOINTS_0 accessor #{accessor} 越界")));
+        }
+        let read_component = move |bytes: &[u8]| -> u32 {
+            match stride {
+                1 => bytes[0] as u32,
+                _ => u16::from_le_bytes([bytes[0], bytes[1]]) as u32,
+            }
+        };
+        let mut out = Vec::with_capacity(acc.count);
+        for i in 0..acc.count {
+            let base = start + i * 4 * stride;
+            let joint = |k: usize| read_component(&data[base + k * stride..]);
+            out.push([joint(0), joint(1), joint(2), joint(3)]);
+        }
+        Ok(out)
+    }
+
     /// 组装单个 primitive 的 CPU 网格。
     fn build_mesh_data(&self, mesh_index: usize, prim_index: usize) -> Result<MeshData, GltfError> {
         let primitive = self
@@ -501,6 +571,7 @@ impl GltfLoader {
         if components != 3 {
             return Err(GltfError::OutOfRange("POSITION 必须是 VEC3".into()));
         }
+        let vertex_count = positions.len() / 3;
         let normals = match primitive.attributes.get("NORMAL") {
             Some(&n) => {
                 let (data, comps) = self.read_floats(n)?;
@@ -521,8 +592,43 @@ impl GltfLoader {
             }
             None => None,
         };
+        // 蒙皮属性：JOINTS_0 与 WEIGHTS_0 必须成对出现
+        let joints_accessor = primitive.attributes.get("JOINTS_0");
+        let weights_accessor = primitive.attributes.get("WEIGHTS_0");
+        if joints_accessor.is_some() != weights_accessor.is_some() {
+            return Err(GltfError::Missing(
+                "JOINTS_0 与 WEIGHTS_0 必须同时出现".into(),
+            ));
+        }
+        let skin = match (joints_accessor, weights_accessor) {
+            (Some(&j), Some(&w)) => {
+                let joints = self.read_joints(j)?;
+                let (weights, comps) = self.read_floats(w)?;
+                if comps != 4 {
+                    return Err(GltfError::OutOfRange("WEIGHTS_0 必须是 VEC4".into()));
+                }
+                if joints.len() != vertex_count || weights.len() / 4 != vertex_count {
+                    return Err(GltfError::OutOfRange(
+                        "蒙皮属性数量与顶点数量不一致".into(),
+                    ));
+                }
+                Some(
+                    (0..vertex_count)
+                        .map(|i| {
+                            let w = [weights[i * 4], weights[i * 4 + 1], weights[i * 4 + 2], weights[i * 4 + 3]];
+                            // 防御非法资产：权重和偏离 1 时归一化
+                            let sum = (w[0] + w[1] + w[2] + w[3]).max(1e-9);
+                            SkinVertex {
+                                joints: joints[i],
+                                weights: [w[0] / sum, w[1] / sum, w[2] / sum, w[3] / sum],
+                            }
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
 
-        let vertex_count = positions.len() / 3;
         let indices = match primitive.indices {
             Some(i) => self.read_indices(i)?,
             None => (0..vertex_count as u32).collect(),
@@ -554,7 +660,7 @@ impl GltfLoader {
             }
         }
 
-        Ok(MeshData { vertices, indices })
+        Ok(MeshData { vertices, indices, skin })
     }
 
     /// 读取图片（外部文件或 data URI）并解码为 CPU 纹理。
@@ -681,6 +787,7 @@ impl GltfLoader {
                 };
                 let part = world.spawn((Transform::IDENTITY, mesh_handle, material_handle));
                 world.add_child(entity, part);
+                self.node_parts.borrow_mut()[node_index].push(part);
             }
         }
 
@@ -706,6 +813,45 @@ impl GltfLoader {
             .add(self.build_mesh_data(mesh_index, prim)?);
         self.mesh_handles.borrow_mut().insert(key, handle);
         Ok(handle)
+    }
+
+    /// 把 glTF skin 转换为运行时蒙皮（关节实体 + 逆绑定矩阵）。
+    fn build_skin(&self, index: usize) -> Result<Skin, GltfError> {
+        let skin = self
+            .doc
+            .skins
+            .get(index)
+            .ok_or_else(|| GltfError::OutOfRange(format!("skin #{index}")))?;
+        if skin.joints.is_empty() {
+            return Err(GltfError::OutOfRange(format!("skin #{index} 没有关节")));
+        }
+        let mut joints = Vec::with_capacity(skin.joints.len());
+        for &node in &skin.joints {
+            let entity = self.node_entities.borrow().get(node).copied().flatten();
+            joints.push(entity.ok_or_else(|| {
+                GltfError::OutOfRange(format!("skin #{index} 的关节 node #{node} 不在场景内"))
+            })?);
+        }
+        let ibms = match skin.inverse_bind_matrices {
+            Some(accessor) => {
+                let (flat, comps) = self.read_floats(accessor)?;
+                if comps != 16 {
+                    return Err(GltfError::OutOfRange(
+                        "inverseBindMatrices 必须是 MAT4".into(),
+                    ));
+                }
+                let matrices = mat4_list_from_flat(&flat);
+                if matrices.len() != joints.len() {
+                    return Err(GltfError::OutOfRange(
+                        "逆绑定矩阵数量与关节数量不一致".into(),
+                    ));
+                }
+                matrices
+            }
+            // 规范允许省略：关节已处于网格空间，逆绑定矩阵为恒等
+            None => vec![glam::Mat4::IDENTITY; joints.len()],
+        };
+        Ok(Skin::new(joints, ibms))
     }
 
     /// 把 glTF 动画转换为运行时剪辑（关键帧数据全部解码为紧凑 Vec）。
@@ -845,6 +991,7 @@ pub fn spawn_gltf_instance(
     }
     let loader = GltfLoader {
         node_entities: RefCell::new(vec![None; json.nodes.len()]),
+        node_parts: RefCell::new(vec![Vec::new(); json.nodes.len()]),
         doc: json,
         bin: doc.bin,
         base_dir: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
@@ -877,6 +1024,33 @@ pub fn spawn_gltf_instance(
     for node_index in top_level {
         roots.push(loader.spawn_node(world, node_index, None)?);
     }
+
+    // 蒙皮：全部节点实体生成完毕后解析（关节可以是场景内任意节点），
+    // 为引用蒙皮的节点的每个 primitive 实体挂载 Skin 组件
+    let mut skin_cache: HashMap<usize, Skin> = HashMap::new();
+    for (node_index, node) in loader.doc.nodes.iter().enumerate() {
+        let Some(skin_index) = node.skin else {
+            continue;
+        };
+        let skin = match skin_cache.get(&skin_index) {
+            Some(s) => s.clone(),
+            None => {
+                let s = loader.build_skin(skin_index)?;
+                skin_cache.insert(skin_index, s.clone());
+                s
+            }
+        };
+        let parts = loader.node_parts.borrow()[node_index].clone();
+        if parts.is_empty() {
+            return Err(GltfError::OutOfRange(format!(
+                "node #{node_index} 引用了蒙皮 #{skin_index} 但没有网格"
+            )));
+        }
+        for part in parts {
+            world.insert(part, skin.clone());
+        }
+    }
+
     Ok(GltfInstance {
         roots,
         node_entities: loader.node_entities.into_inner(),
@@ -1160,5 +1334,135 @@ mod tests {
         let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
         assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
         Ok(())
+    }
+
+    /// 把 Mat4 以列主序平铺写入 BIN（与 glTF MAT4 accessor 布局一致）。
+    fn extend_mat4(bin: &mut Vec<u8>, m: glam::Mat4) {
+        for col in m.to_cols_array_2d() {
+            bin.extend_from_slice(&col.map(f32::to_le_bytes).concat());
+        }
+    }
+
+    /// 蒙皮三角网格 fixture：3 顶点（v0/v2 绑髋关节，v1 绑肘关节），
+    /// 关节 = hip（恒等）+ elbow（bind 在 (0,1,0)）。
+    /// BIN 布局：positions 0..36 | indices 36..42 | pad→44 | joints 44..68 |
+    /// weights 68..116 | ibm 116..244。
+    fn skinned_triangle_parts() -> (String, Vec<u8>) {
+        let mut bin: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            bin.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        bin.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        while bin.len() < 44 {
+            bin.push(0);
+        }
+        // JOINTS_0：u16 VEC4
+        for j in [[0u16, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]] {
+            bin.extend_from_slice(&j.map(u16::to_le_bytes).concat());
+        }
+        // WEIGHTS_0：f32 VEC4（v1 的权重故意写成 0.9，验证加载归一化）
+        for w in [
+            [1.0f32, 0.0, 0.0, 0.0],
+            [0.0, 0.9, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ] {
+            bin.extend_from_slice(&w.map(f32::to_le_bytes).concat());
+        }
+        // inverseBindMatrices：hip 恒等；elbow bind 全局 = T(0,1,0) → ibm = T(0,-1,0)
+        extend_mat4(&mut bin, glam::Mat4::IDENTITY);
+        extend_mat4(&mut bin, glam::Mat4::from_translation([0.0, -1.0, 0.0].into()));
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "buffers": [{"byteLength": 244}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 6},
+                {"buffer": 0, "byteOffset": 44, "byteLength": 24},
+                {"buffer": 0, "byteOffset": 68, "byteLength": 48},
+                {"buffer": 0, "byteOffset": 116, "byteLength": 128}
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+                {"bufferView": 2, "componentType": 5123, "count": 3, "type": "VEC4"},
+                {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC4"},
+                {"bufferView": 4, "componentType": 5126, "count": 2, "type": "MAT4"}
+            ],
+            "meshes": [{"primitives": [{
+                "attributes": {"POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3}, "indices": 1
+            }]}],
+            "skins": [{"joints": [1, 2], "inverseBindMatrices": 4}],
+            "nodes": [
+                {"mesh": 0, "skin": 0},
+                {"name": "hip", "children": [2]},
+                {"name": "elbow", "translation": [0.0, 1.0, 0.0]}
+            ],
+            "scenes": [{"nodes": [0, 1]}],
+            "scene": 0
+        }"#;
+        (json.to_string(), bin)
+    }
+
+    #[test]
+    fn loads_skinned_glb_and_binds_skin() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = skinned_triangle_parts();
+        let path = dir.join("skinned.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        assert_eq!(instance.roots.len(), 2, "mesh 节点与 hip 都应在场景顶层");
+
+        // 关节实体解析正确
+        let hip = instance.node_entities[1].expect("hip 应已生成");
+        let elbow = instance.node_entities[2].expect("elbow 应已生成");
+
+        // mesh 节点的 primitive 子实体应挂上 Skin
+        let parts = world.children(instance.roots[0]);
+        assert_eq!(parts.len(), 1);
+        let skin = world
+            .get::<Skin>(parts[0])
+            .expect("蒙皮网格实体应有 Skin 组件")
+            .clone();
+        assert_eq!(skin.joints, vec![hip, elbow]);
+        assert!(
+            skin.inverse_bind_matrices[0].abs_diff_eq(glam::Mat4::IDENTITY, 1e-6),
+            "hip 的逆绑定矩阵应为恒等"
+        );
+        assert!(
+            skin.inverse_bind_matrices[1]
+                .abs_diff_eq(glam::Mat4::from_translation([0.0, -1.0, 0.0].into()), 1e-6),
+            "elbow 的逆绑定矩阵应为 T(0,-1,0)，实际 {:#?}",
+            skin.inverse_bind_matrices[1]
+        );
+
+        // 蒙皮顶点属性：关节索引 + 权重归一化（0.9 → 1.0）
+        let meshes = world.resource::<MeshStore>();
+        let data = meshes.get(MeshHandle(0)).unwrap();
+        let skin_attrs = data.skin.as_ref().expect("网格应携带蒙皮属性");
+        assert_eq!(skin_attrs.len(), 3);
+        assert_eq!(skin_attrs[0].joints, [0, 0, 0, 0]);
+        assert_eq!(skin_attrs[1].joints, [1, 0, 0, 0]);
+        assert!(
+            (skin_attrs[1].weights[1] - 1.0).abs() < 1e-6,
+            "权重应归一化，实际 {:?}",
+            skin_attrs[1].weights
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_joints_without_weights() {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut json, bin) = skinned_triangle_parts();
+        json = json.replace("\"JOINTS_0\": 2, \"WEIGHTS_0\": 3", "\"JOINTS_0\": 2");
+        let path = dir.join("joints_only.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+        let mut world = world_with_stores();
+        let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
+        assert!(matches!(err, GltfError::Missing(_)), "实际错误：{err:?}");
     }
 }

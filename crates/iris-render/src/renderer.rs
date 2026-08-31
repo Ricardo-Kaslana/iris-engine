@@ -22,6 +22,7 @@ use crate::light::{DirectionalLight, PointLight, MAX_POINT_LIGHTS};
 use crate::material::{MaterialHandle, MaterialStore};
 use crate::mesh::{upload_mesh, MeshHandle, MeshStore};
 use crate::pipeline::create_pipeline;
+use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
 use crate::SAMPLE_COUNT;
 
@@ -70,6 +71,28 @@ struct GpuMesh {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     num_indices: u32,
+    /// 蒙皮属性缓冲（非蒙皮网格为 None）。
+    skin_buf: Option<wgpu::Buffer>,
+}
+
+/// 每具蒙皮的 GPU 资源：关节矩阵 storage 缓冲与对应绑定组。
+/// 动画驱动下关节矩阵每帧变化，缓冲按关节数上限容量复用。
+struct GpuSkin {
+    joint_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// 缓冲可容纳的关节数量（不足以时整体重建）。
+    capacity: usize,
+}
+
+/// 一帧内收集到的蒙皮绘制项（每实体一项，不参与普通批处理）。
+struct SkinnedItem {
+    /// 蒙皮实体位标识（GpuSkin 缓存键）。
+    skin_entity: u64,
+    mesh: u32,
+    material: u32,
+    instance: InstanceRaw,
+    /// 关节矩阵（列主序平铺后直接上传）。
+    joint_matrices: Vec<glam::Mat4>,
 }
 
 struct GpuTexture {
@@ -101,6 +124,8 @@ pub struct Renderer {
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
     material_gpu: HashMap<u32, GpuMaterial>,
+    /// 蒙皮实体位标识 → 关节矩阵缓冲。
+    skin_gpu: HashMap<u64, GpuSkin>,
     /// 持有纹理以保证对应 view 在渲染器存活期间有效。
     #[allow(dead_code)]
     shadow_map: wgpu::Texture,
@@ -118,6 +143,7 @@ pub struct Renderer {
     hdr_size: (u32, u32),
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
+    skinned_scratch: Vec<SkinnedItem>,
     clear_color: wgpu::Color,
     pub(crate) stats: FrameStats,
 }
@@ -312,6 +338,7 @@ impl Renderer {
             mesh_gpu: HashMap::new(),
             texture_gpu,
             material_gpu: HashMap::new(),
+            skin_gpu: HashMap::new(),
             shadow_map,
             shadow_map_view,
             shadow_depth_buf,
@@ -321,6 +348,7 @@ impl Renderer {
             hdr_size: (0, 0),
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
+            skinned_scratch: Vec::new(),
             clear_color: wgpu::Color { r: 0.055, g: 0.07, b: 0.10, a: 1.0 },
             stats: FrameStats::default(),
         }
@@ -602,7 +630,42 @@ impl Renderer {
         let mut items = std::mem::take(&mut self.scratch);
         items.clear();
         let mut culled = 0u32;
-        world.query::<(&GlobalTransform, &MeshHandle, &MaterialHandle)>(|(gt, m, mat)| {
+
+        // 2a. 蒙皮实体独立收集：不参与视锥剔除（关节可把顶点移出绑定姿势
+        // 包围盒，v1 保守全画）；关节矩阵在此即时计算（J = inv(mesh) ×
+        // global(joint) × ibm，蒙皮定义在网格局部空间，随父级整体移动）
+        let mut skinned = std::mem::take(&mut self.skinned_scratch);
+        skinned.clear();
+        world.query::<(
+            iris_core::prelude::Entity,
+            &GlobalTransform,
+            &MeshHandle,
+            &MaterialHandle,
+            &Skin,
+        )>(|(e, gt, m, mat, skin)| {
+            let mut joint_matrices = Vec::with_capacity(skin.joints.len());
+            skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
+            skinned.push(SkinnedItem {
+                skin_entity: e.to_bits(),
+                mesh: m.0,
+                material: mat.0,
+                instance: InstanceRaw::from_matrix(gt.matrix()),
+                joint_matrices,
+            });
+        });
+        let skinned_entities: std::collections::HashSet<u64> =
+            skinned.iter().map(|s| s.skin_entity).collect();
+
+        world.query::<(
+            iris_core::prelude::Entity,
+            &GlobalTransform,
+            &MeshHandle,
+            &MaterialHandle,
+        )>(|(e, gt, m, mat)| {
+            // 蒙皮实体走独立路径，避免同网格重复绘制
+            if skinned_entities.contains(&e.to_bits()) {
+                return;
+            }
             let model = gt.matrix();
             // 包围球剔除：局部球心经模型矩阵变换，半径按最大列缩放保守放大
             let culled_now = mesh_store
@@ -635,12 +698,14 @@ impl Renderer {
             log::trace!("视锥剔除 {culled} / {} 实例", total + culled as usize);
         }
 
-        // 3. 实例缓冲（容量不足时重建）；剔除排序键后按 112B 紧凑布局整体上传
-        if total > 0 {
-            self.ensure_instance_capacity(total);
+        // 3. 实例缓冲（容量不足时重建）；剔除排序键后按 112B 紧凑布局整体上传，
+        //    蒙皮实例追加在普通实例之后（实例区间 [total, total+skinned)）
+        if total + skinned.len() > 0 {
+            self.ensure_instance_capacity(total + skinned.len());
             let mut instances = std::mem::take(&mut self.instance_scratch);
             instances.clear();
             instances.extend(items.iter().map(|item| item.instance));
+            instances.extend(skinned.iter().map(|item| item.instance));
             self.gpu.queue.write_buffer(
                 self.instance_buf.as_ref().expect("实例缓冲已就绪"),
                 0,
@@ -663,6 +728,21 @@ impl Renderer {
             self.ensure_material(&material_store, texture_store.as_deref(), material);
             index += count;
         }
+        // 4a. 蒙皮资源：网格 / 材质 + 关节矩阵缓冲（动画驱动下每帧覆写）
+        for item in &skinned {
+            self.ensure_mesh(&mesh_store, MeshHandle(item.mesh));
+            self.ensure_material(&material_store, texture_store.as_deref(), MaterialHandle(item.material));
+        }
+        let mut joint_bytes: Vec<u8> = Vec::new();
+        for item in &skinned {
+            self.ensure_skin(item.skin_entity, item.joint_matrices.len());
+            joint_bytes.clear();
+            for m in &item.joint_matrices {
+                joint_bytes.extend_from_slice(bytemuck::bytes_of(&m.to_cols_array_2d()));
+            }
+            let skin = self.skin_gpu.get(&item.skin_entity).expect("蒙皮缓冲已就绪");
+            self.gpu.queue.write_buffer(&skin.joint_buf, 0, &joint_bytes);
+        }
 
         // 5. 编码渲染通道：先阴影 pass（光源视角，深度写入颜色附件），后主 pass
         let mut encoder = self
@@ -671,7 +751,8 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("iris.frame") });
         let mut draw_calls = 0u32;
         let mut instances = 0u32;
-        if shadow_enabled && total > 0 {
+        if shadow_enabled && total + skinned.len() > 0 {
+            let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.shadow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -722,6 +803,27 @@ impl Renderer {
                 shadow_pass.draw_indexed(0..mesh.num_indices, 0, first..last);
                 index += count;
             }
+            // 蒙皮几何体：独立阴影管线（组 1 = 关节矩阵），阴影随骨骼变形
+            if !skinned.is_empty() {
+                shadow_pass.set_pipeline(&self.bundle.skinned_shadow_pipeline);
+                shadow_pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, item) in skinned.iter().enumerate() {
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    shadow_pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    shadow_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    shadow_pass.set_bind_group(1, &skin.bind_group, &[]);
+                    let base = (total + i) as u32;
+                    shadow_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                }
+            }
         }
         // 主 pass：场景渲染到 HDR MSAA 中间缓冲，解析到单采样 HDR
         let hdr = self.hdr.as_ref().expect("HDR 中间缓冲已就绪");
@@ -755,7 +857,7 @@ impl Renderer {
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.bundle.pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            if total > 0 {
+            if total + skinned.len() > 0 {
                 pass.set_vertex_buffer(
                     1,
                     self.instance_buf
@@ -782,6 +884,33 @@ impl Renderer {
                 draw_calls += 1;
                 instances += count as u32;
                 index += count;
+            }
+            // 蒙皮实体：独立管线（组 2 = 关节矩阵 storage），实例区间紧随普通实例
+            if !skinned.is_empty() {
+                let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+                pass.set_pipeline(&self.bundle.skinned_pipeline);
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, item) in skinned.iter().enumerate() {
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let material = &self.material_gpu[&item.material];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_bind_group(2, &skin.bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    let base = (total + i) as u32;
+                    pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                    draw_calls += 1;
+                    instances += 1;
+                }
             }
         }
         // 泛光：提取 -> 水平模糊 -> 垂直模糊（半分辨率三个全屏 pass）。
@@ -886,6 +1015,7 @@ impl Renderer {
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
         self.scratch = items;
+        self.skinned_scratch = skinned;
     }
 
     fn ensure_instance_capacity(&mut self, needed: usize) {
@@ -911,11 +1041,37 @@ impl Renderer {
             log::warn!("网格句柄 {handle:?} 不存在");
             return;
         };
-        let (vertex_buf, index_buf, num_indices) = upload_mesh(&self.gpu, data);
+        let (vertex_buf, index_buf, num_indices, skin_buf) = upload_mesh(&self.gpu, data);
         self.mesh_gpu.insert(
             handle.0,
-            GpuMesh { vertex_buf, index_buf, num_indices },
+            GpuMesh { vertex_buf, index_buf, num_indices, skin_buf },
         );
+    }
+
+    /// 蒙皮的关节矩阵缓冲：按关节数上限分配，不足以时整体重建。
+    fn ensure_skin(&mut self, skin_entity: u64, joint_count: usize) {
+        if let Some(skin) = self.skin_gpu.get(&skin_entity) {
+            if skin.capacity >= joint_count {
+                return;
+            }
+        }
+        let capacity = joint_count.max(16);
+        let joint_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.skin.joints"),
+            size: (capacity * 64) as u64, // 每关节一个 4x4 f32 矩阵
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.skin.bg"),
+            layout: &self.bundle.joints_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: joint_buf.as_entire_binding(),
+            }],
+        });
+        self.skin_gpu
+            .insert(skin_entity, GpuSkin { joint_buf, bind_group, capacity });
     }
 
     fn ensure_texture(&mut self, store: Option<&TextureStore>, handle: TextureHandle) {

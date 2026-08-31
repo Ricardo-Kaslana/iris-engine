@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 + 分割求和，零资产依赖）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 + 分割求和，零资产依赖）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -78,6 +78,10 @@ cargo run --example bloom_snapshot --release
 # 蓝色立方体自转 + 浮动（GLB 容器 + AnimationPlayer 播放链路）
 cargo run --example gen_asset --release
 cargo run --example anim_snapshot --release
+
+# 骨骼蒙皮验收场景（同用 gen_asset 资产），输出两个时刻的位图：
+# 两段臂绑髋/肘关节，肘关节挥舞 90°（GPU LBS 蒙皮 + 蒙皮阴影）
+cargo run --example skin_snapshot --release
 
 # ECS 吞吐基准
 cargo run -p iris-core --example bench_ecs --release
@@ -192,10 +196,18 @@ glTF 动画实测（`docs/anim_preview.png`，左 t=0 / 右 t=1）：`anim_cube.
 
 ![glTF 动画](docs/anim_preview.png)
 
+骨骼蒙皮实测（`docs/skin_preview.png`，左 t=0 / 右 t=1.5）：两段臂分别绑定
+髋 / 肘关节，肘关节旋转 90° 时上段**绕肘点**扫成水平——关节矩阵
+`J = inv(蒙皮全局) × global(joint) × ibm` 每帧算出后经 storage buffer
+进顶点着色器做 4 关节线性混合（LBS）；蒙皮阴影管线复用同一份矩阵，
+阴影随骨骼同步变形。
+
+![骨骼蒙皮](docs/skin_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 95 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 107 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -204,6 +216,7 @@ cargo test --workspace   # 95 个测试：单元 + GPU 端到端离屏渲染
 **泛光（开/关整帧差分：光晕变亮、无变暗、远场不变）**、
 **IBL（铬球反射蓝天：蓝主导像素对比 + 整帧变亮）**、
 **glTF 动画（旋转方块离屏渲染：正对 → 侧对红色像素锐减）**、
+**骨骼蒙皮（肘关节动画驱动顶点位移：最左像素左移 ≥30px + 蒙皮阴影成片变暗）**、
 glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）。
 
 ## 跨平台矩阵
@@ -227,7 +240,7 @@ glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness �
 - [x] IBL 环境光照（程序化天空 + 分割求和）
 - [x] 天空盒背景 pass（射线采样，与 IBL 同源）
 - [x] GLB 二进制容器与 glTF 节点动画（AnimationPlayer）
-- [ ] 骨骼蒙皮动画（skinning）
+- [x] 骨骼蒙皮动画（GPU LBS + 蒙皮阴影）
 - [ ] 外部 HDR 资产加载（equirectangular）
 - [ ] 点光阴影（cubemap）
 - [ ] 多线程系统调度（查询并行）

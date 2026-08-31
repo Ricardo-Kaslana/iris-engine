@@ -25,6 +25,7 @@ pub mod offscreen;
 pub mod pipeline;
 pub mod post;
 pub mod renderer;
+pub mod skin;
 pub mod surface;
 pub mod texture;
 
@@ -41,10 +42,11 @@ pub mod prelude {
     pub use crate::instance::InstanceRaw;
     pub use crate::light::{DirectionalLight, PointLight, MAX_POINT_LIGHTS};
     pub use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
-    pub use crate::mesh::{primitives, MeshData, MeshHandle, MeshStore, Vertex};
+    pub use crate::mesh::{primitives, MeshData, MeshHandle, MeshStore, SkinVertex, Vertex};
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::post::BloomSettings;
     pub use crate::renderer::{FrameStats, Renderer};
+    pub use crate::skin::{skin_vertex, Skin};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
 }

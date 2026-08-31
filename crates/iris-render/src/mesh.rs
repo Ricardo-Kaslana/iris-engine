@@ -28,11 +28,36 @@ impl Vertex {
     };
 }
 
-/// CPU 侧网格数据（顶点 + 索引）。
+/// 蒙皮顶点属性：4 个关节索引 + 4 个混合权重（16 字节，POD）。
+///
+/// 与主顶点数据分离为独立缓冲：非蒙皮网格不为蒙皮属性付出 16 字节/顶点。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkinVertex {
+    /// 关节索引（指向 `Skin::joints`，进而指向关节矩阵缓冲）。
+    pub joints: [u32; 4],
+    /// 混合权重（约定和为 1；加载时归一化）。
+    pub weights: [f32; 4],
+}
+
+impl SkinVertex {
+    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<SkinVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute { offset: 0, shader_location: 10, format: wgpu::VertexFormat::Uint32x4 },
+            wgpu::VertexAttribute { offset: 16, shader_location: 11, format: wgpu::VertexFormat::Float32x4 },
+        ],
+    };
+}
+
+/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮属性）。
 #[derive(Clone, Debug, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// 蒙皮属性；Some 时长度必须与 `vertices` 一致。
+    pub skin: Option<Vec<SkinVertex>>,
 }
 
 impl MeshData {
@@ -177,7 +202,18 @@ impl MeshStore {
 }
 
 /// 便捷上传：由渲染器调用，将 `MeshData` 变为 GPU 缓冲。
-pub(crate) fn upload_mesh(gpu: &crate::context::Gpu, data: &MeshData) -> (wgpu::Buffer, wgpu::Buffer, u32) {
+/// 蒙皮属性存在时附带第三张顶点缓冲。
+pub(crate) fn upload_mesh(
+    gpu: &crate::context::Gpu,
+    data: &MeshData,
+) -> (wgpu::Buffer, wgpu::Buffer, u32, Option<wgpu::Buffer>) {
+    if let Some(skin) = &data.skin {
+        assert_eq!(
+            skin.len(),
+            data.vertices.len(),
+            "蒙皮属性数量必须与顶点数量一致"
+        );
+    }
     let vertex_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("iris.mesh.vbo"),
         contents: bytemuck::cast_slice(&data.vertices),
@@ -188,7 +224,15 @@ pub(crate) fn upload_mesh(gpu: &crate::context::Gpu, data: &MeshData) -> (wgpu::
         contents: bytemuck::cast_slice(&data.indices),
         usage: wgpu::BufferUsages::INDEX,
     });
-    (vertex_buf, index_buf, data.indices.len() as u32)
+    let skin_buf = data.skin.as_ref().map(|skin| {
+        gpu.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.mesh.skin_vbo"),
+                contents: bytemuck::cast_slice(skin),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+    });
+    (vertex_buf, index_buf, data.indices.len() as u32, skin_buf)
 }
 
 #[cfg(test)]
@@ -258,5 +302,40 @@ mod tests {
                 .sqrt();
             assert!((len - 1.0).abs() < 1e-4, "球面顶点应位于半径 1 上");
         }
+    }
+
+    #[test]
+    fn skin_vertex_is_pod_and_layout_matches() {
+        // GPU 布局契约：32 字节（16B 关节 + 16B 权重），
+        // 两个属性（loc10 Uint32x4 + loc11 Float32x4）
+        assert_eq!(std::mem::size_of::<SkinVertex>(), 32);
+        assert_eq!(SkinVertex::LAYOUT.array_stride, 32);
+        let attrs = SkinVertex::LAYOUT.attributes;
+        assert_eq!(attrs.len(), 2);
+        assert_eq!((attrs[0].shader_location, attrs[0].offset), (10, 0));
+        assert_eq!((attrs[1].shader_location, attrs[1].offset), (11, 16));
+        // 位级往返（Pod 契约）
+        let v = SkinVertex { joints: [7, 0, 3, 1], weights: [0.5, 0.25, 0.125, 0.125] };
+        let bytes: &[u8] = bytemuck::bytes_of(&v);
+        let back: SkinVertex = *bytemuck::from_bytes(bytes);
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    #[should_panic(expected = "蒙皮属性数量必须与顶点数量一致")]
+    fn upload_mesh_rejects_mismatched_skin_attributes() {
+        let gpu = crate::context::Gpu::offscreen();
+        let Some(gpu) = gpu else {
+            return; // 无 GPU 环境：跳过
+        };
+        let data = MeshData {
+            vertices: primitives::cube().vertices,
+            indices: primitives::cube().indices,
+            skin: Some(vec![
+                SkinVertex { joints: [0; 4], weights: [0.0; 4] };
+                3
+            ]),
+        };
+        let _ = upload_mesh(&gpu, &data);
     }
 }

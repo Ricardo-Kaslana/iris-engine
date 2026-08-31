@@ -20,6 +20,8 @@ struct Globals {
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
+// 蒙皮关节矩阵（vs_skinned 专用；vs_main 静态不使用）
+@group(1) @binding(0) var<storage, read> joint_mats: array<mat4x4<f32>>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -27,6 +29,16 @@ struct VertexInput {
     @location(4) model1: vec4<f32>,
     @location(5) model2: vec4<f32>,
     @location(6) model3: vec4<f32>,
+};
+
+struct SkinnedShadowVertexInput {
+    @location(0) position: vec3<f32>,
+    @location(3) model0: vec4<f32>,
+    @location(4) model1: vec4<f32>,
+    @location(5) model2: vec4<f32>,
+    @location(6) model3: vec4<f32>,
+    @location(10) joints: vec4<u32>,
+    @location(11) weights: vec4<f32>,
 };
 
 struct ShadowVertexOutput {
@@ -37,6 +49,21 @@ struct ShadowVertexOutput {
 fn vs_main(in: VertexInput) -> ShadowVertexOutput {
     let model = mat4x4<f32>(in.model0, in.model1, in.model2, in.model3);
     let world_pos = model * vec4<f32>(in.position, 1.0);
+    var out: ShadowVertexOutput;
+    out.clip_position = globals.light_view_proj * world_pos;
+    return out;
+}
+
+// 蒙皮几何体的阴影：与 standard.wgsl vs_skinned 相同的 LBS 混合
+// （先 skin 后 model），保证阴影与主 pass 几何逐顶点一致。
+@vertex
+fn vs_skinned(in: SkinnedShadowVertexInput) -> ShadowVertexOutput {
+    let j = in.joints;
+    let w = in.weights;
+    let skin_mat = joint_mats[j.x] * w.x + joint_mats[j.y] * w.y
+                 + joint_mats[j.z] * w.z + joint_mats[j.w] * w.w;
+    let model = mat4x4<f32>(in.model0, in.model1, in.model2, in.model3);
+    let world_pos = model * (skin_mat * vec4<f32>(in.position, 1.0));
     var out: ShadowVertexOutput;
     out.clip_position = globals.light_view_proj * world_pos;
     return out;
