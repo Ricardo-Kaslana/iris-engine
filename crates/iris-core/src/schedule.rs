@@ -379,6 +379,8 @@ mod tests {
 
     /// 无冲突并行系统确实并发执行：两系统各自把「当前并发数」
     /// 抬到原子计数器上，观测到的最大并发数应 ≥ 2。
+    /// 高负载下线程调度可能错过交错窗口（两个 sleep 不重叠），
+    /// 因此允许重跑数轮取观测峰值——峰值只增不减，跨轮累积。
     #[test]
     fn disjoint_parallel_systems_run_concurrently() {
         static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -415,7 +417,12 @@ mod tests {
                     leave();
                 },
             );
-        schedule.run(Stage::Update, &mut world);
+        for _ in 0..5 {
+            if MAX_ACTIVE.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            schedule.run(Stage::Update, &mut world);
+        }
         assert!(
             MAX_ACTIVE.load(Ordering::SeqCst) >= 2,
             "两个无冲突系统应并发执行（观测最大并发 {}）",

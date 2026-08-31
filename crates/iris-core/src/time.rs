@@ -28,7 +28,8 @@ impl Default for Time {
             delta: Duration::ZERO,
             elapsed: Duration::ZERO,
             ticks: 0,
-            fixed_delta: Duration::from_secs_f64(1.0 / 60.0),
+            // 纳秒向内截断（见 set_fixed_hz 的舍入说明）
+            fixed_delta: Duration::from_nanos(1_000_000_000 / 60),
             accumulator: Duration::ZERO,
             max_delta: Duration::from_secs_f64(0.25),
             last_instant: None,
@@ -80,8 +81,16 @@ impl Time {
     }
 
     /// 以赫兹设置固定逻辑帧率。
+    ///
+    /// 舍入说明：`Duration::from_secs_f64(1/hz)` 会四舍五入到纳秒——
+    /// 60Hz 时 16,666,666.67ns 被舍入为 16,666,667ns，于是「3/60 秒的一帧」
+    /// 只够 2 个固定步（3 × 16,666,667 > 50,000,000ns），名义帧率与实际
+    /// 步数出现差一。此处**向内截断**到纳秒，保证 N 个名义步 ≤ N/hz 秒，
+    /// 确定性模拟与回放不会因舍入方向漂移；代价是每步少 0.67ns（每分钟
+    /// 累积约 40μs，可忽略）。
     pub fn set_fixed_hz(&mut self, hz: f64) {
-        self.fixed_delta = Duration::from_secs_f64(1.0 / hz);
+        assert!(hz > 0.0, "固定帧率必须为正，实际 {hz}");
+        self.fixed_delta = Duration::from_nanos((1.0e9 / hz) as u64);
     }
 
     /// 消耗累积器，返回本帧应执行的固定逻辑步数（含防死亡螺旋上限）。
@@ -130,9 +139,13 @@ mod tests {
     fn fixed_steps_consume_accumulator() {
         let mut time = Time::default();
         time.set_fixed_hz(60.0);
-        time.begin_frame(at(0));
+        // 两帧时间点必须源自同一次 Instant::now()：分别调用 now() 会把
+        // 测试进程被抢占的真实墙钟间隔算进 delta（并行测试争抢 CPU 时
+        // 偶发超过一个固定步长，步数断言随机挂）
+        let t0 = Instant::now();
+        time.begin_frame(t0);
         // 3/60 秒的一帧 → 3 个固定步
-        time.begin_frame(at(0) + Duration::from_secs_f64(3.0 / 60.0));
+        time.begin_frame(t0 + Duration::from_secs_f64(3.0 / 60.0));
         assert_eq!(time.fixed_steps(), 3);
         assert_eq!(time.fixed_steps(), 0, "累积器应耗尽");
     }
