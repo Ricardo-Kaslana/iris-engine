@@ -16,6 +16,7 @@ struct Globals {
     light_view_proj: mat4x4<f32>,
     shadow_params: vec4<f32>,
     env_params: vec4<f32>, // 与 standard.wgsl 保持同布局（本 pass 不读）
+    inv_view_proj: mat4x4<f32>, // 与 standard.wgsl 保持同布局（本 pass 不读）
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;

@@ -169,8 +169,11 @@ pub(crate) fn bake_environment(gpu: &Gpu) -> EnvironmentMaps {
     });
     let mut params_data = vec![0u8; SLOTS as usize * STRIDE as usize];
     let mut write_slot = |slot: usize, face: f32, roughness: f32| {
+        // 写入步长必须与烘焙 pass 的动态偏移步长（STRIDE=256）一致：
+        // slot k 的参数必须落在字节 k·256 处，pass k 才能在偏移 k·256 读到它
+        let base = slot * STRIDE as usize;
         let bytes: [u8; 16] = bytemuck::cast([face, roughness, 0.0, 0.0]);
-        params_data[slot * 16..slot * 16 + 16].copy_from_slice(&bytes);
+        params_data[base..base + 16].copy_from_slice(&bytes);
     };
     for face in 0..6u32 {
         write_slot(SKY_BASE + face as usize, face as f32, 0.0);

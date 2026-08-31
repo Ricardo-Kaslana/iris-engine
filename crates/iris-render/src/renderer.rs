@@ -33,7 +33,7 @@ struct PointLightRaw {
     color: [f32; 4], // rgb × intensity, w = range
 }
 
-/// 与 WGSL `Globals` 结构对齐（496 字节，POD）。
+/// 与 WGSL `Globals` 结构对齐（560 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsRaw {
@@ -47,9 +47,10 @@ struct GlobalsRaw {
     light_view_proj: [[f32; 4]; 4],
     shadow_params: [f32; 4], // texel_size, bias, strength, enabled
     env_params: [f32; 4],    // 预滤波最大 mip 级, IBL 强度, 保留
+    inv_view_proj: [[f32; 4]; 4], // 天空盒射线重建用
 }
 
-const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 496, "Globals 必须与 WGSL 布局一致");
+const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 560, "Globals 必须与 WGSL 布局一致");
 
 /// 阴影深度偏移（正交投影 + 正面剔除下的小常数即可抑制 acne）。
 const SHADOW_BIAS: f32 = 0.0015;
@@ -590,6 +591,7 @@ impl Renderer {
                 0.0,
                 0.0,
             ],
+            inv_view_proj: vp.inverse().to_cols_array_2d(),
         };
         self.gpu
             .queue
@@ -747,6 +749,10 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // 天空盒背景最先绘制（深度只读，几何体随后覆盖）
+            pass.set_pipeline(&self.bundle.sky_pipeline);
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.bundle.pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             if total > 0 {

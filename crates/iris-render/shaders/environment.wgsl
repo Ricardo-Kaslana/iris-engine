@@ -39,7 +39,10 @@ fn vs_main(@builtin(vertex_index) index: u32) -> EnvVertexOutput {
     return out;
 }
 
-// 面片 uv -> 立方体方向（采样器 dir->uv 的精确逆映射，WebGPU 沿用 OpenGL 立方体约定）
+// 面片 uv -> 立方体方向（采样器 dir->uv 的精确逆映射，WebGPU 沿用 OpenGL
+// 立方体约定：+X: sc=-rz,tc=-ry | -X: sc=rz,tc=-ry | +Y: sc=rx,tc=rz |
+// -Y: sc=rx,tc=-rz | +Z: sc=rx,tc=-ry | -Z: sc=-rx,tc=-ry。
+// ±Z 面的 tc 符号写反会把天空垂直镜像烘焙（实测：仰视天顶拿到地平线浅色）
 fn face_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {
     let a = uv * 2.0 - 1.0;
     switch face {
@@ -47,8 +50,8 @@ fn face_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {
         case 1u: { return vec3<f32>(-1.0, -a.y, a.x); }   // -X
         case 2u: { return vec3<f32>(a.x, 1.0, a.y); }     // +Y
         case 3u: { return vec3<f32>(a.x, -1.0, -a.y); }   // -Y
-        case 4u: { return vec3<f32>(a.x, a.y, 1.0); }     // +Z
-        default: { return vec3<f32>(-a.x, a.y, -1.0); }   // -Z
+        case 4u: { return vec3<f32>(a.x, -a.y, 1.0); }    // +Z
+        default: { return vec3<f32>(-a.x, -a.y, -1.0); }  // -Z
     }
 }
 
@@ -61,9 +64,12 @@ const SUN_DIR = vec3<f32>(0.4, 0.8, 0.45);
 fn sky_color(d: vec3<f32>) -> vec3<f32> {
     let dir = normalize(d);
     let t = dir.y;
-    let zenith = vec3<f32>(0.18, 0.42, 0.92);
-    let horizon = vec3<f32>(0.82, 0.88, 0.98);
-    let ground = vec3<f32>(0.30, 0.24, 0.18);
+    // 亮部必须保持在泛光阈值（1.0）以下，否则地平线会自发泛光、
+    // 经三轮模糊铺满整个天空，把渐变洗成一片均匀的浅蓝；
+    // 太阳盘（30.0）是天空里唯一的泛光源
+    let zenith = vec3<f32>(0.10, 0.36, 0.94);
+    let horizon = vec3<f32>(0.70, 0.80, 0.94);
+    let ground = vec3<f32>(0.30, 0.24, 0.18) * 0.55;
     var c = horizon;
     if (t >= 0.0) {
         c = mix(horizon, zenith, pow(clamp(t, 0.0, 1.0), 0.45));

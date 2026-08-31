@@ -62,9 +62,10 @@ fn world_with_stores() -> World {
     world
 }
 
-fn is_background(px: &[u8], i: usize) -> bool {
-    let clear = [64i32, 77, 99]; // ACES 色调映射后的背景 sRGB 值
-    (0..3).all(|c| (px[i + c] as i32 - clear[c]).abs() <= 8)
+/// 天空背景色以左上角像素为参照（同一高度的角点互为天空；
+/// 中心与之相同即说明该处没有几何体）。
+fn is_background(px: &[u8], i: usize, sky: usize) -> bool {
+    (0..3).all(|c| (px[i + c] as i32 - px[sky + c] as i32).abs() <= 8)
 }
 
 #[test]
@@ -89,7 +90,8 @@ fn offscreen_renders_gltf_model() {
     let (w, h) = renderer.size();
     let px = renderer.read_pixels();
     let center = ((h / 2) * w + w / 2) as usize * 4;
-    assert!(!is_background(&px, center), "资源相机下画面中心应是红色 quad");
+    let sky = ((2 * w + 2) as usize) * 4;
+    assert!(!is_background(&px, center, sky), "资源相机下画面中心应是红色 quad");
     // 红色材质：R 通道应显著高于 G/B
     assert!(
         px[center] as i32 - px[center + 1] as i32 > 40
@@ -108,7 +110,8 @@ fn offscreen_renders_gltf_model() {
     renderer.render(&world);
     let px = renderer.read_pixels();
     let center = ((h / 2) * w + w / 2) as usize * 4;
-    assert!(!is_background(&px, center), "挂载相机下画面中心应是红色 quad");
+    let sky = ((2 * w + 2) as usize) * 4;
+    assert!(!is_background(&px, center, sky), "挂载相机下画面中心应是红色 quad");
     assert!(
         px[center] as i32 - px[center + 1] as i32 > 40,
         "挂载相机路径应看到红色 quad，实际 RGBA {:?}",
@@ -160,7 +163,8 @@ fn offscreen_renders_repository_cube_asset() {
     let (w, h) = renderer.size();
     let px = renderer.read_pixels();
     let center = ((h / 2) * w + w / 2) as usize * 4;
-    assert!(!is_background(&px, center), "画面中心应是仓库立方体资产");
+    let sky = ((2 * w + 2) as usize) * 4;
+    assert!(!is_background(&px, center, sky), "画面中心应是仓库立方体资产");
     // 材质 baseColorFactor [0.92, 0.48, 0.18]：橙色 → R 明显高于 B
     assert!(
         px[center] as i32 - px[center + 2] as i32 > 30,

@@ -6,9 +6,10 @@ pub const SHADOW_MAP_SIZE: u32 = 2048;
 /// HDR 中间缓冲格式（线性、单采样，供色调映射 pass 采样）。
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// 主管线、阴影管线、泛光管线（提取 + 模糊）与色调映射管线，以及全部绑定组布局。
+/// 主管线、阴影管线、天空盒、泛光管线（提取 + 模糊）与色调映射管线，以及全部绑定组布局。
 pub(crate) struct PipelineBundle {
     pub pipeline: wgpu::RenderPipeline,
+    pub sky_pipeline: wgpu::RenderPipeline,
     pub shadow_pipeline: wgpu::RenderPipeline,
     pub blit_pipeline: wgpu::RenderPipeline,
     pub bloom_threshold_pipeline: wgpu::RenderPipeline,
@@ -176,6 +177,57 @@ pub(crate) fn create_pipeline(
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
             depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 天空盒：全屏三角形按像素射线采样预滤波环境贴图 0 级 mip（= 原始天空）。
+    // 主 pass 内最先绘制；深度只测不写（Always + write false），几何体随后覆盖。
+    let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.skybox"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/skybox.wgsl").into()),
+    });
+    let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.sky.pipeline.layout"),
+        bind_group_layouts: &[Some(&globals_layout)],
+        immediate_size: 0,
+    });
+    let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.sky"),
+        layout: Some(&sky_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &sky_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &sky_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -408,6 +460,7 @@ pub(crate) fn create_pipeline(
 
     PipelineBundle {
         pipeline,
+        sky_pipeline,
         shadow_pipeline,
         blit_pipeline,
         bloom_threshold_pipeline,

@@ -169,9 +169,9 @@ PCF 边缘自然、无 acne 条纹；`DirectionalLight.shadows = false` 可整�
 
 PBR + HDR + IBL 实测（`docs/pbr_preview.png`）：Cook-Torrance 金属度/粗糙度工作流——
 金 / 铜 / 银 / 钢四种金属球（粗糙度 0.05 → 0.55 递增）+ 绝缘体红球，方向光软阴影，
-IBL 环境光照（程序化天空立方体贴图：漫反射辐照度卷积 + GGX 预滤波 + BRDF LUT
-分割求和），金属球呈现天空 / 地面的真实镜面反射；场景在线性 Rgba16Float HDR
-空间渲染后经 ACES 色调映射输出 sRGB。
+程序化天空背景（inv_view_proj 射线采样），IBL 环境光照（天空立方体贴图：
+漫反射辐照度卷积 + GGX 预滤波 + BRDF LUT 分割求和），金属球上半球反射蓝天、
+下半球反射地面；线性 Rgba16Float HDR 渲染经 ACES 色调映射输出 sRGB。
 
 ![PBR + HDR 渲染](docs/pbr_preview.png)
 
@@ -213,7 +213,8 @@ glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness �
 - [x] PBR 材质模型（Cook-Torrance）与 HDR / ACES 色调映射
 - [x] 泛光（Bloom）后处理
 - [x] IBL 环境光照（程序化天空 + 分割求和）
-- [ ] 天空盒背景 pass 与外部 HDR 资产加载
+- [x] 天空盒背景 pass（射线采样，与 IBL 同源）
+- [ ] 外部 HDR 资产加载（equirectangular）
 - [ ] 点光阴影（cubemap）
 - [ ] 多线程系统调度（rayon 风格查询并行）
 - [ ] GLB 二进制容器、骨架与动画

@@ -30,6 +30,8 @@ struct Globals {
     shadow_params: vec4<f32>,
     // x: 预滤波环境最大 mip 级, y: IBL 强度
     env_params: vec4<f32>,
+    // 天空盒射线重建用（clip -> world）
+    inv_view_proj: mat4x4<f32>,
 };
 
 struct MaterialParams {

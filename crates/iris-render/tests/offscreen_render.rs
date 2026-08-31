@@ -33,10 +33,10 @@ fn scene() -> World {
     world
 }
 
-/// 背景清屏色的 sRGB 编码（渲染器默认 clearColor 0.055/0.07/0.10 线性）。
-fn is_background(px: &[u8], i: usize) -> bool {
-    let clear = [64i32, 77, 99]; // ACES 色调映射后的背景 sRGB 值
-    (0..3).all(|c| (px[i + c] as i32 - clear[c]).abs() <= 8)
+/// 两个像素是否为同一颜色（天空背景下角点互证：同一高度的左右角点
+/// 天空色相同——仍能捕获全零回读与区域错位）。
+fn same_color(px: &[u8], a: usize, b: usize) -> bool {
+    (0..3).all(|c| (px[a + c] as i32 - px[b + c] as i32).abs() <= 8)
 }
 
 #[test]
@@ -51,37 +51,43 @@ fn offscreen_renders_lit_cube() {
     let px = renderer.read_pixels();
     assert_eq!(px.len(), (w * h * 4) as usize);
 
-    // 1. 画面角落必须是背景清屏色（场景不会铺满画面；全零数据会在此暴露）
-    let corner = ((2 * w + 2) as usize) * 4;
+    // 1. 画面上缘左右角点应为同一片天空色（场景不会铺满画面；
+    //    全零回读或天空 pass 失效会在此暴露）
+    let corner_l = ((2 * w + 2) as usize) * 4;
+    let corner_r = ((2 * w + w - 3) as usize) * 4;
     assert!(
-        is_background(&px, corner),
-        "左上角应为背景色，实际 RGBA {:?}",
-        &px[corner..corner + 4]
+        same_color(&px, corner_l, corner_r),
+        "上缘左右角点应为同一片天空色，实际 {:?} vs {:?}",
+        &px[corner_l..corner_l + 4],
+        &px[corner_r..corner_r + 4]
     );
 
-    // 2. 画面中心应命中立方体（相机注视点在原点上方，非背景）
+    // 2. 画面中心应命中立方体（与天空色不同）
     let center = ((h / 2) * w + w / 2) as usize * 4;
     assert!(
-        !is_background(&px, center),
-        "画面中心应为立方体而非背景，实际 RGBA {:?}",
+        !same_color(&px, center, corner_l),
+        "画面中心应为立方体而非天空，实际 RGBA {:?}",
         &px[center..center + 4]
     );
 
-    // 2. 非背景覆盖率应超过 3%（相机距 4.5，边长 1 立方体的合理投影）——
-    //    若面环绕顺序写反导致全部背面剔除，覆盖率会趋近 0
+    // 3. 天空覆盖率应在合理区间（相机俯视原点，天空只占上缘一条；
+    //    天空全无说明几何铺满异常，天空占大半说明几何未绘制）
     let mut sampled = 0u32;
-    let mut covered = 0u32;
+    let mut sky = 0u32;
     for y in (0..h).step_by(4) {
         for x in (0..w).step_by(4) {
             let i = ((y * w + x) as usize) * 4;
             sampled += 1;
-            if !is_background(&px, i) {
-                covered += 1;
+            if same_color(&px, i, corner_l) {
+                sky += 1;
             }
         }
     }
-    let ratio = covered as f32 / sampled as f32;
-    assert!(ratio > 0.03, "非背景覆盖率 {ratio:.3} 过低，管线可能失效");
+    let ratio = sky as f32 / sampled as f32;
+    assert!(
+        (0.05..0.9).contains(&ratio),
+        "天空覆盖率 {ratio:.3} 超出合理区间，几何或天空 pass 异常"
+    );
 }
 
 #[test]
