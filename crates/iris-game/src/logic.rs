@@ -27,6 +27,10 @@ pub const PICKUP_RADIUS: f32 = 0.9;
 /// 常规移动与小幅跳跃均满足，规则上为「贴地金币」留出扩展空间）。
 pub const PICKUP_MAX_Y: f32 = 1.5;
 
+/// 转身锐度：朝向平滑的指数逼近速率（1/秒）。越大转身越快，
+/// 12 ≈ 0.2 s 完成约 90% 转身——第三人称的常规手感区间。
+const TURN_SHARPNESS: f32 = 12.0;
+
 /// 游戏阶段：进行中 / 全部收集获胜 / 超时落败。
 ///
 /// 进入 [`Phase::Won`] / [`Phase::Lost`] 后 [`GameState::step`] 冻结
@@ -152,7 +156,7 @@ impl GameState {
             return;
         }
 
-        // ---- 移动：输入归一化后按速度积分；非零移动更新朝向 ----
+        // ---- 移动：输入归一化后按速度积分；朝向向移动方向平滑转身 ----
         let wish = Vec2::new(input.x, input.z);
         let len = wish.length();
         if len > 1e-6 {
@@ -161,7 +165,16 @@ impl GameState {
             self.player.z += dir.y * MOVE_SPEED * dt;
             // facing 的前方是 -Z：由 forward = (-sin f, -cos f) 反解
             // （sin f = -dx、cos f = -dz → f = atan2(-dx, -dz)）
-            self.player.facing = (-dir.x).atan2(-dir.y);
+            let target = (-dir.x).atan2(-dir.y);
+            // 最短角路径指数逼近：转身是渐进动画而非瞬时跳变；
+            // 跨 ±π 边界（如 170° → -170°）必须走 20° 短路径而非 340° 长路
+            let mut delta = target - self.player.facing;
+            delta = delta.rem_euclid(std::f32::consts::TAU);
+            if delta > std::f32::consts::PI {
+                delta -= std::f32::consts::TAU;
+            }
+            let t = (TURN_SHARPNESS * dt).clamp(0.0, 1.0);
+            self.player.facing += delta * t;
         }
 
         // ---- 跳跃与重力：仅落地状态可起跳；穿地即着陆 ----
@@ -241,19 +254,63 @@ mod tests {
     #[test]
     fn move_integrates_at_five_mps_and_updates_facing() {
         let mut state = GameState::new(ARENA, DURATION);
-        // +X 匀速移动 1 s → x = 5，朝向 +X（facing = atan2(0, -1) = -π/2）
+        // +X 匀速移动 1 s → x = 5，朝向**逼近** +X（facing = atan2(0, -1) = -π/2）。
+        // 转身是指数平滑动画而非瞬时赋值：60 帧（t=0.2/帧）后残差 < 1e-7，
+        // 但恒不严格等于目标。
         run(&mut state, MoveInput { x: 1.0, z: 0.0, jump: false }, 1.0, 1.0 / 60.0);
         assert!((state.player.x - 5.0).abs() < 1e-4, "x 应为 5，实际 {}", state.player.x);
         assert!(state.player.z.abs() < 1e-5);
         let want = -std::f32::consts::FRAC_PI_2;
         assert!(
             (state.player.facing - want).abs() < 1e-4,
-            "朝向应为 -π/2（+X），实际 {}",
+            "朝向应逼近 -π/2（+X），实际 {}",
             state.player.facing
+        );
+        // 首帧后应可见转身过程（未到位）：平滑生效的直接证据
+        let mut probe = GameState::new(ARENA, DURATION);
+        run(&mut probe, MoveInput { x: 1.0, z: 0.0, jump: false }, 1.0 / 60.0, 1.0 / 60.0);
+        assert!(
+            (probe.player.facing - want).abs() > 1e-3,
+            "单帧后朝向不应已到位（转身应是渐进的），实际 {}",
+            probe.player.facing
         );
         // 前方单位向量应指向 +X
         let f = state.player.forward();
         assert!((f.x - 1.0).abs() < 1e-4 && f.y.abs() < 1e-4);
+    }
+
+    /// 朝向跨 ±π 边界必须走最短角路径：facing = +170° 时向目标 -170°
+    /// （输入方向约 (0.176, 1.0)）转身——短路径为 20°（经由 180°），
+    /// 无边界处理的朴素插值会走 340° 长路、中途扫过 -90°。
+    #[test]
+    fn facing_takes_shortest_path_across_pi_boundary() {
+        let mut state = GameState::new(ARENA, DURATION);
+        state.player.facing = 170.0_f32.to_radians();
+        // 目标朝向 = atan2(-0.176, -1.0) ≈ -170°：与起点夹 20°（经 ±180°）
+        let input = MoveInput { x: 0.1763, z: 1.0, jump: false };
+        run(&mut state, input, 0.1, 1.0 / 60.0);
+        // 0.1 s（6 帧，平滑累计 ≈ 0.74）后：短路径应停在 ±180° 附近
+        // （|facing| > 155°）；长路径会扫到 ≈ -81°，|facing| 远小于 90°
+        let normalized = state.player.facing.rem_euclid(std::f32::consts::TAU);
+        let distance_to_pi = (normalized - std::f32::consts::PI).abs();
+        assert!(
+            distance_to_pi < 25.0_f32.to_radians(),
+            "跨 ±π 应走短路径（停在 ±180° 附近），实际 facing = {}（{}°）",
+            state.player.facing,
+            state.player.facing.to_degrees()
+        );
+        // 继续推进到 1 s：应到位并稳定逼近 -170°
+        run(&mut state, input, 1.0, 1.0 / 60.0);
+        let want = -170.0_f32.to_radians();
+        let end_delta = (state.player.facing - want)
+            .rem_euclid(std::f32::consts::TAU);
+        let end_delta = end_delta.min(std::f32::consts::TAU - end_delta);
+        assert!(
+            end_delta < 0.05,
+            "终态应逼近 -170°，实际 {}（{}°）",
+            state.player.facing,
+            state.player.facing.to_degrees()
+        );
     }
 
     #[test]

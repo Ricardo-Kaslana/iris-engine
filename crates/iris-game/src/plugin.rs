@@ -52,7 +52,11 @@ pub struct GameAssets {
 /// `Name` 之前，这里曾被迫登记全部跨系统实体。
 #[derive(Clone, Resource)]
 pub struct GameEntities {
+    /// 玩家根实体：仅承载逻辑位置（rotation 恒为恒等）——相机子实体
+    /// 挂在它下面，若把朝向写进根实体会让相机绕玩家公转、画面剧转。
     pub player: Entity,
+    /// 玩家模型子实体：网格挂这里，转身朝向（偏航）写它的 rotation。
+    pub player_model: Entity,
     pub camera: Entity,
     /// 金币实体，下标与 `GameState.pickups` 一一对应。
     pub coins: Vec<Entity>,
@@ -251,8 +255,12 @@ fn build_scene(world: &mut World) {
         },
     ));
 
-    // ---- 玩家（蓝方块）+ 子实体相机 ----
-    let player = world.spawn((Transform::from_xyz(0.0, PLAYER_HALF_HEIGHT, 0.0), cube_mesh, player_mat));
+    // ---- 玩家三层结构：根实体只承载位置（rotation 恒恒等），
+    // 朝向写在模型子实体上，相机子实体与朝向解耦——若把转身写进根
+    // 实体，相机会绕玩家公转，画面方位剧变（dogfooding 实测症状）----
+    let player = world.spawn((Transform::from_xyz(0.0, PLAYER_HALF_HEIGHT, 0.0),));
+    let player_model = world.spawn((Transform::IDENTITY, cube_mesh, player_mat));
+    world.add_child(player, player_model);
     // 俯视 -25°：绕 X 负角旋转后局部 -Z 前方指向斜下，恰好望向玩家
     let camera = world.spawn((
         Transform {
@@ -319,7 +327,7 @@ fn build_scene(world: &mut World) {
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
 
-    world.insert_resource(GameEntities { player, camera, coins });
+    world.insert_resource(GameEntities { player, player_model, camera, coins });
 }
 
 /// Update 1：读输入与时间 → 推进纯逻辑 → 写玩家实体 → 触发音效。
@@ -328,13 +336,35 @@ fn update_gameplay(world: &World) {
         .try_resource::<Time>()
         .map(|time| time.delta_secs())
         .unwrap_or(0.0);
+
+    // 屏幕相对移动：W/ S = 相机水平前向（画面纵深），A/D = 相机右向。
+    // 相机与玩家朝向解耦后方位恒定，但按相机向量实现可容忍未来
+    // 相机公转/环绕的扩展。传播前的首帧回退固定世界系（与相机
+    // 初始方位一致：看 -Z）。
+    let (mut forward, mut right) = (glam::Vec2::new(0.0, -1.0), glam::Vec2::new(1.0, 0.0));
+    if let Some(ents) = world.try_resource::<GameEntities>() {
+        if let Some(cam) = world.get::<GlobalTransform>(ents.camera) {
+            let m = cam.matrix();
+            let f = -m.z_axis.truncate();
+            let r = m.x_axis.truncate();
+            let f_ground = glam::Vec2::new(f.x, f.z);
+            let r_ground = glam::Vec2::new(r.x, r.z);
+            if f_ground.length_squared() > 1e-6 {
+                forward = f_ground.normalize();
+            }
+            if r_ground.length_squared() > 1e-6 {
+                right = r_ground.normalize();
+            }
+        }
+    }
     let move_input = world
         .try_resource::<Input>()
-        .map(|input| MoveInput {
-            // 世界系 WASD：W = -Z（屏幕里侧），D = +X
-            x: (input.key(KeyCode::KeyD) as i32 - input.key(KeyCode::KeyA) as i32) as f32,
-            z: (input.key(KeyCode::KeyS) as i32 - input.key(KeyCode::KeyW) as i32) as f32,
-            jump: input.key_pressed(KeyCode::Space),
+        .map(|input| {
+            let x = (input.key(KeyCode::KeyD) as i32 - input.key(KeyCode::KeyA) as i32) as f32;
+            let z = (input.key(KeyCode::KeyS) as i32 - input.key(KeyCode::KeyW) as i32) as f32;
+            // MoveInput 的 x/z 是世界系意图：合成 = x·相机右 + (-z)·相机前
+            let dir = right * x + forward * -z;
+            MoveInput { x: dir.x, z: dir.y, jump: input.key_pressed(KeyCode::Space) }
         })
         .unwrap_or(MoveInput::IDLE);
 
@@ -347,14 +377,17 @@ fn update_gameplay(world: &World) {
     let picked = game.score > score_before;
     let finished = was_playing && game.phase != Phase::Playing;
 
-    // 逻辑坐标 → 玩家实体：位置（y 抬半高贴地）+ 朝向偏航
+    // 逻辑坐标 → 实体：根实体只写位置（rotation 恒等，保证相机方位
+    // 稳定）；转身朝向写模型子实体
     let Some(ents) = world.try_resource::<GameEntities>() else {
         return;
     };
     if let Some(mut transform) = world.get_mut::<Transform>(ents.player) {
         transform.position =
             Vec3::new(game.player.x, game.player.y + PLAYER_HALF_HEIGHT, game.player.z);
-        transform.rotation = Quat::from_rotation_y(game.player.facing);
+    }
+    if let Some(mut model) = world.get_mut::<Transform>(ents.player_model) {
+        model.rotation = Quat::from_rotation_y(game.player.facing);
     }
     drop(ents);
 

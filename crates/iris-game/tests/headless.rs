@@ -175,8 +175,9 @@ fn idle_input_keeps_player_still() {
     assert!(game.time_left < 60.0 && game.time_left > 59.0);
 }
 
-/// 按住 D（世界 +X）：位移符合 5 m/s 积分、朝向转往 +X、
-/// 相机（玩家子实体）经 PostUpdate 层级传播跟随。
+/// 按住 D（屏幕右侧 = 世界 +X，相机固定方位下二者一致）：
+/// 位移符合 5 m/s 积分、朝向**平滑逼近** +X（渐进而非瞬跳）、
+/// 相机（玩家子实体）经 PostUpdate 层级传播跟随且方位恒定。
 #[test]
 fn held_key_drives_player_and_camera_follows() {
     let mut harness = Harness::new();
@@ -187,25 +188,27 @@ fn held_key_drives_player_and_camera_follows() {
     assert!(pos.z.abs() < EPS);
     {
         let game = harness.game();
+        // 指数平滑 30 帧（t=0.2/帧）后应已逼近目标 99% 以上，但不是精确等于——
+        // 转身是渐进动画
+        let want = -std::f32::consts::FRAC_PI_2;
         assert!(
-            (game.player.facing + std::f32::consts::FRAC_PI_2).abs() < 1e-3,
-            "+X 移动后朝向应为 -π/2，实际 {}",
+            (game.player.facing - want).abs() < 0.05,
+            "+X 移动后朝向应逼近 -π/2（容差 0.05），实际 {}",
             game.player.facing
         );
     }
-    // 相机全局位置 = 玩家位置 + Ry(facing)·(0, 4.5, 8)；
-    // facing = -π/2 时局部偏移旋到 (-8, 4.5, 0)。
-    // 传播发生在 PostUpdate（Update 写完玩家 Transform 之后）——当帧即生效。
+    // 相机全局位置 = 玩家位置 + (0, 4.5, 8)——朝向写在模型子实体上，
+    // 根实体 rotation 恒等，相机方位不随转身变化（旧实现会绕玩家公转）。
     let cam = harness
         .app
         .world
         .get::<GlobalTransform>(harness.entities().camera)
         .expect("相机应已有 GlobalTransform")
         .position();
-    let expected_cam = glam::Vec3::new(pos.x - 8.0, 4.95, pos.z);
+    let expected_cam = glam::Vec3::new(pos.x, 4.95, pos.z + 8.0);
     assert!(
         (cam - expected_cam).length() < 1e-3,
-        "相机应跟随玩家到 {expected_cam:?}，实际 {cam:?}"
+        "相机应固定方位跟随玩家到 {expected_cam:?}，实际 {cam:?}"
     );
 }
 
