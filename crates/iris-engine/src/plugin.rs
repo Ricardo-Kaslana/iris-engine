@@ -6,6 +6,7 @@ use iris_core::prelude::Time;
 use iris_render::prelude::{Camera, DirectionalLight, MaterialStore, MeshStore, TextureStore};
 
 use crate::app::App;
+use crate::audio::Audio;
 
 /// 插件：一次 `build` 机会，可修改世界的资源、系统与窗口配置。
 pub trait Plugin {
@@ -58,6 +59,17 @@ impl Plugin for RenderPlugin {
     }
 }
 
+/// 音频插件：注册 [`Audio`] 资源（优先接真实输出设备，无设备 / wasm32
+/// 自动降级为纯混音器，见 `crate::audio`）。
+#[derive(Default)]
+pub struct AudioPlugin;
+
+impl Plugin for AudioPlugin {
+    fn build(&self, app: &mut App) {
+        app.world.insert_resource(Audio::new());
+    }
+}
+
 /// 层级插件：每帧在用户 Update 系统之前执行全局变换传播。
 ///
 /// 已包含在 [`DefaultPlugins`] 中；自建 App（不用 DefaultPlugins）时需要
@@ -96,7 +108,7 @@ impl Plugin for AnimationPlugin {
     }
 }
 
-/// 默认插件组：窗口 + 时间 + 输入 + 渲染。
+/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频。
 ///
 /// ```ignore
 /// App::new().add_plugins(DefaultPlugins::new("我的游戏")).run();
@@ -129,6 +141,7 @@ impl Plugin for DefaultPlugins {
         TimePlugin.build(app);
         InputPlugin.build(app);
         RenderPlugin.build(app);
+        AudioPlugin.build(app);
         AnimationPlugin.build(app);
         HierarchyPlugin.build(app);
     }

@@ -11,6 +11,7 @@ authors.workspace = true
 iris-core = { workspace = true }
 iris-render = { workspace = true }
 iris-platform = { workspace = true }
+iris-audio = { workspace = true }
 winit = { workspace = true }
 log = { workspace = true }
 

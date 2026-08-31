@@ -15,13 +15,13 @@
 ## 2. Crate 划分与依赖方向
 
 ```text
-iris-macros (proc-macro)
-    ↑
-iris-core ──── iris-platform
-    ↑              ↑
-iris-render ───────┘
-    ↑
-iris-engine（门面，用户唯一入口）
+iris-macros (proc-macro)      iris-audio（纯音频库，零 iris 依赖）
+    ↑                              ↑
+iris-core ──── iris-platform       │
+    ↑              ↑               │
+iris-render ───────┘               │
+    ↑                              │
+iris-engine（门面，用户唯一入口）────┘
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -29,6 +29,9 @@ iris-engine（门面，用户唯一入口）
 - **iris-core**：不依赖任何图形/窗口库，可独立用于无渲染的服务端模拟或工具链。
 - **iris-render**：只依赖 winit 类型做窗口句柄，不反向依赖 engine 门面；离屏渲染完全不触碰窗口。
 - **iris-platform**：窗口配置与输入状态，薄封装 winit。
+- **iris-audio**：不依赖任何 iris 内部 crate 的纯音频库（软件混音核心 + WAV + 程序化音效），
+  可脱离引擎独立使用；混音数学全部纯函数（§4.14），cpal 设备层为 native 专属依赖，
+  wasm32 下优雅降级为纯混音器。
 - **iris-engine**：App 框架、插件、winit `ApplicationHandler` 主循环，把三者粘合。
 
 ## 3. ECS 设计（iris-core）
@@ -473,6 +476,51 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
   （缺省白矩形会盖住文字的实测教训），面板背景用独立矩形实体表达
   （验收示例的血条即「深底矩形 + 红色前景矩形」两实体）。
 
+### 4.14 音频子系统（iris-audio）
+
+**分层：混音核心与设备层彻底分离**。`AudioMixer` 是纯软件混音器，不接触任何
+设备——采样推进由调用方每帧 `mix(&mut out, channels, sample_rate)` 填充输出
+缓冲驱动，因此**全部混音数学都是可确定性断言的纯函数**（音量缩放、多声音线性
+叠加、循环回绕、重采样过零点、限幅边界均有采样级单测）；设备层 `AudioOutput`
+只是把混音器接到 cpal 输出流的薄壳。这条线画在「能测什么」上：混音的每个
+可观察行为都可以离线复现，设备只是把它变成声音。
+
+- **数据模型**：`AudioClip` = `Arc<Vec<f32>>` 交错 PCM（归一化 [-1,1]）+ 声道 +
+  采样率；`Arc` 使多声音共享同一份大缓冲，`play` 只克隆指针。
+- **混合模型**：活动声音采样 × 音量后逐帧线性叠加。叠加结果做 `[-1, 1]` **硬钳制
+  软限幅**——选钳制而非 tanh：tanh 在未超限时也压缩动态（音色失真）且每采样
+  多一次超越函数；钳制对 |x| ≤ 1 的信号完全透明，只在叠加爆表时兜底。
+- **重采样**：声音采样率 ≠ 输出采样率时按 `src_rate / out_rate` 步进的线性插值
+  （f64 游标累积，长缓冲无漂移）；采样率一致时步进恰为整数、插值系数为 0，
+  **逐采样直通**（单测以精确相等断言）。v1 不做抗混叠滤波——主要场景是
+  48k ↔ 44.1k 的轻微比率。通道映射：单声道源复制上混、立体声源平均下混。
+- **声音生命周期**：槽位 + 空闲链（非紧凑 Vec）——stop / 自然播完只把槽位置空，
+  复用时世代 +1。`SoundId` = 槽位下标 + 世代（与 ECS 实体「索引 + 代数」同款），
+  stop 旧句柄必然失配返回 `false`，绝不误伤复用槽位的新声音。
+- **实时回调 try_lock 原则**：cpal 回调跑在设备驱动的音频线程上，任何阻塞都是
+  可闻爆音。回调内 `try_lock` 混音器——锁被主线程持有（play / stop / 手动 mix）
+  时**立即放弃并填静音**，绝不等待；主线程侧的锁操作保持短临界区。
+- **线程模型**：cpal 0.15 的 `Stream` 是 `!Send`（平台音频句柄不允许跨线程迁移），
+  无法由调用方线程代为保活。设备枚举、流构建、`play` 与流保活全部发生在专属
+  后台线程内，协商格式（声道 / 采样率）经 channel 传回；`AudioOutput` 被丢弃后
+  关闭信号发送端析构 → 后台线程从 `recv` 返回 → `Stream` 析构停流。
+- **格式协商**：设备默认输出配置、f32 采样（各平台共享模式的默认格式）；默认
+  格式非 f32 时显式降级为纯混音器并告警，不为少见格式手写逐格式转换。
+- **WAV 加载**（`wav.rs`）：手写 RIFF 解析器（零新依赖，风格同 `asset/hdr.rs`）——
+  支持 PCM 16-bit、声道 1/2、任意采样率；其他编码 / 位深 / 声道数报
+  `Unsupported`（诚实报错而非静默出错）；RIFF 块 2 字节对齐、未知块跳过、
+  16-bit 小端 → f32 / 32768 全值域映射。
+- **程序化音效**（`procedural.rs`）：正弦 / 方波 / 伪随机噪声（xorshift64\\*，固定
+  seed 可复现），全部确定性（禁用随机源）；相位由解析式逐采样计算（非增量振荡
+  器，无漂移），单测对照解析解逐采样验证（容差 1e-5）；首尾 5ms 线性淡入淡出
+  防爆音（时长不足自动缩包络）。
+- **wasm32 降级**：cpal 在 wasm 上不可编译（Web Audio 回调模型 + wasm-bindgen
+  链路），cpal 依赖整体收敛在 `cfg(not(target_arch = "wasm32"))` 的 target 专属
+  dependencies 里，cfg 分支集中在 `iris-audio/src/device.rs` 一处；wasm 分支保留
+  同名占位类型，`AudioOutput::device()` 恒返回 `None`——引擎侧 `Audio` 资源
+  （iris-engine，包装共享混音器 + Option\<设备\>）自动降级为纯混音器，
+  play / stop / set_volume 语义不变，只是不发声。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -495,9 +543,10 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
   `Send + Sync`，无冲突系统经 `std::thread::scope` 并行执行（§3.7），
   工作线程按帧创建销毁（批次粒度，无驻留线程池）。
 - **wasm32（Web）**：全 workspace 以 `wasm32-unknown-unknown` 编译零警告，
-  平台差异收敛为四类，cfg 分支集中在 `iris-core/src/instant.rs`、
+  平台差异收敛为五类，cfg 分支集中在 `iris-core/src/instant.rs`、
   `iris-core/src/schedule.rs`、`iris-render/src/context.rs`、
-  `iris-render/src/surface.rs`（另平台层 `iris-platform/src/window.rs` 与
+  `iris-render/src/surface.rs`、`iris-audio/src/device.rs`
+  （另平台层 `iris-platform/src/window.rs` 与
   门面 `iris-engine/src/app.rs` 各一处，均有平台原因注释）：
   - **时间源**：std 的 `Instant::now()` 在 wasm 运行时 panic（std 未实现
     时间源，实测探针确认）。`instant.rs` 导出平台封装——native 直接
@@ -522,6 +571,10 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
     已显式 `with_append(true)`。
   - **日志**：`env_logger` 在 wasm 编译通过但写往不可见的 stderr（无输出），
     v1 不接 console log。
+  - **音频**：cpal 的 Web 后端在 wasm32 上不可编译，cpal 依赖为 native 专属
+    （target 专属 dependencies），设备层 cfg 收敛在 `iris-audio/src/device.rs`；
+    wasm 下 `AudioOutput::device()` 恒返回 `None`，`Audio` 资源自动降级为
+    纯混音器（play / stop / set_volume 照常，只是不发声，见 §4.14）。
 - **交叉编译**：安装对应 std target 即可（如 `aarch64-pc-windows-msvc`、
   `wasm32-unknown-unknown`）；平台条件编译分支集中且均有平台原因注释（见上）。
 
@@ -573,6 +626,12 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
     （非 ASCII 字符跳过并告警一次），`\n` 之外无自动换行 / 自动布局；
     `UiText` 复用同实体 `UiRect.position` 定位且该矩形不绘制；UI 顶点
     每帧 CPU 重组上传（无 GPU 持久化 / 增量更新）；无输入命中测试。
+11. **音频为 v1**：无空间音频（无 3D 定位 / HRTF / 多普勒）；无流式播放
+    （音频全量解码为 PCM 常驻内存，长音频 / 音乐播放成本高）；每 App 一个
+    混合器（无总线 / 子混音分组 / 每声音滤波）；解码仅支持 16-bit PCM WAV
+    （无 mp3 / ogg / flac）；重采样为线性插值（无抗混叠滤波，比率悬殊时
+    会引入混叠）；软限幅为硬钳制（叠加爆表段有可闻削底）；cpal `Stream`
+    非 `Send`，设备会话托管在专属后台线程（§4.14）。
 
 ## 9. 关键设计取舍记录
 

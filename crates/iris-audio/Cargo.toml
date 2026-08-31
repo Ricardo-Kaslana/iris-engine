@@ -1,0 +1,18 @@
+[package]
+name = "iris-audio"
+description = "Iris 音频子系统：纯软件混音器、WAV 加载、程序化音效生成与 cpal 设备层"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+log = { workspace = true }
+
+# 平台原因（wasm32）：cpal 在 wasm32-unknown-unknown 上不可用（其 Web 后端
+# 依赖 Web Audio 回调模型与 wasm-bindgen 链路，当前无法编译），因此设备层
+# 依赖仅限 native；wasm32 下本 crate 只编译混音核心，
+# `AudioOutput::device()` 恒返回 None（cfg 分支集中在 device.rs 一处）。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "0.15"

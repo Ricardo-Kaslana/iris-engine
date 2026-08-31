@@ -35,6 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
+| **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
@@ -81,6 +82,11 @@ cargo run --example bloom_snapshot --release
 # 2D UI 叠加层（HUD）验收场景（离屏渲染），输出 iris_ui.bmp：
 # 点光阴影 3D 场景 + 顶部位图标题 / 血条 / 右下文本（矩形 + 位图字体单批渲染）
 cargo run --example ui_snapshot --release
+
+# 音频子系统验收场景（离屏渲染混音波形），输出 iris_audio.bmp：
+# 混音器编排 boom/blip/噪声三段程序化音效 → 240 根渐变波形条（481 矩形单批），
+# 有真实音频设备时同步真声播放一遍
+cargo run --example audio_snapshot --release
 
 # GLB 动画验收场景（先 gen_asset 生成资产），输出两个时刻的位图：
 # 蓝色立方体自转 + 浮动（GLB 容器 + AnimationPlayer 播放链路）
@@ -150,8 +156,9 @@ iris-engine/
 │   ├── iris-core/       # ECS、调度、变换层级、时间、事件
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
+│   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / web（wasm 专用入口，见「Web 构建」）
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / web（wasm 专用入口，见「Web 构建」）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -244,10 +251,21 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 
 ![2D UI 叠加层](docs/ui_preview.png)
 
+音频子系统实测（`docs/audio_preview.png`）：`AudioMixer` 离线编排三段程序化
+音效——55Hz 低频 boom（t=0，起始强峰）、880Hz 短 blip（t=0.4，与 boom 尾部
+线性叠加出更高峰）、噪声 burst（t=0.7，后段尖峰）——混音到 2 秒 48kHz 立体声
+缓冲，逐 400 帧取峰值归一化，映射为 240 根青→橙渐变垂直条（暗色双层底条 +
+波形条，复用 UI 矩形系统：481 个 UiRect 实体合批为**一个 draw call**）。
+音量编排使全程峰值 0.95 不触软限幅——包络三段清晰、无爆音削顶的平顶；
+混音数学（音量 / 叠加 / 循环 / 重采样 / 限幅）全部为确定性纯函数单测覆盖，
+有真实音频设备时示例同步真声播放同一编排（无设备自动降级为纯混音器）。
+
+![音频子系统](docs/audio_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 145 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 172 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -264,7 +282,12 @@ cargo test --workspace   # 145 个测试：单元 + GPU 端到端离屏渲染
 HUD 区域不透 3D 且 HUD 外区域与无 UI 渲染逐像素一致）**、
 **并行调度（原子计数观测真并发 / 读写冲突分批保序 / 独占系统屏障）**、
 glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）、
-Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 位模式转换）。
+Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 位模式转换）、
+**音频混音核心（音量缩放与即时生效、多声音线性叠加可分解、播完自动移除、
+循环回绕、stop 静音与 SoundId 世代防悬垂、通道上/下混、重采样过零点保持、
+软限幅边界）**、WAV 解析器（16-bit PCM 值映射、帧交错保留、奇数长度未知块
+跳过、坏魔数 / 非 16-bit / 非 PCM / 声道数报错）与程序化音效（正弦 / 方波
+对照解析解逐采样 1e-5 容差、噪声固定 seed 可复现、首尾防爆音包络）。
 
 ## 跨平台矩阵
 
@@ -292,7 +315,9 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 平台要点（详见 ARCHITECTURE.md §6）：wasm 上 `Instant` 由 `performance.now()` 封装
 （std 版本运行时 panic）；无 std 线程，并行系统自动内联顺序执行；GPU 适配器请求
 是 JS Promise，引擎在事件循环内逐帧异步驱动（同步阻塞会卡死页面）；`env_logger`
-编译通过但无输出（v1 未接 console log）；canvas 由 winit 自动附加到 `<body>`。
+编译通过但无输出（v1 未接 console log）；canvas 由 winit 自动附加到 `<body>`；
+音频设备层不可用（cpal 不支持 wasm32，`AudioOutput::device()` 恒 `None`），
+混音核心照常编译、`Audio` 资源自动降级为纯混音器。
 
 ## 路线图
 
@@ -312,6 +337,8 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] 2D UI 叠加层（HUD：屏幕空间矩形 + 位图字体文本，单批单 draw）
 - [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
 - [x] wasm32 Web 目标端到端验证（全 workspace 编译 + Instant/线程/异步 GPU 初始化平台封装 + 真实浏览器渲染确认）
+- [x] 音频子系统（纯软件混音器 + cpal 设备层 + WAV 加载 + 程序化音效生成，wasm32 降级为纯混音器）
+- [ ] 实例缓冲 GPU 持久化与增量更新
 
 ### Web 端到端实测
 
@@ -319,8 +346,6 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 位图字体标题 "IRIS WEB"、血条 HUD、四个彩色方块 + 中央点光径向照明 +
 天空盒背景完整成像。整条链路（wasm 模块实例化 → winit canvas →
 WebGPU 适配器/设备 → 全渲染栈 → HUD 叠加）在浏览器主线程上逐帧运行。
-- [ ] 音频（2D UI 叠加层已交付）
-- [ ] 实例缓冲 GPU 持久化与增量更新
 
 ## License
 

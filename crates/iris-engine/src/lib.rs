@@ -15,15 +15,25 @@
 //! ```
 
 pub mod app;
+pub mod audio;
 pub mod plugin;
+
+// 纯音频库随门面一并可用：`iris_engine::iris_audio::...` 全路径直达
+pub use iris_audio;
 
 pub mod prelude {
     pub use iris_core::prelude::*;
     pub use iris_platform::prelude::*;
     pub use iris_render::prelude::*;
     pub use crate::app::App;
+    pub use crate::audio::Audio;
     pub use crate::plugin::{
-        DefaultPlugins, HierarchyPlugin, InputPlugin, Plugin, RenderPlugin, TimePlugin,
-        WindowPlugin,
+        AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, Plugin, RenderPlugin,
+        TimePlugin, WindowPlugin,
+    };
+    // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）
+    pub use iris_audio::{
+        load_wav, noise, parse_wav, sine, square, AudioClip, AudioError, AudioMixer, AudioOutput,
+        SoundId,
     };
 }
