@@ -113,7 +113,37 @@ impl Plugin for AnimationPlugin {
     }
 }
 
-/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频。
+/// 物理插件：在 Update 阶段推进刚体物理（积分 → 检测 → 响应 → 迭代松弛，
+/// 见 `iris_core::physics::step_physics`）。
+///
+/// 已包含在 [`DefaultPlugins`] 中。编排语义与动画一致：物理在 Update 写
+/// 局部 `Transform`，随后的 PostUpdate（[`HierarchyPlugin`]）当帧完成全局
+/// 传播——「物理结果当帧可见」。注册为**并行系统**：访问集声明
+/// 写 Transform / Collider / RigidBody + 读 Time——Collider v1 只读，
+/// 属保守声明（保留物理材质演化等扩展位，并把读 Collider 的用户系统
+/// 与物理分批，避免读到半求解状态）；与 [`AnimationPlugin`] 的访问集
+/// 重叠（都写 Transform、读 Time），调度器自动分批并保持注册顺序
+/// （动画先、物理后）。
+#[derive(Default)]
+pub struct PhysicsPlugin;
+
+impl Plugin for PhysicsPlugin {
+    fn build(&self, app: &mut App) {
+        use iris_core::physics::{Collider, RigidBody, step_physics};
+        use iris_core::prelude::{Access, Stage, Transform};
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<Transform>()
+                .write::<Collider>()
+                .write::<RigidBody>()
+                .read::<Time>(),
+            step_physics,
+        );
+    }
+}
+
+/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级。
 ///
 /// ```ignore
 /// App::new().add_plugins(DefaultPlugins::new("我的游戏")).run();
@@ -148,6 +178,7 @@ impl Plugin for DefaultPlugins {
         RenderPlugin.build(app);
         AudioPlugin.build(app);
         AnimationPlugin.build(app);
+        PhysicsPlugin.build(app);
         HierarchyPlugin.build(app);
     }
 }

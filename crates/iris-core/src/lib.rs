@@ -20,6 +20,7 @@ pub mod event;
 pub mod hierarchy;
 pub mod instant;
 pub mod name;
+pub mod physics;
 pub mod query;
 pub mod resource;
 pub mod schedule;
@@ -42,6 +43,7 @@ pub mod prelude {
     // 跨平台时间点封装（wasm 上 std::time::Instant 会运行时 panic，见 instant.rs）
     pub use crate::instant::Instant;
     pub use crate::name::Name;
+    pub use crate::physics::{PHYSICS_GRAVITY, Collider, ColliderShape, RigidBody, step_physics};
     pub use crate::query::QueryPart;
     pub use crate::resource::Resource;
     pub use crate::schedule::{Access, Schedule, Stage, System};

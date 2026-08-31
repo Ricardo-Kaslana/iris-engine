@@ -144,6 +144,49 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   独占屏障可见性，均有确定性测试；诚实性由「冲突即 panic」兜底——
   声明不诚实的并行系统会在运行期被锁检查当场击穿。
 
+### 3.8 物理子系统（iris-core/physics）
+
+轻量刚体物理 v1（Sphere / AABB）：与变换层级同款的「组件 + 单一系统」模型，
+零新依赖（全部数学基于 glam 手写）。
+
+- **组件模型**：`Collider`（形状 Sphere/AABB + `is_static` + `restitution`）与
+  `RigidBody`（速度 / `gravity_scale` / 摩擦 / 线性阻尼）。**组件缺席语义**：
+  只有 `Collider`（无 `RigidBody`）= 静态体（与 `is_static` 取或）——不积分
+  不移动，只作碰撞对象；只有 `RigidBody`（无 `Collider`）= 仅受力积分，
+  不参与碰撞；两者都有且非静态 = 完整刚体。
+- **求解管线**（`step_physics`，系统只做编排，数值逻辑全在纯函数中）：
+  两阶段收集（读 `Time.delta`，缺席视为 0；照 `update_animations` 的
+  「收集 → 写回」两段式，迭代期间不持组件借用）→ 半隐式欧拉积分
+  （`v += g·scale·dt`；`v ×= exp(-damping·dt)`；`pos += v·dt`）→
+  O(n²) 配对检测（跳过静-静对）→ 响应（穿透沿法线分离，静态体不动、
+  动体按动体数均分——等质量近似；法向速度按 restitution 反弹
+  `v_n' = -e·v_n`，仅当朝向穿透，e 取双方 max；切向乘 `max(0, 1-friction)`，
+  friction 取参与响应的动体均值——近似库仑）→ 2 次迭代位置松弛
+  （`SOLVER_ITERATIONS`，速度响应只在首轮施加——重复施加会把摩擦/反弹
+  多次结算）→ 写回 `Transform` / `RigidBody`。
+- **纯函数与确定性**：检测（`detect_pair`：球-球 / 球-AABB 含盒内最近面
+  退出 / AABB-AABB 最小穿透轴）与求解（`solve_contact`：分离 + 反弹 + 摩擦）
+  均为不触碰世界的纯函数，「穿透量 / 法线 / 反弹量」可脱离 ECS 单测。
+  系统内部严格单线程、固定遍历序（收集序 = 组件存储序），同一输入两次
+  模拟逐采样 bit 级一致（单测守护）——配 `Time::advance` / 固定步长即可
+  确定性回放。
+- **编排**：`PhysicsPlugin` 把 `step_physics` 注册为 Update 阶段的**并行
+  系统**（访问集写 Transform / Collider / RigidBody + 读 Time；Collider
+  v1 只读，属保守声明），层级传播在 PostUpdate——「物理在 Update 内求解、
+  传播在 PostUpdate 收尾」，物理结果当帧即完成全局变换传播；与
+  `update_animations` 访问集重叠，调度器自动分批并保持注册顺序
+  （动画先、物理后，§3.7）。
+- **v1 限制（诚实清单）**：
+  1. **AABB 不随实体旋转**：`ColliderShape::Box` 是世界轴对齐包围盒，
+     旋转实体的碰撞盒不跟着转（物理体应使用不旋转的实体，或把旋转只给
+     表现子实体）；
+  2. **物理体须为根实体**：`step_physics` 把 `Transform.position` 当世界
+     坐标读写，与层级并用时须自行保证物理体无父级（或父级变换恒等）；
+  3. **非迭代完整求解器**：等质量冲量 + 2 次位置松弛，重堆叠会松弛不
+     彻底（残余穿透 / 缓慢滑移），不是完整 LCP 求解器；
+  4. **O(n²) 检测**：v1 规模上限约数百个碰撞体，空间划分（网格 hash /
+     BVH）留白给后续版本。
+
 ## 4. 渲染管线（iris-render）
 
 ### 4.1 帧流程

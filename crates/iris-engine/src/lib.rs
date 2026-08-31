@@ -28,8 +28,8 @@ pub mod prelude {
     pub use crate::app::App;
     pub use crate::audio::Audio;
     pub use crate::plugin::{
-        AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, Plugin, RenderPlugin,
-        TimePlugin, WindowPlugin,
+        AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, PhysicsPlugin, Plugin,
+        RenderPlugin, TimePlugin, WindowPlugin,
     };
     // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）
     pub use iris_audio::{

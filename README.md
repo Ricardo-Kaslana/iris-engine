@@ -36,6 +36,7 @@ fn gameplay(world: &mut World) {
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
+| **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → O(n²) 检测 → 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致 |
 | **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
@@ -101,6 +102,11 @@ cargo run --example skin_snapshot --release
 # iris_game_start.bmp / iris_game_after.bmp（headless 同款驱动 + 离屏渲染）
 cargo run --example game_snapshot --release
 
+# 物理与碰撞验收场景（离屏渲染 + headless 终态断言），输出 iris_physics_midair.bmp /
+# iris_physics_rest.bmp：10 颗不同弹性的刚体球落到静态台面与地面——t=0.3s 半空 /
+# t=3s 静止（球心 y>0、两两不穿透、总速度 < 2 m/s 三重断言）
+cargo run -p iris-engine --example physics_snapshot --release
+
 # 外部 HDR 环境贴图验收场景（先 gen_asset 生成日落全景），输出 iris_hdr.bmp：
 # Radiance .hdr equirectangular → IBL + 天空盒，铬球反射暖色天空与太阳
 cargo run --example gen_asset --release
@@ -157,12 +163,12 @@ iris-engine/
 ├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr，gen_asset 生成）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
-│   ├── iris-core/       # ECS、调度、变换层级、时间、事件
+│   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
 │   ├── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / physics_snapshot / web（wasm 专用入口，见「Web 构建」）
 │   └── iris-game/       # 引擎下游示范游戏：第三人称限时收集（见「用 Iris 做的游戏」）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
@@ -267,6 +273,17 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 
 ![音频子系统](docs/audio_preview.png)
 
+物理与碰撞实测（`docs/physics_preview.png`，左 t=0.3s / 右 t=3s，同一世界 headless
+驱动到两个时刻各自离屏渲染）：10 颗彩色刚体球（restitution 0.2..0.9、半径
+0.35..0.55）从 3.5~6.5 m 落向静态高台与地面——左图球群半空中（点光软阴影随球
+移动），右图球群落定在台面顶与地面上、无穿插；同一运行内嵌 headless 终态断言
+（全部球心 y > 0、球-球与球-静态体残余穿透 ≤ 2e-3、总速度 0.998 < 2.0 m/s 近似
+静止）。求解器核心为纯函数（检测 = 穿透/法线、求解 = 分离/反弹/摩擦），17 项
+单测覆盖球-球 / 球-AABB / AABB-AABB 几何、自由落体解析解、e² 回弹高度、静止
+不抖、摩擦与阻尼衰减、静态体不动、逐采样确定性等。
+
+![物理与碰撞](docs/physics_preview.png)
+
 ## 用 Iris 做的游戏：Iris Collect
 
 **Dogfooding 验证**——`crates/iris-game` 是引擎的第一个「真实用户」：只用公开
@@ -296,7 +313,7 @@ cargo run --example game_snapshot --release   # 双时刻离屏验收图
 ## 测试
 
 ```sh
-cargo test --workspace   # 221 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 239 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -324,7 +341,12 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 `Time::advance` 确定性推进 + `Input::press / release` 脚本化按键注入驱动真实
 游戏世界——静止 / 移动积分与朝向 / 单次跳跃弧线 / 相机子实体层级跟随 /
 脚本路线拾取与计分 / 金币可见性隐藏 / HUD 文本刷新 / 全收集胜利与终局冻结 /
-超时落败）**。
+超时落败）**、
+**物理与碰撞（球-球 / 球-AABB（顶面 / 侧向 / 角点 / 盒内退出）/ AABB-AABB
+接触几何与反弹 / 摩擦均值的纯函数断言；自由落体对照 y(t)=h-½gt² 的 60Hz 离散
+容差、gravity_scale 缩放、e=0.8 回弹顶点 ≈ 初高×0.64 且逐次衰减、e=0 落地静止
+穿透 <1e-3 不抖、摩擦切向衰减对比、线性阻尼对照 v₀e^(-λt)、静态体 bit 级不动、
+双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、Time 缺席零步长）**。
 
 ## 跨平台矩阵
 
@@ -376,6 +398,7 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] wasm32 Web 目标端到端验证（全 workspace 编译 + Instant/线程/异步 GPU 初始化平台封装 + 真实浏览器渲染确认）
 - [x] 音频子系统（纯软件混音器 + cpal 设备层 + WAV 加载 + 程序化音效生成，wasm32 降级为纯混音器）
 - [x] 实例缓冲 GPU 持久化与增量更新（帧级比对：静态场景零上传，动态实体仅传变化段）
+- [x] 物理与碰撞 v1（Sphere/AABB 刚体：积分 / 检测 / 响应 / 迭代松弛，纯函数确定性求解器）
 
 ### Web 端到端实测
 
