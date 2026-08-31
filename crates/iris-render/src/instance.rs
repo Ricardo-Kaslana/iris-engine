@@ -7,8 +7,12 @@ use iris_core::prelude::Transform;
 ///
 /// `model` 为列主序 4x4 模型矩阵；`normal` 为模型矩阵逆转置的 3x3
 /// 法线矩阵（每列补零填充到 vec4，规避 WGSL 对齐陷阱）。
+///
+/// `PartialEq` 供渲染器帧级实例比对（增量上传）使用：逐字段 IEEE 相等。
+/// 矩阵含 NaN 时恒判不等 → 退化为每帧重传，不影响正确性；−0.0 与 0.0
+/// 判等 → 跳过上传，GPU 侧数值语义一致。
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct InstanceRaw {
     pub model: [[f32; 4]; 4],
     pub normal: [[f32; 4]; 3],

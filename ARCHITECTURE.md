@@ -138,7 +138,7 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 World 查询 (Transform, MeshHandle, MaterialHandle)
   → 实例数据 InstanceRaw（模型矩阵 + 法线矩阵，112B/实例）
   → 按 (网格, 材质) 稳定排序 → 相同 key 连续成批
-  → 一次 write_buffer 上传全部实例
+  → 实例缓冲跨帧持久：与上帧镜像比对后全量 / 变化段增量 / 零上传（见 §4.2）
   → 阴影 pass（可选）：光源正交视角，深度写入 R32Float 颜色附件（2048²）
   → 点光阴影（可选）：首盏 shadows 点光的 cubemap，6 面 × 512² 各一个
     render pass，R32Float 颜色附件存归一化线性距离（见 §4.7.1）
@@ -157,6 +157,30 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 - 排序键 `(mesh_id << 32) | material_id`，排序后相同 key 天然连续，
   渲染器无需预知场景即可把 **同网格同材质的所有实体压成一个 draw call**。
 - 实测：4096 实例 + 地面 = 2 draw call（见 `instanced` 示例与集成测试断言）。
+
+**跨帧持久化与增量上传**：实例缓冲（`iris.instances`）不因帧切换失效——
+上一帧上传的内容保留在 CPU 镜像 `last_instances` 中，本帧实例数组组装完成后
+逐实例比对（112B/实例，含蒙皮段），按结果三分决策：
+
+- 实例缓冲刚重建（容量不足整体扩容）或实例数与上帧不同 → **全量上传**
+  （重建后旧缓冲内容作废，镜像失效）；
+- 逐项完全一致 → **整帧跳过**（静态场景零上传）；
+- 存在变化 → 只对**连续变化段** `write_buffer`（offset = 段起始实例 × 112B；
+  wgpu 要求 write_buffer offset 4 字节对齐，112 = 4×28 天然满足）；
+- 变化实例数超过总数 50%（阈值常量 `INSTANCE_DIFF_FULL_FALLBACK_RATIO`）→
+  **回退全量**：大量碎段的驱动提交 / 编码开销会反噬省下的拷贝带宽。
+
+实现要点：
+
+- 比对为纯函数 `diff_changed_ranges(prev, next) -> Vec<Range<usize>>`
+  （renderer.rs，模块单测覆盖全等 / 单点 / 首尾分离 / 相邻合并 / 长度不等 /
+  空到非空）。
+- 镜像零拷贝维护：上传决策完成后 `mem::swap(last_instances, 组装 scratch)`
+  ——镜像取得本帧数据，上帧镜像连同其堆分配交还 scratch，下帧
+  clear + extend 直接复用容量，实例数据全程无额外拷贝。
+- 实际上传字节数经 `FrameStats::instance_upload_bytes` 观测（跳过帧 = 0），
+  集成测试 `instance_upload_render.rs` 断言静态场景连续帧零上传且像素一致、
+  单实体移动仅传变化段（字节数 < 全量）。
 
 ### 4.3 着色与颜色管线（PBR + HDR）
 
@@ -585,7 +609,7 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 | 数据 | 稀疏集 dense 数组连续遍历；组件按类型分储避免缓存行浪费 |
 | 调度 | 声明式读写集冲突分批，无冲突系统多线程并行（§3.7） |
 | 数学 | glam：SSE/NEON 自动向量化（release 构建生效） |
-| GPU | 自动实例化合批；单实例 112B 紧凑布局；一次 write_buffer 上传全部实例 |
+| GPU | 自动实例化合批；单实例 112B 紧凑布局；实例缓冲跨帧持久——与上帧镜像比对后仅传变化段，静态场景零上传（变化 >50% 或缓冲重建 / 实例数变化时回退全量，§4.2） |
 | 提交 | wgpu 命令编码 → 队列异步提交，CPU/GPU 并行 |
 | 内存 | 无 GC；实体索引复用；scratch 缓冲跨帧复用（批处理排序数组） |
 | 构建 | `lto = "thin"`、`codegen-units = 1`、`strip = "debuginfo"` |

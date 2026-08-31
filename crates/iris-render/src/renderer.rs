@@ -137,6 +137,10 @@ pub struct Renderer {
     shadow_globals_bg: wgpu::BindGroup,
     instance_buf: Option<wgpu::Buffer>,
     instance_capacity: usize,
+    /// 上一帧已上传实例的 CPU 镜像（与 GPU 缓冲前 `len` 个实例内容一致），
+    /// 供帧级比对决策全量 / 增量 / 跳过上传。上传完成后与组装 scratch
+    /// `mem::swap` 零拷贝交换（见 `draw` 步骤 3）。
+    last_instances: Vec<InstanceRaw>,
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
     material_gpu: HashMap<u32, GpuMaterial>,
@@ -250,6 +254,44 @@ const _: () = assert!(std::mem::size_of::<UiGlobalsRaw>() == 16, "UiGlobals 必�
 pub struct FrameStats {
     pub draw_calls: u32,
     pub instances: u32,
+    /// 本帧实例缓冲实际 `write_buffer` 的字节数。0 = 与上一帧逐实例比对
+    /// 完全一致、整帧跳过实例上传（静态场景零上传）。
+    pub instance_upload_bytes: u64,
+}
+
+/// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
+/// 大量碎段 `write_buffer` 的驱动提交开销会超过省下的拷贝字节数。
+const INSTANCE_DIFF_FULL_FALLBACK_RATIO: f32 = 0.5;
+
+/// 计算两帧实例数组之间的连续变化段（实例索引区间，升序且互不相邻）。
+///
+/// 语义：
+/// - 逐实例比对公共前缀（`min(prev.len(), next.len())`），相邻的变化实例
+///   合并为一个连续区间；
+/// - `next` 比 `prev` 长：新增尾部整体算作一个变化段（空 `prev` + 非空
+///   `next` 即返回覆盖整个 `next` 的单区间）；
+/// - `prev` 比 `next` 长：缩短部分无需写入 GPU，不产生区间——调用方在
+///   实例数不等时本就走全量上传，此分支仅保证函数语义自洽。
+fn diff_changed_ranges(prev: &[InstanceRaw], next: &[InstanceRaw]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let common = prev.len().min(next.len());
+    let mut start: Option<usize> = None;
+    for i in 0..common {
+        if prev[i] == next[i] {
+            if let Some(s) = start.take() {
+                ranges.push(s..i);
+            }
+        } else {
+            start.get_or_insert(i);
+        }
+    }
+    if let Some(s) = start.take() {
+        ranges.push(s..common);
+    }
+    if next.len() > prev.len() {
+        ranges.push(common..next.len());
+    }
+    ranges
 }
 
 /// 构建全局绑定组。其中的 env 视图随每次环境重烘焙而更换，重烘后必须
@@ -564,6 +606,7 @@ impl Renderer {
             shadow_globals_bg,
             instance_buf: None,
             instance_capacity: 0,
+            last_instances: Vec::new(),
             mesh_gpu: HashMap::new(),
             texture_gpu,
             material_gpu: HashMap::new(),
@@ -1041,19 +1084,51 @@ impl Renderer {
             Vec::new()
         };
 
-        // 3. 实例缓冲（容量不足时重建）；剔除排序键后按 112B 紧凑布局整体上传，
-        //    蒙皮实例追加在普通实例之后（实例区间 [total, total+skinned)）
+        // 3. 实例缓冲（容量不足时重建）+ 跨帧增量上传：剔除排序键后按
+        //    112B 紧凑布局写入，蒙皮实例追加在普通实例之后（实例区间
+        //    [total, total+skinned)）。
+        //    实例缓冲跨帧持久：GPU 缓冲不因帧切换失效，上一帧上传内容由
+        //    `last_instances` 镜像记录，本帧组装完成后逐实例比对——完全
+        //    一致则整帧跳过上传（静态场景零上传），存在变化则只写连续
+        //    变化段，缓冲重建 / 实例数变化 / 变化过半时回退全量。
         if total + skinned.len() > 0 {
-            self.ensure_instance_capacity(total + skinned.len());
+            let rebuilt = self.ensure_instance_capacity(total + skinned.len());
             let mut instances = std::mem::take(&mut self.instance_scratch);
             instances.clear();
             instances.extend(items.iter().map(|item| item.instance));
             instances.extend(skinned.iter().map(|item| item.instance));
-            self.gpu.queue.write_buffer(
-                self.instance_buf.as_ref().expect("实例缓冲已就绪"),
-                0,
-                bytemuck::cast_slice(&instances),
-            );
+            let count = instances.len();
+            let instance_bytes = std::mem::size_of::<InstanceRaw>() as u64;
+            let buffer = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+            let mut uploaded_bytes = 0u64;
+            if rebuilt || self.last_instances.len() != count {
+                // 缓冲刚重建（旧内容随缓冲作废）或实例数变化：全量上传
+                self.gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
+                uploaded_bytes = count as u64 * instance_bytes;
+            } else {
+                let ranges = diff_changed_ranges(&self.last_instances, &instances);
+                let changed: usize = ranges.iter().map(|r| r.len()).sum();
+                if changed as f32 > count as f32 * INSTANCE_DIFF_FULL_FALLBACK_RATIO {
+                    // 变化过半：碎段编码开销超过带宽收益，回退全量
+                    self.gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
+                    uploaded_bytes = count as u64 * instance_bytes;
+                } else if changed > 0 {
+                    for range in ranges {
+                        // write_buffer 的 offset 必须 4 字节对齐；InstanceRaw
+                        // 112B = 4 × 28，实例粒度偏移天然满足
+                        self.gpu.queue.write_buffer(
+                            buffer,
+                            range.start as u64 * instance_bytes,
+                            bytemuck::cast_slice(&instances[range]),
+                        );
+                    }
+                    uploaded_bytes = changed as u64 * instance_bytes;
+                }
+            }
+            self.stats.instance_upload_bytes = uploaded_bytes;
+            // 零拷贝交换：镜像取得本帧数据，上帧镜像连同其分配交还
+            // instance_scratch——下帧 clear + extend 直接复用该容量
+            std::mem::swap(&mut self.last_instances, &mut instances);
             self.instance_scratch = instances;
         }
 
@@ -1511,9 +1586,11 @@ impl Renderer {
         self.skinned_scratch = skinned;
     }
 
-    fn ensure_instance_capacity(&mut self, needed: usize) {
+    /// 实例缓冲容量复用：足够则零开销返回 `false`；不足时按 2 倍扩容
+    /// 整体重建并返回 `true`——重建后缓冲内容作废，调用方必须全量上传。
+    fn ensure_instance_capacity(&mut self, needed: usize) -> bool {
         if self.instance_capacity >= needed {
-            return;
+            return false;
         }
         let capacity = (needed * 2).max(256);
         self.instance_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1524,6 +1601,7 @@ impl Renderer {
         }));
         self.instance_capacity = capacity;
         log::debug!("实例缓冲扩容至 {capacity} 实例");
+        true
     }
 
     /// UI 顶点缓冲容量复用（与实例缓冲同款模式）：容量足够则零开销，
@@ -1693,5 +1771,64 @@ impl Renderer {
             ],
         });
         self.material_gpu.insert(handle.0, GpuMaterial { bind_group });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造仅平移 x 分量不同的实例数据（其余字段保持单位矩阵）。
+    fn raw(x: f32) -> InstanceRaw {
+        let mut r = InstanceRaw::from_matrix(glam::Mat4::IDENTITY);
+        r.model[3][0] = x;
+        r
+    }
+
+    fn slice(xs: &[f32]) -> Vec<InstanceRaw> {
+        xs.iter().map(|x| raw(*x)).collect()
+    }
+
+    fn ranges_of(prev: &[f32], next: &[f32]) -> Vec<std::ops::Range<usize>> {
+        diff_changed_ranges(&slice(prev), &slice(next))
+    }
+
+    #[test]
+    fn diff_identical_is_empty() {
+        assert!(ranges_of(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]).is_empty());
+    }
+
+    #[test]
+    fn diff_single_point_change() {
+        assert_eq!(ranges_of(&[1.0, 2.0, 3.0], &[1.0, 9.0, 3.0]), vec![1..2]);
+    }
+
+    #[test]
+    fn diff_first_and_last_changes_are_separate_ranges() {
+        assert_eq!(ranges_of(&[1.0, 2.0, 3.0], &[9.0, 2.0, 9.0]), vec![0..1, 2..3]);
+    }
+
+    #[test]
+    fn diff_adjacent_changes_merge() {
+        // 交替「变 / 不变」：相邻变化各自成段，间隔的不变项把段分开
+        assert_eq!(
+            ranges_of(&[1.0, 1.0, 1.0, 1.0, 1.0], &[9.0, 9.0, 1.0, 9.0, 9.0]),
+            vec![0..2, 3..5]
+        );
+    }
+
+    #[test]
+    fn diff_length_mismatch() {
+        // next 更长：新增尾部整体为变化段
+        assert_eq!(ranges_of(&[1.0, 2.0], &[1.0, 2.0, 3.0, 4.0]), vec![2..4]);
+        // prev 更长：缩短部分不产生写入区间（调用方走全量上传）
+        assert!(ranges_of(&[1.0, 2.0, 3.0], &[1.0, 2.0]).is_empty());
+        assert_eq!(ranges_of(&[1.0, 2.0, 3.0], &[9.0, 2.0]), vec![0..1]);
+    }
+
+    #[test]
+    fn diff_empty_to_nonempty_is_entire_range() {
+        assert_eq!(ranges_of(&[], &[1.0, 2.0, 3.0]), vec![0..3]);
+        assert!(ranges_of(&[1.0], &[]).is_empty());
     }
 }
