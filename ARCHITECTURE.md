@@ -164,25 +164,48 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 **数据流**：
 
 ```text
-.gltf (JSON) ──┬─ buffers：外部 .bin 文件 / data-URI base64 内嵌
-               ├─ accessors：POSITION/NORMAL/TEXCOORD_0 (FLOAT)、索引 (u16/u32)
+.gltf (JSON) / .glb（容器：JSON chunk + BIN chunk）──┬─ buffers：外部 .bin / data-URI base64 / GLB 内嵌
+               ├─ accessors：POSITION/NORMAL/TEXCOORD_0 (FLOAT)、索引 (u16/u32)、动画采样器数据
                ├─ materials：baseColorFactor / emissiveFactor / metallicFactor / roughnessFactor
                ├─ textures/images：PNG/JPEG（文件或 data-URI）→ CpuTexture
+               ├─ animations：translation/rotation/scale 通道（LINEAR/STEP）→ AnimationClip
                └─ nodes TRS + children ──→ Iris 实体树（add_child 级联）
 ```
 
-- **加载即场景**：`spawn_gltf(&mut world, path)` 把节点层级映射为实体树——
+- **加载即场景**：`spawn_gltf_instance` 把节点层级映射为实体树——
   有 mesh 的节点生成父实体（携带节点 TRS），每个 primitive 挂一个子实体
-  （独立材质批次，复用父变换）；返回顶层实体列表。
+  （独立材质批次，复用父变换）；返回 [`GltfInstance`]（顶层实体 +
+  节点索引→实体映射 + 全部动画剪辑）。`spawn_gltf` 为只取实体树的便捷包装。
+- **GLB 容器**：按内容嗅探（magic "glTF"），校验版本（仅 2）、chunk 边界与
+  顺序（JSON 首位、BIN 仅一个且在 JSON 后）；BIN chunk 作为无 uri 的
+  buffer 0 数据源。`write_glb` 为对称的容器组装工具（gen_asset 示例使用）。
 - **去重**：同一 glTF 的 mesh / material / texture 按 (索引[, primitive]) 缓存句柄，
   多节点引用同一网格不重复上传 CPU 目录。
 - **容错与降级**：所有错误收敛为 `GltfError`（Io / Json / Image / Unsupported /
   Missing / OutOfRange），越界引用不 panic；NORMAL 缺失时按三角形自动生成
   平面法线；TEXCOORD 缺失填充 (0,0)。
-- **v1 不支持**（显式报错而非静默出错）：GLB 二进制容器、骨架 / 蒙皮 / 动画、
-  非三角形拓扑、非 FLOAT 顶点分量、bufferView 引用图片。
+- **v1 不支持**（显式报错而非静默出错）：骨架 / 蒙皮 / 形变目标、
+  CUBICSPLAT 插值、非三角形拓扑、非 FLOAT 顶点分量、bufferView 引用图片。
 - base64 解码为手写实现（RFC 4648 严格校验：长度 4 对齐、padding 后禁止数据、
   残位必须为零），避免为此引入依赖。
+
+### 4.6.1 glTF 动画（节点 TRS）
+
+- **模型**：每条通道绑定「节点索引 + 属性（translation/rotation/scale）」，
+  关键帧时间轴 + 平铺值数组；加载时全部解码为紧凑 `Vec<f32>`（`AnimationClip`）。
+- **采样**（`AnimationChannel::sample`）：二分定位关键帧段；LINEAR 分量插值，
+  **旋转用最短路径 slerp**（点积为负先翻转，glTF 规范要求）——分量线性插值
+  会破坏四元数归一化且旋转路径错误（单测实测抓出）；STEP 保持上一关键帧；
+  端点外钳制到首/末关键帧。
+- **播放**：`AnimationPlayer` 组件持有剪辑、节点映射与播放状态
+  （active / time / speed / playing / looping），挂在 glTF 根实体上；
+  `instance.player()` 一行挂载。
+- **系统**（`update_animations`，DefaultPlugins 在层级传播前注册）：
+  两阶段——先只读查询推进时间并采样出「目标实体 → 覆写字段」任务列表，
+  再统一写入目标 `Transform`（被动画的属性覆写，其余字段保持静止姿势）。
+  `Time` 资源缺席时 dt=0，可手动设置 `player.time` 定位到任意时刻（离屏快照用）。
+- **单帧 delta 钳制**：`Time.max_delta`（默认 0.25s）会钳制大步长——
+  测试或回放需要确定性大步长时分多帧推进。
 
 ### 4.7 方向光阴影贴图
 
@@ -334,6 +357,8 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
    资源），与烘焙立方体里的太阳盘无联动。
 8. **阴影偏移为常数 bias**：无坡度缩放 / 法线偏移（normal offset），大入射角
    掠射表面可能有轻微 acne；PCF 9 采样在实际场景中已足够干净。
+9. **动画仅节点 TRS**：骨骼蒙皮（skinning）、形变目标与 CUBICSPLAT 插值在
+   路线图中；节点动画已覆盖相机 / 灯光 / 道具 / 载具等常见场景动画。
 
 ## 9. 关键设计取舍记录
 

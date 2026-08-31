@@ -72,6 +72,20 @@ impl Plugin for HierarchyPlugin {
     }
 }
 
+/// 动画插件：在层级传播之前推进所有 [`iris_render::animation::AnimationPlayer`]。
+///
+/// 已包含在 [`DefaultPlugins`] 中（先于 [`HierarchyPlugin`] 执行，
+/// 动画写入的局部变换当帧即完成全局传播）。
+#[derive(Default)]
+pub struct AnimationPlugin;
+
+impl Plugin for AnimationPlugin {
+    fn build(&self, app: &mut App) {
+        app.schedule
+            .add_system(iris_core::prelude::Stage::Update, iris_render::animation::update_animations);
+    }
+}
+
 /// 默认插件组：窗口 + 时间 + 输入 + 渲染。
 ///
 /// ```ignore
@@ -105,6 +119,7 @@ impl Plugin for DefaultPlugins {
         TimePlugin.build(app);
         InputPlugin.build(app);
         RenderPlugin.build(app);
+        AnimationPlugin.build(app);
         HierarchyPlugin.build(app);
     }
 }

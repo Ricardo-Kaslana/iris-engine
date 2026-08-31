@@ -3,4 +3,4 @@
 pub mod base64;
 pub mod gltf;
 
-pub use gltf::{spawn_gltf, GltfError};
+pub use gltf::{spawn_gltf, spawn_gltf_instance, write_glb, GltfError, GltfInstance};

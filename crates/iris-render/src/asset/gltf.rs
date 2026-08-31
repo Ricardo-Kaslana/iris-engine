@@ -2,16 +2,19 @@
 //!
 //! 支持：
 //! - `.gltf`（JSON）+ 外部 `.bin` buffer 或 `data:` URI 内嵌 buffer；
-//!   GLB 二进制容器暂不支持；
+//!   `.glb` 二进制容器（JSON chunk + BIN chunk）；
 //! - 三角形网格（mode 4），POSITION 必需，NORMAL 缺失时自动计算平面法线，
 //!   TEXCOORD_0 缺失时填充 (0, 0)；
 //! - 索引 u16 / u32，顶点分量 FLOAT；
 //! - 材质：`baseColorFactor`、`emissiveFactor`；`roughness` 映射为高光锐度；
 //!   `baseColorTexture` 支持外部图片文件或 data URI（PNG / JPEG）；
-//! - 节点 TRS 与 children 层级 → Iris 实体树（父节点实体 + 每 primitive 一个子实体）。
+//! - 节点 TRS 与 children 层级 → Iris 实体树（父节点实体 + 每 primitive 一个子实体）；
+//! - 动画剪辑（translation / rotation / scale 通道，LINEAR / STEP 插值）
+//!   → [`AnimationClip`]，配合 [`AnimationPlayer`] 播放。
 //!
 //! ```ignore
-//! let entities = iris_render::asset::spawn_gltf(&mut world, "assets/scene.gltf")?;
+//! let instance = iris_render::asset::spawn_gltf_instance(&mut world, "assets/model.glb")?;
+//! world.insert(instance.roots[0], instance.player());
 //! ```
 
 use std::cell::RefCell;
@@ -23,6 +26,7 @@ use iris_core::prelude::{Quat, Transform, World};
 use serde::Deserialize;
 
 use super::base64;
+use crate::animation::{AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath};
 use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
 use crate::mesh::{MeshData, MeshHandle, MeshStore, Vertex};
 use crate::texture::{CpuTexture, TextureHandle, TextureStore};
@@ -97,6 +101,8 @@ struct GltfJson {
     buffer_views: Vec<GltfBufferView>,
     #[serde(default)]
     buffers: Vec<GltfBuffer>,
+    #[serde(default)]
+    animations: Vec<GltfAnimation>,
 }
 
 #[derive(Deserialize)]
@@ -229,22 +235,131 @@ struct GltfBuffer {
     byte_length: usize,
 }
 
+#[derive(Deserialize)]
+struct GltfAnimation {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    channels: Vec<GltfChannel>,
+    #[serde(default)]
+    samplers: Vec<GltfAnimationSampler>,
+}
+
+#[derive(Deserialize)]
+struct GltfChannel {
+    sampler: usize,
+    target: GltfTarget,
+}
+
+#[derive(Deserialize)]
+struct GltfTarget {
+    #[serde(default)]
+    node: Option<usize>,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GltfAnimationSampler {
+    input: usize,
+    output: usize,
+    #[serde(default)]
+    interpolation: Option<String>,
+}
+
 const COMPONENT_FLOAT: u32 = 5126;
 const COMPONENT_UNSIGNED_SHORT: u32 = 5123;
 const COMPONENT_UNSIGNED_INT: u32 = 5125;
 
+// GLB 容器常量（magic 与 chunk 类型为 glTF 规范字面量）
+const GLB_MAGIC: &[u8; 4] = b"glTF";
+const GLB_VERSION: u32 = 2;
+const CHUNK_JSON: u32 = 0x4E4F_534A; // "JSON"
+const CHUNK_BIN: u32 = 0x004E_4942; // "BIN\0"
+
+/// 解析后的 glTF 文档：JSON 结构 + GLB 内嵌二进制（如有）。
+struct GltfDocument {
+    json: GltfJson,
+    bin: Option<Vec<u8>>,
+}
+
+/// 按内容嗅探加载 .gltf（JSON 文本）或 .glb（二进制容器）。
+fn load_document(path: &Path) -> Result<GltfDocument, GltfError> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() >= 4 && &bytes[0..4] == GLB_MAGIC {
+        parse_glb(&bytes)
+    } else {
+        Ok(GltfDocument { json: serde_json::from_slice(&bytes)?, bin: None })
+    }
+}
+
+/// 解析 GLB 容器：12 字节文件头 + 若干 chunk（长度 u32 + 类型 u32 + 数据）。
+fn parse_glb(bytes: &[u8]) -> Result<GltfDocument, GltfError> {
+    let u32_at = |i: usize| {
+        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+    };
+    if bytes.len() < 12 {
+        return Err(GltfError::OutOfRange("GLB 文件短于 12 字节头部".into()));
+    }
+    if u32_at(4) != GLB_VERSION {
+        return Err(GltfError::Unsupported(format!(
+            "GLB 版本 {}（仅支持版本 {GLB_VERSION}）",
+            u32_at(4)
+        )));
+    }
+    let total = (u32_at(8) as usize).min(bytes.len());
+    let mut offset = 12usize;
+    let mut json = None;
+    let mut bin = None;
+    while offset + 8 <= total {
+        let len = u32_at(offset) as usize;
+        let ty = u32_at(offset + 4);
+        let (start, end) = (offset + 8, offset + 8 + len);
+        if end > total {
+            return Err(GltfError::OutOfRange("GLB chunk 越出文件长度".into()));
+        }
+        match ty {
+            CHUNK_JSON => {
+                if json.is_some() {
+                    return Err(GltfError::OutOfRange("GLB 含多个 JSON chunk".into()));
+                }
+                json = Some(serde_json::from_slice(&bytes[start..end])?);
+            }
+            CHUNK_BIN => {
+                if json.is_none() {
+                    return Err(GltfError::OutOfRange("GLB 的 BIN chunk 必须位于 JSON 之后".into()));
+                }
+                if bin.is_some() {
+                    return Err(GltfError::OutOfRange("GLB 含多个 BIN chunk".into()));
+                }
+                bin = Some(bytes[start..end].to_vec());
+            }
+            _ => {} // 未知 chunk 类型（扩展位）：跳过
+        }
+        offset = end;
+    }
+    Ok(GltfDocument {
+        json: json.ok_or_else(|| GltfError::Missing("GLB 缺少 JSON chunk".into()))?,
+        bin,
+    })
+}
+
 /// glTF 加载器：持有解析后的文档与去重缓存。
 struct GltfLoader {
     doc: GltfJson,
+    /// GLB 容器的 BIN chunk（buffer 0 无 uri 时的数据来源）。
+    bin: Option<Vec<u8>>,
     base_dir: PathBuf,
     buffers: RefCell<HashMap<usize, Vec<u8>>>,
     mesh_handles: RefCell<HashMap<usize, MeshHandle>>,
     material_handles: RefCell<HashMap<usize, MaterialHandle>>,
     texture_handles: RefCell<HashMap<usize, TextureHandle>>,
+    /// 节点索引 → 已生成实体（动画目标解析用）。
+    node_entities: RefCell<Vec<Option<iris_core::prelude::Entity>>>,
 }
 
 impl GltfLoader {
-    /// 读取 buffer 内容（文件或 data URI，带缓存）。
+    /// 读取 buffer 内容（GLB BIN chunk / 文件 / data URI，带缓存）。
     fn buffer(&self, index: usize) -> Result<Vec<u8>, GltfError> {
         if let Some(data) = self.buffers.borrow().get(&index) {
             return Ok(data.clone());
@@ -256,9 +371,18 @@ impl GltfLoader {
             .ok_or_else(|| GltfError::OutOfRange(format!("buffer #{index}")))?;
         let data = match &buffer.uri {
             None => {
-                return Err(GltfError::Unsupported(
-                    "GLB 二进制容器（buffer 无 uri）。请使用 .gltf + .bin 或 data URI".into(),
-                ))
+                // glTF 规范：仅 GLB 容器的 buffer 0 可省略 uri
+                if index == 0 {
+                    self.bin.clone().ok_or_else(|| {
+                        GltfError::Unsupported(
+                            "buffer 无 uri：.gltf 文件的 buffer 必须提供 uri 或 data URI".into(),
+                        )
+                    })?
+                } else {
+                    return Err(GltfError::OutOfRange(
+                        "GLB 容器中仅 buffer 0 可省略 uri".into(),
+                    ));
+                }
             }
             Some(uri) if uri.starts_with("data:") => {
                 let payload = uri
@@ -531,6 +655,9 @@ impl GltfLoader {
         if let Some(parent) = parent {
             world.add_child(parent, entity);
         }
+        if let Some(slot) = self.node_entities.borrow_mut().get_mut(node_index) {
+            *slot = Some(entity);
+        }
 
         // mesh 的每个 primitive 一个子实体（独立材质批次）
         if let Some(mesh_index) = node.mesh {
@@ -580,6 +707,71 @@ impl GltfLoader {
         self.mesh_handles.borrow_mut().insert(key, handle);
         Ok(handle)
     }
+
+    /// 把 glTF 动画转换为运行时剪辑（关键帧数据全部解码为紧凑 Vec）。
+    fn build_clip(&self, index: usize) -> Result<AnimationClip, GltfError> {
+        let anim = self
+            .doc
+            .animations
+            .get(index)
+            .ok_or_else(|| GltfError::OutOfRange(format!("animation #{index}")))?;
+        let mut channels = Vec::with_capacity(anim.channels.len());
+        let mut duration = 0f32;
+        for ch in &anim.channels {
+            let node = ch.target.node.ok_or_else(|| {
+                GltfError::Missing(format!("animation #{index} 的通道缺少目标节点"))
+            })?;
+            let path = match ch.target.path.as_str() {
+                "translation" => AnimationPath::Translation,
+                "rotation" => AnimationPath::Rotation,
+                "scale" => AnimationPath::Scale,
+                other => {
+                    return Err(GltfError::Unsupported(format!("动画通道路径 {other}（仅支持 translation / rotation / scale）")))
+                }
+            };
+            let sampler = anim.samplers.get(ch.sampler).ok_or_else(|| {
+                GltfError::OutOfRange(format!("animation #{index} sampler #{}", ch.sampler))
+            })?;
+            let interpolation = match sampler.interpolation.as_deref() {
+                None | Some("LINEAR") => AnimationInterpolation::Linear,
+                Some("STEP") => AnimationInterpolation::Step,
+                Some(other) => {
+                    return Err(GltfError::Unsupported(format!("动画插值 {other}（支持 LINEAR / STEP）")))
+                }
+            };
+            let (times, comps) = self.read_floats(sampler.input)?;
+            if comps != 1 {
+                return Err(GltfError::OutOfRange("动画时间轴必须是 SCALAR".into()));
+            }
+            let (values, comps) = self.read_floats(sampler.output)?;
+            let expected = match path {
+                AnimationPath::Rotation => 4,
+                _ => 3,
+            };
+            if comps != expected {
+                return Err(GltfError::OutOfRange(format!(
+                    "动画输出应为 VEC{expected}，实际 VEC{comps}"
+                )));
+            }
+            if values.len() % expected != 0 || values.len() / expected != times.len() {
+                return Err(GltfError::OutOfRange(
+                    "动画关键帧数量与时间轴不一致".into(),
+                ));
+            }
+            if times.windows(2).any(|w| w[1] < w[0]) {
+                return Err(GltfError::OutOfRange("动画关键帧时间非递减".into()));
+            }
+            if let Some(&last) = times.last() {
+                duration = duration.max(last);
+            }
+            channels.push(AnimationChannel { node, path, interpolation, times, values });
+        }
+        Ok(AnimationClip {
+            name: anim.name.clone().unwrap_or_default(),
+            channels,
+            duration,
+        })
+    }
 }
 
 fn format_key(mesh: usize, prim: usize) -> usize {
@@ -587,26 +779,74 @@ fn format_key(mesh: usize, prim: usize) -> usize {
     (mesh << 16) | prim
 }
 
-/// 从 glTF 文件生成实体树，返回场景顶层实体列表。
+/// 组装 GLB 容器字节：JSON chunk（空格补齐 4 字节）+ 可选 BIN chunk（零补齐）。
+///
+/// 与 [`parse_glb`] 互为逆操作；导出供资产生成工具（如 `gen_asset` 示例）使用。
+pub fn write_glb(json: &str, bin: &[u8]) -> Vec<u8> {
+    let pad4 = |data: &[u8], fill: u8| {
+        let mut v = data.to_vec();
+        while v.len() % 4 != 0 {
+            v.push(fill);
+        }
+        v
+    };
+    let json_data = pad4(json.as_bytes(), b' ');
+    let bin_data = pad4(bin, 0);
+    let total = 12 + 8 + json_data.len() + 8 + bin_data.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(GLB_MAGIC);
+    out.extend_from_slice(&GLB_VERSION.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(json_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&CHUNK_JSON.to_le_bytes());
+    out.extend_from_slice(&json_data);
+    out.extend_from_slice(&(bin_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&CHUNK_BIN.to_le_bytes());
+    out.extend_from_slice(&bin_data);
+    out
+}
+
+/// glTF 场景实例：生成的实体树、节点映射与动画剪辑。
+#[derive(Debug)]
+pub struct GltfInstance {
+    /// active scene 的顶层实体。
+    pub roots: Vec<iris_core::prelude::Entity>,
+    /// 节点索引 → 实体（仅 active scene 内的节点有值，动画目标解析用）。
+    pub node_entities: Vec<Option<iris_core::prelude::Entity>>,
+    /// 文件内的全部动画剪辑。
+    pub clips: Vec<AnimationClip>,
+}
+
+impl GltfInstance {
+    /// 构造默认播放器：循环播放第一个剪辑，原速，自动开始。
+    /// 用 `world.insert(root, instance.player())` 挂到根实体上。
+    pub fn player(&self) -> crate::animation::AnimationPlayer {
+        crate::animation::AnimationPlayer::new(self.clips.clone(), self.node_entities.clone())
+    }
+}
+
+/// 从 glTF / GLB 文件生成实体树，返回完整场景实例（实体 + 节点映射 + 动画）。
 ///
 /// 节点层级映射为 Iris 层级：有 mesh 的节点生成一个父实体，
 /// 其每个 primitive 挂一个子实体（共享父节点的变换）。
-pub fn spawn_gltf(
+pub fn spawn_gltf_instance(
     world: &mut World,
     path: impl AsRef<Path>,
-) -> Result<Vec<iris_core::prelude::Entity>, GltfError> {
+) -> Result<GltfInstance, GltfError> {
     let path = path.as_ref();
-    let text = std::fs::read_to_string(path)?;
-    let doc: GltfJson = serde_json::from_str(&text)?;
-    if !doc.scenes.is_empty() && doc.scene >= doc.scenes.len() {
+    let doc = load_document(path)?;
+    let json = doc.json;
+    if !json.scenes.is_empty() && json.scene >= json.scenes.len() {
         return Err(GltfError::OutOfRange(format!(
             "scene #{} 超出 scenes 长度 {}",
-            doc.scene,
-            doc.scenes.len()
+            json.scene,
+            json.scenes.len()
         )));
     }
     let loader = GltfLoader {
-        doc,
+        node_entities: RefCell::new(vec![None; json.nodes.len()]),
+        doc: json,
+        bin: doc.bin,
         base_dir: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
         buffers: RefCell::new(HashMap::new()),
         mesh_handles: RefCell::new(HashMap::new()),
@@ -627,11 +867,31 @@ pub fn spawn_gltf(
         loader.doc.scenes[loader.doc.scene].nodes.clone()
     };
 
-    let mut spawned = Vec::new();
-    for node_index in top_level {
-        spawned.push(loader.spawn_node(world, node_index, None)?);
+    // 动画在生成实体前解析：不支持的特性直接报错，不产生半加载场景
+    let mut clips = Vec::with_capacity(loader.doc.animations.len());
+    for i in 0..loader.doc.animations.len() {
+        clips.push(loader.build_clip(i)?);
     }
-    Ok(spawned)
+
+    let mut roots = Vec::new();
+    for node_index in top_level {
+        roots.push(loader.spawn_node(world, node_index, None)?);
+    }
+    Ok(GltfInstance {
+        roots,
+        node_entities: loader.node_entities.into_inner(),
+        clips,
+    })
+}
+
+/// 从 glTF / GLB 文件生成实体树，返回场景顶层实体列表。
+///
+/// 需要动画或节点映射时请用 [`spawn_gltf_instance`]。
+pub fn spawn_gltf(
+    world: &mut World,
+    path: impl AsRef<Path>,
+) -> Result<Vec<iris_core::prelude::Entity>, GltfError> {
+    Ok(spawn_gltf_instance(world, path)?.roots)
 }
 
 #[cfg(test)]
@@ -743,7 +1003,7 @@ mod tests {
         let dir = std::env::temp_dir().join("iris-gltf-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("glb.gltf");
-        // buffer 无 uri 且被 accessor 实际引用 —— 惰性加载时应报「不支持 GLB」
+        // buffer 无 uri 且被 accessor 实际引用 —— 惰性加载时应报「不支持」
         std::fs::write(
             &path,
             r#"{
@@ -761,5 +1021,144 @@ mod tests {
         let mut world = world_with_stores();
         let err = spawn_gltf(&mut world, &path).unwrap_err();
         assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
+    }
+
+    /// 三角形网格 + 旋转动画（yaw 0°→90°，1 秒）的 JSON 与 BIN 数据。
+    /// BIN 布局：positions 0..36 | indices 36..42 | pad 2 | times 44..52 | quats 52..84。
+    fn animated_triangle_parts() -> (String, Vec<u8>) {
+        let mut bin: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            bin.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        bin.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        bin.extend_from_slice(&[0.0f32, 1.0].map(f32::to_le_bytes).concat());
+        // yaw 0° 与 yaw 90° 的四元数 (x, y, z, w)
+        bin.extend_from_slice(&[0.0f32, 0.0, 0.0, 1.0].map(f32::to_le_bytes).concat());
+        bin.extend_from_slice(&[0.0f32, 0.70710678, 0.0, 0.70710678].map(f32::to_le_bytes).concat());
+        let json = r#"{
+                "asset": {"version": "2.0"},
+                "buffers": [{"byteLength": 84}],
+                "bufferViews": [
+                    {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                    {"buffer": 0, "byteOffset": 36, "byteLength": 6},
+                    {"buffer": 0, "byteOffset": 44, "byteLength": 8},
+                    {"buffer": 0, "byteOffset": 52, "byteLength": 32}
+                ],
+                "accessors": [
+                    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                    {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+                    {"bufferView": 2, "componentType": 5126, "count": 2, "type": "SCALAR"},
+                    {"bufferView": 3, "componentType": 5126, "count": 2, "type": "VEC4"}
+                ],
+                "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+                "nodes": [{"mesh": 0, "translation": [2.0, 0.0, 0.0]}],
+                "scenes": [{"nodes": [0]}],
+                "scene": 0,
+                "animations": [{
+                    "channels": [{"sampler": 0, "target": {"node": 0, "path": "rotation"}}],
+                    "samplers": [{"input": 2, "output": 3, "interpolation": "LINEAR"}]
+                }]
+            }"#;
+        (json.to_string(), bin)
+    }
+
+    #[test]
+    fn loads_glb_container_with_animation() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = animated_triangle_parts();
+        let path = dir.join("animated.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        assert_eq!(instance.roots.len(), 1);
+        assert_eq!(instance.clips.len(), 1, "应有 1 个动画剪辑");
+        let clip = &instance.clips[0];
+        assert_eq!(clip.channels.len(), 1);
+        assert!((clip.duration - 1.0).abs() < 1e-6, "时长应取最后关键帧时间");
+        assert_eq!(instance.node_entities.len(), 1);
+        assert_eq!(instance.node_entities[0], Some(instance.roots[0]));
+
+        // 中点采样应为 yaw 45°
+        let expected = glam::Quat::from_rotation_y(45f32.to_radians());
+        match clip.channels[0].sample(0.5) {
+            crate::animation::AnimatedField::Rotation(q) => {
+                assert!((q.dot(expected) - 1.0).abs() < 1e-4, "实际 {q:?}");
+            }
+            other => panic!("应为旋转字段，实际 {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn animated_node_moves_through_player_system() -> Result<(), GltfError> {
+        use crate::animation::{update_animations, AnimationPlayer};
+        use iris_core::prelude::Time;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = animated_triangle_parts();
+        let path = dir.join("animated.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        let root = instance.roots[0];
+        world.insert(root, instance.player());
+
+        // 时间资源推进 0.5 秒（确定性：显式构造 Instant；
+        // 单帧 delta 被 max_delta=0.25s 钳制，分两帧推进）
+        world.insert_resource(Time::default());
+        let t0 = Instant::now();
+        world.resource_mut::<Time>().begin_frame(t0);
+        world.resource_mut::<Time>().begin_frame(t0 + Duration::from_secs_f64(0.25));
+        update_animations(&mut world);
+        world.resource_mut::<Time>().begin_frame(t0 + Duration::from_secs_f64(0.5));
+        update_animations(&mut world);
+        let expected = glam::Quat::from_rotation_y(45f32.to_radians());
+        let transform = world.get::<Transform>(root).unwrap();
+        assert!(
+            (transform.rotation.dot(expected) - 1.0).abs() < 1e-4,
+            "系统推进 0.5s 后节点应为 yaw 45°，实际 {:?}",
+            transform.rotation
+        );
+        // 播放器时间应同步推进
+        let player = world.get::<AnimationPlayer>(root).unwrap();
+        assert!((player.time - 0.5).abs() < 1e-5, "实际 {}", player.time);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_glb_bad_version() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"glTF");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&12u32.to_le_bytes());
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad_version.glb");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut world = world_with_stores();
+        let err = spawn_gltf(&mut world, &path).unwrap_err();
+        assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
+    }
+
+    #[test]
+    fn rejects_cubicsplat_animation() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut json, bin) = animated_triangle_parts();
+        json = json.replace("\"LINEAR\"", "\"CUBICSPLAT\"");
+        let path = dir.join("cubicsplat.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+        let mut world = world_with_stores();
+        let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
+        assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
+        Ok(())
     }
 }

@@ -12,6 +12,7 @@
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
 pub mod asset;
+pub mod animation;
 pub mod camera;
 pub mod context;
 pub mod environment;
@@ -28,7 +29,11 @@ pub mod surface;
 pub mod texture;
 
 pub mod prelude {
-    pub use crate::asset::{spawn_gltf, GltfError};
+    pub use crate::animation::{
+        update_animations, AnimatedField, AnimationChannel, AnimationClip,
+        AnimationInterpolation, AnimationPath, AnimationPlayer,
+    };
+    pub use crate::asset::{spawn_gltf, spawn_gltf_instance, write_glb, GltfError, GltfInstance};
     pub use crate::camera::{view_from_global, ActiveCamera, Camera};
     pub use crate::context::Gpu;
     pub use crate::environment::EnvironmentSettings;

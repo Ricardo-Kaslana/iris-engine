@@ -1,19 +1,20 @@
-//! 工具：程序化生成 `assets/cube.gltf` + `cube0.bin`（外部 buffer 的标准 glTF 资产）。
+//! 工具：程序化生成示例 glTF 资产。
+//!
+//! - `assets/cube.gltf` + `cube0.bin`：外部 buffer 的标准 glTF（`model` 示例加载）
+//! - `assets/anim_cube.glb`：GLB 容器，带旋转 + 浮动动画（`anim_snapshot` 示例加载）
 //!
 //! ```sh
 //! cargo run --example gen_asset --release   # 在仓库根目录执行
 //! ```
-//!
-//! 产出的资产随后由 `model.rs` 示例加载，用于验证 glTF 管线的
-//! 外部 buffer、POSITION/NORMAL/TEXCOORD、索引与材质完整链路。
-
 
 use iris_render::mesh::primitives;
+use iris_render::asset::write_glb;
 
 fn main() {
     let cube = primitives::cube();
     write_gltf_cube("assets/cube.gltf", "cube0.bin", &cube);
-    println!("已生成 assets/cube.gltf 与 assets/cube0.bin");
+    write_animated_cube_glb("assets/anim_cube.glb", &cube);
+    println!("已生成 assets/cube.gltf、assets/cube0.bin 与 assets/anim_cube.glb");
 }
 
 /// 把单位立方体数据写成 glTF（JSON + 外部二进制 buffer）。
@@ -93,4 +94,113 @@ fn write_gltf_cube(gltf_path: &str, bin_name: &str, cube: &iris_render::mesh::Me
         bin,
     )
     .expect("写入 bin");
+}
+
+/// 把立方体写成 GLB 容器，附带「自转 4s + 上下浮动 4s」循环动画。
+///
+/// BIN 布局：POSITION | NORMAL | TEXCOORD | INDICES | times_spin(5) |
+/// quats_spin(5×16) | times_bob(3) | trans_bob(3×12)，各段 4 字节对齐。
+fn write_animated_cube_glb(path: &str, cube: &iris_render::mesh::MeshData) {
+    let pos_len = cube.vertices.len() * 12;
+    let normal_len = cube.vertices.len() * 12;
+    let uv_len = cube.vertices.len() * 8;
+    let index_len = cube.indices.len() * 2;
+
+    let mut bin = Vec::new();
+    for v in &cube.vertices {
+        bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
+    }
+    for v in &cube.vertices {
+        bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
+    }
+    for v in &cube.vertices {
+        bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
+    }
+    for i in &cube.indices {
+        bin.extend_from_slice(&(*i as u16).to_le_bytes());
+    }
+    // 动画数据（网格数据总长 840 已是 4 的倍数，直接续写）
+    let times_spin_off = bin.len();
+    let times_spin = [0.0f32, 1.0, 2.0, 3.0, 4.0];
+    bin.extend_from_slice(&times_spin.map(f32::to_le_bytes).concat());
+    let quats_spin_off = bin.len();
+    for deg in [0.0f32, 90.0, 180.0, 270.0, 360.0] {
+        let (s, c) = (deg * 0.5).to_radians().sin_cos();
+        bin.extend_from_slice(&[0.0f32, s, 0.0, c].map(f32::to_le_bytes).concat());
+    }
+    let times_bob_off = bin.len();
+    bin.extend_from_slice(&[0.0f32, 2.0, 4.0].map(f32::to_le_bytes).concat());
+    let trans_bob_off = bin.len();
+    for y in [0.0f32, 0.6, 0.0] {
+        bin.extend_from_slice(&[0.0f32, y, 0.0].map(f32::to_le_bytes).concat());
+    }
+
+    let (tq, tt, tb, tr) = (
+        times_spin_off, quats_spin_off, times_bob_off, trans_bob_off,
+    );
+    let json = format!(
+        r#"{{
+  "asset": {{ "version": "2.0", "generator": "iris gen_asset" }},
+  "buffers": [{{ "byteLength": {buffer_len} }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": 0, "byteLength": {pos_len} }},
+    {{ "buffer": 0, "byteOffset": {pos_len}, "byteLength": {normal_len} }},
+    {{ "buffer": 0, "byteOffset": {uv_offset}, "byteLength": {uv_len} }},
+    {{ "buffer": 0, "byteOffset": {index_offset}, "byteLength": {index_len} }},
+    {{ "buffer": 0, "byteOffset": {tq}, "byteLength": 20 }},
+    {{ "buffer": 0, "byteOffset": {tt}, "byteLength": 80 }},
+    {{ "buffer": 0, "byteOffset": {tb}, "byteLength": 12 }},
+    {{ "buffer": 0, "byteOffset": {tr}, "byteLength": 36 }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": {vertex_count}, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": {vertex_count}, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5126, "count": {vertex_count}, "type": "VEC2" }},
+    {{ "bufferView": 3, "componentType": 5123, "count": {index_count}, "type": "SCALAR" }},
+    {{ "bufferView": 4, "componentType": 5126, "count": 5, "type": "SCALAR" }},
+    {{ "bufferView": 5, "componentType": 5126, "count": 5, "type": "VEC4" }},
+    {{ "bufferView": 6, "componentType": 5126, "count": 3, "type": "SCALAR" }},
+    {{ "bufferView": 7, "componentType": 5126, "count": 3, "type": "VEC3" }}
+  ],
+  "materials": [
+    {{ "pbrMetallicRoughness": {{ "baseColorFactor": [0.25, 0.55, 0.95, 1.0], "metallicFactor": 0.1, "roughnessFactor": 0.3 }} }}
+  ],
+  "meshes": [
+    {{ "name": "Cube", "primitives": [{{ "attributes": {{ "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 }}, "indices": 3, "material": 0 }}] }}
+  ],
+  "nodes": [{{ "name": "SpinCube", "mesh": 0 }}],
+  "scenes": [{{ "nodes": [0] }}],
+  "scene": 0,
+  "animations": [
+    {{ "name": "spin_bob",
+       "channels": [
+         {{ "sampler": 0, "target": {{ "node": 0, "path": "rotation" }} }},
+         {{ "sampler": 1, "target": {{ "node": 0, "path": "translation" }} }}
+       ],
+       "samplers": [
+         {{ "input": 4, "output": 5, "interpolation": "LINEAR" }},
+         {{ "input": 6, "output": 7, "interpolation": "LINEAR" }}
+       ]
+    }}
+  ]
+}}"#,
+        buffer_len = bin.len(),
+        pos_len = pos_len,
+        normal_len = normal_len,
+        uv_offset = pos_len + normal_len,
+        uv_len = uv_len,
+        index_offset = pos_len + normal_len + uv_len,
+        index_len = index_len,
+        vertex_count = cube.vertices.len(),
+        index_count = cube.indices.len(),
+        tq = tq,
+        tt = tt,
+        tb = tb,
+        tr = tr,
+    );
+
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).expect("创建 assets 目录");
+    }
+    std::fs::write(path, write_glb(&json, &bin)).expect("写入 GLB");
 }
