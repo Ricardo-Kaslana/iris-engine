@@ -1,0 +1,33 @@
+//! # iris-game
+//!
+//! Iris 引擎下游示范游戏：**第三人称限时收集**（10 枚金币、60 秒倒计时、
+//! 竞技场边界、跳跃拾取、HUD 与音效）。本 crate 是 dogfooding 验证——
+//! 只使用引擎公开 API（`iris-engine` 门面 + glam），不修改引擎本体。
+//!
+//! 结构：
+//! - [`logic`]：纯逻辑状态机（只依赖 glam、零引擎依赖、全部可单测）；
+//! - [`plugin`]：[`GamePlugin`]——场景搭建、输入/时间 → 逻辑 → 实体/HUD/
+//!   音效的每帧接线，系统编排可经
+//!   [`GamePlugin::build_schedule`](plugin::GamePlugin::build_schedule)
+//!   供 headless 测试与离屏快照复用。
+//!
+//! ```ignore
+//! use iris_engine::prelude::*;
+//! use iris_game::GamePlugin;
+//!
+//! App::new()
+//!     .add_plugins(DefaultPlugins::new("Iris Collect"))
+//!     .add_plugin(GamePlugin)
+//!     .run();
+//! ```
+//!
+//! 操作：WASD 世界系移动，Space 跳跃；60 秒内收齐 10 枚金币获胜。
+
+pub mod logic;
+pub mod plugin;
+
+pub use logic::{
+    GameState, MoveInput, Phase, PickupState, PlayerState, GRAVITY, GROUND_Y, JUMP_SPEED,
+    MOVE_SPEED, PICKUP_MAX_Y, PICKUP_RADIUS,
+};
+pub use plugin::{Coin, GameAssets, GameEntities, GamePlugin, ARENA_HALF, DURATION_SECS};

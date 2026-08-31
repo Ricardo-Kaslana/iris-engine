@@ -22,6 +22,8 @@ iris-core ──── iris-platform       │
 iris-render ───────┘               │
     ↑                              │
 iris-engine（门面，用户唯一入口）────┘
+    ↑
+iris-game（下游示范游戏，引擎 dogfooding）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -33,6 +35,13 @@ iris-engine（门面，用户唯一入口）────┘
   可脱离引擎独立使用；混音数学全部纯函数（§4.14），cpal 设备层为 native 专属依赖，
   wasm32 下优雅降级为纯混音器。
 - **iris-engine**：App 框架、插件、winit `ApplicationHandler` 主循环，把三者粘合。
+- **iris-game**：引擎的最下游消费者（示范游戏 Iris Collect，第三人称限时收集）——
+  只依赖 iris-engine 门面（+ glam），是「只用公开 API 能否拼出完整游戏」的
+  dogfooding 验证（§8.12 起的引擎缺口清单即来自这次实践）。纯逻辑状态机
+  （`logic.rs`）只依赖 glam、零引擎依赖、全部可单测；`GamePlugin` 把
+  `Input`/`Time` 翻译进逻辑并写回实体 / HUD / 音频，系统编排经
+  `GamePlugin::build_schedule` 暴露，headless 集成测试与离屏快照在不建
+  `App` / 窗口 / GPU 的前提下复用同一条推进路径。
 
 ## 3. ECS 设计（iris-core）
 
@@ -656,6 +665,35 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
     （无 mp3 / ogg / flac）；重采样为线性插值（无抗混叠滤波，比率悬殊时
     会引入混叠）；软限幅为硬钳制（叠加爆表段有可闻削底）；cpal `Stream`
     非 `Send`，设备会话托管在专属后台线程（§4.14）。
+12. **dogfooding 发现的引擎缺口（iris-game 实践反馈）**——以下均为用引擎拼
+    一个完整游戏时实际撞到的摩擦与绕行方式：
+    - **无实体可见性开关**：隐藏实体的唯一办法是移出视野（游戏把已收集
+      金币每帧钉在 y = -100）或销毁重建（丢失句柄语义）。建议 `Visibility`
+      组件在批处理阶段过滤。
+    - **无系统排序 API**：同阶段系统按注册顺序分批，DefaultPlugins 之后的
+      插件无法把自己的系统排到层级传播**之前**（也无 before/after 约束）——
+      iris-game 在系统链末尾补一次幂等的 `propagate_transforms` 绕行（同帧
+      双次传播，约 20 实体代价可忽略）。且并行系统的先后顺序完全由声明的
+      读写集冲突「涌现」（逻辑系统写 `GameState` / HUD 系统读之，恰好分批
+      保序）：声明漂移即静默破坏顺序（运行期借用检查兜底 panic，不会数据
+      竞争）。建议显式排序约束或增加 PostUpdate 阶段。
+    - **并行系统无法发送事件**：`send_event` 需要 `&mut World`（独占系统
+      专属），并行系统（`&World`）只能旁路——拾取音效改为在系统内直接调用
+      `Audio::play` 而非「拾取事件」。建议资源形态的事件写入器。
+    - **无按名查实体**：跨系统定位实体（HUD 刷新、金币动画）只能自建
+      「实体句柄索引」资源（`GameEntities`）。建议 `Name` 组件 + 查询辅助。
+    - **Input 注入侧类型未重导出**：查询侧 `KeyCode` 在 prelude，脚本化
+      注入所需的 `PhysicalKey` / `ElementState` 不在——下游 headless 测试
+      被迫直接依赖 winit。且「按住」状态跨帧保持、换向必须显式 `Released`
+      （快照脚本忘发释放事件导致两键叠加相消，实测踩坑）。建议补重导出与
+      `press / release` 便捷方法。
+    - **Audio 无法强制纯混音器模式**：`Audio::new()` 优先建设备且字段私有，
+      有声卡的开发机上 `cargo test` 会短暂打开真实设备（无声卡 CI 自动
+      降级）。建议 `Audio::headless()` 构造器。
+    - **小项**：`Time` 的确定性推进需手工构造单调 `Instant`（`advance`
+      便捷方法会更直白，首帧 delta = 0 也需测试知晓）；`UiText` 无文本
+      测量（右对齐 HUD 需手算 8×scale×字符数）；图元库无圆柱 / 胶囊
+      （金币以压扁球体替代）。
 
 ## 9. 关键设计取舍记录
 

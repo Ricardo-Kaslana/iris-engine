@@ -910,9 +910,20 @@ dependencies = [
  "env_logger",
  "iris-audio",
  "iris-core",
+ "iris-game",
  "iris-platform",
  "iris-render",
  "log",
+ "winit",
+]
+
+[[package]]
+name = "iris-game"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
  "winit",
 ]
 

@@ -97,6 +97,10 @@ cargo run --example anim_snapshot --release
 # 两段臂绑髋/肘关节，肘关节挥舞 90°（GPU LBS 蒙皮 + 蒙皮阴影）
 cargo run --example skin_snapshot --release
 
+# 收集小游戏双时刻验收图（左：开局 / 右：拾取 3 枚后），输出
+# iris_game_start.bmp / iris_game_after.bmp（headless 同款驱动 + 离屏渲染）
+cargo run --example game_snapshot --release
+
 # 外部 HDR 环境贴图验收场景（先 gen_asset 生成日落全景），输出 iris_hdr.bmp：
 # Radiance .hdr equirectangular → IBL + 天空盒，铬球反射暖色天空与太阳
 cargo run --example gen_asset --release
@@ -157,8 +161,9 @@ iris-engine/
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
-│   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   ├── iris-engine/     # App 门面、插件系统、主循环 + 示例
+│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   └── iris-game/       # 引擎下游示范游戏：第三人称限时收集（见「用 Iris 做的游戏」）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -262,10 +267,33 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 
 ![音频子系统](docs/audio_preview.png)
 
+## 用 Iris 做的游戏：Iris Collect
+
+**Dogfooding 验证**——`crates/iris-game` 是引擎的第一个「真实用户」：只用公开
+API（`iris-engine` 门面 + glam）拼出一个完整的第三人称限时收集游戏（10 枚金币、
+60 秒倒计时、围墙竞技场、跳跃拾取、HUD、程序化音效），**引擎侧零改动**。纯逻辑
+状态机（`logic.rs`，只依赖 glam、零引擎依赖）与插件接线（`GamePlugin`）分离：
+Startup 搭场景并让**相机作为玩家子实体**（层级跟随验证 `ActiveCamera`），Update
+把 `Input` + `Time` 翻译进逻辑再把结果写回实体 / HUD / `Audio`——金币自发光供
+泛光、点光 cubemap 阴影、位图字体 HUD 全部来自引擎既有能力；同一套插件系统链经
+`GamePlugin::build_schedule` 在无窗口无 GPU 的 headless 测试与离屏快照中复用。
+
+![收集小游戏双时刻验收](docs/game_preview.png)
+
+实测（`docs/game_preview.png`，左：开局 / 右：拾取 3 枚后，同一世界用 headless
+方式驱动到两个时刻各自离屏渲染）：左图玩家居中、金币环带泛光、SCORE 0/10；
+右图 SCORE 3/10、TIME 开始倒数、金币减少、玩家与子实体相机已随输入移动——
+层级跟随、点光阴影、泛光、HUD 在真实游戏负载下完整工作。
+
+```sh
+cargo run -p iris-game --release   # 玩游戏（WASD 移动 / Space 跳跃）
+cargo run --example game_snapshot --release   # 双时刻离屏验收图
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 180 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 199 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -288,7 +316,11 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 循环回绕、stop 静音与 SoundId 世代防悬垂、通道上/下混、重采样过零点保持、
 软限幅边界）**、WAV 解析器（16-bit PCM 值映射、帧交错保留、奇数长度未知块
 跳过、坏魔数 / 非 16-bit / 非 PCM / 声道数报错）与程序化音效（正弦 / 方波
-对照解析解逐采样 1e-5 容差、噪声固定 seed 可复现、首尾防爆音包络）。
+对照解析解逐采样 1e-5 容差、噪声固定 seed 可复现、首尾防爆音包络）、
+**headless 游戏集成（iris-game：不建窗口不建 GPU，`GamePlugin` 完整系统链 +
+`Time` 固定步进 + `Input` 脚本化按键注入驱动真实游戏世界——静止 / 移动积分
+与朝向 / 单次跳跃弧线 / 相机子实体层级跟随 / 脚本路线拾取与计分 / 金币沉底
+隐藏 / HUD 文本刷新 / 全收集胜利与终局冻结 / 超时落败）**。
 
 ## 跨平台矩阵
 

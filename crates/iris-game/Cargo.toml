@@ -1,0 +1,21 @@
+[package]
+name = "iris-game"
+description = "Iris 引擎下游示范游戏：第三人称限时收集（dogfooding——只用引擎公开 API 拼一个完整游戏）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# 依赖方向：iris-game 是引擎的最下游消费者（用户视角）。
+# 除 glam（logic.rs 的纯数学核心）外只允许依赖引擎门面 iris-engine。
+[dependencies]
+iris-core = { workspace = true }
+iris-engine = { workspace = true }
+glam = { workspace = true }
+
+# headless 测试需要脚本化注入按键：Input::on_key 的参数类型
+# （PhysicalKey / ElementState）定义在 winit 中，iris-platform 的 prelude
+# 只重导出了查询侧的 KeyCode，注入侧类型须直接引用 winit。
+[dev-dependencies]
+winit = { workspace = true }
