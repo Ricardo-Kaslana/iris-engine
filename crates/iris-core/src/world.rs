@@ -286,7 +286,8 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Time::default());
         // 推进两帧，使 delta 生效（首帧 delta 为 0）
-        let t0 = std::time::Instant::now();
+        // 平台封装 Instant：wasm 上 std::time::Instant 运行时 panic（见 instant.rs）
+        let t0 = crate::instant::Instant::now();
         world.resource_mut::<Time>().begin_frame(t0);
         world
             .resource_mut::<Time>()

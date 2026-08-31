@@ -4,3 +4,5 @@
 *.ppm
 # 本文档产出的示例渲染结果
 iris_offscreen.bmp
+# Web 冒烟构建产物（wasm-bindgen 输出，可按 README「Web 构建」重新生成）
+/web-demo/

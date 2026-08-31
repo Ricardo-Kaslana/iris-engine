@@ -494,8 +494,36 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 - **线程模型**：主线程驱动事件循环与渲染（winit 平台约束）；ECS 全部状态
   `Send + Sync`，无冲突系统经 `std::thread::scope` 并行执行（§3.7），
   工作线程按帧创建销毁（批次粒度，无驻留线程池）。
+- **wasm32（Web）**：全 workspace 以 `wasm32-unknown-unknown` 编译零警告，
+  平台差异收敛为四类，cfg 分支集中在 `iris-core/src/instant.rs`、
+  `iris-core/src/schedule.rs`、`iris-render/src/context.rs`、
+  `iris-render/src/surface.rs`（另平台层 `iris-platform/src/window.rs` 与
+  门面 `iris-engine/src/app.rs` 各一处，均有平台原因注释）：
+  - **时间源**：std 的 `Instant::now()` 在 wasm 运行时 panic（std 未实现
+    时间源，实测探针确认）。`instant.rs` 导出平台封装——native 直接
+    `pub use std::time::Instant`；wasm 用 `performance.now()`（毫秒 f64）
+    手写最小实现（构造 / `elapsed` / `duration_since` / 与 `Duration`
+    加减），web-sys 依赖经 target 专属 dependencies 引入（已在 wgpu/winit
+    依赖树内，无新增编译单元）。
+  - **线程**：wasm 无 std 线程（`thread::spawn` 必 panic；实测
+    `available_parallelism` 返回 `Err`）。`run_parallel` 在可用线程数 ≤ 1
+    时内联顺序执行、不进 scope 不 spawn——native 单核同样受益，语义等价。
+  - **GPU 初始化**：WebGPU 后端的适配器 / 设备请求是 JS Promise，无法阻塞
+    等待（pollster 在 wasm 是忙自旋：`thread::park` 立即返回，std 无线程可
+    阻塞）。`Gpu::with_instance_async` / `SurfaceKit::with_window_async`
+    为全平台统一异步核心；native 保留同名同步包装（pollster），wasm 由
+    App 的事件循环逐帧手动 poll 初始化未来（noop Waker，Promise 在帧间由
+    微任务队列 resolve）。离屏渲染器在 wasm 恒返回 `None`（`device.poll`
+    阻塞语义与 `std::fs` 读回均不可用），快照示例 web 上优雅降级。
+    浏览器 `requestAdapter()` 不依赖 compatible_surface（wgpu WebGPU 后端
+    不转发该参数），但呈现必须有画布：winit 窗口经 raw-window-handle 的
+    `WebCanvas` 变体直达 `HtmlCanvasElement`，同一 `create_surface(window)`
+    调用两端通用；winit web 创建的 canvas 默认不进 DOM，`WindowConfig`
+    已显式 `with_append(true)`。
+  - **日志**：`env_logger` 在 wasm 编译通过但写往不可见的 stderr（无输出），
+    v1 不接 console log。
 - **交叉编译**：安装对应 std target 即可（如 `aarch64-pc-windows-msvc`、
-  `wasm32-unknown-unknown`），工程无平台条件编译分支。
+  `wasm32-unknown-unknown`）；平台条件编译分支集中且均有平台原因注释（见上）。
 
 ## 7. 性能策略
 
@@ -519,7 +547,13 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 3. **批处理粒度**：按 (网格, 材质) 合批，无深度排序（不透明物体绘制顺序无关紧要，
    半透明需额外排序，暂未处理）。
 4. **无热重载**：CPU 目录句柄不可变，资产修改需重建。
-5. **Web 目标**：代码路径兼容（无平台分支），但 winit/wasm 窗口层未做端到端验证。
+5. **Web 目标（wasm32）**：全 workspace 编译零警告，Instant / 线程 / 异步
+   GPU 初始化平台封装就位；**端到端验证通过**——无头 Chrome（152）冒烟
+   「winit 窗口创建 + canvas 附加 DOM + 适配器请求发出 + 无适配器时优雅
+   降级不卡死」，随后在带 WebGPU 的真实浏览器中完整渲染确认
+   （点光场景 + HUD，`docs/web_preview.png`）。WebGL2 回退未启用
+   （需非默认 `webgl` feature）；离屏渲染器在 web 不可用（恒 `None`）；
+   `env_logger` 无输出。
 6. **点光阴影为 v1 限定**：只有查询顺序中的首盏 `shadows` 点光投影
    （cubemap 每灯 6 个 pass，多灯投影在路线图）；单采样无 PCF，阴影边缘
    为硬边；面矩阵约定（OpenGL 层序 + NDC y 翻转）依赖 GPU Cube 采样的

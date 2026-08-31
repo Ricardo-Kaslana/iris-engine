@@ -1273,8 +1273,8 @@ mod tests {
     #[test]
     fn animated_node_moves_through_player_system() -> Result<(), GltfError> {
         use crate::animation::{update_animations, AnimationPlayer};
-        use iris_core::prelude::Time;
-        use std::time::{Duration, Instant};
+        use iris_core::prelude::{Instant, Time};
+        use std::time::Duration;
 
         let dir = std::env::temp_dir().join("iris-gltf-test");
         std::fs::create_dir_all(&dir).unwrap();

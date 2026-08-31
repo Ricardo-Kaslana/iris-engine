@@ -765,6 +765,7 @@ dependencies = [
  "glam",
  "iris-macros",
  "log",
+ "web-sys",
 ]
 
 [[package]]

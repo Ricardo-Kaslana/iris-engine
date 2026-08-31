@@ -6,8 +6,10 @@
 //!                 -> accumulator 累积，fixed_steps() 返回本帧需执行的固定步数
 //! ```
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+// 平台封装：wasm 上 std::time::Instant 运行时 panic，见 crate::instant
+use crate::instant::Instant;
 use crate::Resource;
 
 /// 时间资源：可变步长渲染 + 固定步长逻辑（fixed timestep）。

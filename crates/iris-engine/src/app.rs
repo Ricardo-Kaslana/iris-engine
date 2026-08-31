@@ -10,9 +10,14 @@
 //!   -> 事件清空 / 输入一次性状态清零 / 检查 AppExit
 //! ```
 
-use std::time::Instant;
+// 平台原因（wasm32）：手动驱动异步 GPU 初始化未来所需的任务原语只在
+// wasm 分支（Runner::poll_surface_init）使用，native 下引入会产生未用告警
+#[cfg(target_arch = "wasm32")]
+use std::pin::Pin;
+#[cfg(target_arch = "wasm32")]
+use std::task::{Context, Poll, Waker};
 
-use iris_core::prelude::{AppExit, Schedule, Stage, System, Time, World};
+use iris_core::prelude::{AppExit, Instant, Schedule, Stage, System, Time, World};
 use iris_platform::input::Input;
 use iris_platform::window::{WindowConfig, WindowHandle};
 use iris_render::surface::SurfaceKit;
@@ -87,6 +92,11 @@ impl App {
     /// 进入主循环（阻塞直到窗口关闭或收到 `AppExit` 事件）。
     ///
     /// 注意：必须在主线程调用（winit 的平台约束）。
+    ///
+    /// 平台原因（wasm32）：winit web 后端的 `run_app` 以 JS 异常 unwind
+    /// 退出循环——**本函数在 web 上不会正常返回**，`run_app` 之后的代码
+    /// （包括下面的 `.expect`）不会执行，因此不要在 `run()` 之后放置任何
+    /// 「正常收尾」逻辑。
     pub fn run(self) {
         let event_loop = EventLoop::builder()
             .build()
@@ -96,6 +106,9 @@ impl App {
             window: None,
             surface: None,
             startup_done: false,
+            // 平台原因（wasm32）：GPU 初始化改走逐帧驱动的异步未来
+            #[cfg(target_arch = "wasm32")]
+            surface_init: None,
         };
         event_loop.run_app(&mut runner).expect("事件循环异常退出");
     }
@@ -106,11 +119,20 @@ struct Runner {
     window: Option<WindowHandle>,
     surface: Option<SurfaceKit>,
     startup_done: bool,
+    /// 平台原因（wasm32）：GPU 适配器 / 设备请求是 JS Promise，无法阻塞
+    /// 等待，`SurfaceKit` 的初始化只能异步进行。这里暂存待驱动的初始化
+    /// 未来，由每帧 `tick` 推进一步（Promise 在帧间由 JS 微任务队列 resolve）。
+    #[cfg(target_arch = "wasm32")]
+    surface_init: Option<Pin<Box<dyn std::future::Future<Output = Option<SurfaceKit>>>>>,
 }
 
 impl Runner {
     /// 每帧逻辑：更新 -> 渲染 -> 收尾。
     fn tick(&mut self, event_loop: &ActiveEventLoop) {
+        // wasm：先推进一步异步 GPU 初始化（见 Runner.surface_init 注释）
+        #[cfg(target_arch = "wasm32")]
+        self.poll_surface_init();
+
         let Some(surface) = &mut self.surface else {
             return;
         };
@@ -118,6 +140,7 @@ impl Runner {
 
         // 1. 时间推进（时间资源缺失时按无时间模式运行）
         if let Some(mut time) = world.try_resource_mut::<Time>() {
+            // 跨平台封装 Instant：wasm 上 std::time::Instant 运行时 panic
             time.begin_frame(Instant::now());
         }
 
@@ -147,6 +170,39 @@ impl Runner {
             event_loop.exit();
         }
     }
+
+    /// 平台原因（wasm32）：逐帧驱动异步 GPU 初始化未来。
+    ///
+    /// JS Promise 只能在本帧 Rust 代码让出控制权后由浏览器微任务队列
+    /// resolve，因此这里用 noop Waker 手动 poll：未就绪则把未来放回
+    /// `surface_init` 等下一帧；Promise settle 后内部状态已更新，下一次
+    /// poll 即返回 Ready（无需真实唤醒通知，winit web 每帧都会请求重绘）。
+    /// 就绪后走与 native `resumed` 相同的 Startup 流程。
+    #[cfg(target_arch = "wasm32")]
+    fn poll_surface_init(&mut self) {
+        if self.surface.is_some() {
+            return;
+        }
+        let Some(mut init) = self.surface_init.take() else {
+            return;
+        };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match init.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(kit)) => {
+                self.surface = Some(kit);
+                if !self.startup_done {
+                    self.app.schedule.run(Stage::Startup, &mut self.app.world);
+                    self.startup_done = true;
+                }
+            }
+            Poll::Ready(None) => {
+                // 与 native resumed 的降级路径一致；不再重试，事件循环空转
+                log::error!("没有可用的 GPU 适配器，无法启动渲染");
+            }
+            Poll::Pending => self.surface_init = Some(init),
+        }
+    }
 }
 
 impl ApplicationHandler for Runner {
@@ -158,20 +214,37 @@ impl ApplicationHandler for Runner {
             .create_window(self.app.window_config.to_attributes())
             .expect("创建窗口失败");
         let window: WindowHandle = std::sync::Arc::new(window);
-        match SurfaceKit::with_window(window.clone()) {
-            Some(surface) => self.surface = Some(surface),
-            None => {
-                log::error!("没有可用的 GPU 适配器，无法启动渲染");
-                event_loop.exit();
-                return;
-            }
-        }
-        self.window = Some(window);
 
-        // Startup 阶段：GPU 就绪后执行一次，系统可安全注册网格等资源
-        if !self.startup_done {
-            self.app.schedule.run(Stage::Startup, &mut self.app.world);
-            self.startup_done = true;
+        // 平台原因（wasm32）：SurfaceKit 初始化是 JS Promise，只能异步等待
+        // （pollster::block_on 在 wasm 是忙自旋，会卡死浏览器主线程）。把
+        // 初始化未来暂存到 Runner，由每帧 tick 推进一步；完成前 tick 因
+        // surface 为 None 直接返回，事件循环照常运转。
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.surface_init =
+                Some(Box::pin(SurfaceKit::with_window_async(window.clone())));
+            self.window = Some(window);
+            return;
+        }
+
+        // native：同步创建（winit 平台约束要求在主线程，直接阻塞等待 GPU 就绪）
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match SurfaceKit::with_window(window.clone()) {
+                Some(surface) => self.surface = Some(surface),
+                None => {
+                    log::error!("没有可用的 GPU 适配器，无法启动渲染");
+                    event_loop.exit();
+                    return;
+                }
+            }
+            self.window = Some(window);
+
+            // Startup 阶段：GPU 就绪后执行一次，系统可安全注册网格等资源
+            if !self.startup_done {
+                self.app.schedule.run(Stage::Startup, &mut self.app.world);
+                self.startup_done = true;
+            }
         }
     }
 

@@ -151,7 +151,7 @@ iris-engine/
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / web（wasm 专用入口，见「Web 构建」）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -273,7 +273,26 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 | Windows x64 / ARM64 | DirectX 12 / Vulkan | ✅ 已验证（本机 DX12） |
 | Linux x64 / ARM64 | Vulkan | ✅ wgpu 官方支持 |
 | macOS / iOS | Metal | ✅ wgpu 官方支持 |
-| Web (wasm32) | WebGPU | 🚧 wgpu 支持，窗口层适配中 |
+| Web (wasm32) | WebGPU | ✅ **端到端验证通过**：全 workspace 编译零警告 + 真实浏览器渲染确认（点光场景 + HUD 完整成像，见 `docs/web_preview.png` 与下方「Web 构建」） |
+
+### Web 构建（wasm32-unknown-unknown）
+
+需要 WebGPU 浏览器（Chrome / Edge 113+）；wgpu 30 在 wasm 下只编译 WebGPU 后端。
+
+```sh
+rustup target add wasm32-unknown-unknown
+# wasm-bindgen-cli 版本必须与 Cargo.lock 中 wasm-bindgen 一致（先 grep 查询）
+cargo install wasm-bindgen-cli --version 0.2.127 --locked
+cargo build --example web --release --target wasm32-unknown-unknown
+wasm-bindgen --out-dir web-demo --target web     target/wasm32-unknown-unknown/release/examples/web.wasm
+# web-demo/index.html 已随构建脚本就位；起静态服务器访问：
+npx serve web-demo    # 或 python -m http.server -d web-demo
+```
+
+平台要点（详见 ARCHITECTURE.md §6）：wasm 上 `Instant` 由 `performance.now()` 封装
+（std 版本运行时 panic）；无 std 线程，并行系统自动内联顺序执行；GPU 适配器请求
+是 JS Promise，引擎在事件循环内逐帧异步驱动（同步阻塞会卡死页面）；`env_logger`
+编译通过但无输出（v1 未接 console log）；canvas 由 winit 自动附加到 `<body>`。
 
 ## 路线图
 
@@ -292,7 +311,14 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 - [x] 点光阴影（cubemap，首灯 6 面归一化距离）
 - [x] 2D UI 叠加层（HUD：屏幕空间矩形 + 位图字体文本，单批单 draw）
 - [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
-- [ ] wasm32 Web 目标端到端验证
+- [x] wasm32 Web 目标端到端验证（全 workspace 编译 + Instant/线程/异步 GPU 初始化平台封装 + 真实浏览器渲染确认）
+
+### Web 端到端实测
+
+`docs/web_preview.png`：真实浏览器（WebGPU）中加载 wasm 版引擎的截图——
+位图字体标题 "IRIS WEB"、血条 HUD、四个彩色方块 + 中央点光径向照明 +
+天空盒背景完整成像。整条链路（wasm 模块实例化 → winit canvas →
+WebGPU 适配器/设备 → 全渲染栈 → HUD 叠加）在浏览器主线程上逐帧运行。
 - [ ] 音频（2D UI 叠加层已交付）
 - [ ] 实例缓冲 GPU 持久化与增量更新
 

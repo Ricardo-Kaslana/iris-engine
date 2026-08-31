@@ -295,6 +295,12 @@ impl Schedule {
 
 /// 并行批次执行：线程数取 min(系统数, 可用核数)，
 /// 工作线程以原子计数器自取任务，全部完成后 scope 返回。
+///
+/// 平台原因（wasm32）：std 线程在 wasm 上不可用——`thread::spawn` 运行时
+/// panic（实测探针：`thread::scope` + spawn 1 线程即触发 unreachable 陷阱），
+/// 且 `available_parallelism` 返回 `Err`（兜底为 1）。因此可用线程数 ≤ 1 时
+/// 不进 scope、不 spawn，直接内联顺序执行（native 单核同样受益：避免
+/// 无谓的线程创建，语义与顺序执行完全等价）。
 fn run_parallel(systems: &[Entry], indices: &[usize], world: &World) {
     let fns: Vec<&(dyn Fn(&World) + Send + Sync)> = indices
         .iter()
@@ -306,6 +312,11 @@ fn run_parallel(systems: &[Entry], indices: &[usize], world: &World) {
     let threads = fns
         .len()
         .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    if threads <= 1 {
+        // 单线程可用：内联顺序执行（wasm 无 std 线程 / native 单核）
+        run_inline(&fns, world);
+        return;
+    }
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -320,6 +331,13 @@ fn run_parallel(systems: &[Entry], indices: &[usize], world: &World) {
             });
         }
     });
+}
+
+/// 顺序执行一批并行系统（单线程 fallback 路径，注册顺序保序）。
+fn run_inline(fns: &[&(dyn Fn(&World) + Send + Sync)], world: &World) {
+    for f in fns {
+        f(world);
+    }
 }
 
 #[cfg(test)]
@@ -502,5 +520,44 @@ mod tests {
         schedule.run(Stage::Update, &mut world);
         // 并行系统 +1，屏障后独占系统 ×10：结果证明两步严格按序发生
         assert_eq!(world.get::<Counter>(entity).unwrap().0, 10);
+    }
+
+    /// 单线程可用时并行系统仍全部执行：run_parallel 的内联 fallback 路径
+    /// （wasm 无 std 线程时 threads 兜底为 1，落到 run_inline）按注册顺序
+    /// 执行批内全部系统。直接驱动 run_inline 验证批处理结果。
+    #[test]
+    fn single_thread_fallback_runs_all_systems_in_order() {
+        let mut world = World::new();
+        let a = world.spawn((MarkerA, Counter(0)));
+        let b = world.spawn((MarkerB, Counter(0)));
+
+        // 两个互不冲突的系统：各自的 Counter += 自己的步长，并把执行序
+        // 写进自己实体的 Observed（0 = 先执行，1 = 后执行）。
+        let order = std::sync::atomic::AtomicUsize::new(0);
+        let record = |world: &World, e: iris_core::entity::Entity| {
+            let n = order.fetch_add(1, Ordering::SeqCst) as i32;
+            world.get_mut::<Observed>(e).unwrap().0 = n;
+        };
+        let sys_a = |world: &World| {
+            let e = world.entities().next().unwrap();
+            world.get_mut::<Counter>(e).unwrap().0 += 1;
+            record(world, e);
+        };
+        let sys_b = |world: &World| {
+            let e = world.entities().nth(1).unwrap();
+            world.get_mut::<Counter>(e).unwrap().0 += 2;
+            record(world, e);
+        };
+        let fns: Vec<&(dyn Fn(&World) + Send + Sync)> = vec![&sys_a, &sys_b];
+        world.insert(a, Observed(-1));
+        world.insert(b, Observed(-1));
+
+        run_inline(&fns, &world);
+
+        // 全部系统都执行了，且批内顺序 = 注册顺序
+        assert_eq!(world.get::<Counter>(a).unwrap().0, 1, "系统一必须执行");
+        assert_eq!(world.get::<Counter>(b).unwrap().0, 2, "系统二必须执行");
+        assert_eq!(world.get::<Observed>(a).unwrap().0, 0, "系统一先执行");
+        assert_eq!(world.get::<Observed>(b).unwrap().0, 1, "系统二后执行");
     }
 }

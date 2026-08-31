@@ -18,6 +18,7 @@ pub mod component;
 pub mod entity;
 pub mod event;
 pub mod hierarchy;
+pub mod instant;
 pub mod query;
 pub mod resource;
 pub mod schedule;
@@ -37,6 +38,8 @@ pub mod prelude {
     pub use crate::entity::Entity;
     pub use crate::event::{AppExit, Event, Events};
     pub use crate::hierarchy::{propagate_transforms, ChildOf, Children, GlobalTransform};
+    // 跨平台时间点封装（wasm 上 std::time::Instant 会运行时 panic，见 instant.rs）
+    pub use crate::instant::Instant;
     pub use crate::query::QueryPart;
     pub use crate::resource::Resource;
     pub use crate::schedule::{Access, Schedule, Stage, System};

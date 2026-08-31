@@ -7,8 +7,7 @@
 //! cargo run -p iris-core --example bench_parallel --release
 //! ```
 
-use std::time::Instant;
-
+// Instant 用 prelude 的跨平台封装（wasm 上 std 版本运行时 panic，见 iris_core::instant）
 use iris_core::prelude::*;
 
 const ENTITY_COUNT: u32 = 50_000;
