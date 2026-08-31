@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -69,6 +69,10 @@ cargo run --example gltf_snapshot --release
 # PBR / HDR / 阴影验收场景（离屏渲染），输出 iris_shadow_preview.bmp：
 # 金属球粗糙度梯度 + 绝缘体球 + 地面软阴影 + ACES 色调映射
 cargo run --example shadow_snapshot --release
+
+# 点光 cubemap 阴影验收场景（离屏渲染），输出 iris_point_shadow.bmp：
+# 暗色房间中央点光，环灯物体的阴影背离灯的方向径向拉伸（点光阴影特征）
+cargo run --example point_shadow_snapshot --release
 
 # 泛光验收场景（离屏渲染），输出 iris_bloom_preview.bmp：
 # 三颗自发光彩球的 HDR 光晕（阈值提取 + 半分辨率高斯模糊）
@@ -143,7 +147,7 @@ iris-engine/
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / bloom_snapshot / hdr_snapshot
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -184,6 +188,13 @@ PCF 边缘自然、无 acne 条纹；`DirectionalLight.shadows = false` 可整�
 
 ![方向光阴影](docs/shadow_preview.png)
 
+点光 cubemap 阴影实测（`docs/point_shadow_preview.png`）：暗色房间中央点光
+（512² × 6 面 R32Float，存归一化线性距离），环灯方块/球的阴影从根部
+**背离点光方向径向拉伸**——放射状阴影是点光区别于方向光平行阴影的视觉特征；
+`PointLight.shadows = true` 时查询顺序中的第一盏点光投影（v1 限定）。
+
+![点光 cubemap 阴影](docs/point_shadow_preview.png)
+
 PBR + HDR + IBL 实测（`docs/pbr_preview.png`）：Cook-Torrance 金属度/粗糙度工作流——
 金 / 铜 / 银 / 钢四种金属球（粗糙度 0.05 → 0.55 递增）+ 绝缘体红球，方向光软阴影，
 程序化天空背景（inv_view_proj 射线采样），IBL 环境光照（天空立方体贴图：
@@ -223,12 +234,14 @@ glTF 动画实测（`docs/anim_preview.png`，左 t=0 / 右 t=1）：`anim_cube.
 ## 测试
 
 ```sh
-cargo test --workspace   # 128 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 132 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
 着色器编译、深度测试、MSAA、实例化合批、视锥剔除、多光源照明、
 **方向光阴影（开/关整帧差分：成片变暗、无变亮、大部分不变）**、
+**点光 cubemap 阴影（面矩阵全方向覆盖 + 偏置遮挡物阴影落在解析预测位置 +
+开/关整帧差分 + 空跑不污染）**、
 **泛光（开/关整帧差分：光晕变亮、无变暗、远场不变）**、
 **IBL（铬球反射蓝天：蓝主导像素对比 + 整帧变亮）**、
 **glTF 动画（旋转方块离屏渲染：正对 → 侧对红色像素锐减）**、
@@ -261,7 +274,7 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 - [x] GLB 二进制容器与 glTF 节点动画（AnimationPlayer）
 - [x] 骨骼蒙皮动画（GPU LBS + 蒙皮阴影）
 - [x] 外部 HDR 资产加载（equirectangular）
-- [ ] 点光阴影（cubemap）
+- [x] 点光阴影（cubemap，首灯 6 面归一化距离）
 - [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
 - [ ] wasm32 Web 目标端到端验证
 - [ ] 音频与 2D 叠加层（UI）

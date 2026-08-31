@@ -137,6 +137,8 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   → 按 (网格, 材质) 稳定排序 → 相同 key 连续成批
   → 一次 write_buffer 上传全部实例
   → 阴影 pass（可选）：光源正交视角，深度写入 R32Float 颜色附件（2048²）
+  → 点光阴影（可选）：首盏 shadows 点光的 cubemap，6 面 × 512² 各一个
+    render pass，R32Float 颜色附件存归一化线性距离（见 §4.7.1）
   → 主 pass：天空盒背景（inv_view_proj 射线采样预滤波环境 0 级 mip，深度只读）
     → 几何体渲染到线性 HDR 中间缓冲（Rgba16Float + 4x MSAA → resolve），
     环境光采样初始化时烘焙好的 IBL 贴图（辐照度 / 预滤波 / BRDF LUT）
@@ -158,7 +160,8 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   菲涅尔 Schlick（绝缘体 F0 = 0.04，金属 F0 = albedo）；
   能量守恒 `kd = (1 − F)(1 − metallic)`，金属无漫反射。
 - **照明**：环境光（**IBL 分割求和**，见 §4.12；另有方向光资源上的常量补光项）+
-  1 个方向光（受阴影调制）+ 最多 8 个点光。点光采用**物理平方衰减**
+  1 个方向光（受阴影调制）+ 最多 8 个点光（查询顺序中的首盏可投射
+  cubemap 阴影，见 §4.7.1）。点光采用**物理平方衰减**
   `window² / d²`（`window = 1 − (d/range)²`），在有效半径处平滑归零。
 - 法线矩阵在 CPU 端取模型矩阵的**逆转置 3×3**，保证非均匀缩放下光照方向正确。
 - **HDR 管线**：主 pass 渲染到线性 `Rgba16Float` 中间缓冲（MSAA 4x 解析），
@@ -294,6 +297,51 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   在同一 render pass 内会触发资源互斥校验错误。
 - 阴影只调制方向光的辐射度，不影响环境光 / 点光 / 自发光；
   `DirectionalLight.shadows` 可整帧关闭（贴图 pass 跳过 + shader 掩码兜底）。
+
+### 4.7.1 点光阴影（cubemap）
+
+- **范围（v1 限定）**：只有查询顺序中的**第一盏** `PointLight.shadows == true`
+  的点光投射阴影（收集后交换到 uniform 槽位 0，着色器只对 `i == 0` 采样）；
+  多盏开启时取首灯并 `log::warn`。cubemap 每灯 6 个 pass，多灯投影在路线图。
+- **归一化距离存储**：cubemap 的 `R32Float` 存
+  `length(world_frag − light_pos) / range` 而非光空间 `z/w`——
+  采样侧因此**无需任何光空间矩阵**：`normalize(world_pos − light_pos)` 直接
+  `textureSampleLevel(shadow_cube, ..., dir, 0.0)` 查 texel，比较
+  `stored >= dist/range − bias/range`（bias 以米存 uniform，比较时归一化）。
+  捕获侧由片段着色器从插值世界坐标现算距离（距离函数非线性，顶点插值会在
+  大三角形上产生米级误差）；清空值 1.0（= range/range）代表无遮挡。
+- **面矩阵**：每面 `look_at(light_pos, light_pos + dir, up)` × 90° 透视
+  （near 0.05、far = range，DirectX 深度 [0,1] 约定）；面序 = wgpu/OpenGL
+  立方体层序 `[+X, −X, +Y, −Y, +Z, −Z]`，(dir, up) 取标准正交面集
+  （±X 与 ±Z 面的 up = (0,−1,0)，+Y 面 up = (0,0,1)，−Y 面 up = (0,0,−1)）。
+  投影只决定光栅化覆盖，**面方向必须与 GPU Cube 采样约定精确一致**。
+- **NDC y 翻转（关键推导）**：OpenGL 的面矩阵标准集在 wgpu 下**直接用会垂直镜像**。
+  原因：GL 的 FBO 渲染把 NDC y=+1 写进贴图**最后一行**（t = (y_ndc+1)/2），
+  而 wgpu/Vulkan/D3D 的光栅化把 NDC y=+1 写进**第 0 行**（v = (1−y_ndc)/2）；
+  Cube 采样表（s、t 由主轴分量给出）两者相同，于是捕获结果逐面 V 镜像。
+  补救是在面矩阵左乘 `scale(1, −1, 1)`（只翻 y 行）：u 与深度 z 不受影响，
+  三角形环绕方向反转由阴影管线的 cull None 吸收。横向 u 逐面核对过均与采样表
+  一致，无需翻转。集成测试 `face_orientation_matches_cube_sampling` 用**偏置
+  遮挡物**守护此约定——居中遮挡物的阴影对镜像对称，抓不住这个错（实测：去掉
+  翻转后径向差分测试照常通过，偏置测试 0/148 全错位）。
+- **双附件教训的复刻**：与方向光阴影同构——`R32Float` 颜色附件存值 +
+  `Depth32Float` 深度附件（Less）并存，颜色附件的 texel 只在深度测试通过时
+  更新，保证存最近遮挡物；没有深度测试时重叠表面按绘制顺序互相覆盖，
+  背面值污染贴图（§4.7 的实证教训）。
+- **6 个渲染视图与 6 份独立 uniform**：采样视图 dimension Cube 一次创建；
+  渲染视图每面一个（D2 + `base_array_layer = i`）。每面参数（64B 面矩阵 +
+  16B 灯位置/range = 80B）放**独立小 uniform 缓冲**而非一份缓冲的六个插槽——
+  绑定偏移必须满足 min_uniform_buffer_offset_alignment（典型 256），且同一
+  submit 内对同一缓冲的多次 write_buffer 会在执行前全部合并（泛光参数教训，
+  §4.11）。全部 write_buffer 后随本帧统一 submit。
+- **uniform 控制流掩码**：采样在 `dist < range` 受光分支之外无条件执行
+  （`i == 0` 由均匀的 point_count 派生，分支均匀；`textureSampleLevel` 带
+  显式 mip 不依赖导数），最后把阴影系数乘进该灯的 radiance——与
+  `shadow_factor` 同款模式；超出 range 的片段不进受光分支，掩码自然为受光。
+- **捕获时的粗剔除**：实例包围球到灯的距离减去半径仍超出 range 的，六个
+  90° 面的并集（以灯为中心的完整球域）必不覆盖它，六面全部跳过；剔除只
+  影响阴影 pass 的绘制区间（可见性变化处拆分 run），不影响主 pass 合批。
+- 阴影只调制首盏点光的辐射度，不影响环境光 / 方向光 / 其余点光 / 自发光。
 
 ### 4.8 MSAA 与深度
 
@@ -432,7 +480,11 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
    半透明需额外排序，暂未处理）。
 4. **无热重载**：CPU 目录句柄不可变，资产修改需重建。
 5. **Web 目标**：代码路径兼容（无平台分支），但 winit/wasm 窗口层未做端到端验证。
-6. **点光无阴影**：方向光已有阴影贴图；点光阴影（cubemap）在路线图中。
+6. **点光阴影为 v1 限定**：只有查询顺序中的首盏 `shadows` 点光投影
+   （cubemap 每灯 6 个 pass，多灯投影在路线图）；单采样无 PCF，阴影边缘
+   为硬边；面矩阵约定（OpenGL 层序 + NDC y 翻转）依赖 GPU Cube 采样的
+   方向语义——更换图形栈或 wgpu 大版本时需重新验证
+   （集成测试 `face_orientation_matches_cube_sampling` 守护）。
 7. **外部 HDR 环境源仅覆盖 Radiance .hdr 的 `-Y +X` equirectangular 形式**：
    其他分辨率朝向（±X ±Z 组合、垂直镜像）解析为 Unsupported；不读 `.exr` /
    `.ktx` 等其他 HDR 容器；超大图受设备纹理尺寸上限约束（Rgba16Float 中间

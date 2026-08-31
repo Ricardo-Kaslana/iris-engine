@@ -1,7 +1,8 @@
 // Iris 标准材质着色器：Cook-Torrance PBR（金属度/粗糙度工作流）。
 // 照明 = 环境光（Lambert 近似）+ 1 个方向光 + 最多 8 个点光（物理平方衰减）。
-// 方向光带阴影贴图（R 通道深度 + 3×3 手工比较 PCF）；渲染在线性 HDR 空间，
-// 色调映射由 blit pass 完成。
+// 方向光带阴影贴图（R 通道深度 + 3×3 手工比较 PCF）；首盏点光带 cubemap
+// 阴影贴图（R 通道存归一化线性距离，单采样无 PCF）。
+// 渲染在线性 HDR 空间，色调映射由 blit pass 完成。
 // 实例化绘制：每个实例携带模型矩阵（4 个 vec4 列）与法线矩阵（3 个 vec4 列）。
 
 struct PointLight {
@@ -32,6 +33,8 @@ struct Globals {
     env_params: vec4<f32>,
     // 天空盒射线重建用（clip -> world）
     inv_view_proj: mat4x4<f32>,
+    // x: 是否启用点光阴影, y: bias（米）, z: 投影灯 range, w: 保留
+    point_shadow_params: vec4<f32>,
 };
 
 struct MaterialParams {
@@ -49,6 +52,10 @@ struct MaterialParams {
 @group(0) @binding(4) var env_map: texture_cube<f32>;
 @group(0) @binding(5) var brdf_lut: texture_2d<f32>;
 @group(0) @binding(6) var env_sampler: sampler;
+// 点光 cubemap 阴影贴图（R 存归一化线性距离 length(world-light)/range，
+// 清空值 1.0 = 无遮挡）；采样复用 binding 2 的 NonFiltering 采样器
+// （R32Float 双线性过滤需要 float32-filterable 扩展，不依赖）。
+@group(0) @binding(7) var point_shadow_cube: texture_cube<f32>;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -229,18 +236,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let radiance = globals.light_color.rgb * sun;
     var color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
 
-    // 点光：物理平方衰减 + range 平滑窗口
+    // 点光：物理平方衰减 + range 平滑窗口；首灯（i==0）受 cubemap 阴影调制
     let count = u32(globals.point_count.x);
     for (var i = 0u; i < count; i = i + 1u) {
         let light = globals.point_lights[i];
         let to_light = light.position.xyz - in.world_pos;
         let dist = length(to_light);
+
+        // 点光阴影系数：只有查询顺序中的第 0 盏点光投射 cubemap 阴影（v1 限定）。
+        // 采样在 `dist < range` 分支之外无条件执行（textureSample 系要求均匀
+        // 控制流的掩码模式，与 shadow_factor 一致）；i==0 与开关掩码都由
+        // uniform 派生，分支本身均匀。textureSampleLevel 带显式 mip 不依赖导数。
+        // 采样方向 = 从灯指向片段的归一化方向——Cube 按此方向查 texel，
+        // 与捕获面矩阵的方向约定（POINT_SHADOW_FACES + NDC y 翻转）配对。
+        // 超出 range 的片段不会进入受光分支（掩码自然混向受光），贴图清空值
+        // 1.0（= range/range）代表无遮挡。
+        var shadow = 1.0;
+        if (i == 0u && globals.point_shadow_params.x > 0.5) {
+            let dir = (in.world_pos - light.position.xyz) / max(dist, 1e-4);
+            let stored = textureSampleLevel(point_shadow_cube, shadow_sampler, dir, 0.0).r;
+            let range = max(globals.point_shadow_params.z, 1e-4);
+            // bias 以米存储，除以 range 归一化到距离值域后再比较
+            let biased = dist / range - globals.point_shadow_params.y / range;
+            shadow = select(0.0, 1.0, stored >= biased);
+        }
+
         if (dist < light.color.w) {
             let lp = to_light / max(dist, 1e-4);
             let t = dist / light.color.w;
             let window = 1.0 - t * t;
             let atten = (window * window) / max(dist * dist, 0.01);
-            let pl = light.color.rgb * atten;
+            let pl = light.color.rgb * atten * shadow;
             color = color + pbr_light(n, v, lp, pl, albedo, f0, metallic, roughness);
         }
     }

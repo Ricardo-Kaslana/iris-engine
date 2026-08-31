@@ -6,6 +6,8 @@
 //! - 跨后端：Vulkan / DirectX 12 / Metal 由 wgpu 统一抽象，同一份 WGSL 着色器；
 //! - 自动实例化批处理：共享网格与材质的实体合并为一个 draw call；
 //! - 4x MSAA、深度测试、Cook-Torrance PBR（方向光 + 点光 + 环境光 + 自发光）；
+//! - 方向光阴影贴图（2048² 深度图 + PCF）与点光 cubemap 阴影
+//!   （首灯 6 面 × 512²，R32Float 存归一化线性距离）；
 //! - HDR 中间缓冲 + ACES 色调映射 + 泛光（Bloom）后处理；
 //! - IBL 环境光照（程序化天空 + 分割求和，初始化时一次性烘焙）；
 //! - 外部 HDR 环境贴图（Radiance .hdr equirectangular → IBL 与天空盒，generation 失效重烘）；
@@ -44,7 +46,9 @@ pub mod prelude {
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;
-    pub use crate::light::{DirectionalLight, PointLight, MAX_POINT_LIGHTS};
+    pub use crate::light::{
+        DirectionalLight, PointLight, POINT_SHADOW_FACES, MAX_POINT_LIGHTS,
+    };
     pub use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{primitives, MeshData, MeshHandle, MeshStore, SkinVertex, Vertex};
     pub use crate::offscreen::OffscreenRenderer;

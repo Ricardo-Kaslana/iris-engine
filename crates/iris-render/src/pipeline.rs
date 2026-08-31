@@ -3,6 +3,9 @@
 /// 阴影贴图分辨率（正方形边长）。
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
+/// 点光 cubemap 阴影贴图分辨率（每面边长；6 面 × 512² R32Float）。
+pub const POINT_SHADOW_MAP_SIZE: u32 = 512;
+
 /// HDR 中间缓冲格式（线性、单采样，供色调映射 pass 采样）。
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -16,6 +19,10 @@ pub(crate) struct PipelineBundle {
     pub shadow_pipeline: wgpu::RenderPipeline,
     /// 阴影蒙皮变体（组 1 绑定关节矩阵，保证阴影随骨骼变形）。
     pub skinned_shadow_pipeline: wgpu::RenderPipeline,
+    /// 点光 cubemap 阴影管线（每面独立 uniform + 6 个 pass）。
+    pub point_shadow_pipeline: wgpu::RenderPipeline,
+    /// 点光阴影蒙皮变体（组 1 绑定关节矩阵）。
+    pub skinned_point_shadow_pipeline: wgpu::RenderPipeline,
     pub blit_pipeline: wgpu::RenderPipeline,
     pub bloom_threshold_pipeline: wgpu::RenderPipeline,
     pub bloom_blur_pipeline: wgpu::RenderPipeline,
@@ -23,6 +30,9 @@ pub(crate) struct PipelineBundle {
     /// 阴影 pass 专用的精简全局布局（只含 uniform，
     /// 不绑定阴影贴图本身——避免同 pass 内读写冲突）。
     pub shadow_globals_layout: wgpu::BindGroupLayout,
+    /// 点光阴影每面参数布局：binding 0 = 独立小 uniform
+    /// （面视图投影矩阵 + 灯位置/range；顶点算裁剪、片段算归一化距离）。
+    pub point_shadow_layout: wgpu::BindGroupLayout,
     pub material_layout: wgpu::BindGroupLayout,
     /// 关节矩阵只读 storage（蒙皮管线专用）。
     pub joints_layout: wgpu::BindGroupLayout,
@@ -111,6 +121,19 @@ pub(crate) fn create_pipeline(
                 binding: 6,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // 点光 cubemap 阴影贴图（R32Float 存归一化线性距离）。
+            // 采样复用 binding 2 的 NonFiltering 采样器：R32Float 双线性过滤
+            // 需要 float32-filterable 扩展，不依赖；与方向光阴影一致。
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::Cube,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
                 count: None,
             },
         ],
@@ -423,6 +446,118 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
+    // 点光 cubemap 阴影：每面一个独立小 uniform（80B：面视图投影矩阵 +
+    // 灯位置/range），顶点算裁剪位置、片段算归一化线性距离写入 R32Float。
+    // 一面一缓冲而非一份缓冲的六个插槽：绑定偏移必须满足
+    // min_uniform_buffer_offset_alignment（典型 256），且同一 submit 内
+    // 对同一缓冲的多次 write_buffer 会在执行前全部合并（泛光参数的教训）。
+    let point_shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.point_shadow"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let point_shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.point_shadow.pipeline.layout"),
+        bind_group_layouts: &[Some(&point_shadow_layout)],
+        immediate_size: 0,
+    });
+    // 阴影面管线与方向光阴影同构：R32Float 颜色附件 + Depth32Float 深度附件
+    // （Less 测试保证每 texel 存最近遮挡物）+ cull None（面翻转与环绕方向的
+    // 实证结论见方向光阴影管线）。
+    let point_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.point_shadow"),
+        layout: Some(&point_shadow_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shadow_shader,
+            entry_point: Some("vs_point"),
+            compilation_options: Default::default(),
+            buffers: &[Some(crate::mesh::Vertex::LAYOUT), Some(crate::instance::InstanceRaw::LAYOUT)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shadow_shader,
+            entry_point: Some("fs_point"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 点光阴影蒙皮变体：组 1 绑定关节矩阵，蒙皮几何体的点光阴影随骨骼变形。
+    let skinned_point_shadow_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.skinned.point_shadow.pipeline.layout"),
+            bind_group_layouts: &[Some(&point_shadow_layout), Some(&joints_layout)],
+            immediate_size: 0,
+        });
+    let skinned_point_shadow_pipeline =
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("iris.pipeline.skinned_point_shadow"),
+            layout: Some(&skinned_point_shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_point_skinned"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    Some(crate::mesh::Vertex::LAYOUT),
+                    Some(crate::mesh::SkinVertex::LAYOUT),
+                    Some(crate::instance::InstanceRaw::LAYOUT),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_shader,
+                entry_point: Some("fs_point"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
     // 色调映射 blit：全屏三角形采样 HDR 中间缓冲 + 泛光叠加，输出到 sRGB 目标
     let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("iris.shader.blit"),
@@ -585,11 +720,14 @@ pub(crate) fn create_pipeline(
         sky_pipeline,
         shadow_pipeline,
         skinned_shadow_pipeline,
+        point_shadow_pipeline,
+        skinned_point_shadow_pipeline,
         blit_pipeline,
         bloom_threshold_pipeline,
         bloom_blur_pipeline,
         globals_layout,
         shadow_globals_layout,
+        point_shadow_layout,
         material_layout,
         joints_layout,
         blit_layout,

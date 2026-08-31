@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use iris_core::prelude::GlobalTransform;
 
 use crate::camera::{view_from_global, ActiveCamera, Camera};
@@ -34,7 +34,7 @@ struct PointLightRaw {
     color: [f32; 4], // rgb × intensity, w = range
 }
 
-/// 与 WGSL `Globals` 结构对齐（560 字节，POD）。
+/// 与 WGSL `Globals` 结构对齐（576 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsRaw {
@@ -49,14 +49,30 @@ struct GlobalsRaw {
     shadow_params: [f32; 4], // texel_size, bias, strength, enabled
     env_params: [f32; 4],    // 预滤波最大 mip 级, IBL 强度, 保留
     inv_view_proj: [[f32; 4]; 4], // 天空盒射线重建用
+    // x: 是否启用点光阴影, y: bias（米）, z: 投影灯 range, w: 保留
+    point_shadow_params: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 560, "Globals 必须与 WGSL 布局一致");
+const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 576, "Globals 必须与 WGSL 布局一致");
+
+/// 与 WGSL `PointFaceParams` 对齐（80 字节，POD）：点光阴影每面独立小 uniform。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PointFaceParamsRaw {
+    view_proj: [[f32; 4]; 4],
+    light_pos_range: [f32; 4], // xyz: 灯世界位置, w: range
+}
+
+const _: () =
+    assert!(std::mem::size_of::<PointFaceParamsRaw>() == 80, "PointFaceParams 必须与 WGSL 布局一致");
 
 /// 阴影深度偏移（正交投影 + 正面剔除下的小常数即可抑制 acne）。
 const SHADOW_BIAS: f32 = 0.0015;
 /// 阴影暗部保留的光照比例（0 = 全黑阴影，1 = 无阴影）。
 const SHADOW_STRENGTH: f32 = 0.45;
+/// 点光阴影偏移（米，归一化距离值域下按 range 归一后比较）。
+/// 点光距离值域大，从 0.02 起步实测调到无 acne 且无可见 peter-panning。
+const POINT_SHADOW_BIAS: f32 = 0.03;
 
 /// 与 WGSL `MaterialParams` 结构对齐（48 字节，POD）。
 #[repr(C)]
@@ -134,6 +150,22 @@ pub struct Renderer {
     #[allow(dead_code)]
     shadow_depth_buf: wgpu::Texture,
     shadow_depth_buf_view: wgpu::TextureView,
+    /// 点光 cubemap 阴影贴图：R32Float 6 层，R 存归一化线性距离
+    /// （length(world − light) / range，1.0 = 无遮挡）。
+    #[allow(dead_code)]
+    point_shadow_map: wgpu::Texture,
+    /// Cube 维度采样视图（进全局绑定组 binding 7）。
+    point_shadow_cube_view: wgpu::TextureView,
+    /// 每面一个 D2 渲染视图（base_array_layer = 面序）。
+    point_shadow_face_views: [wgpu::TextureView; 6],
+    /// 点光阴影深度附件（Depth32Float 6 层，Less 测试保证存最近遮挡物）。
+    #[allow(dead_code)]
+    point_shadow_depth: wgpu::Texture,
+    point_shadow_depth_face_views: [wgpu::TextureView; 6],
+    /// 每面一个独立参数缓冲 + 绑定组（一缓冲一面：同一 submit 内对同一
+    /// 缓冲的多次 write_buffer 会在执行前全部合并，泛光参数的教训）。
+    point_shadow_face_bufs: [wgpu::Buffer; 6],
+    point_shadow_face_bgs: [wgpu::BindGroup; 6],
     /// IBL 环境贴图（初始化时一次性烘焙；视图已进全局绑定组，
     /// 此字段保持纹理存活）。`SkySource` 资源变更时整体重烘焙替换。
     #[allow(dead_code)]
@@ -204,6 +236,7 @@ fn build_globals_bind_group(
     bundle: &crate::pipeline::PipelineBundle,
     globals_buf: &wgpu::Buffer,
     shadow_map_view: &wgpu::TextureView,
+    point_shadow_cube_view: &wgpu::TextureView,
     env: &crate::environment::EnvironmentMaps,
 ) -> wgpu::BindGroup {
     let env_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -256,6 +289,10 @@ fn build_globals_bind_group(
                 binding: 6,
                 resource: wgpu::BindingResource::Sampler(&env_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(point_shadow_cube_view),
+            },
         ],
     })
 }
@@ -304,6 +341,79 @@ impl Renderer {
         });
         let shadow_depth_buf_view =
             shadow_depth_buf.create_view(&wgpu::TextureViewDescriptor::default());
+        // 点光 cubemap 阴影贴图：R32Float 6 层（层序 = OpenGL 约定
+        // [+X, −X, +Y, −Y, +Z, −Z]，与 PointLight::shadow_face_view_proj 配对）。
+        // 复刻方向光阴影的双附件教训：颜色附件存值的同时必须挂深度附件做
+        // Less 测试——没有它重叠表面按绘制顺序互相覆盖，背面值污染贴图。
+        let point_shadow_map = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.point_shadow.map"),
+            size: wgpu::Extent3d {
+                width: crate::pipeline::POINT_SHADOW_MAP_SIZE,
+                height: crate::pipeline::POINT_SHADOW_MAP_SIZE,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let point_shadow_cube_view = point_shadow_map.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iris.point_shadow.cube_view"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+        let point_shadow_face_views = std::array::from_fn(|face| {
+            point_shadow_map.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("iris.point_shadow.face_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: face as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        let point_shadow_depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.point_shadow.depth"),
+            size: wgpu::Extent3d {
+                width: crate::pipeline::POINT_SHADOW_MAP_SIZE,
+                height: crate::pipeline::POINT_SHADOW_MAP_SIZE,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let point_shadow_depth_face_views = std::array::from_fn(|face| {
+            point_shadow_depth.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("iris.point_shadow.depth_face_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: face as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        let point_shadow_face_bufs: [wgpu::Buffer; 6] = std::array::from_fn(|_| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.point_shadow.face_params"),
+                size: std::mem::size_of::<PointFaceParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let point_shadow_face_bgs: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.point_shadow.face_bg"),
+                layout: &bundle.point_shadow_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: point_shadow_face_bufs[face].as_entire_binding(),
+                }],
+            })
+        });
         // IBL 环境贴图一次性烘焙（供主 pass 的分割求和环境光采样）
         let env = crate::environment::bake_environment(&gpu);
         let shadow_globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -343,7 +453,14 @@ impl Renderer {
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
         // 全局绑定组（env 视图相关的构建逻辑与重烘焙共用，见 build_globals_bind_group）
-        let globals_bg = build_globals_bind_group(&gpu, &bundle, &globals_buf, &shadow_map_view, &env);
+        let globals_bg = build_globals_bind_group(
+            &gpu,
+            &bundle,
+            &globals_buf,
+            &shadow_map_view,
+            &point_shadow_cube_view,
+            &env,
+        );
         Self {
             gpu,
             bundle,
@@ -360,6 +477,13 @@ impl Renderer {
             shadow_map_view,
             shadow_depth_buf,
             shadow_depth_buf_view,
+            point_shadow_map,
+            point_shadow_cube_view,
+            point_shadow_face_views,
+            point_shadow_depth,
+            point_shadow_depth_face_views,
+            point_shadow_face_bufs,
+            point_shadow_face_bgs,
             env,
             env_baked_generation: 0,
             hdr: None,
@@ -380,6 +504,7 @@ impl Renderer {
             &self.bundle,
             &self.globals_buf,
             &self.shadow_map_view,
+            &self.point_shadow_cube_view,
             &self.env,
         );
     }
@@ -616,11 +741,21 @@ impl Renderer {
             color: [0.0; 4],
         }; MAX_POINT_LIGHTS];
         let mut point_count = 0usize;
+        // 投影灯（v1 限定一盏）：查询顺序中第一个 shadows==true 的点光，
+        // 记录其槽位，收集完成后交换到槽位 0（着色器只对 i==0 采样阴影）。
+        let mut caster_slot: Option<usize> = None;
+        let mut caster_total = 0usize;
         world.query::<(&GlobalTransform, &PointLight)>(|(gt, pl)| {
             if point_count >= MAX_POINT_LIGHTS {
                 return;
             }
             let position = gt.position();
+            if pl.shadows {
+                caster_total += 1;
+                if caster_slot.is_none() {
+                    caster_slot = Some(point_count);
+                }
+            }
             point_lights[point_count] = PointLightRaw {
                 position: [position.x, position.y, position.z, 0.0],
                 color: [
@@ -632,6 +767,19 @@ impl Renderer {
             };
             point_count += 1;
         });
+        if caster_total > 1 {
+            log::warn!("有 {caster_total} 盏点光开启阴影，v1 只取查询顺序中的第一盏投射 cubemap 阴影");
+        }
+        if let Some(slot) = caster_slot {
+            point_lights.swap(0, slot);
+        }
+        // 投影灯交换后必然位于槽位 0；range 直接从 uniform 数据取
+        let point_shadow_params = match caster_slot {
+            Some(_) => {
+                [1.0, POINT_SHADOW_BIAS, point_lights[0].color[3], 0.0]
+            }
+            None => [0.0, POINT_SHADOW_BIAS, 1.0, 0.0],
+        };
         if point_count == MAX_POINT_LIGHTS {
             // 有可能恰好还有更多点光被截断；再探一次数量仅用于日志
             let mut extra = 0;
@@ -672,6 +820,7 @@ impl Renderer {
                 0.0,
             ],
             inv_view_proj: vp.inverse().to_cols_array_2d(),
+            point_shadow_params,
         };
         self.gpu
             .queue
@@ -749,6 +898,44 @@ impl Renderer {
         if culled > 0 {
             log::trace!("视锥剔除 {culled} / {} 实例", total + culled as usize);
         }
+
+        // 2b. 点光阴影 pass 的实例可见性（CPU 粗剔除）：实例包围球到投影灯的
+        // 距离减去半径后仍超出 range，则六个 90° 面的并集（= 以灯为中心、
+        // range 为半径的完整球域）必然不覆盖它，六面全部跳过。结果只用于
+        // 阴影 pass 的绘制区间划分，不影响主 pass 批处理。
+        let point_shadow_visible: Vec<bool> = if caster_slot.is_some() {
+            let light_pos = Vec3::new(
+                point_lights[0].position[0],
+                point_lights[0].position[1],
+                point_lights[0].position[2],
+            );
+            let range = point_lights[0].color[3];
+            items
+                .iter()
+                .map(|item| {
+                    let Some(data) = mesh_store.get(MeshHandle((item.key >> 32) as u32)) else {
+                        return true;
+                    };
+                    let Some((min, max)) = data.bounds() else {
+                        return true;
+                    };
+                    let min = Vec3::from(min);
+                    let max = Vec3::from(max);
+                    let model = Mat4::from_cols_array_2d(&item.instance.model);
+                    let center = model.transform_point3((min + max) * 0.5);
+                    let scale = model
+                        .x_axis
+                        .truncate()
+                        .length()
+                        .max(model.y_axis.truncate().length())
+                        .max(model.z_axis.truncate().length());
+                    let radius = (max - min).length() * 0.5 * scale;
+                    (center - light_pos).length() - radius <= range
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // 3. 实例缓冲（容量不足时重建）；剔除排序键后按 112B 紧凑布局整体上传，
         //    蒙皮实例追加在普通实例之后（实例区间 [total, total+skinned)）
@@ -874,6 +1061,115 @@ impl Renderer {
                     shadow_pass.set_bind_group(1, &skin.bind_group, &[]);
                     let base = (total + i) as u32;
                     shadow_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                }
+            }
+        }
+        // 5b. 点光 cubemap 阴影：投影灯存在时对 6 面各开一个 render pass。
+        // 颜色附件（该面 R32Float 视图）与深度附件都清空为 1.0（1.0 =
+        // range/range = 无遮挡）；存储值为归一化线性距离（见 fs_point），
+        // 深度附件 Less 测试保证每 texel 存最近遮挡物（方向光阴影的教训）。
+        if caster_slot.is_some() {
+            let light_pos = Vec3::new(
+                point_lights[0].position[0],
+                point_lights[0].position[1],
+                point_lights[0].position[2],
+            );
+            let range = point_lights[0].color[3];
+            // 6 面独立小 uniform：一缓冲一面，全部 write_buffer 后随本帧
+            // 统一 submit（write_buffer 按 submit 顺序在 pass 执行前生效）
+            for face in 0..6 {
+                let raw = PointFaceParamsRaw {
+                    view_proj: PointLight::face_view_proj(light_pos, face, range)
+                        .to_cols_array_2d(),
+                    light_pos_range: [light_pos.x, light_pos.y, light_pos.z, range],
+                };
+                self.gpu
+                    .queue
+                    .write_buffer(&self.point_shadow_face_bufs[face], 0, bytemuck::bytes_of(&raw));
+            }
+            if total + skinned.len() > 0 {
+                let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+                for face in 0..6 {
+                    let mut point_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("iris.pass.point_shadow"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.point_shadow_face_views[face],
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 1.0,
+                                    g: 1.0,
+                                    b: 1.0,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.point_shadow_depth_face_views[face],
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    point_pass.set_pipeline(&self.bundle.point_shadow_pipeline);
+                    point_pass.set_bind_group(0, &self.point_shadow_face_bgs[face], &[]);
+                    point_pass.set_vertex_buffer(1, instance_buf.slice(..));
+                    // 超出 range 的实例已在 point_shadow_visible 中剔除；
+                    // 可见性变化处拆分绘制区间，保持同 key 连续实例合批
+                    index = 0;
+                    while index < total {
+                        if !point_shadow_visible[index] {
+                            index += 1;
+                            continue;
+                        }
+                        let key = items[index].key;
+                        let mut count = 1;
+                        while index + count < total
+                            && items[index + count].key == key
+                            && point_shadow_visible[index + count]
+                        {
+                            count += 1;
+                        }
+                        let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                        point_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        point_pass
+                            .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        let first = index as u32;
+                        let last = (index + count) as u32;
+                        point_pass.draw_indexed(0..mesh.num_indices, 0, first..last);
+                        index += count;
+                    }
+                    // 蒙皮批次：实例区间 [total, total+skinned)，v1 不做距离剔除
+                    if !skinned.is_empty() {
+                        point_pass.set_pipeline(&self.bundle.skinned_point_shadow_pipeline);
+                        point_pass.set_vertex_buffer(2, instance_buf.slice(..));
+                        for (i, item) in skinned.iter().enumerate() {
+                            let mesh = &self.mesh_gpu[&item.mesh];
+                            let skin = &self.skin_gpu[&item.skin_entity];
+                            point_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                            point_pass.set_vertex_buffer(
+                                1,
+                                mesh.skin_buf
+                                    .as_ref()
+                                    .expect("蒙皮网格应有蒙皮属性缓冲")
+                                    .slice(..),
+                            );
+                            point_pass.set_index_buffer(
+                                mesh.index_buf.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            point_pass.set_bind_group(1, &skin.bind_group, &[]);
+                            let base = (total + i) as u32;
+                            point_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                        }
+                    }
                 }
             }
         }

@@ -65,6 +65,9 @@ impl DirectionalLight {
 ///
 /// 衰减模型：`saturate(1 - d/range)²`，在 `range` 处平滑归零，
 /// 颜色 × 强度决定亮度。超过 [`MAX_POINT_LIGHTS`] 的点光会被忽略。
+///
+/// 阴影：v1 只允许**一盏**点光投射 cubemap 阴影——多盏开启时取查询
+/// 顺序中的第一盏并记录日志（cubemap 每灯 6 个 pass，成本高）。
 #[derive(Clone, Copy, Debug, Component)]
 pub struct PointLight {
     /// 光的颜色（线性空间）。
@@ -73,19 +76,58 @@ pub struct PointLight {
     pub intensity: f32,
     /// 有效半径（世界单位），超出后无贡献。
     pub range: f32,
+    /// 是否投射 cubemap 阴影（仅查询顺序中第一盏生效）。
+    pub shadows: bool,
 }
 
 impl Default for PointLight {
     fn default() -> Self {
-        Self { color: Vec3::ONE, intensity: 8.0, range: 12.0 }
+        Self { color: Vec3::ONE, intensity: 8.0, range: 12.0, shadows: false }
     }
 }
 
 impl PointLight {
     pub fn new(color: Vec3, intensity: f32, range: f32) -> Self {
-        Self { color, intensity, range }
+        Self { color, intensity, range, shadows: false }
+    }
+
+    /// 点光某一面的视图投影矩阵（90° 视锥、宽高比 1、near 0.05、far = range）。
+    ///
+    /// 面序与观察方向取 [`POINT_SHADOW_FACES`]（wgpu 立方体贴图层序）。
+    /// 返回矩阵已对 NDC y 取反：wgpu 光栅化把 NDC y=+1 写进贴图第 0 行，
+    /// 而 Cube 采样按 OpenGL 面内约定 `t = (1 − dir_分量)/2` 查 texel——
+    /// 不翻转会让每个面的内容垂直镜像，遮挡物落错 texel（推导见
+    /// ARCHITECTURE §4.7.1；翻转只翻 y 行，深度 z 与横向 u 均不受影响，
+    /// 三角形环绕方向反转由阴影管线的 cull None 吸收）。
+    pub fn face_view_proj(light_pos: Vec3, face: usize, range: f32) -> Mat4 {
+        let (dir, up) = POINT_SHADOW_FACES[face];
+        let view = glam::camera::rh::view::look_at_mat4(light_pos, light_pos + dir, up);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            POINT_SHADOW_NEAR,
+            range,
+        );
+        Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) * (proj * view)
     }
 }
+
+/// 点光 cubemap 阴影的面集：wgpu 立方体贴图 6 层的（观察方向， 上方向）。
+///
+/// 层序 = OpenGL / wgpu 约定：[+X, −X, +Y, −Y, +Z, −Z]；每面的观察方向为
+/// 该层正对的轴向，上方向为标准正交面集——面方向必须与 GPU Cube 采样的
+/// 方向约定精确一致，镜像/旋转会让遮挡物落错 texel。
+pub const POINT_SHADOW_FACES: [(Vec3, Vec3); 6] = [
+    (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+    (Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0)),
+    (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, -1.0, 0.0)),
+    (Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, -1.0, 0.0)),
+];
+
+/// 点光阴影的近平面（贴上灯面且极近的几何直接裁掉，避免深度精度塌缩）。
+pub const POINT_SHADOW_NEAR: f32 = 0.05;
 
 #[cfg(test)]
 mod tests {
