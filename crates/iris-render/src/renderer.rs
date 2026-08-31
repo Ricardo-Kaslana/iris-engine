@@ -135,9 +135,12 @@ pub struct Renderer {
     shadow_depth_buf: wgpu::Texture,
     shadow_depth_buf_view: wgpu::TextureView,
     /// IBL 环境贴图（初始化时一次性烘焙；视图已进全局绑定组，
-    /// 此字段保持纹理存活）。
+    /// 此字段保持纹理存活）。`SkySource` 资源变更时整体重烘焙替换。
     #[allow(dead_code)]
     env: crate::environment::EnvironmentMaps,
+    /// 已烘焙环境源对应的 generation（0 = 程序化天空；与 `SkySource`
+    /// 资源上的 generation 不一致时在下一帧 `draw` 触发重烘焙）。
+    env_baked_generation: u64,
     /// HDR 中间缓冲（MSAA 4x 颜色附件 + 单采样解析目标 + blit 绑定组）。
     hdr: Option<HdrTargets>,
     hdr_size: (u32, u32),
@@ -193,6 +196,70 @@ pub struct FrameStats {
     pub instances: u32,
 }
 
+/// 构建全局绑定组。其中的 env 视图随每次环境重烘焙而更换，重烘后必须
+/// 重建本绑定组——初建（`Renderer::new`）与重烘重建（`ensure_environment`）
+/// 共用此逻辑，避免两处条目清单漂移。
+fn build_globals_bind_group(
+    gpu: &Gpu,
+    bundle: &crate::pipeline::PipelineBundle,
+    globals_buf: &wgpu::Buffer,
+    shadow_map_view: &wgpu::TextureView,
+    env: &crate::environment::EnvironmentMaps,
+) -> wgpu::BindGroup {
+    let env_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("iris.env.sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    let shadow_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("iris.shadow.sampler"),
+        // 非过滤采样：R32Float 的双线性过滤需要 float32-filterable 扩展，不依赖；
+        // 深度比较在 shader 内手工完成（standard.wgsl shadow_factor）
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        ..Default::default()
+    });
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("iris.globals.bg"),
+        layout: &bundle.globals_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(shadow_map_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&env.irradiance_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&env.prefiltered_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&env.brdf_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(&env_sampler),
+            },
+        ],
+    })
+}
+
 impl Renderer {
     pub fn new(gpu: Arc<Gpu>, color_format: wgpu::TextureFormat) -> Self {
         let bundle = create_pipeline(&gpu, color_format, SAMPLE_COUNT);
@@ -239,58 +306,6 @@ impl Renderer {
             shadow_depth_buf.create_view(&wgpu::TextureViewDescriptor::default());
         // IBL 环境贴图一次性烘焙（供主 pass 的分割求和环境光采样）
         let env = crate::environment::bake_environment(&gpu);
-        let env_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("iris.env.sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let shadow_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("iris.shadow.sampler"),
-            // 非过滤采样：R32Float 的双线性过滤需要 float32-filterable 扩展，不依赖；
-            // 深度比较在 shader 内手工完成（standard.wgsl shadow_factor）
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
-        let globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("iris.globals.bg"),
-            layout: &bundle.globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_map_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&env.irradiance_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&env.prefiltered_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&env.brdf_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(&env_sampler),
-                },
-            ],
-        });
         let shadow_globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("iris.shadow.globals.bg"),
             layout: &bundle.shadow_globals_layout,
@@ -327,6 +342,8 @@ impl Renderer {
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
+        // 全局绑定组（env 视图相关的构建逻辑与重烘焙共用，见 build_globals_bind_group）
+        let globals_bg = build_globals_bind_group(&gpu, &bundle, &globals_buf, &shadow_map_view, &env);
         Self {
             gpu,
             bundle,
@@ -344,6 +361,7 @@ impl Renderer {
             shadow_depth_buf,
             shadow_depth_buf_view,
             env,
+            env_baked_generation: 0,
             hdr: None,
             hdr_size: (0, 0),
             scratch: Vec::new(),
@@ -352,6 +370,38 @@ impl Renderer {
             clear_color: wgpu::Color { r: 0.055, g: 0.07, b: 0.10, a: 1.0 },
             stats: FrameStats::default(),
         }
+    }
+
+    /// 重建全局绑定组。env 视图随每次环境重烘焙变化（旧视图随旧纹理销毁），
+    /// irradiance / prefiltered / brdf 三个视图引用必须同步更新。
+    fn rebuild_globals_bind_group(&mut self) {
+        self.globals_bg = build_globals_bind_group(
+            &self.gpu,
+            &self.bundle,
+            &self.globals_buf,
+            &self.shadow_map_view,
+            &self.env,
+        );
+    }
+
+    /// 环境源失效检查：`SkySource` 资源的 generation 与缓存不同（资源缺席
+    /// 视为 generation 0 = 程序化天空）时重烘焙 IBL 并重建全局绑定组。
+    fn ensure_environment(&mut self, world: &iris_core::world::World) {
+        let generation = world
+            .try_resource::<crate::environment::SkySource>()
+            .map(|s| s.generation)
+            .unwrap_or(0);
+        if generation == self.env_baked_generation {
+            return;
+        }
+        let kind = world
+            .try_resource::<crate::environment::SkySource>()
+            .map(|s| s.kind.clone())
+            .unwrap_or(crate::environment::SkySourceKind::ProceduralSky);
+        log::info!("环境源变更（generation → {generation}），重新烘焙 IBL 环境贴图");
+        self.env = crate::environment::bake_environment_from(&self.gpu, &kind);
+        self.rebuild_globals_bind_group();
+        self.env_baked_generation = generation;
     }
 
     /// 确保HDR 中间缓冲与当前帧尺寸一致（尺寸变化时重建）。
@@ -510,6 +560,8 @@ impl Renderer {
         width: u32,
         height: u32,
     ) {
+        // 环境源失效检查在最前：重烘焙与绑定组重建必须发生在本帧编码之前
+        self.ensure_environment(world);
         self.ensure_hdr_targets(width, height);
         self.stats = FrameStats::default();
         // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），

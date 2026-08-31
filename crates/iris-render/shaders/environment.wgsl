@@ -1,6 +1,8 @@
-// 环境光照烘焙：程序化天空立方体贴图 -> 漫反射辐照度卷积 / GGX 预滤波 / BRDF LUT。
-// 四个片段入口共享全屏三角形顶点着色器与 uniform（a.x = 立方体面索引，
-// a.y = 预滤波粗糙度）。全部一次性烘焙（渲染器初始化时），运行时零开销。
+// 环境光照烘焙：天空源立方体贴图 -> 漫反射辐照度卷积 / GGX 预滤波 / BRDF LUT。
+// 片段入口共享全屏三角形顶点着色器与 uniform（a.x = 立方体面索引，
+// a.y = 预滤波粗糙度）。天空捕获有两条路径：fs_sky（程序化天空）与
+// fs_capture_equirect（外部 equirectangular 全景图，绑定 2D 纹理）；下游
+// 辐照度 / 预滤波 / BRDF pass 与天空源无关，全部一次性烘焙，运行时零开销。
 //
 // IBL 采用分割求和近似（Karis 2010）：
 //   环境光 ≈ irradiance(n) * kd * albedo + prefiltered_env(r) * (F * LUT.x + LUT.y)
@@ -14,6 +16,10 @@ struct EnvParams {
 // 源环境立方体贴图（辐照度 / 预滤波 pass 采样；天空 / BRDF pass 不用）
 @group(0) @binding(1) var env_cube: texture_cube<f32>;
 @group(0) @binding(2) var env_sampler: sampler;
+// 外部 equirectangular 全景图（fs_capture_equirect 专用；绑定在独立的
+// equirect 布局上，程序化路径的 plain 布局无需提供这两个资源）
+@group(0) @binding(1) var equirect_tex: texture_2d<f32>;
+@group(0) @binding(2) var equirect_sampler: sampler;
 
 struct EnvVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -88,6 +94,23 @@ fn sky_color(d: vec3<f32>) -> vec3<f32> {
 fn fs_sky(in: EnvVertexOutput) -> @location(0) vec4<f32> {
     let d = face_dir(u32(params.a.x), in.uv);
     return vec4<f32>(sky_color(d), 1.0);
+}
+
+// ---- 外部 equirectangular 捕获：方向 -> 全景 uv（图像第 0 行 = +Y 天顶） ----
+
+// u: 方位角（+X 方向在图像水平正中），v: 0 = 天顶行、1 = 天底行
+fn dir_to_equirect_uv(dir: vec3<f32>) -> vec2<f32> {
+    let d = normalize(dir);
+    let u = 0.5 + atan2(d.z, d.x) / (2.0 * PI);
+    let v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) / PI;
+    return vec2<f32>(u, v);
+}
+
+@fragment
+fn fs_capture_equirect(in: EnvVertexOutput) -> @location(0) vec4<f32> {
+    let d = face_dir(u32(params.a.x), in.uv);
+    let uv = dir_to_equirect_uv(d);
+    return vec4<f32>(textureSampleLevel(equirect_tex, equirect_sampler, uv, 0.0).rgb, 1.0);
 }
 
 // ---- 漫反射辐照度：围绕法线的余弦加权半球积分 ----

@@ -3,6 +3,7 @@
 //! - `assets/cube.gltf` + `cube0.bin`：外部 buffer 的标准 glTF（`model` 示例加载）
 //! - `assets/anim_cube.glb`：GLB 容器，带旋转 + 浮动动画（`anim_snapshot` 示例加载）
 //! - `assets/skin_arm.glb`：GLB 容器，两段式蒙皮手臂 + 肘关节挥舞动画（`skin_snapshot` 示例加载）
+//! - `assets/sunset.hdr`：equirectangular 日落全景 Radiance 文件（`hdr_snapshot` 示例加载）
 //!
 //! ```sh
 //! cargo run --example gen_asset --release   # 在仓库根目录执行
@@ -17,7 +18,8 @@ fn main() {
     write_gltf_cube("assets/cube.gltf", "cube0.bin", &cube);
     write_animated_cube_glb("assets/anim_cube.glb", &cube);
     write_skinned_arm_glb("assets/skin_arm.glb");
-    println!("已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb 与 assets/skin_arm.glb");
+    write_sunset_hdr("assets/sunset.hdr");
+    println!("已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb 与 assets/sunset.hdr");
 }
 
 /// 把单位立方体数据写成 glTF（JSON + 外部二进制 buffer）。
@@ -389,4 +391,65 @@ fn write_skinned_arm_glb(path: &str) {
         std::fs::create_dir_all(parent).expect("创建 assets 目录");
     }
     std::fs::write(path, write_glb(&json, &bin)).expect("写入 GLB");
+}
+
+// ---- Radiance .hdr 全景图生成（外部 HDR 环境贴图示例用） ----
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = dot3(v, v).sqrt();
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
+fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+/// 程序化生成 1024×512 equirectangular 日落全景（Radiance `.hdr`，平面编码）：
+/// 地平线暖橙 (3.0, 1.2, 0.4) → 天顶深蓝 (0.05, 0.1, 0.3)，地平线下深灰渐变，
+/// 外加一个角半径约 0.04 rad、亮度 ~40 的软边太阳盘（HDR 亮部，泛光提取源）。
+/// `hdr_snapshot` 示例加载。生成端的 dir→(u, v) 映射与捕获 shader 精确互逆：
+/// 图像第 0 行 = +Y 天顶，+X 方向在图像水平正中。
+fn write_sunset_hdr(path: &str) {
+    use iris_render::asset::hdr::{encode_hdr, HdrImage};
+
+    const W: u32 = 1024;
+    const H: u32 = 512;
+    const PI: f32 = std::f32::consts::PI;
+    let sun = normalize3([0.3, 0.25, -0.9]);
+    let sun_color = [1.0, 0.72, 0.45];
+    let sun_radius: f32 = 0.04; // 角半径（弧度）
+    let sun_softness: f32 = 0.3; // 边缘在半径最后 30% 内软化
+
+    let mut image = HdrImage::new(W, H);
+    for y in 0..H {
+        // v = 0 为天顶行：行中心的仰角 elev = (0.5 - v)·π
+        let elev = (0.5 - (y as f32 + 0.5) / H as f32) * PI;
+        let (sin_elev, cos_elev) = elev.sin_cos();
+        for x in 0..W {
+            let az = ((x as f32 + 0.5) / W as f32 - 0.5) * 2.0 * PI;
+            let dir = [cos_elev * az.cos(), sin_elev, cos_elev * az.sin()];
+            // 天空底色：上半球暖橙→深蓝，下半球地平线灰→暗部渐变
+            let mut rgb = if sin_elev >= 0.0 {
+                mix3([3.0, 1.2, 0.4], [0.05, 0.1, 0.3], sin_elev.sqrt())
+            } else {
+                mix3([0.30, 0.27, 0.25], [0.02, 0.02, 0.03], (-sin_elev).sqrt())
+            };
+            // 太阳盘：角距落入半径内点亮，边缘 smoothstep 软化
+            let angle = dot3(dir, sun).clamp(-1.0, 1.0).acos();
+            let edge = ((sun_radius - angle) / (sun_softness * sun_radius)).clamp(0.0, 1.0);
+            let disc = edge * edge * (3.0 - 2.0 * edge);
+            for c in 0..3 {
+                rgb[c] += sun_color[c] * 40.0 * disc;
+            }
+            image.set_pixel(x, y, rgb);
+        }
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).expect("创建 assets 目录");
+    }
+    std::fs::write(path, encode_hdr(&image)).expect("写入 sunset.hdr");
 }

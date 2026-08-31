@@ -8,6 +8,7 @@
 //! - 4x MSAA、深度测试、Cook-Torrance PBR（方向光 + 点光 + 环境光 + 自发光）；
 //! - HDR 中间缓冲 + ACES 色调映射 + 泛光（Bloom）后处理；
 //! - IBL 环境光照（程序化天空 + 分割求和，初始化时一次性烘焙）；
+//! - 外部 HDR 环境贴图（Radiance .hdr equirectangular → IBL 与天空盒，generation 失效重烘）；
 //! - 视锥剔除与实体挂载相机；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
@@ -34,10 +35,13 @@ pub mod prelude {
         update_animations, AnimatedField, AnimationChannel, AnimationClip,
         AnimationInterpolation, AnimationPath, AnimationPlayer,
     };
-    pub use crate::asset::{spawn_gltf, spawn_gltf_instance, write_glb, GltfError, GltfInstance};
+    pub use crate::asset::{
+        load_hdr, spawn_gltf, spawn_gltf_instance, write_glb, GltfError, GltfInstance, HdrError,
+        HdrImage,
+    };
     pub use crate::camera::{view_from_global, ActiveCamera, Camera};
     pub use crate::context::Gpu;
-    pub use crate::environment::EnvironmentSettings;
+    pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;
     pub use crate::light::{DirectionalLight, PointLight, MAX_POINT_LIGHTS};

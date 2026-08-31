@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 + 分割求和，零资产依赖）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -82,6 +82,11 @@ cargo run --example anim_snapshot --release
 # 骨骼蒙皮验收场景（同用 gen_asset 资产），输出两个时刻的位图：
 # 两段臂绑髋/肘关节，肘关节挥舞 90°（GPU LBS 蒙皮 + 蒙皮阴影）
 cargo run --example skin_snapshot --release
+
+# 外部 HDR 环境贴图验收场景（先 gen_asset 生成日落全景），输出 iris_hdr.bmp：
+# Radiance .hdr equirectangular → IBL + 天空盒，铬球反射暖色天空与太阳
+cargo run --example gen_asset --release
+cargo run --example hdr_snapshot --release
 
 # 并行调度基准：8 个互不冲突系统 串行 vs 并行加速比
 cargo run -p iris-core --example bench_parallel --release
@@ -131,14 +136,14 @@ flowchart TB
 
 ```
 iris-engine/
-├── assets/              # 示例资产（cube.gltf + cube0.bin，gen_asset 生成）
+├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr，gen_asset 生成）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
 │   ├── iris-core/       # ECS、调度、变换层级、时间、事件
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / bloom_snapshot
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / bloom_snapshot / hdr_snapshot
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -207,10 +212,18 @@ glTF 动画实测（`docs/anim_preview.png`，左 t=0 / 右 t=1）：`anim_cube.
 
 ![骨骼蒙皮](docs/skin_preview.png)
 
+外部 HDR 环境贴图实测（`docs/hdr_preview.png`）：程序化生成的日落全景
+`assets/sunset.hdr`（1024×512 equirectangular Radiance 文件，手写 RGBE 解析器
+加载）经 `SkySource` 资源挂入世界，渲染器按 generation 失效自动重烘 IBL——
+暖色天空与亮度 40 的太阳盘成为天空盒背景与泛光源，金属铬球反射出天顶蓝、
+暖色地平线与太阳高光，地面承接 HDR 环境的漫反射辐射。
+
+![外部 HDR 环境贴图](docs/hdr_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 113 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 128 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -220,8 +233,10 @@ cargo test --workspace   # 113 个测试：单元 + GPU 端到端离屏渲染
 **IBL（铬球反射蓝天：蓝主导像素对比 + 整帧变亮）**、
 **glTF 动画（旋转方块离屏渲染：正对 → 侧对红色像素锐减）**、
 **骨骼蒙皮（肘关节动画驱动顶点位移：最左像素左移 ≥30px + 蒙皮阴影成片变暗）**、
+**外部 HDR 环境贴图（红/蓝合成全景：画面上下半球主导通道 + 铬球反射上半球）**、
 **并行调度（原子计数观测真并发 / 读写冲突分批保序 / 独占系统屏障）**、
-glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）。
+glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）、
+Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 位模式转换）。
 
 ## 跨平台矩阵
 
@@ -245,7 +260,7 @@ glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness �
 - [x] 天空盒背景 pass（射线采样，与 IBL 同源）
 - [x] GLB 二进制容器与 glTF 节点动画（AnimationPlayer）
 - [x] 骨骼蒙皮动画（GPU LBS + 蒙皮阴影）
-- [ ] 外部 HDR 资产加载（equirectangular）
+- [x] 外部 HDR 资产加载（equirectangular）
 - [ ] 点光阴影（cubemap）
 - [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
 - [ ] wasm32 Web 目标端到端验证
