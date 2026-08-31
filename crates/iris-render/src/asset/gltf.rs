@@ -1118,7 +1118,8 @@ mod tests {
     fn loads_triangle_with_generated_normals() -> Result<(), GltfError> {
         let dir = std::env::temp_dir().join("iris-gltf-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("triangle.gltf");
+        // 文件名必须测试间唯一：并行测试共用同名文件会互相覆写（偶发竞态）
+        let path = dir.join("triangle_normals.gltf");
         std::fs::write(&path, triangle_gltf()).unwrap();
 
         let mut world = world_with_stores();
@@ -1146,7 +1147,8 @@ mod tests {
     fn node_translation_becomes_local_transform() -> Result<(), GltfError> {
         let dir = std::env::temp_dir().join("iris-gltf-test");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("triangle.gltf");
+        // 文件名必须测试间唯一（并行竞态，见上一测试）
+        let path = dir.join("triangle_translation.gltf");
         std::fs::write(&path, triangle_gltf()).unwrap();
 
         let mut world = world_with_stores();
@@ -1244,7 +1246,7 @@ mod tests {
         let dir = std::env::temp_dir().join("iris-gltf-test");
         std::fs::create_dir_all(&dir).unwrap();
         let (json, bin) = animated_triangle_parts();
-        let path = dir.join("animated.glb");
+        let path = dir.join("animated_container.glb");
         std::fs::write(&path, write_glb(&json, &bin)).unwrap();
 
         let mut world = world_with_stores();
@@ -1277,7 +1279,7 @@ mod tests {
         let dir = std::env::temp_dir().join("iris-gltf-test");
         std::fs::create_dir_all(&dir).unwrap();
         let (json, bin) = animated_triangle_parts();
-        let path = dir.join("animated.glb");
+        let path = dir.join("animated_player.glb");
         std::fs::write(&path, write_glb(&json, &bin)).unwrap();
 
         let mut world = world_with_stores();

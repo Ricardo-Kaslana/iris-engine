@@ -9,6 +9,8 @@
 //! - 方向光阴影贴图（2048² 深度图 + PCF）与点光 cubemap 阴影
 //!   （首灯 6 面 × 512²，R32Float 存归一化线性距离）；
 //! - HDR 中间缓冲 + ACES 色调映射 + 泛光（Bloom）后处理；
+//! - 2D UI 叠加层（HUD）：屏幕空间彩色矩形 + 内嵌 font8x8 位图字体文本，
+//!   单管线单纹理单 draw，渲染在 3D 场景色调映射之后（不吃泛光）；
 //! - IBL 环境光照（程序化天空 + 分割求和，初始化时一次性烘焙）；
 //! - 外部 HDR 环境贴图（Radiance .hdr equirectangular → IBL 与天空盒，generation 失效重烘）；
 //! - 视锥剔除与实体挂载相机；
@@ -31,6 +33,7 @@ pub mod renderer;
 pub mod skin;
 pub mod surface;
 pub mod texture;
+pub mod ui;
 
 pub mod prelude {
     pub use crate::animation::{
@@ -57,6 +60,7 @@ pub mod prelude {
     pub use crate::skin::{skin_vertex, Skin};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
+    pub use crate::ui::{glyph_bits, UiColor, UiRect, UiText};
 }
 
 /// 全引擎固定的多重采样倍率（4x MSAA）。

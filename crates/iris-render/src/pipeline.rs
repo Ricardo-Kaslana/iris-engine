@@ -26,6 +26,8 @@ pub(crate) struct PipelineBundle {
     pub blit_pipeline: wgpu::RenderPipeline,
     pub bloom_threshold_pipeline: wgpu::RenderPipeline,
     pub bloom_blur_pipeline: wgpu::RenderPipeline,
+    /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
+    pub ui_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
     /// 阴影 pass 专用的精简全局布局（只含 uniform，
     /// 不绑定阴影贴图本身——避免同 pass 内读写冲突）。
@@ -38,6 +40,9 @@ pub(crate) struct PipelineBundle {
     pub joints_layout: wgpu::BindGroupLayout,
     pub blit_layout: wgpu::BindGroupLayout,
     pub bloom_layout: wgpu::BindGroupLayout,
+    /// UI 绑定组布局：binding 0 = 字形图集纹理、1 = 采样器、
+    /// 2 = 屏幕尺寸 uniform（顶点阶段）。
+    pub ui_layout: wgpu::BindGroupLayout,
 }
 
 pub(crate) fn create_pipeline(
@@ -714,6 +719,79 @@ pub(crate) fn create_pipeline(
     let bloom_threshold_pipeline = make_bloom_pipeline("iris.pipeline.bloom_threshold", "fs_threshold");
     let bloom_blur_pipeline = make_bloom_pipeline("iris.pipeline.bloom_blur", "fs_blur");
 
+    // 2D UI 叠加层：像素坐标顶点 + 字形图集采样。写 blit 之后的 sRGB 目标：
+    // 无深度附件（叠加而非遮挡）、cull None（UI 面向屏幕）、无 MSAA
+    // （目标是 blit 后的单采样缓冲）、标准 alpha 混合（文本/半透明矩形）。
+    let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.ui"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ui.wgsl").into()),
+    });
+    let ui_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.ui"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.ui.pipeline.layout"),
+        bind_group_layouts: &[Some(&ui_layout)],
+        immediate_size: 0,
+    });
+    let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.ui"),
+        layout: Some(&ui_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &ui_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(crate::ui::UiVertex::LAYOUT)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &ui_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
     PipelineBundle {
         pipeline,
         skinned_pipeline,
@@ -725,6 +803,7 @@ pub(crate) fn create_pipeline(
         blit_pipeline,
         bloom_threshold_pipeline,
         bloom_blur_pipeline,
+        ui_pipeline,
         globals_layout,
         shadow_globals_layout,
         point_shadow_layout,
@@ -732,5 +811,6 @@ pub(crate) fn create_pipeline(
         joints_layout,
         blit_layout,
         bloom_layout,
+        ui_layout,
     }
 }

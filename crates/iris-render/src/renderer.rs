@@ -176,9 +176,22 @@ pub struct Renderer {
     /// HDR 中间缓冲（MSAA 4x 颜色附件 + 单采样解析目标 + blit 绑定组）。
     hdr: Option<HdrTargets>,
     hdr_size: (u32, u32),
+    /// UI 字形图集纹理（初始化时一次性构建；字段仅为保持 view 存活）。
+    #[allow(dead_code)]
+    ui_atlas: wgpu::Texture,
+    /// UI 绑定组：图集纹理 + Nearest 采样器 + 屏幕尺寸 uniform。
+    ui_bind_group: wgpu::BindGroup,
+    /// 屏幕尺寸 uniform（每帧 write_buffer，供像素 → NDC 映射）。
+    ui_screen_buf: wgpu::Buffer,
+    /// UI 顶点缓冲（容量不足时整体重建，照抄实例缓冲的容量复用模式）。
+    ui_vertex_buf: Option<wgpu::Buffer>,
+    /// UI 顶点缓冲可容纳的顶点数。
+    ui_capacity: usize,
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
     skinned_scratch: Vec<SkinnedItem>,
+    /// UI 顶点组装暂存（跨帧复用，避免每帧堆分配）。
+    ui_scratch: Vec<crate::ui::UiVertex>,
     clear_color: wgpu::Color,
     pub(crate) stats: FrameStats,
 }
@@ -220,6 +233,17 @@ struct BloomParamsRaw {
 }
 
 const _: () = assert!(std::mem::size_of::<BloomParamsRaw>() == 32, "BlurParams 必须与 WGSL 布局一致");
+
+/// 与 WGSL `ui_globals` 对齐（16 字节，POD）：xy = 屏幕尺寸（像素），
+/// zw 恒 0（WGSL uniform 地址空间要求根结构体尺寸为 16 的倍数）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct UiGlobalsRaw {
+    screen: [f32; 2],
+    _pad: [f32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<UiGlobalsRaw>() == 16, "UiGlobals 必须与 WGSL 布局一致");
 
 /// 单帧渲染统计。
 #[derive(Clone, Copy, Debug, Default)]
@@ -452,6 +476,77 @@ impl Renderer {
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
+        // UI 字形图集：初始化时一次性构建并上传。单一纹理同时服务矩形
+        // （0 号格纯白块）与文本（字形 texel，白色 + alpha=行位码），
+        // 使 UI 全部内容共享单管线单纹理单 draw。采样器 Nearest：
+        // 位图字形锐利，也弱化图集渗色。
+        let ui_atlas = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ui.atlas"),
+            size: wgpu::Extent3d {
+                width: crate::ui::ATLAS_WIDTH,
+                height: crate::ui::ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ui_atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &crate::ui::build_atlas_rgba(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(crate::ui::ATLAS_WIDTH * 4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: crate::ui::ATLAS_WIDTH,
+                height: crate::ui::ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ui_atlas_view = ui_atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        let ui_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.ui.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let ui_screen_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.ui.screen"),
+            size: std::mem::size_of::<UiGlobalsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.ui.bg"),
+            layout: &bundle.ui_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ui_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&ui_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ui_screen_buf.as_entire_binding(),
+                },
+            ],
+        });
         // 全局绑定组（env 视图相关的构建逻辑与重烘焙共用，见 build_globals_bind_group）
         let globals_bg = build_globals_bind_group(
             &gpu,
@@ -488,9 +583,15 @@ impl Renderer {
             env_baked_generation: 0,
             hdr: None,
             hdr_size: (0, 0),
+            ui_atlas,
+            ui_bind_group,
+            ui_screen_buf,
+            ui_vertex_buf: None,
+            ui_capacity: 0,
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
             skinned_scratch: Vec::new(),
+            ui_scratch: Vec::new(),
             clear_color: wgpu::Color { r: 0.055, g: 0.07, b: 0.10, a: 1.0 },
             stats: FrameStats::default(),
         }
@@ -675,8 +776,11 @@ impl Renderer {
         self.stats
     }
 
-    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），随后
-    /// ACES 色调映射 blit 到 `color_view`（通常为 sRGB 目标）。
+    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），随后 ACES
+    /// 色调映射 blit 到 `color_view`（通常为 sRGB 目标）；最后如有 UI
+    /// 组件（`UiRect` / `UiText` / `UiColor`），在同一 `color_view` 上
+    /// 以 `LoadOp::Load` 叠加 HUD pass——**位于 blit 之后**，因此 HUD
+    /// 不参与 HDR / 泛光 / 色调映射，是干净的 sRGB 界面叠加。
     pub fn draw(
         &mut self,
         world: &iris_core::world::World,
@@ -1359,6 +1463,47 @@ impl Renderer {
             blit.set_bind_group(0, &hdr.blit_bind_group, &[]);
             blit.draw(0..3, 0..1);
         }
+        // UI 叠加层：blit 之后的最后一个 pass。同一 color_view、LoadOp::Load
+        // （不清屏，直接叠加在色调映射结果上）、无深度附件。顶点非空才开
+        // pass——空 UI 场景零额外开销。屏幕尺寸 uniform 每帧写入（write_buffer
+        // 与本帧 submit 同队列，执行顺序保证在 pass 之前生效）。
+        let mut ui_vertices = std::mem::take(&mut self.ui_scratch);
+        ui_vertices.clear();
+        crate::ui::collect_ui_vertices(world, &mut ui_vertices);
+        if !ui_vertices.is_empty() {
+            let screen = UiGlobalsRaw { screen: [width as f32, height as f32], _pad: [0.0; 2] };
+            self.gpu
+                .queue
+                .write_buffer(&self.ui_screen_buf, 0, bytemuck::bytes_of(&screen));
+            self.ensure_ui_vertex_capacity(ui_vertices.len());
+            let ui_buf = self.ui_vertex_buf.as_ref().expect("UI 顶点缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(ui_buf, 0, bytemuck::cast_slice(&ui_vertices));
+            let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.ui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            ui_pass.set_pipeline(&self.bundle.ui_pipeline);
+            ui_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            ui_pass.set_vertex_buffer(0, ui_buf.slice(..));
+            ui_pass.draw(0..ui_vertices.len() as u32, 0..1);
+            // HUD 全部顶点合批为单 draw call
+            draw_calls += 1;
+        }
+        self.ui_scratch = ui_vertices;
         self.gpu.queue.submit([encoder.finish()]);
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
@@ -1379,6 +1524,24 @@ impl Renderer {
         }));
         self.instance_capacity = capacity;
         log::debug!("实例缓冲扩容至 {capacity} 实例");
+    }
+
+    /// UI 顶点缓冲容量复用（与实例缓冲同款模式）：容量足够则零开销，
+    /// 不足时按 2 倍扩容整体重建。
+    fn ensure_ui_vertex_capacity(&mut self, needed: usize) {
+        if self.ui_capacity >= needed {
+            return;
+        }
+        let capacity = (needed * 2).max(1024);
+        self.ui_vertex_buf =
+            Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.ui.vertices"),
+                size: (capacity * std::mem::size_of::<crate::ui::UiVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        self.ui_capacity = capacity;
+        log::debug!("UI 顶点缓冲扩容至 {capacity} 顶点");
     }
 
     fn ensure_mesh(&mut self, store: &MeshStore, handle: MeshHandle) {

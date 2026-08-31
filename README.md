@@ -35,7 +35,7 @@ fn gameplay(world: &mut World) {
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -77,6 +77,10 @@ cargo run --example point_shadow_snapshot --release
 # 泛光验收场景（离屏渲染），输出 iris_bloom_preview.bmp：
 # 三颗自发光彩球的 HDR 光晕（阈值提取 + 半分辨率高斯模糊）
 cargo run --example bloom_snapshot --release
+
+# 2D UI 叠加层（HUD）验收场景（离屏渲染），输出 iris_ui.bmp：
+# 点光阴影 3D 场景 + 顶部位图标题 / 血条 / 右下文本（矩形 + 位图字体单批渲染）
+cargo run --example ui_snapshot --release
 
 # GLB 动画验收场景（先 gen_asset 生成资产），输出两个时刻的位图：
 # 蓝色立方体自转 + 浮动（GLB 容器 + AnimationPlayer 播放链路）
@@ -147,7 +151,7 @@ iris-engine/
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   └── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot
+│       └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -231,10 +235,19 @@ glTF 动画实测（`docs/anim_preview.png`，左 t=0 / 右 t=1）：`anim_cube.
 
 ![外部 HDR 环境贴图](docs/hdr_preview.png)
 
+2D UI 叠加层实测（`docs/ui_preview.png`）：点光阴影 3D 场景之上叠加 HUD——
+顶部 `IRIS ENGINE` 位图标题、左上血条（深底 + 红色前景两个矩形实体）、
+右下青色占位文本。UI pass 位于色调映射 blit 之后：矩形与文本合批为
+**一个 draw call**、直接写 sRGB 目标——文字与色块干净锐利，不受泛光 /
+ACES 影响；屏幕像素坐标系（原点左上、y 向下），字体为内嵌公有领域
+font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由单测守护）。
+
+![2D UI 叠加层](docs/ui_preview.png)
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 132 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 145 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -247,6 +260,8 @@ cargo test --workspace   # 132 个测试：单元 + GPU 端到端离屏渲染
 **glTF 动画（旋转方块离屏渲染：正对 → 侧对红色像素锐减）**、
 **骨骼蒙皮（肘关节动画驱动顶点位移：最左像素左移 ≥30px + 蒙皮阴影成片变暗）**、
 **外部 HDR 环境贴图（红/蓝合成全景：画面上下半球主导通道 + 铬球反射上半球）**、
+**2D UI 叠加层（矩形像素精确落地无溢出 + 文本亮像素命中逐位解析预测 ±25% +
+HUD 区域不透 3D 且 HUD 外区域与无 UI 渲染逐像素一致）**、
 **并行调度（原子计数观测真并发 / 读写冲突分批保序 / 独占系统屏障）**、
 glTF 资产管线（内嵌 data-URI 与外部 .bin buffer、metallic/roughness 直通、双相机路径）、
 Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 位模式转换）。
@@ -275,9 +290,10 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 - [x] 骨骼蒙皮动画（GPU LBS + 蒙皮阴影）
 - [x] 外部 HDR 资产加载（equirectangular）
 - [x] 点光阴影（cubemap，首灯 6 面归一化距离）
+- [x] 2D UI 叠加层（HUD：屏幕空间矩形 + 位图字体文本，单批单 draw）
 - [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
 - [ ] wasm32 Web 目标端到端验证
-- [ ] 音频与 2D 叠加层（UI）
+- [ ] 音频（2D UI 叠加层已交付）
 - [ ] 实例缓冲 GPU 持久化与增量更新
 
 ## License
