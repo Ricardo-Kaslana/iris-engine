@@ -195,7 +195,8 @@ iris-engine/
 │   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 示例
 │   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / scene_snapshot / particle_snapshot / web（wasm 专用入口，见「Web 构建」）
 │   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
-│   └── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
+│   ├── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
+│   └── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -325,8 +326,10 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 ## 用 Iris 做的游戏
 
 引擎的「真实用户」验证——只用公开 API（`iris-engine` 门面 + glam）拼完整游戏，
-**引擎侧零改动**。两作递进：Iris Collect 验证「能不能拼出来」，Iris Arena
-压榨「蒙皮动画 × 对象池 × 弹道 × 多游戏状态」的高强度真实用法。
+**引擎侧零改动**。三作递进：Iris Collect 验证「能不能拼出来」，Iris Arena
+压榨「蒙皮动画 × 对象池 × 弹道 × 多游戏状态」的高强度真实用法，Iris Bastion
+把 R21–R25 的五个新能力（射线拾取 / 蒙皮剔除统计 / 透明材质 / 粒子 / 空间
+音频）当载荷整体压榨一轮。
 
 ### I. Iris Collect（`crates/iris-game`）——第三人称限时收集
 
@@ -408,10 +411,46 @@ cargo run -p iris-arena --release   # 玩游戏（WASD 移动 / Shift 冲刺 / �
 cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏验收图
 ```
 
+### III. Iris Bastion（`crates/iris-bastion`）——俯视塔防
+
+**Dogfooding III**——俯视固定视角塔防：敌人沿 7 段 6 弯的航点折线进攻路径
+末端的核心，玩家用击杀所得积分在 20×14 的 1×1 m 网格上放塔——**哨兵**
+（速射单体，快速弹扫掠命中）与**臼炮**（慢速弹抛射、落点 AOE 半径 1.4 m）
+两种塔、疾行虫 / 重甲兽两种敌人、5 波递增，全清获胜、核心 10 HP 归零告负。
+放塔校验（界内 / 空格 / 积分够）是单独导出的纯函数，幽灵预览据此实时
+红蓝着色。
+
+本作把 R21–R25 的五个新能力当载荷压榨：**鼠标拾取（R21）**——`cursor_
+position()` 像素 → NDC → 相机 vp 逆 → 世界射线 → `raycast` 打地面静态
+Collider → 网格（刻意走引擎查询而非解析平面）；**透明材质（R23）**——
+幽灵塔身 `AlphaMode::Blend` 可放蓝 / 不可放红 + 半透明射程指示盘；
+**粒子（R24）**——枪口闪光 / 命中火花 / 死亡爆炸 / 漏怪告警四类 burst 挂
+FX 池槽位按需触发；**空间音频（R25）**——开火 / 命中 / 爆炸 / 死亡 / 漏怪
+五种程序化音效 `play_spatial` 定位到事件世界坐标，听者每帧跟随俯视相机。
+逻辑侧事件自带世界坐标（`BastionEvent`），表现层零反查。塔 / 敌 / 双弹 /
+FX 四池启动预热，运行期零 spawn / despawn（池守恒由测试守护）。纯逻辑核心
+（`logic.rs`，只 glam、零引擎依赖）含扫掠弹道命中、路径进度索敌（射程内
+**打最靠前**）、航点匀速推进、波次间歇与逐位确定性；headless 集成测试里的
+**脚本化自动玩家**经鼠标点击全链路放塔，真实模拟跑完 5 波**获胜且核心无
+损**（经济 / 索敌闭环可玩的量化证据）。
+
+![塔防中期战局验收](docs/bastion.png)
+
+实测（`docs/bastion.png`，640×360 离屏单帧）：四塔就位（哨兵压西段 / 臼炮
+守弯口）、第 1 波敌群在途（橙色疾行虫沿航点推进）、击杀爆炸粒子在扩散、
+幽灵预览（臼炮形态 + 射程盘）悬停待放格、HUD（CREDITS / WAVE 1/5 /
+CORE HP / 建造提示）完整；该帧 `culled_instances = 8`（界外岩柱全部被视锥
+剔除——剔除在真实场景生效的量化证据）。
+
+```sh
+cargo run -p iris-bastion --release                  # 玩游戏（鼠标选格 / 左键放塔 / 1·2·右键换塔种）
+cargo run -p iris-bastion --example bastion_snapshot --release   # 中期战局离屏验收帧
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 337 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 376 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

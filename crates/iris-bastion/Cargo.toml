@@ -1,0 +1,19 @@
+[package]
+name = "iris-bastion"
+description = "Iris 引擎下游示范游戏 III：Iris Bastion 塔防（dogfooding III——物理射线拾取 × 透明材质 × 粒子 × 空间音频的高强度真实用法）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# 依赖方向：iris-bastion 与 iris-game / iris-arena 同为引擎最下游消费者
+# （用户视角）。除 glam（logic.rs 的纯数学核心）外只允许依赖引擎门面
+# iris-engine（iris-core 用于 Collider / raycast / Resource 等引擎类型的
+# 接入实现）。
+[dependencies]
+iris-core = { workspace = true }
+iris-engine = { workspace = true }
+glam = { workspace = true }
+# 场景 / 资产加载失败的 log 告警（log 已在全 workspace 依赖树内，无新 crate）
+log = { workspace = true }

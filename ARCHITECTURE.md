@@ -24,6 +24,7 @@ iris-render ───────┘               │
 iris-engine（门面，用户唯一入口）────┘
     ↑
 iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
+          └── iris-bastion（下游示范游戏 III）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -54,6 +55,17 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   俯视玩法垂直方向无需引擎参与），插件层 Startup 把场景 `Collider` 一次性
   转换为逻辑形状、Update 每帧零查询；音效由逻辑侧单调事件计数器的差分触发。
   第二轮撞到的 API 摩擦与绕行见 §8.13。
+- **iris-bastion**：与 iris-game / iris-arena 同层的第三作（示范游戏
+  Iris Bastion，俯视塔防）——同一依赖纪律（iris-engine 门面 + glam），
+  把 R21–R25 的五个新能力当载荷压榨：`raycast` 屏幕射线拾取（像素 →
+  NDC → vp 逆 → 世界射线打地面静态 Collider，刻意走引擎查询而非解析
+  平面）、`AlphaMode::Blend` 幽灵预览（红蓝着色 + 射程盘）、粒子 FX 池
+  （发射器挂槽位、按需覆写触发）、`play_spatial` 事件定位音效（逻辑侧
+  事件 `BastionEvent` 自带世界坐标）+ 听者跟随相机。纯逻辑核心（只 glam）
+  含放塔校验纯函数（界内 / 空格 / 积分三分支单独导出）、扫掠弹道命中、
+  路径进度索敌（打最靠前）、航点匀速推进与逐位确定性；塔 / 敌 / 双弹 /
+  FX 四池启动预热零运行期 spawn。headless 自动玩家经鼠标点击全链路放塔、
+  真实模拟 5 波全清获胜（经济 / 索敌闭环量化验证）。
 
 ## 3. ECS 设计（iris-core）
 
