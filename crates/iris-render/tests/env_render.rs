@@ -22,16 +22,22 @@ fn scene(env_intensity: f32) -> World {
         ambient: Vec3::splat(0.02),
         ..DirectionalLight::default()
     });
-    world.insert_resource(EnvironmentSettings { intensity: env_intensity });
+    world.insert_resource(EnvironmentSettings {
+        intensity: env_intensity,
+    });
 
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(1.0, 48, 24));
-    let chrome =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::metal(0.95, 0.95, 0.98, 0.05));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(1.0, 48, 24));
+    let chrome = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::metal(0.95, 0.95, 0.98, 0.05));
     world.spawn((Transform::from_xyz(0.0, 1.0, 0.0), sphere, chrome));
 
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(40.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.25, 0.25, 0.25, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.25, 0.25, 0.25, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     {
@@ -67,8 +73,11 @@ fn ibl_reflects_sky_on_chrome() {
     for y in h / 4..h * 3 / 4 {
         for x in w / 4..w * 3 / 4 {
             let i = ((y * w + x) * 4) as usize;
-            let (r, g, b) =
-                (with_ibl[i] as i32, with_ibl[i + 1] as i32, with_ibl[i + 2] as i32);
+            let (r, g, b) = (
+                with_ibl[i] as i32,
+                with_ibl[i + 1] as i32,
+                with_ibl[i + 2] as i32,
+            );
             let (r0, g0, b0) = (
                 without_ibl[i] as i32,
                 without_ibl[i + 1] as i32,

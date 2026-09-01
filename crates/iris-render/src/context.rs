@@ -39,12 +39,10 @@ impl Gpu {
             .await
             .ok()?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("iris.gpu"),
-                    ..Default::default()
-                },
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("iris.gpu"),
+                ..Default::default()
+            })
             .await
             .ok()?;
         let info = adapter.get_info();
@@ -60,7 +58,12 @@ impl Gpu {
                 _ => "未知",
             }
         );
-        Some(Self { instance, adapter, device, queue })
+        Some(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
     }
 
     /// 同步初始化 GPU 上下文（native 专用）：pollster 阻塞等待请求完成。
@@ -93,7 +96,9 @@ impl Gpu {
     /// （打印「无 GPU」退出），符合「web 只需编译可用」的定位。
     #[cfg(target_arch = "wasm32")]
     pub fn offscreen() -> Option<Self> {
-        log::warn!("Web 目标无离屏渲染路径（GPU 请求为异步 Promise，读回依赖不可用的 std::fs），返回 None");
+        log::warn!(
+            "Web 目标无离屏渲染路径（GPU 请求为异步 Promise，读回依赖不可用的 std::fs），返回 None"
+        );
         None
     }
 }

@@ -35,7 +35,10 @@ impl Entity {
 
     /// 从 `to_bits` 的结果还原实体。
     pub fn from_bits(bits: u64) -> Self {
-        Self { index: bits as u32, generation: (bits >> 32) as u32 }
+        Self {
+            index: bits as u32,
+            generation: (bits >> 32) as u32,
+        }
     }
 }
 

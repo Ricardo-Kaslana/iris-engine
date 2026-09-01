@@ -24,12 +24,11 @@
 
 use std::time::Duration;
 
-use iris_core::physics::{detect_pair, ColliderShape};
+use iris_core::physics::{ColliderShape, detect_pair};
 use iris_core::prelude::{Entity, Stage, Time, Transform, Vec3};
 use iris_engine::prelude::{
-    App, Camera, Collider, DirectionalLight, HierarchyPlugin, MaterialDef, MaterialStore,
-    MeshData, MeshStore, OffscreenRenderer, PhysicsPlugin, Plugin, PointLight, RigidBody,
-    TextureStore,
+    App, Camera, Collider, DirectionalLight, HierarchyPlugin, MaterialDef, MaterialStore, MeshData,
+    MeshStore, OffscreenRenderer, PhysicsPlugin, Plugin, PointLight, RigidBody, TextureStore,
 };
 
 /// 球数量（规格：8~12）。
@@ -75,7 +74,10 @@ impl Harness {
         app.world.insert_resource(MaterialStore::new());
         app.world.insert_resource(TextureStore::new());
         app.world.insert_resource(Camera::default());
-        app.world.insert_resource(DirectionalLight { intensity: 1.0, ..DirectionalLight::default() });
+        app.world.insert_resource(DirectionalLight {
+            intensity: 1.0,
+            ..DirectionalLight::default()
+        });
         // 暖色主点光（cubemap 阴影）：球体在台面与地面上投出柔和阴影
         app.world.spawn((
             Transform::from_xyz(-4.0, 7.5, 6.0),
@@ -91,16 +93,30 @@ impl Harness {
         PhysicsPlugin.build(&mut app);
         HierarchyPlugin.build(&mut app);
 
-        let mut harness = Self { app, balls: Vec::new() };
+        let mut harness = Self {
+            app,
+            balls: Vec::new(),
+        };
         harness.build_scene();
         harness
     }
 
     fn build_scene(&mut self) {
-        let sphere_mesh =
-            self.app.world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(1.0, 32, 16));
-        let cube_mesh = self.app.world.resource_mut::<MeshStore>().add(MeshData::cube());
-        let plane_mesh = self.app.world.resource_mut::<MeshStore>().add(MeshData::plane(60.0));
+        let sphere_mesh = self
+            .app
+            .world
+            .resource_mut::<MeshStore>()
+            .add(MeshData::uv_sphere(1.0, 32, 16));
+        let cube_mesh = self
+            .app
+            .world
+            .resource_mut::<MeshStore>()
+            .add(MeshData::cube());
+        let plane_mesh = self
+            .app
+            .world
+            .resource_mut::<MeshStore>()
+            .add(MeshData::plane(60.0));
 
         // ---- 地面：视觉 plane + 物理静态 AABB（顶面 y = 0）----
         let mat_ground = self
@@ -108,7 +124,9 @@ impl Harness {
             .world
             .resource_mut::<MaterialStore>()
             .add(MaterialDef::solid(0.17, 0.17, 0.19, 1.0));
-        self.app.world.spawn((Transform::IDENTITY, plane_mesh, mat_ground));
+        self.app
+            .world
+            .spawn((Transform::IDENTITY, plane_mesh, mat_ground));
         self.app.world.spawn((
             Transform::from_xyz(0.0, -1.0, 0.0),
             Collider::static_box(Vec3::new(30.0, 1.0, 30.0)),
@@ -123,13 +141,18 @@ impl Harness {
             .resource_mut::<MaterialStore>()
             .add(MaterialDef::solid(0.42, 0.3, 0.22, 1.0));
         self.app.world.spawn((
-            Transform { position: table_pos, scale: table_half, ..Transform::IDENTITY },
+            Transform {
+                position: table_pos,
+                scale: table_half,
+                ..Transform::IDENTITY
+            },
             cube_mesh,
             mat_table,
         ));
-        self.app
-            .world
-            .spawn((Transform::from_translation(table_pos), Collider::static_box(table_half)));
+        self.app.world.spawn((
+            Transform::from_translation(table_pos),
+            Collider::static_box(table_half),
+        ));
 
         // ---- 10 颗刚体球：restitution 0.2..0.9 均布，高度与抖动伪随机 ----
         // 2 行 × 5 列的确定性网格 + 小抖动：水平间距 2.2 保证初始互不重叠
@@ -146,13 +169,12 @@ impl Harness {
             [0.82, 0.30, 0.62],
             [0.88, 0.88, 0.92],
         ];
-        for i in 0..BALL_COUNT {
+        for (i, color) in colors.iter().enumerate() {
             let x = -4.4 + (i % 5) as f32 * 2.2 + (rng.next_f32() - 0.5) * 0.8;
             let z = (if i < 5 { -1.1 } else { 1.1 }) + (rng.next_f32() - 0.5) * 0.8;
             let y = 3.5 + rng.next_f32() * 3.0;
             let radius = 0.35 + rng.next_f32() * 0.2;
             let restitution = 0.2 + 0.7 * (i as f32 / (BALL_COUNT - 1) as f32);
-            let color = colors[i];
             let mat = self
                 .app
                 .world
@@ -168,7 +190,11 @@ impl Harness {
                 mat,
                 Collider::dynamic_sphere(radius, restitution),
                 // 线性阻尼 1.5 + 摩擦 0.6：3 秒内把弹跳能量耗散到近似静止
-                RigidBody { friction: 0.6, linear_damping: 1.5, ..RigidBody::default() },
+                RigidBody {
+                    friction: 0.6,
+                    linear_damping: 1.5,
+                    ..RigidBody::default()
+                },
             ));
             self.balls.push((entity, radius));
         }
@@ -187,7 +213,9 @@ impl Harness {
             .resource_mut::<Time>()
             .advance(Duration::from_secs_f64(1.0 / 60.0));
         self.app.schedule.run(Stage::Update, &mut self.app.world);
-        self.app.schedule.run(Stage::PostUpdate, &mut self.app.world);
+        self.app
+            .schedule
+            .run(Stage::PostUpdate, &mut self.app.world);
     }
 
     fn frames(&mut self, count: usize) {
@@ -201,7 +229,14 @@ impl Harness {
         self.balls
             .iter()
             .map(|&(entity, radius)| {
-                (self.app.world.get::<Transform>(entity).expect("球应有 Transform").position, radius)
+                (
+                    self.app
+                        .world
+                        .get::<Transform>(entity)
+                        .expect("球应有 Transform")
+                        .position,
+                    radius,
+                )
             })
             .collect()
     }
@@ -219,7 +254,9 @@ fn main() {
     // ---- 时刻一：t = 0.3 s（18 步）——球群半空中 ----
     harness.frames(18);
     renderer.render(&harness.app.world);
-    renderer.save_bmp("iris_physics_midair.bmp").expect("写 BMP");
+    renderer
+        .save_bmp("iris_physics_midair.bmp")
+        .expect("写 BMP");
 
     // ---- 推进到 t = 3 s（共 180 步 @ 60Hz）----
     harness.frames(162);
@@ -227,8 +264,12 @@ fn main() {
     // ---- headless 终态断言（与离屏渲染同一世界状态）----
     let mut total_speed = 0.0f32;
     for &(entity, _) in &harness.balls {
-        let velocity =
-            harness.app.world.get::<RigidBody>(entity).expect("球应有 RigidBody").velocity;
+        let velocity = harness
+            .app
+            .world
+            .get::<RigidBody>(entity)
+            .expect("球应有 RigidBody")
+            .velocity;
         total_speed += velocity.length();
     }
     let states = harness.ball_states();
@@ -251,10 +292,16 @@ fn main() {
         // 球-静态体不穿透（地面 AABB 顶面 y = 0、台面 AABB 顶面 y = 2）
         let ground = (
             Vec3::new(0.0, -1.0, 0.0),
-            ColliderShape::Box { half_extents: Vec3::new(30.0, 1.0, 30.0) },
+            ColliderShape::Box {
+                half_extents: Vec3::new(30.0, 1.0, 30.0),
+            },
         );
-        let table =
-            (Vec3::new(2.0, 1.0, 0.0), ColliderShape::Box { half_extents: Vec3::new(3.0, 1.0, 3.0) });
+        let table = (
+            Vec3::new(2.0, 1.0, 0.0),
+            ColliderShape::Box {
+                half_extents: Vec3::new(3.0, 1.0, 3.0),
+            },
+        );
         for (pos, shape) in [ground, table] {
             if let Some(contact) =
                 detect_pair(pa, &ColliderShape::Sphere { radius: ra }, pos, &shape)
@@ -280,5 +327,7 @@ fn main() {
     renderer.save_bmp("iris_physics_rest.bmp").expect("写 BMP");
 
     println!("已输出 iris_physics_midair.bmp / iris_physics_rest.bmp");
-    println!("拼图：ffmpeg -y -i iris_physics_midair.bmp -i iris_physics_rest.bmp -filter_complex hstack docs/physics_preview.png");
+    println!(
+        "拼图：ffmpeg -y -i iris_physics_midair.bmp -i iris_physics_rest.bmp -filter_complex hstack docs/physics_preview.png"
+    );
 }

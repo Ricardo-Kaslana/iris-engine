@@ -107,16 +107,28 @@ fn setup(world: &mut World) {
     // ---- HUD（与 ui_snapshot 同款：标题 + 血条）----
     // 屏幕像素坐标按 1280×720 窗口布设（web 画布初始尺寸同 DefaultPlugins）
     world.spawn((
-        UiRect { position: [24.0, 20.0], size: [0.0, 0.0] },
-        UiText { string: "IRIS WEB".into(), scale: 4.0 },
+        UiRect {
+            position: [24.0, 20.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "IRIS WEB".into(),
+            scale: 4.0,
+        },
         UiColor::default(),
     ));
     world.spawn((
-        UiRect { position: [24.0, 76.0], size: [250.0, 26.0] },
+        UiRect {
+            position: [24.0, 76.0],
+            size: [250.0, 26.0],
+        },
         UiColor([0.04, 0.04, 0.06, 0.85]),
     ));
     world.spawn((
-        UiRect { position: [27.0, 79.0], size: [180.0, 20.0] },
+        UiRect {
+            position: [27.0, 79.0],
+            size: [180.0, 20.0],
+        },
         UiColor([0.90, 0.15, 0.15, 1.0]),
     ));
 }

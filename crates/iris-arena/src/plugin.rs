@@ -47,8 +47,8 @@ use iris_core::prelude::{Access, Entity, Name, Schedule, Stage};
 use iris_engine::prelude::*;
 
 use crate::logic::{
-    ArenaInput, ArenaState, EnemyState, Phase, ProjectileState, StaticShape, ENEMY_HIT_FLASH,
-    MAX_ENEMIES, MAX_PROJECTILES, PLAYER_MAX_HP,
+    ArenaInput, ArenaState, ENEMY_HIT_FLASH, EnemyState, MAX_ENEMIES, MAX_PROJECTILES,
+    PLAYER_MAX_HP, Phase, ProjectileState, StaticShape,
 };
 
 /// 默认关卡文件（仓库相对路径，经 [`asset_path`] 解析——CWD 未命中时
@@ -151,7 +151,11 @@ impl EnemyPool {
     /// 以现成槽位建池（全部视为闲置）。
     fn new(slots: Vec<Entity>) -> Self {
         let free = slots.clone();
-        Self { slots, free, active: Vec::new() }
+        Self {
+            slots,
+            free,
+            active: Vec::new(),
+        }
     }
 
     /// 活跃映射（id → 实体，配对稳定）。
@@ -166,7 +170,10 @@ impl EnemyPool {
 
     /// 按逻辑 id 取槽位实体（未取用 → `None`）。
     pub fn entity_of(&self, id: u32) -> Option<Entity> {
-        self.active.iter().find(|(active_id, _)| *active_id == id).map(|(_, e)| *e)
+        self.active
+            .iter()
+            .find(|(active_id, _)| *active_id == id)
+            .map(|(_, e)| *e)
     }
 
     /// 为逻辑 id 取一个闲置槽位；池空返回 `None`（不超发）。
@@ -181,7 +188,10 @@ impl EnemyPool {
 
     /// 归还逻辑 id 的槽位（未取用 → `None`）。
     pub fn release(&mut self, id: u32) -> Option<Entity> {
-        let index = self.active.iter().position(|(active_id, _)| *active_id == id)?;
+        let index = self
+            .active
+            .iter()
+            .position(|(active_id, _)| *active_id == id)?;
         let (_, entity) = self.active.swap_remove(index);
         self.free.push(entity);
         Some(entity)
@@ -192,7 +202,11 @@ impl ProjectilePool {
     /// 以现成槽位建池（全部视为闲置）。
     fn new(slots: Vec<Entity>) -> Self {
         let free = slots.clone();
-        Self { slots, free, active: Vec::new() }
+        Self {
+            slots,
+            free,
+            active: Vec::new(),
+        }
     }
 
     /// 活跃映射（id → 实体，配对稳定）。
@@ -207,7 +221,10 @@ impl ProjectilePool {
 
     /// 按逻辑 id 取槽位实体（未取用 → `None`）。
     pub fn entity_of(&self, id: u32) -> Option<Entity> {
-        self.active.iter().find(|(active_id, _)| *active_id == id).map(|(_, e)| *e)
+        self.active
+            .iter()
+            .find(|(active_id, _)| *active_id == id)
+            .map(|(_, e)| *e)
     }
 
     /// 为逻辑 id 取一个闲置槽位；池空返回 `None`（不超发）。
@@ -222,7 +239,10 @@ impl ProjectilePool {
 
     /// 归还逻辑 id 的槽位（未取用 → `None`）。
     pub fn release(&mut self, id: u32) -> Option<Entity> {
-        let index = self.active.iter().position(|(active_id, _)| *active_id == id)?;
+        let index = self
+            .active
+            .iter()
+            .position(|(active_id, _)| *active_id == id)?;
         let (_, entity) = self.active.swap_remove(index);
         self.free.push(entity);
         Some(entity)
@@ -257,7 +277,10 @@ impl Default for ArenaPlugin {
 impl ArenaPlugin {
     /// 以指定场景文件构造（测试注入 fixture 关卡、示例显式给默认路径）。
     pub fn new(scene_path: impl Into<PathBuf>) -> Self {
-        Self { scene_path: scene_path.into(), ..Self::default() }
+        Self {
+            scene_path: scene_path.into(),
+            ..Self::default()
+        }
     }
 
     /// 把本插件的全部系统注册到调度器。
@@ -382,21 +405,19 @@ fn build_scene(world: &mut World, scene_path: &Path, enemy_model_path: &Path) {
     // 「仅 Collider 无 RigidBody = 静态」与 is_static 取或（引擎缺席语义）；
     // Box 只取 XZ 半边长（俯视玩法垂直方向无碰撞）。
     let mut statics = ArenaStatics::default();
-    world.query::<(&Transform, &Collider, Option<&RigidBody>)>(
-        |(transform, collider, rigid)| {
-            if !collider.is_static && rigid.is_some() {
-                return; // 动态刚体不进竞技场静态表（本关卡也不该有）
-            }
-            let shape = match collider.shape {
-                ColliderShape::Sphere { radius } => StaticShape::Sphere { radius },
-                ColliderShape::Box { half_extents } => StaticShape::Box {
-                    half_x: half_extents.x,
-                    half_z: half_extents.z,
-                },
-            };
-            statics.0.push((transform.position, shape));
-        },
-    );
+    world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
+        if !collider.is_static && rigid.is_some() {
+            return; // 动态刚体不进竞技场静态表（本关卡也不该有）
+        }
+        let shape = match collider.shape {
+            ColliderShape::Sphere { radius } => StaticShape::Sphere { radius },
+            ColliderShape::Box { half_extents } => StaticShape::Box {
+                half_x: half_extents.x,
+                half_z: half_extents.z,
+            },
+        };
+        statics.0.push((transform.position, shape));
+    });
     world.insert_resource(statics);
 
     // ---- 玩家网格与材质（游戏私有，不进场景文件）----
@@ -501,35 +522,59 @@ fn build_scene(world: &mut World, scene_path: &Path, enemy_model_path: &Path) {
 
     // ---- HUD（屏幕像素坐标，文本实体的 UiRect 仅作定位载体）----
     // 文本实体挂 Name：刷新系统按名定位（O(n) 扫描，本场景 n ≈ 30 可忽略）
-    let title = UiText { string: "IRIS ARENA".into(), scale: 3.0 };
+    let title = UiText {
+        string: "IRIS ARENA".into(),
+        scale: 3.0,
+    };
     world.spawn((
         Name(TITLE_TEXT_NAME.into()),
-        UiRect { position: [24.0, 20.0], size: [0.0, 0.0] },
+        UiRect {
+            position: [24.0, 20.0],
+            size: [0.0, 0.0],
+        },
         title,
         UiColor::default(),
     ));
     world.spawn((
         Name(WAVE_TEXT_NAME.into()),
-        UiRect { position: [HUD_WIDTH - text_width(&wave_text(0)) - 24.0, 20.0], size: [0.0, 0.0] },
+        UiRect {
+            position: [HUD_WIDTH - text_width(&wave_text(0)) - 24.0, 20.0],
+            size: [0.0, 0.0],
+        },
         wave_text(0),
         UiColor::default(),
     ));
     world.spawn((
         Name(SCORE_TEXT_NAME.into()),
-        UiRect { position: [24.0, 60.0], size: [0.0, 0.0] },
-        UiText { string: "SCORE 0".into(), scale: 3.0 },
+        UiRect {
+            position: [24.0, 60.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "SCORE 0".into(),
+            scale: 3.0,
+        },
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
     world.spawn((
         Name(COMBO_TEXT_NAME.into()),
-        UiRect { position: [24.0, 100.0], size: [0.0, 0.0] },
-        UiText { string: String::new(), scale: 2.5 },
+        UiRect {
+            position: [24.0, 100.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: String::new(),
+            scale: 2.5,
+        },
         UiColor([1.0, 0.5, 0.15, 1.0]),
     ));
     // HP 条：深底背景条 + 红色前景条（宽度 = hp/max × 条宽，每帧刷新）
     world.spawn((
         Name(HP_BACK_NAME.into()),
-        UiRect { position: [22.0, 152.0], size: [HP_BAR_WIDTH + 4.0, 18.0] },
+        UiRect {
+            position: [22.0, 152.0],
+            size: [HP_BAR_WIDTH + 4.0, 18.0],
+        },
         UiColor([0.08, 0.08, 0.1, 0.9]),
     ));
     world.spawn((
@@ -542,21 +587,37 @@ fn build_scene(world: &mut World, scene_path: &Path, enemy_model_path: &Path) {
     ));
     // 横幅：空串时不产生顶点（对局中不可见）；标题 / 开波 / 终局时居中
     let banner = "PRESS ANY KEY TO START";
-    let banner_width = text_width(&UiText { string: banner.into(), scale: 4.0 });
+    let banner_width = text_width(&UiText {
+        string: banner.into(),
+        scale: 4.0,
+    });
     world.spawn((
         Name(BANNER_TEXT_NAME.into()),
-        UiRect { position: [(HUD_WIDTH - banner_width) * 0.5, 300.0], size: [0.0, 0.0] },
-        UiText { string: banner.into(), scale: 4.0 },
+        UiRect {
+            position: [(HUD_WIDTH - banner_width) * 0.5, 300.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: banner.into(),
+            scale: 4.0,
+        },
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
 
-    world.insert_resource(ArenaEntities { player, player_model, camera });
+    world.insert_resource(ArenaEntities {
+        player,
+        player_model,
+        camera,
+    });
 }
 
 /// WAVE 文本（Title 阶段波次为 0 → 显示占位）。
 fn wave_text(wave: u32) -> UiText {
-    let string =
-        if wave == 0 { "WAVE -".to_string() } else { format!("WAVE {wave}") };
+    let string = if wave == 0 {
+        "WAVE -".to_string()
+    } else {
+        format!("WAVE {wave}")
+    };
     UiText { string, scale: 3.0 }
 }
 
@@ -577,8 +638,7 @@ fn double_beep(sample_rate: u32) -> AudioClip {
     let gap = (GAP * sample_rate as f32) as usize;
     let silence =
         AudioClip::from_interleaved(vec![0.0; gap], 1, sample_rate).expect("程序化参数恒合法");
-    AudioClip::concat(&[&tone_a, &silence, &tone_b])
-        .expect("同参数生成的剪辑布局必然一致")
+    AudioClip::concat(&[&tone_a, &silence, &tone_b]).expect("同参数生成的剪辑布局必然一致")
 }
 
 /// Update 1：读输入与时间 → 推进纯逻辑 → 差分事件计数触发音效。
@@ -596,15 +656,12 @@ fn run_arena(world: &World) {
     let input = world
         .try_resource::<Input>()
         .map(|keys| {
-            let move_x =
-                (keys.key(KeyCode::KeyD) as i32 - keys.key(KeyCode::KeyA) as i32) as f32;
-            let move_z =
-                (keys.key(KeyCode::KeyS) as i32 - keys.key(KeyCode::KeyW) as i32) as f32;
+            let move_x = (keys.key(KeyCode::KeyD) as i32 - keys.key(KeyCode::KeyA) as i32) as f32;
+            let move_z = (keys.key(KeyCode::KeyS) as i32 - keys.key(KeyCode::KeyW) as i32) as f32;
             ArenaInput {
                 move_x,
                 move_z,
-                dash: keys.key_pressed(KeyCode::ShiftLeft)
-                    || keys.key_pressed(KeyCode::ShiftRight),
+                dash: keys.key_pressed(KeyCode::ShiftLeft) || keys.key_pressed(KeyCode::ShiftRight),
                 // 任意键：Input::any_key_pressed（引擎 API 打磨 II 闭合——
                 // 旧 8 键白名单会漏掉白名单外的按键，玩家卡在标题屏）
                 confirm: keys.any_key_pressed(),
@@ -643,9 +700,10 @@ fn run_arena(world: &World) {
     if events == (0, 0, 0, 0, false) {
         return;
     }
-    if let (Some(assets), Some(audio)) =
-        (world.try_resource::<ArenaAssets>(), world.try_resource::<Audio>())
-    {
+    if let (Some(assets), Some(audio)) = (
+        world.try_resource::<ArenaAssets>(),
+        world.try_resource::<Audio>(),
+    ) {
         if events.0 > 0 {
             audio.play(assets.shoot.clone(), 0.22, false);
         }
@@ -694,7 +752,11 @@ fn update_arena_visuals(world: &World) {
         let blink = state.phase == Phase::Playing
             && state.player.invuln > 0.0
             && (elapsed * PLAYER_INVULN_BLINK_HZ) as u32 % 2 == 1;
-        *visibility = if blink { Visibility::HIDDEN } else { Visibility::VISIBLE };
+        *visibility = if blink {
+            Visibility::HIDDEN
+        } else {
+            Visibility::VISIBLE
+        };
     }
 
     // ---- 敌人池：先归还（退场槽位翻回隐藏），再取用（同帧「旧波退场 +
@@ -827,12 +889,17 @@ fn update_arena_hud(world: &World) {
     if let Some(entity) = world.entity_named(BANNER_TEXT_NAME) {
         // 横幅文案按优先级：终局 > 标题 > 开波倒计时 > 空
         let (banner, color): (String, [f32; 4]) = match state.phase {
-            Phase::GameOver => {
-                ("GAME OVER - PRESS R TO RESTART".to_string(), [1.0, 0.3, 0.25, 1.0])
-            }
+            Phase::GameOver => (
+                "GAME OVER - PRESS R TO RESTART".to_string(),
+                [1.0, 0.3, 0.25, 1.0],
+            ),
             Phase::Title => ("PRESS ANY KEY TO START".to_string(), [1.0, 0.85, 0.3, 1.0]),
             Phase::Playing if state.breather > 0.0 => (
-                format!("WAVE {} IN {}...", state.wave + 1, state.breather.ceil() as i32),
+                format!(
+                    "WAVE {} IN {}...",
+                    state.wave + 1,
+                    state.breather.ceil() as i32
+                ),
                 [0.7, 0.9, 1.0, 1.0],
             ),
             Phase::Playing => (String::new(), [1.0, 0.85, 0.3, 1.0]),
@@ -880,7 +947,10 @@ mod tests {
         assert_eq!(pool.free_count(), 1);
         let reused = pool.acquire(14).expect("归还后应可再取用");
         assert_eq!(reused, b, "栈式闲置表应先归还后进槽位");
-        assert!(pool.release(99).is_none(), "未取用的 id 归还应安全返回 None");
+        assert!(
+            pool.release(99).is_none(),
+            "未取用的 id 归还应安全返回 None"
+        );
         let _ = (a, c);
     }
 }

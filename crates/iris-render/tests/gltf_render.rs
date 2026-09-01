@@ -84,14 +84,21 @@ fn offscreen_renders_gltf_model() {
     let mut world = world_with_stores();
     let spawned = spawn_gltf(&mut world, &path).expect("glTF 应加载成功");
     assert_eq!(spawned.len(), 1);
-    assert_eq!(world.children(spawned[0]).len(), 1, "quad 的 primitive 应为子实体");
+    assert_eq!(
+        world.children(spawned[0]).len(),
+        1,
+        "quad 的 primitive 应为子实体"
+    );
     propagate_transforms(&mut world);
     renderer.render(&world);
     let (w, h) = renderer.size();
     let px = renderer.read_pixels();
     let center = ((h / 2) * w + w / 2) as usize * 4;
     let sky = ((2 * w + 2) as usize) * 4;
-    assert!(!is_background(&px, center, sky), "资源相机下画面中心应是红色 quad");
+    assert!(
+        !is_background(&px, center, sky),
+        "资源相机下画面中心应是红色 quad"
+    );
     // 红色材质：R 通道应显著高于 G/B
     assert!(
         px[center] as i32 - px[center + 1] as i32 > 40
@@ -111,7 +118,10 @@ fn offscreen_renders_gltf_model() {
     let px = renderer.read_pixels();
     let center = ((h / 2) * w + w / 2) as usize * 4;
     let sky = ((2 * w + 2) as usize) * 4;
-    assert!(!is_background(&px, center, sky), "挂载相机下画面中心应是红色 quad");
+    assert!(
+        !is_background(&px, center, sky),
+        "挂载相机下画面中心应是红色 quad"
+    );
     assert!(
         px[center] as i32 - px[center + 1] as i32 > 40,
         "挂载相机路径应看到红色 quad，实际 RGBA {:?}",
@@ -132,7 +142,10 @@ fn gltf_material_roughness_maps_to_shininess() {
     let store = world.resource::<MaterialStore>();
     let material = store.get(MaterialHandle(1)).unwrap();
     assert!((material.roughness - 0.5).abs() < 0.01);
-    assert!((material.metallic - 1.0).abs() < 0.01, "glTF 默认金属度为 1.0");
+    assert!(
+        (material.metallic - 1.0).abs() < 0.01,
+        "glTF 默认金属度为 1.0"
+    );
     assert_eq!(material.base_color, [0.9, 0.1, 0.1, 1.0]);
 }
 
@@ -164,7 +177,10 @@ fn offscreen_renders_repository_cube_asset() {
     let px = renderer.read_pixels();
     let center = ((h / 2) * w + w / 2) as usize * 4;
     let sky = ((2 * w + 2) as usize) * 4;
-    assert!(!is_background(&px, center, sky), "画面中心应是仓库立方体资产");
+    assert!(
+        !is_background(&px, center, sky),
+        "画面中心应是仓库立方体资产"
+    );
     // 材质 baseColorFactor [0.92, 0.48, 0.18]：橙色 → R 明显高于 B
     assert!(
         px[center] as i32 - px[center + 2] as i32 > 30,

@@ -20,13 +20,16 @@ fn scene() -> World {
 
     // 悬浮立方体（在地面上方，必然向地面投影）
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
-    let mat = world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.9, 0.3, 0.1, 1.0));
+    let mat = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.9, 0.3, 0.1, 1.0));
     world.spawn((Transform::from_xyz(0.0, 1.5, 0.0), cube, mat));
 
     // 地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(40.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     propagate_transforms(&mut world);
@@ -61,9 +64,11 @@ fn shadow_darkens_ground_without_brightening_anything() {
     let mut brightened = 0u32;
     let mut unchanged = 0u32;
     for i in (0..with_shadows.len()).step_by(4) {
-        let sum_on = with_shadows[i] as i32 + with_shadows[i + 1] as i32 + with_shadows[i + 2] as i32;
-        let sum_off =
-            without_shadows[i] as i32 + without_shadows[i + 1] as i32 + without_shadows[i + 2] as i32;
+        let sum_on =
+            with_shadows[i] as i32 + with_shadows[i + 1] as i32 + with_shadows[i + 2] as i32;
+        let sum_off = without_shadows[i] as i32
+            + without_shadows[i + 1] as i32
+            + without_shadows[i + 2] as i32;
         if sum_on < sum_off - 12 {
             darkened += 1;
         } else if sum_on > sum_off + 12 {
@@ -109,5 +114,3 @@ fn shadow_map_covers_scene_range() {
         );
     }
 }
-
-

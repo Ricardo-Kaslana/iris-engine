@@ -16,8 +16,8 @@
 //! - 视锥剔除与实体挂载相机；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
-pub mod asset;
 pub mod animation;
+pub mod asset;
 pub mod camera;
 pub mod context;
 pub mod environment;
@@ -38,30 +38,28 @@ pub mod visibility;
 
 pub mod prelude {
     pub use crate::animation::{
-        update_animations, AnimatedField, AnimationChannel, AnimationClip,
-        AnimationInterpolation, AnimationPath, AnimationPlayer,
+        AnimatedField, AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath,
+        AnimationPlayer, update_animations,
     };
     pub use crate::asset::{
-        load_hdr, spawn_gltf, spawn_gltf_instance, write_glb, GltfError, GltfInstance, HdrError,
-        HdrImage,
+        GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
+        write_glb,
     };
-    pub use crate::camera::{view_from_global, ActiveCamera, Camera};
+    pub use crate::camera::{ActiveCamera, Camera, view_from_global};
     pub use crate::context::Gpu;
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;
-    pub use crate::light::{
-        DirectionalLight, PointLight, POINT_SHADOW_FACES, MAX_POINT_LIGHTS,
-    };
+    pub use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_FACES, PointLight};
     pub use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
-    pub use crate::mesh::{primitives, MeshData, MeshHandle, MeshStore, SkinVertex, Vertex};
+    pub use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex, primitives};
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::post::BloomSettings;
     pub use crate::renderer::{FrameStats, Renderer};
-    pub use crate::skin::{skin_vertex, Skin};
+    pub use crate::skin::{Skin, skin_vertex};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
-    pub use crate::ui::{glyph_bits, text_width, UiColor, UiRect, UiText};
+    pub use crate::ui::{UiColor, UiRect, UiText, glyph_bits, text_width};
     pub use crate::visibility::Visibility;
 }
 

@@ -18,7 +18,10 @@ fn base_world() -> World {
     world.insert_resource(MaterialStore::new());
     world.insert_resource(TextureStore::new());
     world.insert_resource(Camera::default());
-    world.insert_resource(DirectionalLight { shadows: false, ..DirectionalLight::default() });
+    world.insert_resource(DirectionalLight {
+        shadows: false,
+        ..DirectionalLight::default()
+    });
     world.insert_resource(BloomSettings::disabled());
     world
 }
@@ -42,7 +45,10 @@ fn ui_rect_draws_at_pixel_coordinates() {
     };
     let mut world = base_world();
     world.spawn((
-        UiRect { position: [64.0, 64.0], size: [64.0, 64.0] },
+        UiRect {
+            position: [64.0, 64.0],
+            size: [64.0, 64.0],
+        },
         UiColor([1.0, 0.1, 0.1, 1.0]),
     ));
     renderer.render(&world);
@@ -104,8 +110,14 @@ fn ui_text_matches_analytic_bit_prediction() {
         camera.target = Vec3::ZERO;
     }
     world.spawn((
-        UiRect { position: [32.0, 100.0], size: [128.0, 32.0] },
-        UiText { string: "AAAA".into(), scale: 4.0 },
+        UiRect {
+            position: [32.0, 100.0],
+            size: [128.0, 32.0],
+        },
+        UiText {
+            string: "AAAA".into(),
+            scale: 4.0,
+        },
         UiColor::default(),
     ));
     propagate_transforms(&mut world);
@@ -124,7 +136,13 @@ fn ui_text_matches_analytic_bit_prediction() {
             }
         }
     }
-    let predicted = 4 * glyph_bits(b'A').unwrap().iter().map(|b| b.count_ones()).sum::<u32>() * 16;
+    let predicted = 4
+        * glyph_bits(b'A')
+            .unwrap()
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>()
+        * 16;
     assert_eq!(predicted, 1792, "解析预测基准：4 字符 × 28 亮位 × 16 px²");
     assert!(
         (lit as i64 - predicted as i64).abs() <= predicted as i64 / 4,
@@ -155,7 +173,10 @@ fn ui_hud_overlays_3d_without_touching_scene() {
         world.spawn((Transform::IDENTITY, plane, mat_ground));
         if with_hud {
             world.spawn((
-                UiRect { position: [0.0, 224.0], size: [256.0, 32.0] },
+                UiRect {
+                    position: [0.0, 224.0],
+                    size: [256.0, 32.0],
+                },
                 UiColor([0.2, 0.5, 1.0, 1.0]),
             ));
         }
@@ -174,13 +195,20 @@ fn ui_hud_overlays_3d_without_touching_scene() {
     for y in 228..252 {
         for x in 8..248 {
             let i = ((y * w + x) * 4) as usize;
-            let (r, g, b) = (with_hud[i] as i32, with_hud[i + 1] as i32, with_hud[i + 2] as i32);
+            let (r, g, b) = (
+                with_hud[i] as i32,
+                with_hud[i + 1] as i32,
+                with_hud[i + 2] as i32,
+            );
             if b > r + 40 && b > g + 20 {
                 blue += 1;
             }
         }
     }
-    assert_eq!(blue, total, "HUD 条内部应全部蓝主导（不透 3D），实际 {blue}/{total}");
+    assert_eq!(
+        blue, total,
+        "HUD 条内部应全部蓝主导（不透 3D），实际 {blue}/{total}"
+    );
 
     // HUD 外部：与无 UI 渲染一致（±12 和差容差，与既有差分测试同款）
     let mut changed = 0u32;

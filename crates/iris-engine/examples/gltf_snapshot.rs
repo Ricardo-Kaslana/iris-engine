@@ -41,13 +41,19 @@ fn main() {
 
     // 地面 + 彩色点光
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(20.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
-    world.spawn((Transform::from_xyz(2.0, 1.5, 2.0), PointLight::new(Vec3::new(0.4, 0.7, 1.0), 10.0, 10.0)));
+    world.spawn((
+        Transform::from_xyz(2.0, 1.5, 2.0),
+        PointLight::new(Vec3::new(0.4, 0.7, 1.0), 10.0, 10.0),
+    ));
 
     propagate_transforms(&mut world);
     renderer.render(&world);
-    renderer.save_bmp("iris_gltf_preview.bmp").expect("写入 BMP 失败");
+    renderer
+        .save_bmp("iris_gltf_preview.bmp")
+        .expect("写入 BMP 失败");
     println!("已输出 iris_gltf_preview.bmp");
 }

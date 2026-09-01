@@ -76,11 +76,8 @@ mod tests {
     use glam::Vec3;
 
     fn default_frustum() -> Frustum {
-        let view = glam::camera::rh::view::look_at_mat4(
-            Vec3::new(0.0, 0.0, 5.0),
-            Vec3::ZERO,
-            Vec3::Y,
-        );
+        let view =
+            glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
         let proj = glam::camera::rh::proj::directx::perspective(
             std::f32::consts::FRAC_PI_4,
             1.0,
@@ -102,10 +99,7 @@ mod tests {
         let frustum = default_frustum();
         // 相机在 +Z 看向原点：背后是更远的 +Z
         assert!(!frustum.intersects_sphere(Vec3::new(0.0, 0.0, 20.0), 0.5));
-        assert!(!frustum.intersects_aabb(
-            Vec3::new(-0.5, -0.5, 19.5),
-            Vec3::new(0.5, 0.5, 20.5),
-        ));
+        assert!(!frustum.intersects_aabb(Vec3::new(-0.5, -0.5, 19.5), Vec3::new(0.5, 0.5, 20.5),));
     }
 
     #[test]

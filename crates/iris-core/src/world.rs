@@ -126,7 +126,10 @@ impl World {
     /// 可变访问实体的组件（尝试型 RwLock 借用检查，冲突即 panic）。
     pub fn get_mut<C: Component>(&self, entity: Entity) -> Option<RefMut<'_, C>> {
         let store = self.components.borrow_mut::<C>()?;
-        store.get(entity).is_some().then(|| RefMut::new(store, entity))
+        store
+            .get(entity)
+            .is_some()
+            .then(|| RefMut::new(store, entity))
     }
 
     pub fn remove_component<C: Component>(&mut self, entity: Entity) -> Option<C> {
@@ -167,7 +170,10 @@ impl World {
     /// 读取资源；未注册时 panic 并给出类型名。
     pub fn resource<R: Resource>(&self) -> ResourceRef<'_, R> {
         self.try_resource().unwrap_or_else(|| {
-            panic!("资源 {} 未注册，请先 insert_resource", std::any::type_name::<R>())
+            panic!(
+                "资源 {} 未注册，请先 insert_resource",
+                std::any::type_name::<R>()
+            )
         })
     }
 
@@ -177,7 +183,10 @@ impl World {
 
     pub fn resource_mut<R: Resource>(&self) -> ResourceRefMut<'_, R> {
         self.try_resource_mut().unwrap_or_else(|| {
-            panic!("资源 {} 未注册，请先 insert_resource", std::any::type_name::<R>())
+            panic!(
+                "资源 {} 未注册，请先 insert_resource",
+                std::any::type_name::<R>()
+            )
         })
     }
 
@@ -278,9 +287,12 @@ mod tests {
     // derive 宏与同名 trait 分属不同命名空间，可同时导入
     use crate::{Component, Event, Resource};
 
-    #[derive(Component)] struct Position(f32);
-    #[derive(Component)] struct Velocity(f32);
-    #[derive(Debug, PartialEq, Clone, Copy, Event)] struct Message(&'static str);
+    #[derive(Component)]
+    struct Position(f32);
+    #[derive(Component)]
+    struct Velocity(f32);
+    #[derive(Debug, PartialEq, Clone, Copy, Event)]
+    struct Message(&'static str);
 
     fn integrate(world: &mut World) {
         let dt = world.resource::<Time>();
@@ -326,7 +338,10 @@ mod tests {
         schedule.run(Stage::Update, &mut world);
 
         assert_eq!(
-            world.get::<Position>(world.entities().next().unwrap()).unwrap().0,
+            world
+                .get::<Position>(world.entities().next().unwrap())
+                .unwrap()
+                .0,
             1.0
         );
     }
@@ -348,7 +363,10 @@ mod tests {
         let mut world = World::new();
         // 未注册：返回 false 且不可读出
         assert!(!world.try_send_event(Message("lost")));
-        assert!(world.try_events::<Message>().is_none(), "未注册类型不应被自动注册");
+        assert!(
+            world.try_events::<Message>().is_none(),
+            "未注册类型不应被自动注册"
+        );
 
         // 注册后：返回 true 且可读出
         world.register_event::<Message>();
@@ -371,7 +389,11 @@ mod tests {
         }
 
         let mut schedule = Schedule::new();
-        schedule.add_parallel_system(Stage::Update, crate::prelude::Access::new(), parallel_sender);
+        schedule.add_parallel_system(
+            Stage::Update,
+            crate::prelude::Access::new(),
+            parallel_sender,
+        );
         schedule.run(Stage::Update, &mut world);
         assert_eq!(world.events::<Message>().len(), 1);
     }

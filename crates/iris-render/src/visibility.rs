@@ -37,8 +37,9 @@ mod tests {
 
     #[test]
     fn constants_and_default() {
-        assert!(Visibility::VISIBLE.visible);
-        assert!(!Visibility::HIDDEN.visible);
+        // 常量断言放进 const 块：编译期求值（clippy::assertions_on_constants）
+        const { assert!(Visibility::VISIBLE.visible) };
+        const { assert!(!Visibility::HIDDEN.visible) };
         assert_eq!(Visibility::default(), Visibility::VISIBLE, "默认可见");
     }
 }

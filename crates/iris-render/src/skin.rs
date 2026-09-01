@@ -40,7 +40,10 @@ impl Skin {
             "关节数量与逆绑定矩阵数量必须一致"
         );
         assert!(!joints.is_empty(), "蒙皮至少需要一个关节");
-        Self { joints, inverse_bind_matrices }
+        Self {
+            joints,
+            inverse_bind_matrices,
+        }
     }
 
     /// 关节这一帧的蒙皮矩阵：`J_i = inv(mesh) × global(joint_i) × ibm_i`。
@@ -128,7 +131,11 @@ mod tests {
         );
         // 顶点在 bind 姿势下不动
         let p = skin_vertex([0.3, 1.7, -0.4], [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0], &mats);
-        assert!(p.iter().zip([0.3, 1.7, -0.4]).all(|(a, b)| (a - b).abs() < 1e-5));
+        assert!(
+            p.iter()
+                .zip([0.3, 1.7, -0.4])
+                .all(|(a, b)| (a - b).abs() < 1e-5)
+        );
     }
 
     /// 单关节旋转 90°：权重 1 的顶点应随关节刚体旋转。
@@ -141,10 +148,19 @@ mod tests {
         propagate_transforms(&mut world);
         let skin = Skin::new(vec![joint], vec![Mat4::IDENTITY]);
         let mut mats = Vec::new();
-        skin.joint_matrices(&world, world.get::<GlobalTransform>(mesh).unwrap().matrix(), &mut mats);
+        skin.joint_matrices(
+            &world,
+            world.get::<GlobalTransform>(mesh).unwrap().matrix(),
+            &mut mats,
+        );
         // (1, 0, 0) → (0, 0, -1)
         let p = skin_vertex([1.0, 0.0, 0.0], [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0], &mats);
-        assert!(p.iter().zip([0.0, 0.0, -1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "实际 {p:?}");
+        assert!(
+            p.iter()
+                .zip([0.0, 0.0, -1.0])
+                .all(|(a, b)| (a - b).abs() < 1e-5),
+            "实际 {p:?}"
+        );
     }
 
     /// 两关节各 0.5 权重：结果为两个变换的线性混合（LBS 的定义性特征）。
@@ -158,7 +174,12 @@ mod tests {
         let mut mats = Vec::new();
         skin.joint_matrices(&world, Mat4::IDENTITY, &mut mats);
         let p = skin_vertex([0.0, 0.0, 0.0], [0, 1, 0, 0], [0.5, 0.5, 0.0, 0.0], &mats);
-        assert!(p.iter().zip([0.0, 1.0, 0.0]).all(|(a, b)| (a - b).abs() < 1e-5), "实际 {p:?}");
+        assert!(
+            p.iter()
+                .zip([0.0, 1.0, 0.0])
+                .all(|(a, b)| (a - b).abs() < 1e-5),
+            "实际 {p:?}"
+        );
     }
 
     /// 关节层级：父关节旋转必须通过 GlobalTransform 传播带动子关节。
@@ -214,7 +235,10 @@ mod tests {
         let skin = Skin::new(vec![joint], vec![bind.inverse()]);
         let mut mats = Vec::new();
         skin.joint_matrices(&world, Mat4::IDENTITY, &mut mats);
-        assert!(mats[0].abs_diff_eq(Mat4::IDENTITY, 1e-5), "失效关节应退化为 bind 姿势");
+        assert!(
+            mats[0].abs_diff_eq(Mat4::IDENTITY, 1e-5),
+            "失效关节应退化为 bind 姿势"
+        );
     }
 
     /// 平铺矩阵组装：列主序 16 floats ↔ Mat4。

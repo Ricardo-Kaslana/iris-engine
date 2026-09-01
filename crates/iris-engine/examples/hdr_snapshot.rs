@@ -37,14 +37,18 @@ fn main() {
     // 外部 HDR 天空源：generation 失效机制让渲染器首帧即重烘 IBL
     world.insert_resource(SkySource::equirect_hdr(image));
 
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(1.0, 48, 24));
-    let chrome =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::metal(0.95, 0.95, 0.98, 0.05));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(1.0, 48, 24));
+    let chrome = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::metal(0.95, 0.95, 0.98, 0.05));
     world.spawn((Transform::from_xyz(0.0, 1.0, 0.0), sphere, chrome));
 
     let ground = world.resource_mut::<MeshStore>().add(MeshData::plane(40.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.25, 0.25, 0.25, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.25, 0.25, 0.25, 1.0));
     world.spawn((Transform::IDENTITY, ground, mat_ground));
 
     {

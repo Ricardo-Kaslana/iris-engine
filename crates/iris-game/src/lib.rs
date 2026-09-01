@@ -29,10 +29,10 @@ pub mod logic;
 pub mod plugin;
 
 pub use logic::{
-    GameState, MoveInput, Phase, PickupState, PlayerState, GRAVITY, GROUND_Y, JUMP_SPEED,
-    MOVE_SPEED, PICKUP_MAX_Y, PICKUP_RADIUS,
+    GRAVITY, GROUND_Y, GameState, JUMP_SPEED, MOVE_SPEED, MoveInput, PICKUP_MAX_Y, PICKUP_RADIUS,
+    Phase, PickupState, PlayerState,
 };
 pub use plugin::{
-    Coin, GameAssets, GameEntities, GamePlugin, BANNER_TEXT_NAME, DEFAULT_SCENE_PATH,
-    DURATION_SECS, SCORE_TEXT_NAME, TIME_TEXT_NAME,
+    BANNER_TEXT_NAME, Coin, DEFAULT_SCENE_PATH, DURATION_SECS, GameAssets, GameEntities,
+    GamePlugin, SCORE_TEXT_NAME, TIME_TEXT_NAME,
 };

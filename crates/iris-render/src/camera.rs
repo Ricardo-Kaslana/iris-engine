@@ -1,8 +1,8 @@
 //! 透视相机：资源形态（全局唯一）与实体挂载形态（可跟随实体运动）。
 
 use glam::{Mat4, Vec3};
-use iris_core::prelude::GlobalTransform;
 use iris_core::Resource;
+use iris_core::prelude::GlobalTransform;
 
 #[derive(Clone, Debug, Resource)]
 pub struct Camera {
@@ -105,7 +105,10 @@ mod tests {
         let camera = Camera::default();
         let vp = camera.view_proj(16.0 / 9.0);
         let clip = vp * camera.target.extend(1.0);
-        assert!(clip.x.abs() < 1e-5 && clip.y.abs() < 1e-5, "注视点应投影到屏幕中心");
+        assert!(
+            clip.x.abs() < 1e-5 && clip.y.abs() < 1e-5,
+            "注视点应投影到屏幕中心"
+        );
         assert!(clip.w > 0.0, "注视点应在相机前方");
     }
 
@@ -125,7 +128,10 @@ mod tests {
         // 前方 1 米处的点应位于视图正前方（-Z）
         let ahead = view * Vec3::new(0.0, 0.0, 4.0).extend(1.0);
         assert!((ahead.x).abs() < 1e-5 && (ahead.y).abs() < 1e-5);
-        assert!(ahead.z < 0.0 && ahead.w > 0.0, "相机前方点应在视图 -Z 半空间");
+        assert!(
+            ahead.z < 0.0 && ahead.w > 0.0,
+            "相机前方点应在视图 -Z 半空间"
+        );
     }
 
     #[test]
@@ -160,7 +166,10 @@ mod tests {
         // 相机无旋转朝 -Z：正前 / 正后方的点分别投影到视图 -Z / +Z
         let ahead = view * Vec3::new(10.0, 2.0, 0.0).extend(1.0);
         let behind = view * Vec3::new(10.0, 2.0, 6.0).extend(1.0);
-        assert!(ahead.z < 0.0 && ahead.w > 0.0, "正前方的点应在视图 -Z 半空间");
+        assert!(
+            ahead.z < 0.0 && ahead.w > 0.0,
+            "正前方的点应在视图 -Z 半空间"
+        );
         assert!(behind.z > 0.0, "正后方的点应在视图 +Z 半空间（被裁剪侧）");
     }
 }

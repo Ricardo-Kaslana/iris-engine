@@ -82,13 +82,23 @@ pub struct PointLight {
 
 impl Default for PointLight {
     fn default() -> Self {
-        Self { color: Vec3::ONE, intensity: 8.0, range: 12.0, shadows: false }
+        Self {
+            color: Vec3::ONE,
+            intensity: 8.0,
+            range: 12.0,
+            shadows: false,
+        }
     }
 }
 
 impl PointLight {
     pub fn new(color: Vec3, intensity: f32, range: f32) -> Self {
-        Self { color, intensity, range, shadows: false }
+        Self {
+            color,
+            intensity,
+            range,
+            shadows: false,
+        }
     }
 
     /// 点光某一面的视图投影矩阵（90° 视锥、宽高比 1、near 0.05、far = range）。
@@ -141,12 +151,18 @@ mod tests {
         let vp = light.shadow_view_proj(center, range);
         let clip = vp * center.extend(1.0);
         let ndc = clip.truncate() / clip.w;
-        assert!(ndc.x.abs() < 1e-4 && ndc.y.abs() < 1e-4, "覆盖中心应投影到 NDC 原点");
+        assert!(
+            ndc.x.abs() < 1e-4 && ndc.y.abs() < 1e-4,
+            "覆盖中心应投影到 NDC 原点"
+        );
         // 光源相机沿 -dir 拉远 2×range，覆盖中心的深度应精确落在
         // (distance - near) / (far - near) —— 保证 center ± range 全程在 [0, 1]
         let distance = range * 2.0;
         let expected_z = (distance - 0.1) / (distance + range - 0.1);
-        assert!((ndc.z - expected_z).abs() < 1e-4, "深度 {ndc:?} 应为 {expected_z}");
+        assert!(
+            (ndc.z - expected_z).abs() < 1e-4,
+            "深度 {ndc:?} 应为 {expected_z}"
+        );
     }
 
     #[test]
@@ -161,16 +177,24 @@ mod tests {
         ] {
             let clip = vp * corner.extend(1.0);
             let ndc = clip.truncate() / clip.w;
-            assert!(ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
-                "角点 {corner:?} 超出阴影覆盖范围：{ndc:?}");
+            assert!(
+                ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0 && (0.0..=1.0).contains(&ndc.z),
+                "角点 {corner:?} 超出阴影覆盖范围：{ndc:?}"
+            );
         }
     }
 
     #[test]
     fn vertical_light_direction_falls_back_up_vector() {
         // 光方向几乎竖直时 look_at 会退化，不应产生 NaN
-        let light = DirectionalLight { direction: Vec3::NEG_Y, ..Default::default() };
+        let light = DirectionalLight {
+            direction: Vec3::NEG_Y,
+            ..Default::default()
+        };
         let vp = light.shadow_view_proj(Vec3::ZERO, 24.0);
-        assert!(vp.to_cols_array().iter().all(|v| v.is_finite()), "矩阵不应包含 NaN");
+        assert!(
+            vp.to_cols_array().iter().all(|v| v.is_finite()),
+            "矩阵不应包含 NaN"
+        );
     }
 }

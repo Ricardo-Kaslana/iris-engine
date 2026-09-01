@@ -205,7 +205,10 @@ pub(crate) fn create_pipeline(
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[Some(crate::mesh::Vertex::LAYOUT), Some(crate::instance::InstanceRaw::LAYOUT)],
+            buffers: &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -243,7 +246,11 @@ pub(crate) fn create_pipeline(
     // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
     let skinned_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("iris.skinned.pipeline.layout"),
-        bind_group_layouts: &[Some(&globals_layout), Some(&material_layout), Some(&joints_layout)],
+        bind_group_layouts: &[
+            Some(&globals_layout),
+            Some(&material_layout),
+            Some(&joints_layout),
+        ],
         immediate_size: 0,
     });
     let skinned_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -370,7 +377,10 @@ pub(crate) fn create_pipeline(
             module: &shadow_shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[Some(crate::mesh::Vertex::LAYOUT), Some(crate::instance::InstanceRaw::LAYOUT)],
+            buffers: &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ],
         },
         // 颜色附件写入深度（Rgba32Float），无深度附件、无剔除
         fragment: Some(wgpu::FragmentState {
@@ -469,11 +479,12 @@ pub(crate) fn create_pipeline(
             count: None,
         }],
     });
-    let point_shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("iris.point_shadow.pipeline.layout"),
-        bind_group_layouts: &[Some(&point_shadow_layout)],
-        immediate_size: 0,
-    });
+    let point_shadow_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.point_shadow.pipeline.layout"),
+            bind_group_layouts: &[Some(&point_shadow_layout)],
+            immediate_size: 0,
+        });
     // 阴影面管线与方向光阴影同构：R32Float 颜色附件 + Depth32Float 深度附件
     // （Less 测试保证每 texel 存最近遮挡物）+ cull None（面翻转与环绕方向的
     // 实证结论见方向光阴影管线）。
@@ -484,7 +495,10 @@ pub(crate) fn create_pipeline(
             module: &shadow_shader,
             entry_point: Some("vs_point"),
             compilation_options: Default::default(),
-            buffers: &[Some(crate::mesh::Vertex::LAYOUT), Some(crate::instance::InstanceRaw::LAYOUT)],
+            buffers: &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shadow_shader,
@@ -716,7 +730,8 @@ pub(crate) fn create_pipeline(
             cache: None,
         })
     };
-    let bloom_threshold_pipeline = make_bloom_pipeline("iris.pipeline.bloom_threshold", "fs_threshold");
+    let bloom_threshold_pipeline =
+        make_bloom_pipeline("iris.pipeline.bloom_threshold", "fs_threshold");
     let bloom_blur_pipeline = make_bloom_pipeline("iris.pipeline.bloom_blur", "fs_blur");
 
     // 2D UI 叠加层：像素坐标顶点 + 字形图集采样。写 blit 之后的 sRGB 目标：

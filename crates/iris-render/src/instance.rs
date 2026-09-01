@@ -23,13 +23,41 @@ impl InstanceRaw {
         array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 3, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 4, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 32, shader_location: 5, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 48, shader_location: 6, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 64, shader_location: 7, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 80, shader_location: 8, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 96, shader_location: 9, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 48,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 64,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 80,
+                shader_location: 8,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 96,
+                shader_location: 9,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 
@@ -78,7 +106,10 @@ mod tests {
     #[test]
     fn normal_matrix_correct_under_uniform_scale() {
         let scale = 3.0;
-        let t = Transform { scale: Vec3::splat(scale), ..Transform::from_rotation_y(1.23) };
+        let t = Transform {
+            scale: Vec3::splat(scale),
+            ..Transform::from_rotation_y(1.23)
+        };
         let raw = InstanceRaw::from_transform(&t);
         // 逆转置下均匀缩放 s 使每列长度变为 1/s（着色器 normalize 后恢复单位长度）；
         // 关键不变量是各列长度一致（保持角度关系）

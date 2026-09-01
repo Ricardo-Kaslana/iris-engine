@@ -28,7 +28,9 @@ fn main() {
         ..DirectionalLight::default()
     });
 
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(0.8, 48, 24));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(0.8, 48, 24));
 
     // 金属球：金 / 铜 / 银色，粗糙度 0.05 → 0.5 递增
     let metals: [([f32; 3], f32); 4] = [
@@ -46,12 +48,16 @@ fn main() {
     }
 
     // 绝缘体红球（只有白色高光）
-    let mat_red = world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.9, 0.15, 0.1, 1.0));
+    let mat_red = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.9, 0.15, 0.1, 1.0));
     world.spawn((Transform::from_xyz(5.8, 0.8, 0.0), sphere, mat_red));
 
     // 地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(40.0));
-    let mat_g = world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.55, 0.55, 0.55, 1.0));
+    let mat_g = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.55, 0.55, 0.55, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_g));
 
     // 相机稍微拉高看全景
@@ -63,6 +69,8 @@ fn main() {
 
     propagate_transforms(&mut world);
     renderer.render(&world);
-    renderer.save_bmp("iris_shadow_preview.bmp").expect("写 BMP");
+    renderer
+        .save_bmp("iris_shadow_preview.bmp")
+        .expect("写 BMP");
     println!("已输出 iris_shadow_preview.bmp");
 }

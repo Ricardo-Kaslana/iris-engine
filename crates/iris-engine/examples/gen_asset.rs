@@ -11,8 +11,8 @@
 //! cargo run --example gen_asset --release   # 在仓库根目录执行
 //! ```
 
-use iris_render::mesh::primitives;
 use iris_render::asset::write_glb;
+use iris_render::mesh::primitives;
 use iris_render::mesh::{MeshData, SkinVertex, Vertex};
 
 fn main() {
@@ -22,7 +22,9 @@ fn main() {
     write_skinned_arm_glb("assets/skin_arm.glb");
     write_enemy_worm_glb("assets/enemy_worm.glb");
     write_sunset_hdr("assets/sunset.hdr");
-    println!("已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb、assets/enemy_worm.glb 与 assets/sunset.hdr");
+    println!(
+        "已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb、assets/enemy_worm.glb 与 assets/sunset.hdr"
+    );
 }
 
 /// 把单位立方体数据写成 glTF（JSON + 外部二进制 buffer）。
@@ -88,8 +90,12 @@ fn write_gltf_cube(gltf_path: &str, bin_name: &str, cube: &iris_render::mesh::Me
         index_offset = index_offset,
         index_len = index_len,
         vertex_count = cube.vertices.len(),
-        min0 = min[0], min1 = min[1], min2 = min[2],
-        max0 = max[0], max1 = max[1], max2 = max[2],
+        min0 = min[0],
+        min1 = min[1],
+        min2 = min[2],
+        max0 = max[0],
+        max1 = max[1],
+        max2 = max[2],
         index_count = cube.indices.len(),
     );
 
@@ -98,7 +104,10 @@ fn write_gltf_cube(gltf_path: &str, bin_name: &str, cube: &iris_render::mesh::Me
     }
     std::fs::write(gltf_path, json).expect("写入 glTF");
     std::fs::write(
-        std::path::Path::new(gltf_path).parent().unwrap().join(bin_name),
+        std::path::Path::new(gltf_path)
+            .parent()
+            .unwrap()
+            .join(bin_name),
         bin,
     )
     .expect("写入 bin");
@@ -143,9 +152,7 @@ fn write_animated_cube_glb(path: &str, cube: &iris_render::mesh::MeshData) {
         bin.extend_from_slice(&[0.0f32, y, 0.0].map(f32::to_le_bytes).concat());
     }
 
-    let (tq, tt, tb, tr) = (
-        times_spin_off, quats_spin_off, times_bob_off, trans_bob_off,
-    );
+    let (tq, tt, tb, tr) = (times_spin_off, quats_spin_off, times_bob_off, trans_bob_off);
     let json = format!(
         r#"{{
   "asset": {{ "version": "2.0", "generator": "iris gen_asset" }},
@@ -220,7 +227,10 @@ fn write_animated_cube_glb(path: &str, cube: &iris_render::mesh::MeshData) {
 /// skin.joints=[1,2]，ibm=[I, T(0,-1,0)]。
 fn write_skinned_arm_glb(path: &str) {
     // 臂网格：两个细长立方体段
-    let mut arm = MeshData { skin: Some(Vec::new()), ..MeshData::default() };
+    let mut arm = MeshData {
+        skin: Some(Vec::new()),
+        ..MeshData::default()
+    };
     let add_segment = |data: &mut MeshData, center: [f32; 3], joint: u32| {
         let base = data.vertices.len() as u32;
         let cube = primitives::cube();
@@ -236,37 +246,44 @@ fn write_skinned_arm_glb(path: &str) {
             });
         }
         data.indices.extend(cube.indices.iter().map(|i| i + base));
-        data.skin
-            .as_mut()
-            .unwrap()
-            .extend(std::iter::repeat_n(
-                SkinVertex { joints: [joint, 0, 0, 0], weights: [1.0, 0.0, 0.0, 0.0] },
-                cube.vertices.len(),
-            ));
+        data.skin.as_mut().unwrap().extend(std::iter::repeat_n(
+            SkinVertex {
+                joints: [joint, 0, 0, 0],
+                weights: [1.0, 0.0, 0.0, 0.0],
+            },
+            cube.vertices.len(),
+        ));
     };
     add_segment(&mut arm, [0.0, 0.5, 0.0], 0);
     add_segment(&mut arm, [0.0, 1.5, 0.0], 1);
     let ground = primitives::plane(30.0);
 
     let mut bin: Vec<u8> = Vec::new();
-    let put_vertices = |bin: &mut Vec<u8>, mesh: &MeshData| -> (usize, usize, usize, usize, usize) {
-        let pos_off = bin.len();
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
-        }
-        let normal_off = bin.len();
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
-        }
-        let uv_off = bin.len();
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
-        }
-        while bin.len() % 4 != 0 {
-            bin.push(0);
-        }
-        (pos_off, normal_off, uv_off, mesh.vertices.len(), mesh.indices.len())
-    };
+    let put_vertices =
+        |bin: &mut Vec<u8>, mesh: &MeshData| -> (usize, usize, usize, usize, usize) {
+            let pos_off = bin.len();
+            for v in &mesh.vertices {
+                bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
+            }
+            let normal_off = bin.len();
+            for v in &mesh.vertices {
+                bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
+            }
+            let uv_off = bin.len();
+            for v in &mesh.vertices {
+                bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
+            }
+            while bin.len() % 4 != 0 {
+                bin.push(0);
+            }
+            (
+                pos_off,
+                normal_off,
+                uv_off,
+                mesh.vertices.len(),
+                mesh.indices.len(),
+            )
+        };
     let (a_pos, a_nrm, a_uv, a_vtx, a_idx) = put_vertices(&mut bin, &arm);
     let a_idx_off = bin.len();
     for i in &arm.indices {
@@ -373,21 +390,33 @@ fn write_skinned_arm_glb(path: &str) {
   ]
 }}"#,
         buffer_len = bin.len(),
-        a_pos = a_pos, a_pos_len = a_nrm - a_pos,
-        a_nrm = a_nrm, a_nrm_len = a_uv - a_nrm,
-        a_uv = a_uv, a_uv_len = a_idx_off - a_uv,
-        a_idx_off = a_idx_off, a_idx_len = a_idx_len,
-        a_joint_off = a_joint_off, a_joint_len = a_joint_len,
-        a_weight_off = a_weight_off, a_weight_len = a_weight_len,
-        g_pos = g_pos, g_pos_len = g_nrm - g_pos,
-        g_nrm = g_nrm, g_nrm_len = g_uv - g_nrm,
-        g_uv = g_uv, g_uv_len = g_idx_off - g_uv,
-        g_idx_off = g_idx_off, g_idx_len = g_idx_len,
+        a_pos = a_pos,
+        a_pos_len = a_nrm - a_pos,
+        a_nrm = a_nrm,
+        a_nrm_len = a_uv - a_nrm,
+        a_uv = a_uv,
+        a_uv_len = a_idx_off - a_uv,
+        a_idx_off = a_idx_off,
+        a_idx_len = a_idx_len,
+        a_joint_off = a_joint_off,
+        a_joint_len = a_joint_len,
+        a_weight_off = a_weight_off,
+        a_weight_len = a_weight_len,
+        g_pos = g_pos,
+        g_pos_len = g_nrm - g_pos,
+        g_nrm = g_nrm,
+        g_nrm_len = g_uv - g_nrm,
+        g_uv = g_uv,
+        g_uv_len = g_idx_off - g_uv,
+        g_idx_off = g_idx_off,
+        g_idx_len = g_idx_len,
         times_off = times_off,
         quats_off = quats_off,
         ibm_off = ibm_off,
-        a_vtx = a_vtx, a_idx = a_idx,
-        g_vtx = g_vtx, g_idx = g_idx,
+        a_vtx = a_vtx,
+        a_idx = a_idx,
+        g_vtx = g_vtx,
+        g_idx = g_idx,
     );
 
     if let Some(parent) = std::path::Path::new(path).parent() {
@@ -407,7 +436,10 @@ fn write_skinned_arm_glb(path: &str) {
 /// 绑定姿势的**全局** T(1.6)——节点平移是父局部，ibm 是全局的逆）。
 fn write_enemy_worm_glb(path: &str) {
     // 蠕虫网格：三段箱体（沿 -X 排布，段间略缩；底面落在 y = 0）
-    let mut worm = MeshData { skin: Some(Vec::new()), ..MeshData::default() };
+    let mut worm = MeshData {
+        skin: Some(Vec::new()),
+        ..MeshData::default()
+    };
     let add_segment = |data: &mut MeshData, center: [f32; 3], half: [f32; 3], joint: u32| {
         let base = data.vertices.len() as u32;
         let cube = primitives::cube();
@@ -423,13 +455,13 @@ fn write_enemy_worm_glb(path: &str) {
             });
         }
         data.indices.extend(cube.indices.iter().map(|i| i + base));
-        data.skin
-            .as_mut()
-            .unwrap()
-            .extend(std::iter::repeat_n(
-                SkinVertex { joints: [joint, 0, 0, 0], weights: [1.0, 0.0, 0.0, 0.0] },
-                cube.vertices.len(),
-            ));
+        data.skin.as_mut().unwrap().extend(std::iter::repeat_n(
+            SkinVertex {
+                joints: [joint, 0, 0, 0],
+                weights: [1.0, 0.0, 0.0, 0.0],
+            },
+            cube.vertices.len(),
+        ));
     };
     // （中心, 全边长, 关节）——头部在原点，躯干与尾巴依次向 -X 排开。
     // 图元立方体跨度为 ±0.5，缩放系数即全边长；段间恰好相接：头 [−0.45,
@@ -440,24 +472,31 @@ fn write_enemy_worm_glb(path: &str) {
     add_segment(&mut worm, [-1.6, 0.25, 0.0], [0.7, 0.5, 0.5], 2);
 
     let mut bin: Vec<u8> = Vec::new();
-    let put_vertices = |bin: &mut Vec<u8>, mesh: &MeshData| -> (usize, usize, usize, usize, usize) {
-        let pos_off = bin.len();
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
-        }
-        let normal_off = bin.len();
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
-        }
-        let uv_off = bin.len();
-        for v in &mesh.vertices {
-            bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
-        }
-        while bin.len() % 4 != 0 {
-            bin.push(0);
-        }
-        (pos_off, normal_off, uv_off, mesh.vertices.len(), mesh.indices.len())
-    };
+    let put_vertices =
+        |bin: &mut Vec<u8>, mesh: &MeshData| -> (usize, usize, usize, usize, usize) {
+            let pos_off = bin.len();
+            for v in &mesh.vertices {
+                bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
+            }
+            let normal_off = bin.len();
+            for v in &mesh.vertices {
+                bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
+            }
+            let uv_off = bin.len();
+            for v in &mesh.vertices {
+                bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
+            }
+            while bin.len() % 4 != 0 {
+                bin.push(0);
+            }
+            (
+                pos_off,
+                normal_off,
+                uv_off,
+                mesh.vertices.len(),
+                mesh.indices.len(),
+            )
+        };
     let (w_pos, w_nrm, w_uv, w_vtx, w_idx) = put_vertices(&mut bin, &worm);
     let w_idx_off = bin.len();
     for i in &worm.indices {
@@ -560,17 +599,24 @@ fn write_enemy_worm_glb(path: &str) {
   ]
 }}"#,
         buffer_len = bin.len(),
-        w_pos = w_pos, w_pos_len = w_nrm - w_pos,
-        w_nrm = w_nrm, w_nrm_len = w_uv - w_nrm,
-        w_uv = w_uv, w_uv_len = w_idx_off - w_uv,
-        w_idx_off = w_idx_off, w_idx_len = w_idx_len,
-        w_joint_off = w_joint_off, w_joint_len = w_joint_len,
-        w_weight_off = w_weight_off, w_weight_len = w_weight_len,
+        w_pos = w_pos,
+        w_pos_len = w_nrm - w_pos,
+        w_nrm = w_nrm,
+        w_nrm_len = w_uv - w_nrm,
+        w_uv = w_uv,
+        w_uv_len = w_idx_off - w_uv,
+        w_idx_off = w_idx_off,
+        w_idx_len = w_idx_len,
+        w_joint_off = w_joint_off,
+        w_joint_len = w_joint_len,
+        w_weight_off = w_weight_off,
+        w_weight_len = w_weight_len,
         times_off = times_off,
         quats_j1_off = quats_j1_off,
         quats_j2_off = quats_j2_off,
         ibm_off = ibm_off,
-        w_vtx = w_vtx, w_idx = w_idx,
+        w_vtx = w_vtx,
+        w_idx = w_idx,
     );
 
     if let Some(parent) = std::path::Path::new(path).parent() {
@@ -591,7 +637,11 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 }
 
 fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
 }
 
 /// 程序化生成 1024×512 equirectangular 日落全景（Radiance `.hdr`，平面编码）：
@@ -600,7 +650,7 @@ fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 /// `hdr_snapshot` 示例加载。生成端的 dir→(u, v) 映射与捕获 shader 精确互逆：
 /// 图像第 0 行 = +Y 天顶，+X 方向在图像水平正中。
 fn write_sunset_hdr(path: &str) {
-    use iris_render::asset::hdr::{encode_hdr, HdrImage};
+    use iris_render::asset::hdr::{HdrImage, encode_hdr};
 
     const W: u32 = 1024;
     const H: u32 = 512;

@@ -179,7 +179,7 @@ impl Runner {
         }
 
         // 5. 退出检查
-        if world.try_events::<AppExit>().is_some_and(|e| e.len() > 0) {
+        if world.try_events::<AppExit>().is_some_and(|e| !e.is_empty()) {
             event_loop.exit();
         }
     }
@@ -234,10 +234,9 @@ impl ApplicationHandler for Runner {
         // surface 为 None 直接返回，事件循环照常运转。
         #[cfg(target_arch = "wasm32")]
         {
-            self.surface_init =
-                Some(Box::pin(SurfaceKit::with_window_async(window.clone())));
+            self.surface_init = Some(Box::pin(SurfaceKit::with_window_async(window.clone())));
             self.window = Some(window);
-            return;
+            // wasm 路径到此为止（下方 native 块被 cfg 摘除，函数在此收尾）
         }
 
         // native：同步创建（winit 平台约束要求在主线程，直接阻塞等待 GPU 就绪）
@@ -284,7 +283,11 @@ impl ApplicationHandler for Runner {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if is_main => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if is_main => {
                 if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
                     input.on_key(event.physical_key, event.state);
                 }
@@ -329,11 +332,12 @@ impl ApplicationHandler for Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iris_core::prelude::{GlobalTransform, Transform, Vec3};
     use iris_core::Component;
+    use iris_core::prelude::{GlobalTransform, Transform, Vec3};
     use std::time::Duration;
 
-    #[derive(Component)] struct Ticks(u32);
+    #[derive(Component)]
+    struct Ticks(u32);
 
     /// 阶段编排：Update 先于 PostUpdate，且 PostUpdate 每帧恰好一次
     /// （即便 FixedUpdate 跑了多步——收尾系统不在固定步长循环内）。
@@ -390,7 +394,10 @@ mod tests {
                 // 用户系统在 Update 内移动父级
                 world.get_mut::<Transform>(parent).unwrap().position = Vec3::new(5.0, 0.0, 0.0);
             })
-            .add_system(Stage::PostUpdate, iris_core::hierarchy::propagate_transforms);
+            .add_system(
+                Stage::PostUpdate,
+                iris_core::hierarchy::propagate_transforms,
+            );
 
         run_update_stages(&mut schedule, &mut world);
 

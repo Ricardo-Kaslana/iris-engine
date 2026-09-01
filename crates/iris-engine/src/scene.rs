@@ -86,20 +86,19 @@
 //! let count = save_scene(&mut world, "assets/arena_out.json")?;
 //! ```
 
+use iris_core::name::Name;
+use iris_core::physics::{Collider, ColliderShape, RigidBody};
+use iris_core::prelude::{Entity, Quat, Transform, Vec3, World};
+use iris_core::{Component, Resource};
+use iris_render::asset::{GltfError, HdrError, load_hdr, spawn_gltf_instance};
+use iris_render::prelude::{
+    CpuTexture, DirectionalLight, MaterialDef, MaterialHandle, MaterialStore, MeshData, MeshHandle,
+    MeshStore, PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore, Visibility,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use iris_core::name::Name;
-use iris_core::prelude::{Entity, Quat, Transform, Vec3, World};
-use iris_core::{Component, Resource};
-use iris_core::physics::{Collider, ColliderShape, RigidBody};
-use iris_render::asset::{load_hdr, spawn_gltf_instance, GltfError, HdrError};
-use iris_render::prelude::{
-    CpuTexture, DirectionalLight, MaterialDef, MaterialHandle, MaterialStore, MeshData,
-    MeshHandle, MeshStore, PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore,
-    Visibility,
-};
-use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // 错误
@@ -323,12 +322,16 @@ struct TransformSection {
 
 impl Default for TransformSection {
     fn default() -> Self {
-        Self { position: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 3] }
+        Self {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+        }
     }
 }
 
 impl TransformSection {
-    fn to_transform(&self) -> Transform {
+    fn to_transform(self) -> Transform {
         Transform {
             position: self.position.into(),
             rotation: Quat::from_xyzw(
@@ -416,7 +419,11 @@ impl PrimitiveSection {
         match self {
             Self::Cube => Ok(MeshData::cube()),
             Self::Plane { size } => Ok(MeshData::plane(*size)),
-            Self::Sphere { radius, segments, rings } => {
+            Self::Sphere {
+                radius,
+                segments,
+                rings,
+            } => {
                 if *segments < 3 || *rings < 2 {
                     return Err(SceneError::OutOfRange(format!(
                         "球体分段数过低：segments = {segments}（≥3）、rings = {rings}（≥2）"
@@ -424,7 +431,11 @@ impl PrimitiveSection {
                 }
                 Ok(MeshData::uv_sphere(*radius, *segments, *rings))
             }
-            Self::Cylinder { radius, height, segments } => {
+            Self::Cylinder {
+                radius,
+                height,
+                segments,
+            } => {
                 if *segments < 3 {
                     return Err(SceneError::OutOfRange(format!(
                         "圆柱分段数过低：segments = {segments}（≥3）"
@@ -527,17 +538,21 @@ enum ColliderShapeSection {
 }
 
 impl ColliderShapeSection {
-    fn to_shape(&self) -> ColliderShape {
+    fn to_shape(self) -> ColliderShape {
         match self {
-            Self::Sphere { radius } => ColliderShape::Sphere { radius: *radius },
-            Self::Box { half_extents } => ColliderShape::Box { half_extents: (*half_extents).into() },
+            Self::Sphere { radius } => ColliderShape::Sphere { radius },
+            Self::Box { half_extents } => ColliderShape::Box {
+                half_extents: half_extents.into(),
+            },
         }
     }
 
     fn from_shape(shape: &ColliderShape) -> Self {
         match shape {
             ColliderShape::Sphere { radius } => Self::Sphere { radius: *radius },
-            ColliderShape::Box { half_extents } => Self::Box { half_extents: half_extents.to_array() },
+            ColliderShape::Box { half_extents } => Self::Box {
+                half_extents: half_extents.to_array(),
+            },
         }
     }
 }
@@ -556,7 +571,11 @@ struct RigidBodySection {
 impl Default for RigidBodySection {
     fn default() -> Self {
         let body = RigidBody::default();
-        Self { gravity_scale: body.gravity_scale, friction: body.friction, linear_damping: body.linear_damping }
+        Self {
+            gravity_scale: body.gravity_scale,
+            friction: body.friction,
+            linear_damping: body.linear_damping,
+        }
     }
 }
 
@@ -578,7 +597,9 @@ pub fn load_scene(world: &mut World, path: impl AsRef<Path>) -> Result<Vec<Entit
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
     let doc: SceneDoc = serde_json::from_slice(&bytes)?;
-    let defs = doc.entities.ok_or_else(|| SceneError::Missing("entities".into()))?;
+    let defs = doc
+        .entities
+        .ok_or_else(|| SceneError::Missing("entities".into()))?;
     let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     ensure_resources(world);
@@ -633,8 +654,10 @@ fn spawn_section(
     base_dir: &Path,
     section: EntitySection,
 ) -> Result<Entity, SceneError> {
-    let transform =
-        section.transform.map(|t| t.to_transform()).unwrap_or(Transform::IDENTITY);
+    let transform = section
+        .transform
+        .map(|t| t.to_transform())
+        .unwrap_or(Transform::IDENTITY);
     let entity = world.spawn((transform,));
 
     if let Some(name) = section.name {
@@ -670,7 +693,10 @@ fn spawn_section(
                     mark_gltf_tree(world, root);
                     world.add_child(entity, root);
                 }
-                world.resource_mut::<SceneAssetRegistry>().gltfs.insert(entity, rel.clone());
+                world
+                    .resource_mut::<SceneAssetRegistry>()
+                    .gltfs
+                    .insert(entity, rel.clone());
             }
         }
     }
@@ -680,11 +706,14 @@ fn spawn_section(
             Some(rel) => Some(load_texture(world, base_dir, rel)?),
             None => None,
         };
-        let handle =
-            world.resource_mut::<MaterialStore>().add(material.to_def(texture.unwrap_or(TextureHandle(0))));
+        let handle = world
+            .resource_mut::<MaterialStore>()
+            .add(material.to_def(texture.unwrap_or(TextureHandle(0))));
         world.resource_mut::<SceneAssetRegistry>().materials.insert(
             handle.0,
-            MaterialRef { texture: material.texture.clone() },
+            MaterialRef {
+                texture: material.texture.clone(),
+            },
         );
         world.insert(entity, handle);
     }
@@ -747,9 +776,11 @@ fn load_texture(
         .map_err(|e| SceneError::Unsupported(format!("贴图解码失败（支持 PNG / JPEG）：{e}")))?;
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
-    Ok(world
-        .resource_mut::<TextureStore>()
-        .add(CpuTexture { width, height, rgba: rgba.into_raw() }))
+    Ok(world.resource_mut::<TextureStore>().add(CpuTexture {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -876,11 +907,14 @@ fn build_entity_section(
     if let Some(handle) = world.get::<MaterialHandle>(entity) {
         if handle.0 != 0 {
             if let Some(def) = materials.and_then(|m| m.get(*handle)) {
-                let texture = registry.materials.get(&handle.0).and_then(|m| m.texture.clone());
+                let texture = registry
+                    .materials
+                    .get(&handle.0)
+                    .and_then(|m| m.texture.clone());
                 if def.texture.0 != 0 && texture.is_none() {
                     *lost_textures += 1;
                 }
-                section.material = Some(MaterialSection::from_def(&def, texture));
+                section.material = Some(MaterialSection::from_def(def, texture));
             }
         }
     }
@@ -921,7 +955,7 @@ fn build_entity_section(
 mod tests {
     use super::*;
     use iris_core::physics::ColliderShape;
-    use iris_render::asset::{encode_hdr, write_glb, HdrImage};
+    use iris_render::asset::{HdrImage, encode_hdr, write_glb};
     use std::path::PathBuf;
 
     /// 测试固定目录（与 gltf.rs / hdr.rs 测试同款约定）。
@@ -982,14 +1016,20 @@ mod tests {
         let (entities, _) = load_str(&mut world, "min.scene.json", r#"{"entities": [{}]}"#);
         assert_eq!(entities.len(), 1);
         let entity = entities[0];
-        assert_eq!(*world.get::<Transform>(entity).unwrap(), Transform::IDENTITY);
+        assert_eq!(
+            *world.get::<Transform>(entity).unwrap(),
+            Transform::IDENTITY
+        );
         assert!(world.get::<Name>(entity).is_none());
         assert!(world.get::<MeshHandle>(entity).is_none());
         assert!(world.get::<MaterialHandle>(entity).is_none());
         assert!(world.get::<PointLight>(entity).is_none());
         assert!(world.get::<Collider>(entity).is_none());
         assert!(world.get::<RigidBody>(entity).is_none());
-        assert!(world.get::<Visibility>(entity).is_none(), "缺席 = 可见，不插组件");
+        assert!(
+            world.get::<Visibility>(entity).is_none(),
+            "缺席 = 可见，不插组件"
+        );
     }
 
     /// 字段缺省值与引擎默认一致：部分段只写个别字段，其余落引擎默认。
@@ -1033,7 +1073,11 @@ mod tests {
         );
 
         let body = *world.get::<RigidBody>(entity).unwrap();
-        assert_eq!(body, RigidBody::default(), "rigidbody 缺省 = RigidBody::default");
+        assert_eq!(
+            body,
+            RigidBody::default(),
+            "rigidbody 缺省 = RigidBody::default"
+        );
     }
 
     /// 未知字段容错：serde 默认忽略未知字段（前向兼容），任意层级均可。
@@ -1079,7 +1123,10 @@ mod tests {
         std::fs::write(&err_path, r#"{ "environment": {} }"#).unwrap();
         let err = load_scene(&mut world, &err_path).unwrap_err();
         assert!(matches!(err, SceneError::Missing(_)), "实际错误：{err:?}");
-        assert!(err.to_string().contains("entities"), "错误信息应指名缺失字段：{err}");
+        assert!(
+            err.to_string().contains("entities"),
+            "错误信息应指名缺失字段：{err}"
+        );
     }
 
     #[test]
@@ -1143,7 +1190,11 @@ mod tests {
         let handle = *world.get::<MeshHandle>(entity).unwrap();
         let meshes = world.resource::<MeshStore>();
         let sphere = meshes.get(handle).expect("网格应已注册");
-        assert_eq!(sphere.vertices.len(), (12 + 1) * (8 + 1), "球体分段数应按段生成");
+        assert_eq!(
+            sphere.vertices.len(),
+            (12 + 1) * (8 + 1),
+            "球体分段数应按段生成"
+        );
         assert!(sphere.vertices.iter().all(|v| {
             let len = (v.position[0] * v.position[0]
                 + v.position[1] * v.position[1]
@@ -1160,7 +1211,11 @@ mod tests {
         assert_eq!(material.base_color, [0.8, 0.2, 0.1, 1.0]);
         assert_eq!(material.metallic, 1.0);
         assert_eq!(material.roughness, 0.25);
-        assert_eq!(material.emissive, [0.5, 0.1, 0.0, 1.0], "RGB 三元组补 alpha=1");
+        assert_eq!(
+            material.emissive,
+            [0.5, 0.1, 0.0, 1.0],
+            "RGB 三元组补 alpha=1"
+        );
         assert_eq!(material.texture, TextureHandle(0), "无贴图段 = 白色兜底");
 
         let light = *world.get::<PointLight>(entity).unwrap();
@@ -1172,7 +1227,9 @@ mod tests {
         let collider = *world.get::<Collider>(entity).unwrap();
         assert_eq!(
             collider.shape,
-            ColliderShape::Box { half_extents: Vec3::new(1.0, 2.0, 3.0) }
+            ColliderShape::Box {
+                half_extents: Vec3::new(1.0, 2.0, 3.0)
+            }
         );
         assert!(collider.is_static);
         assert_eq!(collider.restitution, 0.2);
@@ -1181,7 +1238,11 @@ mod tests {
         assert_eq!(body.gravity_scale, 0.5);
         assert_eq!(body.friction, 0.3);
         assert_eq!(body.linear_damping, 0.1);
-        assert_eq!(body.velocity, Vec3::ZERO, "场景物体从静止开始（v1 不序列化速度）");
+        assert_eq!(
+            body.velocity,
+            Vec3::ZERO,
+            "场景物体从静止开始（v1 不序列化速度）"
+        );
     }
 
     /// 静态体语义：`static: true` 且无 rigidbody → 物理按静态处理；
@@ -1202,7 +1263,10 @@ mod tests {
         let ground = entities[0];
         let collider = *world.get::<Collider>(ground).unwrap();
         assert!(collider.is_static, "static: true 应进组件");
-        assert!(world.get::<RigidBody>(ground).is_none(), "静态体无 RigidBody（物理缺席语义）");
+        assert!(
+            world.get::<RigidBody>(ground).is_none(),
+            "静态体无 RigidBody（物理缺席语义）"
+        );
 
         let ghost = entities[1];
         assert!(world.get::<Collider>(ghost).is_none());
@@ -1246,7 +1310,10 @@ mod tests {
         )
         .unwrap();
         let err = load_scene(&mut world, &path).unwrap_err();
-        assert!(matches!(err, SceneError::OutOfRange(_)), "实际错误：{err:?}");
+        assert!(
+            matches!(err, SceneError::OutOfRange(_)),
+            "实际错误：{err:?}"
+        );
 
         std::fs::write(
             &path,
@@ -1254,7 +1321,10 @@ mod tests {
         )
         .unwrap();
         let err = load_scene(&mut world, &path).unwrap_err();
-        assert!(matches!(err, SceneError::OutOfRange(_)), "实际错误：{err:?}");
+        assert!(
+            matches!(err, SceneError::OutOfRange(_)),
+            "实际错误：{err:?}"
+        );
     }
 
     // ---- glTF 子场景 ----
@@ -1287,7 +1357,11 @@ mod tests {
             "transform 留在父实体（作用于整棵子树）"
         );
         for &child in &children {
-            assert_eq!(*world.get::<GltfMounted>(child).unwrap(), GltfMounted, "子树应带标记");
+            assert_eq!(
+                *world.get::<GltfMounted>(child).unwrap(),
+                GltfMounted,
+                "子树应带标记"
+            );
             // 深层（primitive 子实体）也应带标记
             for &grandchild in &world.children(child) {
                 assert_eq!(*world.get::<GltfMounted>(grandchild).unwrap(), GltfMounted);
@@ -1335,9 +1409,16 @@ mod tests {
 
         // 缺席环境段：既有资源不被覆盖
         let mut world = fresh_world();
-        world.insert_resource(DirectionalLight { intensity: 7.0, ..DirectionalLight::default() });
+        world.insert_resource(DirectionalLight {
+            intensity: 7.0,
+            ..DirectionalLight::default()
+        });
         let _ = load_str(&mut world, "env_absent.scene.json", r#"{"entities": []}"#);
-        assert_eq!(world.resource::<DirectionalLight>().intensity, 7.0, "缺席不改");
+        assert_eq!(
+            world.resource::<DirectionalLight>().intensity,
+            7.0,
+            "缺席不改"
+        );
     }
 
     /// sky_source 指向合成 .hdr → SkySource 为 EquirectHdr + 登记路径。
@@ -1364,7 +1445,10 @@ mod tests {
             matches!(sky.kind, SkySourceKind::EquirectHdr(_)),
             "sky_source 应产生 EquirectHdr 天空源"
         );
-        assert_ne!(sky.generation, 0, "外部源 generation 必须与程序化天空（0）区分");
+        assert_ne!(
+            sky.generation, 0,
+            "外部源 generation 必须与程序化天空（0）区分"
+        );
         drop(sky);
         assert_eq!(
             world.resource::<SceneAssetRegistry>().sky_source.as_deref(),
@@ -1394,14 +1478,27 @@ mod tests {
             }"#,
         );
         let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
-        let material = world.resource::<MaterialStore>().get(handle).expect("材质应已注册").clone();
-        assert_ne!(material.texture, TextureHandle(0), "贴图应已载入（非白色兜底）");
+        let material = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .expect("材质应已注册")
+            .clone();
+        assert_ne!(
+            material.texture,
+            TextureHandle(0),
+            "贴图应已载入（非白色兜底）"
+        );
         let textures = world.resource::<TextureStore>();
         let texture = textures.get(material.texture).expect("纹理应已注册");
         assert_eq!((texture.width, texture.height), (2, 2));
         assert_eq!(texture.rgba, [255u8, 0, 0, 255].repeat(4));
         assert_eq!(
-            world.resource::<SceneAssetRegistry>().materials.get(&handle.0).unwrap().texture,
+            world
+                .resource::<SceneAssetRegistry>()
+                .materials
+                .get(&handle.0)
+                .unwrap()
+                .texture,
             Some("unit_tex.png".to_string()),
             "贴图路径应登记（save 还原用）"
         );
@@ -1485,7 +1582,10 @@ mod tests {
         save_scene(&mut world_b, &out_b).expect("二次保存");
         let text_a = std::fs::read_to_string(&out_a).unwrap();
         let text_b = std::fs::read_to_string(&out_b).unwrap();
-        assert_eq!(text_a, text_b, "save(load(save(load(f)))) 必须与 save(load(f)) 逐字节一致");
+        assert_eq!(
+            text_a, text_b,
+            "save(load(save(load(f)))) 必须与 save(load(f)) 逐字节一致"
+        );
 
         // 语义逐实体比对（顺序 = spawn 顺序，稳定）
         assert_eq!(entities_a.len(), entities_b.len());
@@ -1496,8 +1596,14 @@ mod tests {
 
             let ta = *world_a.get::<Transform>(a).unwrap();
             let tb = *world_b.get::<Transform>(b).unwrap();
-            assert!((ta.position - tb.position).length() < 1e-6, "位置 1e-6 容差");
-            assert!((ta.rotation.dot(tb.rotation) - 1.0).abs() < 1e-6, "旋转语义等价");
+            assert!(
+                (ta.position - tb.position).length() < 1e-6,
+                "位置 1e-6 容差"
+            );
+            assert!(
+                (ta.rotation.dot(tb.rotation) - 1.0).abs() < 1e-6,
+                "旋转语义等价"
+            );
             assert!((ta.scale - tb.scale).length() < 1e-6);
 
             assert_eq!(
@@ -1509,15 +1615,35 @@ mod tests {
             // mesh ref 相等（登记表来源逐项比对）
             let mesh_a = world_a
                 .get::<MeshHandle>(a)
-                .and_then(|h| world_a.resource::<SceneAssetRegistry>().meshes.get(&h.0).cloned())
+                .and_then(|h| {
+                    world_a
+                        .resource::<SceneAssetRegistry>()
+                        .meshes
+                        .get(&h.0)
+                        .cloned()
+                })
                 .or_else(|| {
-                    world_a.resource::<SceneAssetRegistry>().gltfs.get(&a).map(|p| MeshRef::Gltf(p.clone()))
+                    world_a
+                        .resource::<SceneAssetRegistry>()
+                        .gltfs
+                        .get(&a)
+                        .map(|p| MeshRef::Gltf(p.clone()))
                 });
             let mesh_b = world_b
                 .get::<MeshHandle>(b)
-                .and_then(|h| world_b.resource::<SceneAssetRegistry>().meshes.get(&h.0).cloned())
+                .and_then(|h| {
+                    world_b
+                        .resource::<SceneAssetRegistry>()
+                        .meshes
+                        .get(&h.0)
+                        .cloned()
+                })
                 .or_else(|| {
-                    world_b.resource::<SceneAssetRegistry>().gltfs.get(&b).map(|p| MeshRef::Gltf(p.clone()))
+                    world_b
+                        .resource::<SceneAssetRegistry>()
+                        .gltfs
+                        .get(&b)
+                        .map(|p| MeshRef::Gltf(p.clone()))
                 });
             assert_eq!(mesh_a, mesh_b, "mesh 来源应往返相等（{name_a:?}）");
 
@@ -1530,7 +1656,11 @@ mod tests {
                         d.roughness,
                         d.emissive,
                         d.texture.0 != 0,
-                        world_a.resource::<SceneAssetRegistry>().materials.get(&h.0).and_then(|m| m.texture.clone()),
+                        world_a
+                            .resource::<SceneAssetRegistry>()
+                            .materials
+                            .get(&h.0)
+                            .and_then(|m| m.texture.clone()),
                     )
                 })
             });
@@ -1542,7 +1672,11 @@ mod tests {
                         d.roughness,
                         d.emissive,
                         d.texture.0 != 0,
-                        world_b.resource::<SceneAssetRegistry>().materials.get(&h.0).and_then(|m| m.texture.clone()),
+                        world_b
+                            .resource::<SceneAssetRegistry>()
+                            .materials
+                            .get(&h.0)
+                            .and_then(|m| m.texture.clone()),
                     )
                 })
             });
@@ -1550,9 +1684,9 @@ mod tests {
 
             // 点光（组件无 PartialEq，逐字段比对）
             let light_fields = |world: &World, e: Entity| {
-                world.get::<PointLight>(e).map(|l| {
-                    (l.color, l.intensity, l.range, l.shadows)
-                })
+                world
+                    .get::<PointLight>(e)
+                    .map(|l| (l.color, l.intensity, l.range, l.shadows))
             };
             assert_eq!(
                 light_fields(&world_a, a),
@@ -1605,14 +1739,20 @@ mod tests {
             r#"{ "entities": [{ "mesh": { "gltf": "skip_triangle.gltf" } }] }"#,
         );
         let scene_entities = world.entity_count();
-        assert!(scene_entities > 1, "glTF 子树应真实生成实体（父 + 根 + primitive）");
+        assert!(
+            scene_entities > 1,
+            "glTF 子树应真实生成实体（父 + 根 + primitive）"
+        );
 
         let out = dir.join("gltf_skip_out.json");
         let count = save_scene(&mut world, &out).expect("保存");
         assert_eq!(count, 1, "只写 1 个场景实体（glTF 内部实体被标记跳过）");
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains(r#""gltf""#), "mesh 段应还原为 glTF 引用");
-        assert!(!text.contains(r#""primitive""#), "glTF 子树实体不应泄漏为图元段");
+        assert!(
+            !text.contains(r#""primitive""#),
+            "glTF 子树实体不应泄漏为图元段"
+        );
 
         // 重载：又是 1 个场景实体 + 重建的子树
         let mut world2 = fresh_world();
@@ -1632,8 +1772,14 @@ mod tests {
             r#"{ "entities": [{ "name": "scene-cube", "mesh": { "primitive": { "kind": "cube" } } }] }"#,
         );
         // 用户代码直接注册的网格（不经场景加载 → 无登记）
-        let foreign = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(1.0, 8, 4));
-        world.spawn((Transform::from_xyz(5.0, 0.0, 0.0), foreign, MaterialHandle(0)));
+        let foreign = world
+            .resource_mut::<MeshStore>()
+            .add(MeshData::uv_sphere(1.0, 8, 4));
+        world.spawn((
+            Transform::from_xyz(5.0, 0.0, 0.0),
+            foreign,
+            MaterialHandle(0),
+        ));
 
         let out = test_dir().join("foreign_out.json");
         let count = save_scene(&mut world, &out).expect("保存不 panic");
@@ -1642,9 +1788,15 @@ mod tests {
         let doc: SceneDoc = serde_json::from_str(&text).unwrap();
         let defs = doc.entities.expect("实体段应存在");
         assert_eq!(defs.len(), 2);
-        let degraded = defs.iter().find(|d| d.name.is_none()).expect("应有降级的无名实体");
+        let degraded = defs
+            .iter()
+            .find(|d| d.name.is_none())
+            .expect("应有降级的无名实体");
         assert!(degraded.mesh.is_none(), "非场景 mesh 段应省略");
-        let kept = defs.iter().find(|d| d.name.as_deref() == Some("scene-cube")).unwrap();
+        let kept = defs
+            .iter()
+            .find(|d| d.name.as_deref() == Some("scene-cube"))
+            .unwrap();
         assert!(kept.mesh.is_some(), "场景实体照写");
 
         // 产出文件可再次加载（降级实体变成纯逻辑实体）
@@ -1659,7 +1811,9 @@ mod tests {
         let mut world = fresh_world();
         ensure_resources(&mut world);
         let mesh = world.resource_mut::<MeshStore>().add(MeshData::cube());
-        let mat = world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.2, 0.4, 0.8, 1.0));
+        let mat = world
+            .resource_mut::<MaterialStore>()
+            .add(MaterialDef::solid(0.2, 0.4, 0.8, 1.0));
         world.spawn((Transform::IDENTITY, mesh, mat));
 
         let out = test_dir().join("foreign_mat_out.json");
@@ -1668,8 +1822,15 @@ mod tests {
         let doc: SceneDoc = serde_json::from_str(&text).unwrap();
         let defs = doc.entities.expect("实体段应存在");
         let material = defs[0].material.as_ref().expect("材质段应保留数值");
-        assert_eq!(material.color, [0.2, 0.4, 0.8, 1.0], "数值字段照 MaterialDef 写出");
-        assert_eq!(material.texture, None, "无登记路径 → texture 省略（warn 降级）");
+        assert_eq!(
+            material.color,
+            [0.2, 0.4, 0.8, 1.0],
+            "数值字段照 MaterialDef 写出"
+        );
+        assert_eq!(
+            material.texture, None,
+            "无登记路径 → texture 省略（warn 降级）"
+        );
         assert!(defs[0].mesh.is_none(), "非场景 mesh 段省略");
     }
 
@@ -1682,12 +1843,18 @@ mod tests {
             "default_mat.scene.json",
             r#"{ "entities": [{ "mesh": { "primitive": { "kind": "cube" } } }] }"#,
         );
-        assert_eq!(*world.get::<MaterialHandle>(entities[0]).unwrap(), MaterialHandle(0));
+        assert_eq!(
+            *world.get::<MaterialHandle>(entities[0]).unwrap(),
+            MaterialHandle(0)
+        );
         let out = test_dir().join("default_mat_out.json");
         save_scene(&mut world, &out).expect("保存");
         let text = std::fs::read_to_string(&out).unwrap();
         let doc: SceneDoc = serde_json::from_str(&text).unwrap();
-        assert!(doc.entities.unwrap()[0].material.is_none(), "句柄 0 整段省略");
+        assert!(
+            doc.entities.unwrap()[0].material.is_none(),
+            "句柄 0 整段省略"
+        );
     }
 
     /// 错误 Display 风格与 GltfError 一致（含上下文、可作 dyn Error）。
@@ -1729,6 +1896,10 @@ mod tests {
             "glb_ref.scene.json",
             r#"{ "entities": [{ "mesh": { "gltf": "unit_box.glb" } }] }"#,
         );
-        assert_eq!(world.children(entities[0]).len(), 1, "GLB 顶层节点应挂为子实体");
+        assert_eq!(
+            world.children(entities[0]).len(),
+            1,
+            "GLB 顶层节点应挂为子实体"
+        );
     }
 }

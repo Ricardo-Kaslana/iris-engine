@@ -27,10 +27,8 @@ impl Resources {
                     cell,
                     &format!("资源 {}", std::any::type_name::<R>()),
                 );
-                let old = std::mem::replace(
-                    &mut *slot,
-                    Box::new(value) as Box<dyn Any + Send + Sync>,
-                );
+                let old =
+                    std::mem::replace(&mut *slot, Box::new(value) as Box<dyn Any + Send + Sync>);
                 Some(*old.downcast::<R>().expect("存储类型与注册类型一致"))
             }
             None => {
@@ -59,7 +57,11 @@ impl Resources {
 
     pub fn remove<R: Resource>(&mut self) -> Option<R> {
         let (_, cell) = self.map.remove_entry(&TypeId::of::<R>())?;
-        Some(*into_inner(cell).downcast::<R>().expect("存储类型与注册类型一致"))
+        Some(
+            *into_inner(cell)
+                .downcast::<R>()
+                .expect("存储类型与注册类型一致"),
+        )
     }
 
     pub fn contains<R: Resource>(&self) -> bool {
@@ -119,7 +121,11 @@ mod tests {
     fn insert_borrow_mutate() {
         let mut resources = Resources::default();
         assert_eq!(resources.insert(Score(0)), None);
-        assert_eq!(resources.insert(Score(42)), Some(Score(0)), "覆盖应返回旧值");
+        assert_eq!(
+            resources.insert(Score(42)),
+            Some(Score(0)),
+            "覆盖应返回旧值"
+        );
 
         {
             let score = resources.borrow::<Score>().unwrap();

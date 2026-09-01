@@ -28,12 +28,12 @@
 
 use std::time::Duration;
 
+use iris_arena::{ArenaPlugin, ArenaState};
 use iris_core::prelude::{Stage, Vec2};
 use iris_engine::prelude::{
     AnimationPlugin, App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode,
     MaterialStore, MeshStore, OffscreenRenderer, Plugin, TextureStore, Time,
 };
-use iris_arena::{ArenaPlugin, ArenaState};
 
 /// 与 tests/headless.rs 同款测试台：虚拟时钟 + Input 注入 + 插件系统链。
 /// 承载于无窗口的 `App`（`App::new` 不建窗口 / 不碰 GPU，`run` 才会）。
@@ -65,7 +65,10 @@ impl Harness {
         ArenaPlugin::default().build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
-        harness.app.schedule.run(Stage::Startup, &mut harness.app.world);
+        harness
+            .app
+            .schedule
+            .run(Stage::Startup, &mut harness.app.world);
         harness
     }
 
@@ -88,7 +91,9 @@ impl Harness {
             }
         }
         self.app.schedule.run(Stage::Update, &mut self.app.world);
-        self.app.schedule.run(Stage::PostUpdate, &mut self.app.world);
+        self.app
+            .schedule
+            .run(Stage::PostUpdate, &mut self.app.world);
         self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
@@ -143,9 +148,17 @@ fn main() {
     // 同时有贴身蠕虫群与在飞弹道
     game.frames_nofire(220); // 3.7 s：整波围拢到深度贴身
     game.app.world.resource_mut::<ArenaState>().player.hp = 5;
-    let shots_before_reenable =
-        game.app.world.try_resource::<ArenaState>().map(|s| s.total_shots).unwrap_or(0);
-    game.app.world.resource_mut::<ArenaState>().player.fire_timer = 0.0;
+    let shots_before_reenable = game
+        .app
+        .world
+        .try_resource::<ArenaState>()
+        .map(|s| s.total_shots)
+        .unwrap_or(0);
+    game.app
+        .world
+        .resource_mut::<ArenaState>()
+        .player
+        .fire_timer = 0.0;
     game.frames(10); // 恢复自动开火：贴身点射（弹道近，命中即逝）
     {
         let mut state = game.app.world.resource_mut::<ArenaState>();
@@ -155,10 +168,12 @@ fn main() {
         );
         // 构图定向：把玩家挪到整群敌军的**南侧** 2.2 m（蠕虫在北 = 追击
         // 方向朝南 = 朝画面近处，整群入画、经典「被涌进画面」的混战构图）
-        let (avg_x, max_z, count) = state.enemies.iter().fold(
-            (0.0f32, f32::MIN, 0usize),
-            |(sx, mz, n), e| (sx + e.pos.x, mz.max(e.pos.y), n + 1),
-        );
+        let (avg_x, max_z, count) = state
+            .enemies
+            .iter()
+            .fold((0.0f32, f32::MIN, 0usize), |(sx, mz, n), e| {
+                (sx + e.pos.x, mz.max(e.pos.y), n + 1)
+            });
         state.player.pos = Vec2::new(avg_x / count.max(1) as f32, max_z + 2.2);
         // 摆拍弹道：贴身点射的弹道当帧即命中消失，画面上补 4 条 6~9 m 外
         // 的在飞弹道（id 与逻辑分配器错开；逻辑行为已由 headless 集成测试
@@ -178,9 +193,17 @@ fn main() {
     }
     game.frame(&[], &[]);
     {
-        let state = game.app.world.try_resource::<ArenaState>().expect("状态在位");
+        let state = game
+            .app
+            .world
+            .try_resource::<ArenaState>()
+            .expect("状态在位");
         assert_eq!(state.wave, 2, "应已进入第 2 波");
-        assert!(state.enemies.len() >= 4, "第 2 波应仍有敌群在场，实际 {}", state.enemies.len());
+        assert!(
+            state.enemies.len() >= 4,
+            "第 2 波应仍有敌群在场，实际 {}",
+            state.enemies.len()
+        );
         assert!(!state.projectiles.is_empty(), "应有弹道在飞");
         assert!(state.total_damage >= 2, "混战应已发生接触伤害");
         assert_eq!(state.phase, iris_arena::Phase::Playing, "应仍在对局中");
@@ -200,7 +223,10 @@ fn main() {
         state.player.invuln = 0.0;
         state.player.hp = 1;
         state.enemies.clear();
-        for (i, pos) in [Vec2::new(0.5, 0.2), Vec2::new(-1.4, -1.3)].into_iter().enumerate() {
+        for (i, pos) in [Vec2::new(0.5, 0.2), Vec2::new(-1.4, -1.3)]
+            .into_iter()
+            .enumerate()
+        {
             state.enemies.push(iris_arena::EnemyState {
                 id: 9990 + i as u32,
                 pos,
@@ -212,13 +238,25 @@ fn main() {
     }
     game.frame(&[], &[]); // 接触 → hp 归零 → GameOver
     {
-        let state = game.app.world.try_resource::<ArenaState>().expect("状态在位");
-        assert_eq!(state.phase, iris_arena::Phase::GameOver, "接触伤害应触发终局");
+        let state = game
+            .app
+            .world
+            .try_resource::<ArenaState>()
+            .expect("状态在位");
+        assert_eq!(
+            state.phase,
+            iris_arena::Phase::GameOver,
+            "接触伤害应触发终局"
+        );
         assert_eq!(state.player.hp, 0);
     }
     renderer.render(&game.app.world);
-    renderer.save_bmp("iris_arena_gameover.bmp").expect("写 BMP");
+    renderer
+        .save_bmp("iris_arena_gameover.bmp")
+        .expect("写 BMP");
 
     println!("已输出 iris_arena_wave2.bmp / iris_arena_gameover.bmp");
-    println!("拼图：ffmpeg -y -i iris_arena_wave2.bmp -i iris_arena_gameover.bmp -filter_complex hstack docs/arena_preview.png");
+    println!(
+        "拼图：ffmpeg -y -i iris_arena_wave2.bmp -i iris_arena_gameover.bmp -filter_complex hstack docs/arena_preview.png"
+    );
 }

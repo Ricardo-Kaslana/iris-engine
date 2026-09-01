@@ -92,7 +92,10 @@ fn main() {
     world.insert_resource(TextureStore::new());
     world.insert_resource(Camera::default());
     // 纯图表场景：泛光与天空会污染色块读数，显式关闭泛光（背景由全屏暗底矩形覆盖）
-    world.insert_resource(BloomSettings { enabled: false, ..BloomSettings::default() });
+    world.insert_resource(BloomSettings {
+        enabled: false,
+        ..BloomSettings::default()
+    });
 
     const W: f32 = 1280.0;
     const H: f32 = 720.0;
@@ -104,7 +107,10 @@ fn main() {
 
     // 全屏暗底（UI pass 在色调映射后叠加，直接盖住天空背景）
     world.spawn((
-        UiRect { position: [0.0, 0.0], size: [W, H] },
+        UiRect {
+            position: [0.0, 0.0],
+            size: [W, H],
+        },
         UiColor([0.016, 0.024, 0.04, 1.0]),
     ));
 
@@ -114,7 +120,10 @@ fn main() {
         let amp = peak / max_peak; // 归一化 [0, 1]
         let x = bar as f32 * SLOT_W + (SLOT_W - BAR_W) * 0.5;
         world.spawn((
-            UiRect { position: [x, BASELINE - BASE_H], size: [BAR_W, BASE_H] },
+            UiRect {
+                position: [x, BASELINE - BASE_H],
+                size: [BAR_W, BASE_H],
+            },
             UiColor([0.09, 0.11, 0.15, 1.0]),
         ));
         let glow = 0.3 + 0.7 * amp; // 幅值越低越暗
@@ -126,29 +135,49 @@ fn main() {
         ];
         let bar_h = (amp * MAX_BAR_H).max(1.0);
         world.spawn((
-            UiRect { position: [x, BASELINE - BASE_H - bar_h], size: [BAR_W, bar_h] },
+            UiRect {
+                position: [x, BASELINE - BASE_H - bar_h],
+                size: [BAR_W, bar_h],
+            },
             UiColor(color),
         ));
     }
 
     // 标注文本（实体的 UiRect 仅作定位载体，不绘制矩形）
     world.spawn((
-        UiRect { position: [24.0, 24.0], size: [0.0, 0.0] },
-        UiText { string: "IRIS AUDIO MIXER".into(), scale: 4.0 },
+        UiRect {
+            position: [24.0, 24.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "IRIS AUDIO MIXER".into(),
+            scale: 4.0,
+        },
         UiColor([0.85, 0.9, 0.95, 1.0]),
     ));
     world.spawn((
-        UiRect { position: [24.0, 68.0], size: [0.0, 0.0] },
-        UiText { string: "boom 55hz @ 0.0s   blip 880hz @ 0.4s   noise burst @ 0.7s".into(), scale: 2.0 },
+        UiRect {
+            position: [24.0, 68.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "boom 55hz @ 0.0s   blip 880hz @ 0.4s   noise burst @ 0.7s".into(),
+            scale: 2.0,
+        },
         UiColor([0.45, 0.52, 0.6, 1.0]),
     ));
     for (i, label) in ["0", "0.5", "1.0", "1.5", "2.0s"].iter().enumerate() {
         // 末刻度按自身宽度（4 字形 × 8px × scale 2）左移，避免裁出右边缘
-        let x = 24.0 + (W - 48.0) * i as f32 / 4.0
-            - if i == 4 { 4.0 * 8.0 * 2.0 } else { 0.0 };
+        let x = 24.0 + (W - 48.0) * i as f32 / 4.0 - if i == 4 { 4.0 * 8.0 * 2.0 } else { 0.0 };
         world.spawn((
-            UiRect { position: [x, BASELINE + 10.0], size: [0.0, 0.0] },
-            UiText { string: (*label).into(), scale: 2.0 },
+            UiRect {
+                position: [x, BASELINE + 10.0],
+                size: [0.0, 0.0],
+            },
+            UiText {
+                string: (*label).into(),
+                scale: 2.0,
+            },
             UiColor([0.4, 0.46, 0.54, 1.0]),
         ));
     }

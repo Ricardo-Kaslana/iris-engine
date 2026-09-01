@@ -21,16 +21,18 @@ fn scene() -> (World, Entity) {
 
     // 旋转 0.6 弧度的立方体悬在地面上方
     let cube_mesh = world.resource_mut::<MeshStore>().add(MeshData::cube());
-    let mat =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.9, 0.3, 0.1, 1.0));
+    let mat = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.9, 0.3, 0.1, 1.0));
     let mut transform = Transform::from_xyz(0.0, 0.6, 0.0);
     transform.rotation = Quat::from_rotation_y(0.6);
     let cube = world.spawn((transform, cube_mesh, mat));
 
     // 地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(20.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     // 模拟 HierarchyPlugin：主循环之外需要手动执行全局变换传播
@@ -103,7 +105,11 @@ fn moved_entity_uploads_partial_range() {
     );
 
     // 横移方块 1.5 单位（仍在视锥内）→ 仅方块实例（单一连续变化段）变化
-    world.get_mut::<Transform>(cube).expect("方块实体存在").position.x = 1.5;
+    world
+        .get_mut::<Transform>(cube)
+        .expect("方块实体存在")
+        .position
+        .x = 1.5;
     propagate_transforms(&mut world);
     renderer.render(&world);
     let stats = renderer.renderer().stats();

@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 // 平台封装：wasm 上 std::time::Instant 运行时 panic，见 crate::instant
-use crate::instant::Instant;
 use crate::Resource;
+use crate::instant::Instant;
 
 /// 时间资源：可变步长渲染 + 固定步长逻辑（fixed timestep）。
 #[derive(Debug, Clone, Resource)]
@@ -199,7 +199,11 @@ mod tests {
         let mut time = Time::default();
         time.set_fixed_hz(60.0);
         time.advance(Duration::from_secs(3600));
-        assert_eq!(time.delta(), time.max_delta(), "advance 与 begin_frame 同受钳制");
+        assert_eq!(
+            time.delta(),
+            time.max_delta(),
+            "advance 与 begin_frame 同受钳制"
+        );
         assert_eq!(time.fixed_steps(), 5, "钳制后的预算进入固定步长累积器");
         assert_eq!(time.fixed_steps(), 0);
     }

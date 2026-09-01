@@ -23,7 +23,9 @@ fn scene(bloom_enabled: bool) -> World {
     }
 
     // 高自发光球：HDR 值远超阈值 1.0，是唯一的泛光源
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(1.0, 32, 16));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(1.0, 32, 16));
     let mat_glow = world.resource_mut::<MaterialStore>().add(MaterialDef {
         base_color: [0.02, 0.02, 0.02, 1.0],
         emissive: [18.0, 12.0, 7.0, 1.0],
@@ -33,8 +35,9 @@ fn scene(bloom_enabled: bool) -> World {
 
     // 暗地面（照明后亮度远低于泛光阈值，不应产生泛光）
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(40.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.22, 0.22, 0.25, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.22, 0.22, 0.25, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     {

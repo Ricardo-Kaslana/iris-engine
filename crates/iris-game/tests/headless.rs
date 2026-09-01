@@ -26,7 +26,7 @@ use iris_engine::prelude::{
     MaterialStore, MeshStore, Plugin, TextureStore, Time, Transform, UiText, Visibility,
 };
 use iris_game::{
-    GameEntities, GamePlugin, GameState, Phase, BANNER_TEXT_NAME, SCORE_TEXT_NAME, TIME_TEXT_NAME,
+    BANNER_TEXT_NAME, GameEntities, GamePlugin, GameState, Phase, SCORE_TEXT_NAME, TIME_TEXT_NAME,
 };
 
 /// 标准容差：1/60 s 步长下 30 帧位移的浮点误差量级。
@@ -116,7 +116,10 @@ impl Harness {
 
         let mut harness = Self { app };
         // Startup：资源兜底插入 + 场景搭建（与 App 主循环一致，先于首帧）
-        harness.app.schedule.run(Stage::Startup, &mut harness.app.world);
+        harness
+            .app
+            .schedule
+            .run(Stage::Startup, &mut harness.app.world);
         harness
     }
 
@@ -135,7 +138,9 @@ impl Harness {
             }
         }
         self.app.schedule.run(Stage::Update, &mut self.app.world);
-        self.app.schedule.run(Stage::PostUpdate, &mut self.app.world);
+        self.app
+            .schedule
+            .run(Stage::PostUpdate, &mut self.app.world);
         self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
@@ -203,7 +208,11 @@ fn startup_builds_playable_world() {
     // 金币开局全部可见（Visibility 组件就位，收集后由表现系统切 HIDDEN）
     for &coin in &ents.coins {
         assert_eq!(
-            *harness.app.world.get::<Visibility>(coin).expect("金币应有 Visibility"),
+            *harness
+                .app
+                .world
+                .get::<Visibility>(coin)
+                .expect("金币应有 Visibility"),
             Visibility::VISIBLE
         );
     }
@@ -219,8 +228,10 @@ fn startup_builds_playable_world() {
         .get::<GlobalTransform>(ents.camera)
         .expect("相机应已有 GlobalTransform")
         .position();
-    assert!((cam - glam::Vec3::new(0.0, 4.95, 8.0)).length() < 1e-4,
-        "开局相机应在 (0, 4.95, 8)，实际 {cam:?}");
+    assert!(
+        (cam - glam::Vec3::new(0.0, 4.95, 8.0)).length() < 1e-4,
+        "开局相机应在 (0, 4.95, 8)，实际 {cam:?}"
+    );
 }
 
 /// 无输入时玩家静止（Time 照常流逝、倒计时推进）。
@@ -229,7 +240,10 @@ fn idle_input_keeps_player_still() {
     let mut harness = Harness::new();
     harness.frames(30, &[]);
     let pos = harness.player_position();
-    assert!(pos.x.abs() < 1e-5 && pos.z.abs() < 1e-5, "静止输入不应移动：{pos:?}");
+    assert!(
+        pos.x.abs() < 1e-5 && pos.z.abs() < 1e-5,
+        "静止输入不应移动：{pos:?}"
+    );
     let game = harness.game();
     assert_eq!(game.score, 0);
     assert_eq!(game.phase, Phase::Playing);
@@ -246,7 +260,11 @@ fn held_key_drives_player_and_camera_follows() {
     harness.frames(30, &[KeyCode::KeyD]);
     let expected_x = 30.0 / 60.0 * 5.0; // 30 个有效步（Time::advance 首帧即有效）
     let pos = harness.player_position();
-    assert!((pos.x - expected_x).abs() < EPS, "x 应为 {expected_x}，实际 {}", pos.x);
+    assert!(
+        (pos.x - expected_x).abs() < EPS,
+        "x 应为 {expected_x}，实际 {}",
+        pos.x
+    );
     assert!(pos.z.abs() < EPS);
     {
         let game = harness.game();
@@ -285,7 +303,10 @@ fn space_triggers_single_jump_arc() {
         max_y = max_y.max(harness.game().player.y);
     }
     // 解析顶点 1.225 + 离散化误差 ≈ ½·|g|·t_apex·dt（dt = 1/60 时约 +0.058）
-    assert!((max_y - 1.225).abs() < 0.08, "跳跃顶点应约 1.225 m，实际 {max_y}");
+    assert!(
+        (max_y - 1.225).abs() < 0.08,
+        "跳跃顶点应约 1.225 m，实际 {max_y}"
+    );
     let game = harness.game();
     assert_eq!(game.player.y, 0.0, "0.7 s 后应已落地");
     assert_eq!(game.player.y_vel, 0.0);
@@ -340,7 +361,11 @@ fn countdown_updates_hud_time_text() {
     let mut harness = Harness::new();
     assert_eq!(harness.hud_text(TIME_TEXT_NAME), "TIME 60");
     harness.frames(70, &[]);
-    assert_eq!(harness.hud_text(TIME_TEXT_NAME), "TIME 59", "约 1.15 s 后应显示 59");
+    assert_eq!(
+        harness.hud_text(TIME_TEXT_NAME),
+        "TIME 59",
+        "约 1.15 s 后应显示 59"
+    );
 }
 
 /// 全收集流程：标记 9 枚已收 + 传送到最后一枚旁 → 胜利横幅 →
@@ -366,7 +391,11 @@ fn collecting_all_wins_then_freezes() {
         assert_eq!(game.phase, Phase::Won);
         assert!(game.pickups.iter().all(|p| p.collected));
     }
-    assert_eq!(harness.hud_text(BANNER_TEXT_NAME), "YOU WIN!", "胜利横幅应显示");
+    assert_eq!(
+        harness.hud_text(BANNER_TEXT_NAME),
+        "YOU WIN!",
+        "胜利横幅应显示"
+    );
 
     // 终局冻结：继续输入，一切不再变化
     let before_pos = harness.player_position();
@@ -408,7 +437,10 @@ fn wall_collider_blocks_player_before_clamp() {
     harness.app.world.resource_mut::<GameState>().player.x = 17.0;
     harness.frames(60, &[KeyCode::KeyD]);
     let x = harness.game().player.x;
-    assert!((x - 17.05).abs() <= 0.05, "x 应被墙体 Collider 挡在 17.05，实际 {x}");
+    assert!(
+        (x - 17.05).abs() <= 0.05,
+        "x 应被墙体 Collider 挡在 17.05，实际 {x}"
+    );
     assert!(x < 17.9, "x 应小于钳制上限 18（证明在挡的是 Collider）");
     // 表现实体同步：玩家 Transform 已按修正后的逻辑坐标回写
     assert!(

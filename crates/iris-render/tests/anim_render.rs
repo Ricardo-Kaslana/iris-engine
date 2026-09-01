@@ -14,7 +14,12 @@ use iris_render::prelude::*;
 fn animated_quad_glb() -> Vec<u8> {
     let mut bin: Vec<u8> = Vec::new();
     // positions：4 顶点（±1 方块）
-    for p in [[-1.0f32, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]] {
+    for p in [
+        [-1.0f32, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
+    ] {
         bin.extend_from_slice(&p.map(f32::to_le_bytes).concat());
     }
     // normals：全部 +Z
@@ -123,7 +128,7 @@ fn animated_quad_rotates_on_screen() {
         player.looping = false;
         player.time = 1.0;
     }
-    update_animations(&mut world);
+    update_animations(&world);
     propagate_transforms(&mut world);
     renderer.render(&world);
     let at_end = red_dominant_pixels(&renderer.read_pixels(), w, h);

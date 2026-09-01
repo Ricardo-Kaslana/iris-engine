@@ -19,10 +19,7 @@ fn main() {
 
     let t0 = Instant::now();
     for i in 0..N {
-        world.spawn((
-            Position(Vec3::new(i as f32, 0.0, 0.0)),
-            Velocity(Vec3::ONE),
-        ));
+        world.spawn((Position(Vec3::new(i as f32, 0.0, 0.0)), Velocity(Vec3::ONE)));
     }
     let spawn_time = t0.elapsed();
     println!("spawn {N} 实体（2 组件）：{spawn_time:?}");

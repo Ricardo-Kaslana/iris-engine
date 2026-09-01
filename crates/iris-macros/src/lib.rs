@@ -22,8 +22,7 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
 }
 
 fn impl_marker(input: TokenStream, marker_trait: proc_macro2::TokenStream) -> TokenStream {
-    let ast = syn::parse::<syn::DeriveInput>(input)
-        .expect("Iris 派生宏只能用于类型定义");
+    let ast = syn::parse::<syn::DeriveInput>(input).expect("Iris 派生宏只能用于类型定义");
     let name = &ast.ident;
     let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
     quote! {

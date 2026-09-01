@@ -35,7 +35,12 @@ fn setup(world: &mut World) {
             let t = i as f32 / 7.0;
             world
                 .resource_mut::<MaterialStore>()
-                .add(MaterialDef::solid(0.15 + 0.75 * t, 0.35, 1.0 - 0.75 * t, 1.0))
+                .add(MaterialDef::solid(
+                    0.15 + 0.75 * t,
+                    0.35,
+                    1.0 - 0.75 * t,
+                    1.0,
+                ))
         })
         .collect();
 
@@ -50,7 +55,12 @@ fn setup(world: &mut World) {
                     z as f32 * spacing - half,
                 );
                 let material = materials[((x + y + z) % 8) as usize];
-                world.spawn((Transform::from_translation(position), cube, material, BaseY(position.y)));
+                world.spawn((
+                    Transform::from_translation(position),
+                    cube,
+                    material,
+                    BaseY(position.y),
+                ));
             }
         }
     }
@@ -71,6 +81,9 @@ fn wave(world: &mut World) {
 fn print_stats(world: &mut World) {
     if world.resource::<Input>().key_pressed(KeyCode::KeyF) {
         // 帧统计由渲染器内部记录，这里用实体数替代提示规模
-        println!("实体数：{}（按 (网格, 材质) 自动合批）", world.entity_count());
+        println!(
+            "实体数：{}（按 (网格, 材质) 自动合批）",
+            world.entity_count()
+        );
     }
 }

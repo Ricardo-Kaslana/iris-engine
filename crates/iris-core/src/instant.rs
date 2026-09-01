@@ -29,7 +29,9 @@ pub struct Instant {
 impl Instant {
     /// 当前时间点。
     pub fn now() -> Self {
-        Self { millis: now_millis() }
+        Self {
+            millis: now_millis(),
+        }
     }
 
     /// 距当前时刻的时长（`now() - self`）。
@@ -49,7 +51,9 @@ impl std::ops::Add<std::time::Duration> for Instant {
     type Output = Instant;
 
     fn add(self, rhs: std::time::Duration) -> Instant {
-        Instant { millis: self.millis + rhs.as_secs_f64() * 1000.0 }
+        Instant {
+            millis: self.millis + rhs.as_secs_f64() * 1000.0,
+        }
     }
 }
 
@@ -68,7 +72,9 @@ impl std::ops::Sub<std::time::Duration> for Instant {
     type Output = Instant;
 
     fn sub(self, rhs: std::time::Duration) -> Instant {
-        Instant { millis: self.millis - rhs.as_secs_f64() * 1000.0 }
+        Instant {
+            millis: self.millis - rhs.as_secs_f64() * 1000.0,
+        }
     }
 }
 

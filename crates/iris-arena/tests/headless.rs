@@ -20,16 +20,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use iris_arena::{
+    ArenaPlugin, ArenaState, BANNER_TEXT_NAME, COMBO_TEXT_NAME, EnemyPool, HP_FRONT_NAME, Phase,
+    ProjectilePool, SCORE_TEXT_NAME, WAVE_TEXT_NAME,
+};
 use iris_core::prelude::Stage;
 use iris_core::resource::{ResourceRef, ResourceRefMut};
 use iris_engine::prelude::{
-    AnimationPlugin, AnimationPlayer, App, Audio, Camera, DirectionalLight, GlobalTransform,
+    AnimationPlayer, AnimationPlugin, App, Audio, Camera, DirectionalLight, GlobalTransform,
     HierarchyPlugin, Input, KeyCode, MaterialStore, MeshStore, OffscreenRenderer, Plugin,
     TextureStore, Time, Transform, UiRect, UiText, Visibility,
-};
-use iris_arena::{
-    ArenaPlugin, ArenaState, EnemyPool, Phase, ProjectilePool, BANNER_TEXT_NAME, COMBO_TEXT_NAME,
-    HP_FRONT_NAME, SCORE_TEXT_NAME, WAVE_TEXT_NAME,
 };
 
 /// 标准容差：1/60 s 步长下的浮点误差量级。
@@ -125,12 +125,18 @@ impl Harness {
         // 场景：临时 fixture 关卡；敌人模型走 Default 的 asset_path 解析
         // （cargo test 的 cwd 是 crate 目录，CWD 候选未命中回退 workspace
         // 根——资产路径摩擦闭合后无须再注入 CARGO_MANIFEST_DIR 绝对路径）
-        ArenaPlugin { scene_path: fixture_scene_path(), ..Default::default() }
-            .build_schedule(&mut app.schedule);
+        ArenaPlugin {
+            scene_path: fixture_scene_path(),
+            ..Default::default()
+        }
+        .build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
         // Startup：资源兜底插入 + 场景搭建 + 双池预热（与 App 主循环一致）
-        harness.app.schedule.run(Stage::Startup, &mut harness.app.world);
+        harness
+            .app
+            .schedule
+            .run(Stage::Startup, &mut harness.app.world);
         harness
     }
 
@@ -155,7 +161,9 @@ impl Harness {
             }
         }
         self.app.schedule.run(Stage::Update, &mut self.app.world);
-        self.app.schedule.run(Stage::PostUpdate, &mut self.app.world);
+        self.app
+            .schedule
+            .run(Stage::PostUpdate, &mut self.app.world);
         self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
@@ -215,7 +223,11 @@ impl Harness {
 
     /// 敌人根实体的 AnimationPlayer（active 槽位第一个）。
     fn first_enemy_animation(&self) -> (f32, bool, usize) {
-        let (id, _) = self.enemy_pool().active().first().expect("应有活跃敌人槽位").clone();
+        let (id, _) = *self
+            .enemy_pool()
+            .active()
+            .first()
+            .expect("应有活跃敌人槽位");
         let entity = self.enemy_pool().entity_of(id).expect("活跃 id 应有槽位");
         let player = self
             .app
@@ -244,7 +256,11 @@ fn startup_prewarms_pools_and_shows_title() {
         assert!(pool.active().is_empty());
         for &slot in &pool.slots {
             assert_eq!(
-                *harness.app.world.get::<Visibility>(slot).expect("槽位应有 Visibility"),
+                *harness
+                    .app
+                    .world
+                    .get::<Visibility>(slot)
+                    .expect("槽位应有 Visibility"),
                 Visibility::HIDDEN,
                 "待命槽位应隐藏"
             );
@@ -288,13 +304,25 @@ fn any_key_starts_wave_one_and_acquires_pool_slots() {
     drop(pool);
     for &slot in &wave1_slots {
         assert_eq!(
-            *harness.app.world.get::<Visibility>(slot).expect("槽位应有 Visibility"),
+            *harness
+                .app
+                .world
+                .get::<Visibility>(slot)
+                .expect("槽位应有 Visibility"),
             Visibility::VISIBLE,
             "在场的敌人槽位应可见"
         );
         // 敌人根实体已被表现系统挪出待命点（跟随逻辑位置）
-        let position = harness.app.world.get::<Transform>(slot).expect("槽位应有 Transform").position;
-        assert!(position.x.abs() < 24.0 && position.z.abs() < 24.0, "敌人应在场内：{position:?}");
+        let position = harness
+            .app
+            .world
+            .get::<Transform>(slot)
+            .expect("槽位应有 Transform")
+            .position;
+        assert!(
+            position.x.abs() < 24.0 && position.z.abs() < 24.0,
+            "敌人应在场内：{position:?}"
+        );
     }
     // HUD：波次与横幅切换
     assert_eq!(harness.hud_text(WAVE_TEXT_NAME), "WAVE 1");
@@ -307,8 +335,12 @@ fn any_key_starts_wave_one_and_acquires_pool_slots() {
 fn enemy_pool_reuses_slots_across_waves_without_overspawning() {
     let mut harness = Harness::new();
     harness.start();
-    let wave1_slots: Vec<_> =
-        harness.enemy_pool().active().iter().map(|(_, e)| *e).collect();
+    let wave1_slots: Vec<_> = harness
+        .enemy_pool()
+        .active()
+        .iter()
+        .map(|(_, e)| *e)
+        .collect();
     // 直接清空第 1 波（跳过战斗），推进间歇全程进第 2 波
     harness.game_mut().enemies.clear();
     harness.frame(&[], &[]);
@@ -365,9 +397,21 @@ fn hud_tracks_score_combo_hp_and_banner_states() {
     assert_eq!(harness.hud_text(SCORE_TEXT_NAME), "SCORE 375");
     assert_eq!(harness.hud_text(COMBO_TEXT_NAME), "COMBO x4");
     // HP 前景条宽度 = hp/max × 200
-    let hp_entity = harness.app.world.entity_named(HP_FRONT_NAME).expect("HP 条存在");
-    let hp_width = harness.app.world.get::<UiRect>(hp_entity).expect("HP 条应有 UiRect").size[0];
-    assert!((hp_width - 120.0).abs() < EPS, "hp 3/5 → 条宽 120，实际 {hp_width}");
+    let hp_entity = harness
+        .app
+        .world
+        .entity_named(HP_FRONT_NAME)
+        .expect("HP 条存在");
+    let hp_width = harness
+        .app
+        .world
+        .get::<UiRect>(hp_entity)
+        .expect("HP 条应有 UiRect")
+        .size[0];
+    assert!(
+        (hp_width - 120.0).abs() < EPS,
+        "hp 3/5 → 条宽 120，实际 {hp_width}"
+    );
     // 开波倒计时横幅：清空 → 间歇当帧显示下一波倒计时
     harness.game_mut().enemies.clear();
     harness.frame(&[], &[]);
@@ -383,7 +427,10 @@ fn hud_tracks_score_combo_hp_and_banner_states() {
         game.player.hp = 0;
     }
     harness.frame(&[], &[]);
-    assert_eq!(harness.hud_text(BANNER_TEXT_NAME), "GAME OVER - PRESS R TO RESTART");
+    assert_eq!(
+        harness.hud_text(BANNER_TEXT_NAME),
+        "GAME OVER - PRESS R TO RESTART"
+    );
     let hp_width = harness.app.world.get::<UiRect>(hp_entity).unwrap().size[0];
     assert!(hp_width.abs() < EPS, "hp 0 → 条宽 0，实际 {hp_width}");
 }
@@ -422,7 +469,11 @@ fn skinned_animation_plays_and_advances_on_pool_slots() {
 fn enemy_root_translation_carries_joint_subtree() {
     let mut harness = Harness::new();
     harness.start();
-    let (id, slot) = harness.enemy_pool().active().first().expect("应有活跃敌人槽位").clone();
+    let (id, slot) = *harness
+        .enemy_pool()
+        .active()
+        .first()
+        .expect("应有活跃敌人槽位");
     // 收编层级：槽位根实体 = mesh 节点，子实体应含 primitive 部分与
     // 关节树根（蠕虫 GLB：1 个 primitive + hip）
     let children = harness.app.world.children(slot);
@@ -432,7 +483,9 @@ fn enemy_root_translation_carries_joint_subtree() {
         children.len()
     );
     assert!(
-        children.iter().all(|&child| harness.app.world.parent(child) == Some(slot)),
+        children
+            .iter()
+            .all(|&child| harness.app.world.parent(child) == Some(slot)),
         "全部子实体的父级都应是槽位根实体"
     );
 
@@ -440,8 +493,11 @@ fn enemy_root_translation_carries_joint_subtree() {
     let target = glam::Vec2::new(10.0, -8.0);
     {
         let mut game = harness.game_mut();
-        let enemy =
-            game.enemies.iter_mut().find(|enemy| enemy.id == id).expect("敌人应在场");
+        let enemy = game
+            .enemies
+            .iter_mut()
+            .find(|enemy| enemy.id == id)
+            .expect("敌人应在场");
         enemy.pos = target;
     }
     harness.frame(&[], &[]);
@@ -501,7 +557,11 @@ fn projectile_pool_is_bounded_and_slots_recycle() {
     harness.frames(40);
     {
         let pool = harness.projectile_pool();
-        assert!(pool.free_count() >= 38, "短命弹道耗尽后槽位应归还，实际闲置 {}", pool.free_count());
+        assert!(
+            pool.free_count() >= 38,
+            "短命弹道耗尽后槽位应归还，实际闲置 {}",
+            pool.free_count()
+        );
     }
     // 混战不变量：8 s 混战（站桩开火 + 击杀 + 换波）全程 弹道槽位 ≤ 40
     harness.frames(480);
@@ -549,7 +609,11 @@ fn game_over_and_restart_recycle_everything() {
         assert_eq!(game.score, 0, "本脚本未击杀任何敌人（出生环在射程外）");
     }
     // 终局时逻辑侧贴脸敌人仍在场（死亡当帧冻结，不做清理）→ 槽位仍活跃
-    assert_eq!(harness.enemy_pool().active().len(), 1, "贴脸敌人的槽位保留到重开");
+    assert_eq!(
+        harness.enemy_pool().active().len(),
+        1,
+        "贴脸敌人的槽位保留到重开"
+    );
     // R 直接重开（实现取舍：不回 Title，见 ArenaState::restart 文档）
     harness.frame(&[], &[KeyCode::KeyR]);
     {

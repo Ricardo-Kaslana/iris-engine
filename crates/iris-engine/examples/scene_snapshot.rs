@@ -64,14 +64,22 @@ fn main() {
         .world
         .entity_named("ball-dynamic")
         .expect("场景文件应有 ball-dynamic");
-    let y = app.world.get::<Transform>(ball).expect("球应有 Transform").position.y;
+    let y = app
+        .world
+        .get::<Transform>(ball)
+        .expect("球应有 Transform")
+        .position
+        .y;
     let speed = app
         .world
         .get::<RigidBody>(ball)
         .expect("球应有 RigidBody")
         .velocity
         .length();
-    assert!(y < 3.0 && y > 1.0, "动态球应落在台面上（1.0 < y = {y} < 3.0）");
+    assert!(
+        y < 3.0 && y > 1.0,
+        "动态球应落在台面上（1.0 < y = {y} < 3.0）"
+    );
     assert!(speed < 0.5, "动态球应近似静止，实际速度 {speed}");
     println!("物理终态断言通过：ball-dynamic y = {y:.3}（台面静息 1.5）、速度 {speed:.3} m/s");
 

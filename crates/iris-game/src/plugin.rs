@@ -98,7 +98,9 @@ pub const ARENA_HALF: f32 = 18.0;
 const PLAYER_HALF_HEIGHT: f32 = 0.45;
 /// 玩家碰撞形状：球体，半径 = 半高——球心即实体位置（贴地时 y = 0.45），
 /// 控制器推离以它对场景静态体查询（见模块文档「运动学角色控制器」）。
-const PLAYER_SHAPE: ColliderShape = ColliderShape::Sphere { radius: PLAYER_HALF_HEIGHT };
+const PLAYER_SHAPE: ColliderShape = ColliderShape::Sphere {
+    radius: PLAYER_HALF_HEIGHT,
+};
 /// 金币视觉基线高度与浮动幅度。
 const COIN_BASE_Y: f32 = 0.35;
 const COIN_BOB_AMPLITUDE: f32 = 0.12;
@@ -123,14 +125,18 @@ pub struct GamePlugin {
 
 impl Default for GamePlugin {
     fn default() -> Self {
-        Self { scene_path: asset_path(DEFAULT_SCENE_PATH) }
+        Self {
+            scene_path: asset_path(DEFAULT_SCENE_PATH),
+        }
     }
 }
 
 impl GamePlugin {
     /// 以指定场景文件构造（测试注入 fixture 关卡、示例显式给默认路径）。
     pub fn new(scene_path: impl Into<PathBuf>) -> Self {
-        Self { scene_path: scene_path.into() }
+        Self {
+            scene_path: scene_path.into(),
+        }
     }
 
     /// 把本插件的全部系统注册到调度器。
@@ -175,9 +181,7 @@ impl GamePlugin {
             )
             .add_parallel_system(
                 Stage::Update,
-                Access::new()
-                    .read::<GameState>()
-                    .write::<UiText>(),
+                Access::new().read::<GameState>().write::<UiText>(),
                 update_hud,
             );
     }
@@ -307,40 +311,72 @@ fn build_scene(world: &mut World, scene_path: &Path) {
     // 只能全部登记进 GameEntities 句柄资源）
     world.spawn((
         Name("hud/title".into()),
-        UiRect { position: [24.0, 20.0], size: [0.0, 0.0] },
-        UiText { string: "IRIS COLLECT".into(), scale: 3.0 },
+        UiRect {
+            position: [24.0, 20.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "IRIS COLLECT".into(),
+            scale: 3.0,
+        },
         UiColor::default(),
     ));
     world.spawn((
         Name(SCORE_TEXT_NAME.into()),
-        UiRect { position: [24.0, 60.0], size: [0.0, 0.0] },
-        UiText { string: format!("SCORE 0/{}", GameState::spawn_positions().len()), scale: 3.0 },
+        UiRect {
+            position: [24.0, 60.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: format!("SCORE 0/{}", GameState::spawn_positions().len()),
+            scale: 3.0,
+        },
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
     // TIME 右对齐：宽度经 text_width 测量（等宽布局盒宽），不再手算
     // 8 × scale × 字符数
     let time_string = format!("TIME {}", DURATION_SECS as i32);
-    let time_width = text_width(&UiText { string: time_string.clone(), scale: 3.0 });
+    let time_width = text_width(&UiText {
+        string: time_string.clone(),
+        scale: 3.0,
+    });
     world.spawn((
         Name(TIME_TEXT_NAME.into()),
-        UiRect { position: [HUD_WIDTH - time_width - 24.0, 20.0], size: [0.0, 0.0] },
-        UiText { string: time_string, scale: 3.0 },
+        UiRect {
+            position: [HUD_WIDTH - time_width - 24.0, 20.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: time_string,
+            scale: 3.0,
+        },
         UiColor::default(),
     ));
     // 横幅：空串时不产生顶点（开局不可见），胜负时居中显示。
     // 居中偏移按最终显示文本（YOU WIN!）的测量宽度计算。
-    let banner_width = text_width(&UiText { string: "YOU WIN!".into(), scale: 5.0 });
+    let banner_width = text_width(&UiText {
+        string: "YOU WIN!".into(),
+        scale: 5.0,
+    });
     world.spawn((
         Name(BANNER_TEXT_NAME.into()),
         UiRect {
             position: [(HUD_WIDTH - banner_width) * 0.5, 290.0],
             size: [0.0, 0.0],
         },
-        UiText { string: String::new(), scale: 5.0 },
+        UiText {
+            string: String::new(),
+            scale: 5.0,
+        },
         UiColor([1.0, 0.85, 0.3, 1.0]),
     ));
 
-    world.insert_resource(GameEntities { player, player_model, camera, coins });
+    world.insert_resource(GameEntities {
+        player,
+        player_model,
+        camera,
+        coins,
+    });
 }
 
 /// Update 1：读输入与时间 → 推进纯逻辑 → 静态推离（角色控制器）→
@@ -378,7 +414,11 @@ fn update_gameplay(world: &World) {
             let z = (input.key(KeyCode::KeyS) as i32 - input.key(KeyCode::KeyW) as i32) as f32;
             // MoveInput 的 x/z 是世界系意图：合成 = x·相机右 + (-z)·相机前
             let dir = right * x + forward * -z;
-            MoveInput { x: dir.x, z: dir.y, jump: input.key_pressed(KeyCode::Space) }
+            MoveInput {
+                x: dir.x,
+                z: dir.y,
+                jump: input.key_pressed(KeyCode::Space),
+            }
         })
         .unwrap_or(MoveInput::IDLE);
 
@@ -410,8 +450,11 @@ fn update_gameplay(world: &World) {
         return;
     };
     if let Some(mut transform) = world.get_mut::<Transform>(ents.player) {
-        transform.position =
-            Vec3::new(game.player.x, game.player.y + PLAYER_HALF_HEIGHT, game.player.z);
+        transform.position = Vec3::new(
+            game.player.x,
+            game.player.y + PLAYER_HALF_HEIGHT,
+            game.player.z,
+        );
     }
     if let Some(mut model) = world.get_mut::<Transform>(ents.player_model) {
         model.rotation = Quat::from_rotation_y(game.player.facing);
@@ -422,9 +465,10 @@ fn update_gameplay(world: &World) {
     // 若需要解耦（如录音统计、成就系统监听），引擎的 try_send_event
     // 现已支持并行系统发送已注册类型的事件（无需独占世界）
     if picked || finished {
-        if let (Some(assets), Some(audio)) =
-            (world.try_resource::<GameAssets>(), world.try_resource::<Audio>())
-        {
+        if let (Some(assets), Some(audio)) = (
+            world.try_resource::<GameAssets>(),
+            world.try_resource::<Audio>(),
+        ) {
             if picked {
                 audio.play(assets.pickup_clip.clone(), 0.5, false);
             }
@@ -455,7 +499,11 @@ fn animate_coins(world: &World) {
         };
         // 可见性开关幂等翻转：已收集 = 隐藏，未收集 = 可见（重生支持）
         if let Some(mut visibility) = world.get_mut::<Visibility>(entity) {
-            *visibility = if pickup.collected { Visibility::HIDDEN } else { Visibility::VISIBLE };
+            *visibility = if pickup.collected {
+                Visibility::HIDDEN
+            } else {
+                Visibility::VISIBLE
+            };
         }
         if pickup.collected {
             continue;

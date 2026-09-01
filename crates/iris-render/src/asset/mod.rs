@@ -4,5 +4,5 @@ pub mod base64;
 pub mod gltf;
 pub mod hdr;
 
-pub use gltf::{spawn_gltf, spawn_gltf_instance, write_glb, GltfError, GltfInstance};
-pub use hdr::{encode_hdr, load_hdr, parse_hdr, HdrError, HdrImage};
+pub use gltf::{GltfError, GltfInstance, spawn_gltf, spawn_gltf_instance, write_glb};
+pub use hdr::{HdrError, HdrImage, encode_hdr, load_hdr, parse_hdr};

@@ -36,7 +36,10 @@ impl Default for MaterialDef {
 impl MaterialDef {
     /// 纯色无贴图材质的便捷构造（绝缘体、中等粗糙度）。
     pub fn solid(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { base_color: [r, g, b, a], ..Default::default() }
+        Self {
+            base_color: [r, g, b, a],
+            ..Default::default()
+        }
     }
 
     /// 金属材质的便捷构造（金属度 1，F0 取基础色）。
@@ -58,7 +61,9 @@ pub struct MaterialStore {
 
 impl Default for MaterialStore {
     fn default() -> Self {
-        Self { materials: vec![MaterialDef::default()] }
+        Self {
+            materials: vec![MaterialDef::default()],
+        }
     }
 }
 
@@ -85,7 +90,10 @@ mod tests {
     #[test]
     fn zero_handle_is_default_material() {
         let mut store = MaterialStore::new();
-        assert_eq!(store.get(MaterialHandle(0)).unwrap().base_color, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(
+            store.get(MaterialHandle(0)).unwrap().base_color,
+            [1.0, 1.0, 1.0, 1.0]
+        );
         let handle = store.add(MaterialDef::solid(1.0, 0.0, 0.0, 1.0));
         assert_eq!(handle, MaterialHandle(1));
         assert_eq!(store.get(handle).unwrap().base_color, [1.0, 0.0, 0.0, 1.0]);

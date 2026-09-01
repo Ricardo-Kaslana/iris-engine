@@ -58,7 +58,10 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl Default for SkySource {
     fn default() -> Self {
-        Self { kind: SkySourceKind::ProceduralSky, generation: 0 }
+        Self {
+            kind: SkySourceKind::ProceduralSky,
+            generation: 0,
+        }
     }
 }
 
@@ -99,7 +102,11 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     let abs = bits & 0x7fff_ffff;
     // NaN / 无穷（f16 同布局：5 位指数、10 位尾数）
     if abs >= 0x7f80_0000 {
-        return if abs > 0x7f80_0000 { sign | 0x7e00 } else { sign | 0x7c00 };
+        return if abs > 0x7f80_0000 {
+            sign | 0x7e00
+        } else {
+            sign | 0x7c00
+        };
     }
     // 舍入到最近偶数：加「被丢弃的 13 位之半 + 进位提示位」
     let rounded = abs.wrapping_add(0x0fff + ((abs >> 13) & 1));
@@ -116,7 +123,7 @@ fn f32_to_f16_bits(value: f32) -> u16 {
         return sign | ((e16 as u16) << 10) | mantissa;
     }
     // f16 非规格化 / 零：带隐藏位的 11 位尾数右移（f32 非规格化必归零）
-    let mantissa = (((rounded >> 13) & 0x03ff) | 0x0400) as u32;
+    let mantissa = ((rounded >> 13) & 0x03ff) | 0x0400;
     let shift = (1 - e16).clamp(0, 31) as u32;
     sign | (mantissa >> shift) as u16
 }
@@ -301,7 +308,7 @@ pub(crate) fn bake_environment_from(gpu: &Gpu, source: &SkySourceKind) -> Enviro
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let mut params_data = vec![0u8; SLOTS as usize * STRIDE as usize];
+    let mut params_data = vec![0u8; SLOTS * STRIDE as usize];
     let mut write_slot = |slot: usize, face: f32, roughness: f32| {
         // 写入步长必须与烘焙 pass 的动态偏移步长（STRIDE=256）一致：
         // slot k 的参数必须落在字节 k·256 处，pass k 才能在偏移 k·256 读到它
@@ -454,15 +461,23 @@ pub(crate) fn bake_environment_from(gpu: &Gpu, source: &SkySourceKind) -> Enviro
     let equirect_pipeline = equirect.as_ref().map(|(layout, ..)| {
         make_pipeline("iris.env.pipeline.equirect", "fs_capture_equirect", layout)
     });
-    let irradiance_pipeline =
-        make_pipeline("iris.env.pipeline.irradiance", "fs_irradiance", &full_layout);
-    let prefilter_pipeline = make_pipeline("iris.env.pipeline.prefilter", "fs_prefilter", &full_layout);
+    let irradiance_pipeline = make_pipeline(
+        "iris.env.pipeline.irradiance",
+        "fs_irradiance",
+        &full_layout,
+    );
+    let prefilter_pipeline =
+        make_pipeline("iris.env.pipeline.prefilter", "fs_prefilter", &full_layout);
     let brdf_pipeline = make_pipeline("iris.env.pipeline.brdf", "fs_brdf", &plain_layout);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("iris.env.bake"),
     });
-    let mut pass = |view: &wgpu::TextureView, pipeline: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, offset: u32, size: (u32, u32)| {
+    let mut pass = |view: &wgpu::TextureView,
+                    pipeline: &wgpu::RenderPipeline,
+                    bg: &wgpu::BindGroup,
+                    offset: u32,
+                    size: (u32, u32)| {
         let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iris.env.bake.pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -486,14 +501,14 @@ pub(crate) fn bake_environment_from(gpu: &Gpu, source: &SkySourceKind) -> Enviro
     };
     // 1. 天空捕获（写 sky 面：程序化走 shader 内 sky(dir)；外部 equirect 走
     //    2D 全景采样。两条路径的 bind group 均未引用 sky 立方体，无读写冲突）
-    let (sky_pass_pipeline, sky_pass_bg): (&wgpu::RenderPipeline, &wgpu::BindGroup) = match &equirect
-    {
-        None => (&sky_pipeline, &plain_bg),
-        Some((.., bg)) => (
-            equirect_pipeline.as_ref().expect("equirect 管线应已创建"),
-            bg,
-        ),
-    };
+    let (sky_pass_pipeline, sky_pass_bg): (&wgpu::RenderPipeline, &wgpu::BindGroup) =
+        match &equirect {
+            None => (&sky_pipeline, &plain_bg),
+            Some((.., bg)) => (
+                equirect_pipeline.as_ref().expect("equirect 管线应已创建"),
+                bg,
+            ),
+        };
     for face in 0..6u32 {
         pass(
             &face_view(&sky, face, 0),
@@ -603,10 +618,16 @@ mod tests {
     #[test]
     fn sky_source_generation_increments() {
         assert_eq!(SkySource::default().generation, 0);
-        assert!(matches!(SkySource::default().kind, SkySourceKind::ProceduralSky));
+        assert!(matches!(
+            SkySource::default().kind,
+            SkySourceKind::ProceduralSky
+        ));
         let a = SkySource::equirect_hdr(HdrImage::new(4, 2));
         let b = SkySource::equirect_hdr(HdrImage::new(4, 2));
-        assert_ne!(a.generation, 0, "首个外部源的 generation 不得与程序化天空冲突");
+        assert_ne!(
+            a.generation, 0,
+            "首个外部源的 generation 不得与程序化天空冲突"
+        );
         assert_ne!(a.generation, b.generation, "换一次资源 generation 必变");
         assert!(matches!(a.kind, SkySourceKind::EquirectHdr(_)));
     }

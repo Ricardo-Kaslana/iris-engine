@@ -78,10 +78,11 @@ pub struct EventRef<'a, E> {
 }
 
 impl<'a, E: Event> EventRef<'a, E> {
-    pub(crate) fn new(
-        guard: std::sync::RwLockReadGuard<'a, Box<dyn ErasedEvents>>,
-    ) -> Self {
-        Self { guard, _marker: std::marker::PhantomData }
+    pub(crate) fn new(guard: std::sync::RwLockReadGuard<'a, Box<dyn ErasedEvents>>) -> Self {
+        Self {
+            guard,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -97,8 +98,8 @@ impl<E: Event> std::ops::Deref for EventRef<'_, E> {
 
 #[cfg(test)]
 mod tests {
-    use crate::event::Events;
     use crate::Event;
+    use crate::event::Events;
 
     #[derive(Debug, Clone, Copy, PartialEq, Event)]
     struct Hit(u32);
@@ -110,7 +111,10 @@ mod tests {
         events.send(Hit(1));
         events.send(Hit(2));
         assert_eq!(events.len(), 2);
-        assert_eq!(events.iter().copied().collect::<Vec<_>>(), vec![Hit(1), Hit(2)]);
+        assert_eq!(
+            events.iter().copied().collect::<Vec<_>>(),
+            vec![Hit(1), Hit(2)]
+        );
         events.clear();
         assert!(events.is_empty());
     }

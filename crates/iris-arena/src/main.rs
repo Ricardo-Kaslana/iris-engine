@@ -11,8 +11,8 @@
 //! wasm32 说明：`App::run` 在 web 上不会返回（winit web 后端以 JS 异常
 //! unwind 退出循环，见 iris-engine::app 文档），编译目标检查照常通过。
 
-use iris_engine::prelude::*;
 use iris_arena::ArenaPlugin;
+use iris_engine::prelude::*;
 
 fn main() {
     App::new()

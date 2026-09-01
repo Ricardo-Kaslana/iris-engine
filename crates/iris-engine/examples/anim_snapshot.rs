@@ -32,7 +32,7 @@ fn render_at(time: f32, out: &str) {
         player.looping = false;
         player.time = time;
     }
-    update_animations(&mut world);
+    update_animations(&world);
 
     {
         let mut camera = world.resource_mut::<Camera>();

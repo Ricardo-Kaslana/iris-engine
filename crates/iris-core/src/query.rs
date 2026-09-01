@@ -27,7 +27,7 @@ pub trait QueryPart {
     fn len(guard: &Self::Guard<'_>) -> usize;
 
     /// 迭代基准中的第 `index` 个实体。
-    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity>;
+    fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity>;
 
     /// 取出该实体的访问项；实体缺少此组件时返回 `None`（该实体被跳过）。
     fn get<'a>(guard: &'a mut Self::Guard<'_>, entity: Entity) -> Option<Self::Item<'a>>;
@@ -45,7 +45,7 @@ impl<T: Component> QueryPart for &T {
         guard.len()
     }
 
-    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+    fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity> {
         guard.entities().get(index).copied()
     }
 
@@ -66,7 +66,7 @@ impl<T: Component> QueryPart for &mut T {
         guard.len()
     }
 
-    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+    fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity> {
         guard.entities().get(index).copied()
     }
 
@@ -92,7 +92,7 @@ impl<T: Component> QueryPart for Option<&T> {
         guard.as_ref().map_or(0, |store| store.len())
     }
 
-    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+    fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity> {
         guard
             .as_ref()
             .and_then(|store| store.entities().get(index).copied())
@@ -116,7 +116,7 @@ impl<T: Component> QueryPart for Option<&mut T> {
         guard.as_ref().map_or(0, |store| store.len())
     }
 
-    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+    fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity> {
         guard
             .as_ref()
             .and_then(|store| store.entities().get(index).copied())
@@ -140,7 +140,7 @@ impl QueryPart for Entity {
         guard.slot_count()
     }
 
-    fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+    fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity> {
         (index < guard.slot_count()).then(|| guard.entity_at_slot(index))
     }
 
@@ -164,7 +164,7 @@ macro_rules! impl_query_part_for_tuple {
                 <$first as QueryPart>::len(&guard.0)
             }
 
-            fn entity_at<'a>(guard: &'a Self::Guard<'_>, index: usize) -> Option<Entity> {
+            fn entity_at(guard: &Self::Guard<'_>, index: usize) -> Option<Entity> {
                 <$first as QueryPart>::entity_at(&guard.0, index)
             }
 
@@ -190,9 +190,12 @@ mod tests {
     use crate::Component;
     use crate::world::World;
 
-    #[derive(Component)] struct Position(f32);
-    #[derive(Component)] struct Velocity(f32);
-    #[derive(Component)] struct Tag;
+    #[derive(Component)]
+    struct Position(f32);
+    #[derive(Component)]
+    struct Velocity(f32);
+    #[derive(Component)]
+    struct Tag;
 
     #[test]
     fn single_component_query() {
@@ -246,9 +249,8 @@ mod tests {
         world.spawn((Position(2.0),)); // 缺 Velocity：Option 应产出 None 而非跳过
 
         let mut seen = vec![];
-        world.query::<(&Position, Option<&Velocity>)>(|(p, v)| {
-            seen.push((p.0, v.map(|vel| vel.0)))
-        });
+        world
+            .query::<(&Position, Option<&Velocity>)>(|(p, v)| seen.push((p.0, v.map(|vel| vel.0))));
         assert_eq!(seen, vec![(1.0, Some(10.0)), (2.0, None)]);
     }
 

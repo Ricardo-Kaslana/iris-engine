@@ -13,19 +13,31 @@ pub struct Transform {
 }
 
 impl Transform {
-    pub const IDENTITY: Self =
-        Self { position: Vec3::ZERO, rotation: Quat::IDENTITY, scale: Vec3::ONE };
+    pub const IDENTITY: Self = Self {
+        position: Vec3::ZERO,
+        rotation: Quat::IDENTITY,
+        scale: Vec3::ONE,
+    };
 
     pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
-        Self { position: Vec3::new(x, y, z), ..Self::IDENTITY }
+        Self {
+            position: Vec3::new(x, y, z),
+            ..Self::IDENTITY
+        }
     }
 
     pub fn from_translation(translation: Vec3) -> Self {
-        Self { position: translation, ..Self::IDENTITY }
+        Self {
+            position: translation,
+            ..Self::IDENTITY
+        }
     }
 
     pub fn from_rotation_y(angle: f32) -> Self {
-        Self { rotation: Quat::from_rotation_y(angle), ..Self::IDENTITY }
+        Self {
+            rotation: Quat::from_rotation_y(angle),
+            ..Self::IDENTITY
+        }
     }
 
     /// 模型矩阵（缩放 * 旋转 * 平移）。
@@ -94,7 +106,10 @@ mod tests {
 
     #[test]
     fn scale_applies_to_matrix() {
-        let t = Transform { scale: Vec3::splat(2.0), ..Transform::from_xyz(0.0, 0.0, 0.0) };
+        let t = Transform {
+            scale: Vec3::splat(2.0),
+            ..Transform::from_xyz(0.0, 0.0, 0.0)
+        };
         let corner = t.matrix() * Vec4::new(1.0, 0.0, 0.0, 1.0);
         assert_eq!(corner, Vec4::new(2.0, 0.0, 0.0, 1.0));
     }

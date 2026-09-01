@@ -48,7 +48,9 @@ fn main() {
     ));
 
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(0.55, 48, 24));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(0.55, 48, 24));
 
     // 环灯一圈的方块/球（与 point_shadow_snapshot 同款布局）
     let props: [(f32, f32, f32, f32, bool, [f32; 3]); 6] = [
@@ -92,25 +94,43 @@ fn main() {
     // ---- HUD 叠加层（屏幕像素坐标，原点左上、y 向下）----
     // 文本实体的 UiRect 仅作定位载体（不绘制矩形）
     world.spawn((
-        UiRect { position: [24.0, 20.0], size: [0.0, 0.0] },
-        UiText { string: "IRIS ENGINE".into(), scale: 4.0 },
+        UiRect {
+            position: [24.0, 20.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "IRIS ENGINE".into(),
+            scale: 4.0,
+        },
         UiColor::default(),
     ));
 
     // 血条：深底 + 红色前景（两个独立矩形实体，前景短一截模拟「未满血」）
     world.spawn((
-        UiRect { position: [24.0, 76.0], size: [250.0, 26.0] },
+        UiRect {
+            position: [24.0, 76.0],
+            size: [250.0, 26.0],
+        },
         UiColor([0.04, 0.04, 0.06, 0.85]),
     ));
     world.spawn((
-        UiRect { position: [27.0, 79.0], size: [180.0, 20.0] },
+        UiRect {
+            position: [27.0, 79.0],
+            size: [180.0, 20.0],
+        },
         UiColor([0.90, 0.15, 0.15, 1.0]),
     ));
 
     // 右下占位文本：青色，定位载体算好等宽宽度（11 字符 × 8 × 2 = 176px）
     world.spawn((
-        UiRect { position: [1280.0 - 176.0 - 24.0, 720.0 - 16.0 - 24.0], size: [0.0, 0.0] },
-        UiText { string: "HUD OVERLAY".into(), scale: 2.0 },
+        UiRect {
+            position: [1280.0 - 176.0 - 24.0, 720.0 - 16.0 - 24.0],
+            size: [0.0, 0.0],
+        },
+        UiText {
+            string: "HUD OVERLAY".into(),
+            scale: 2.0,
+        },
         UiColor([0.2, 0.9, 0.9, 1.0]),
     ));
 

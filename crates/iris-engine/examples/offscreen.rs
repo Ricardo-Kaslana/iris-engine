@@ -34,19 +34,28 @@ fn main() {
     world.spawn((transform, cube, mat));
 
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(20.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     // 两盏彩色点光（渲染器每帧自动收集，上限 8 盏）
-    world.spawn((Transform::from_xyz(-1.8, 1.2, 1.2), PointLight::new(Vec3::new(0.3, 0.6, 1.0), 14.0, 9.0)));
-    world.spawn((Transform::from_xyz(1.8, 1.0, -1.0), PointLight::new(Vec3::new(1.0, 0.25, 0.2), 12.0, 8.0)));
+    world.spawn((
+        Transform::from_xyz(-1.8, 1.2, 1.2),
+        PointLight::new(Vec3::new(0.3, 0.6, 1.0), 14.0, 9.0),
+    ));
+    world.spawn((
+        Transform::from_xyz(1.8, 1.0, -1.0),
+        PointLight::new(Vec3::new(1.0, 0.25, 0.2), 12.0, 8.0),
+    ));
 
     // 离屏渲染没有主循环：手动执行层级传播，生成 GlobalTransform
     propagate_transforms(&mut world);
 
     renderer.render(&world);
-    renderer.save_bmp("iris_offscreen.bmp").expect("写入 BMP 失败");
+    renderer
+        .save_bmp("iris_offscreen.bmp")
+        .expect("写入 BMP 失败");
     let (w, h) = renderer.size();
     println!("已输出 iris_offscreen.bmp（{w}×{h}，无窗口离屏渲染）");
 }

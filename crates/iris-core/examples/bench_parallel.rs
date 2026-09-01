@@ -113,7 +113,9 @@ fn main() {
     }
     let parallel_time = t1.elapsed();
 
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     println!("实体 {ENTITY_COUNT} × 8 个互不冲突分量系统 × {ITERATIONS} 帧（核心数 {cores}）");
     println!("串行（逐个执行）：{serial_time:?}");
     println!("并行（访问集分批并发）：{parallel_time:?}");

@@ -45,17 +45,19 @@ fn main() {
     ));
 
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(0.55, 48, 24));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(0.55, 48, 24));
 
     // 环灯一圈的方块/球（不同高度、朝向相机可见的半圈为主）：
     // 每个物体的阴影都应从根部背离点光方向径向拉伸，合起来呈放射状
     let props: [(f32, f32, f32, f32, bool, [f32; 3]); 6] = [
         // x, z, 高度, 半宽/半径, 是否方块, 颜色
-        (0.0, 3.0, 1.6, 0.5, true, [0.85, 0.35, 0.2]),   // 近相机：阴影朝 +Z 拉向画面下缘
-        (3.0, 0.0, 1.2, 0.5, true, [0.3, 0.55, 0.85]),   // 右侧：阴影朝 +X
-        (2.2, -2.2, 2.2, 0.45, true, [0.45, 0.8, 0.5]),  // 右后：阴影朝 −X−Z（被自身遮挡一半）
+        (0.0, 3.0, 1.6, 0.5, true, [0.85, 0.35, 0.2]), // 近相机：阴影朝 +Z 拉向画面下缘
+        (3.0, 0.0, 1.2, 0.5, true, [0.3, 0.55, 0.85]), // 右侧：阴影朝 +X
+        (2.2, -2.2, 2.2, 0.45, true, [0.45, 0.8, 0.5]), // 右后：阴影朝 −X−Z（被自身遮挡一半）
         (-3.0, 0.6, 1.0, 0.55, false, [0.9, 0.75, 0.3]), // 左侧球：阴影朝 −X
-        (0.4, -3.2, 1.8, 0.5, true, [0.75, 0.4, 0.8]),   // 正后：阴影朝 −Z
+        (0.4, -3.2, 1.8, 0.5, true, [0.75, 0.4, 0.8]), // 正后：阴影朝 −Z
         (-2.4, 2.6, 0.9, 0.5, false, [0.55, 0.85, 0.9]), // 左前球：阴影朝 −X+Z
     ];
     for (x, z, height, half, is_cube, color) in props {
@@ -65,7 +67,11 @@ fn main() {
         let mesh = if is_cube { cube } else { sphere };
         // 方块用非均匀缩放改变高度；球按半径落地
         let transform = if is_cube {
-            Transform { position: Vec3::new(x, height * 0.5, z), scale: Vec3::new(half * 2.0, height, half * 2.0), ..Transform::IDENTITY }
+            Transform {
+                position: Vec3::new(x, height * 0.5, z),
+                scale: Vec3::new(half * 2.0, height, half * 2.0),
+                ..Transform::IDENTITY
+            }
         } else {
             Transform::from_xyz(x, height, z)
         };
@@ -74,7 +80,9 @@ fn main() {
 
     // 深灰地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(20.0));
-    let mat_g = world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.16, 0.16, 0.18, 1.0));
+    let mat_g = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.16, 0.16, 0.18, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_g));
 
     {

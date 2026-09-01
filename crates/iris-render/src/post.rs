@@ -16,12 +16,19 @@ pub struct BloomSettings {
 
 impl Default for BloomSettings {
     fn default() -> Self {
-        Self { enabled: true, strength: 0.15, threshold: 1.0 }
+        Self {
+            enabled: true,
+            strength: 0.15,
+            threshold: 1.0,
+        }
     }
 }
 
 impl BloomSettings {
     pub fn disabled() -> Self {
-        Self { enabled: false, ..Default::default() }
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
     }
 }

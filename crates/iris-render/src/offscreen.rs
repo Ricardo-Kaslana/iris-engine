@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use crate::SAMPLE_COUNT;
 use crate::context::Gpu;
 use crate::renderer::Renderer;
-use crate::SAMPLE_COUNT;
 
 pub struct OffscreenRenderer {
     gpu: Arc<Gpu>,
@@ -24,11 +24,20 @@ pub struct OffscreenRenderer {
 impl OffscreenRenderer {
     /// 创建离屏渲染器。无适配器 / 设备创建失败时返回 `None`。
     pub fn new(width: u32, height: u32) -> Option<Self> {
+        // 平台原因（wasm32）：wgpu 的 WebGPU 后端类型内嵌 JS 句柄、非
+        // Send + Sync，clippy::arc_with_non_send_sync 只在 wasm 目标触发。
+        // native 上 `Gpu` 恒为 Send + Sync（跨线程共享渲染器是既有语义）；
+        // wasm 单线程事件循环内不会跨线程使用，Arc 语义不变。
+        #[allow(clippy::arc_with_non_send_sync)]
         let gpu = Arc::new(Gpu::offscreen()?);
         let device = &gpu.device;
         let width = width.max(1);
         let height = height.max(1);
-        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
 
         // blit 输出目标（COPY_SRC 用于读回）；MSAA/HDR 由 renderer 内部管理
         let color = device.create_texture(&wgpu::TextureDescriptor {
@@ -77,7 +86,13 @@ impl OffscreenRenderer {
 
     /// 渲染一帧到离屏纹理，并把结果拷贝到读回缓冲。
     pub fn render(&mut self, world: &iris_core::world::World) {
-        self.renderer.draw(world, &self.color_view, &self.depth_view, self.width, self.height);
+        self.renderer.draw(
+            world,
+            &self.color_view,
+            &self.depth_view,
+            self.width,
+            self.height,
+        );
         // 颜色纹理 -> 读回缓冲（同一队列，顺序保证在绘制之后）
         let mut encoder = self
             .gpu
@@ -169,9 +184,8 @@ impl OffscreenRenderer {
                 buf.push(pixels[i + 1]);
                 buf.push(pixels[i]);
             }
-            for _ in 0..row_padding {
-                buf.push(0);
-            }
+            // 行末 4 字节对齐填充（BGR 行长补零到 4 的倍数）
+            buf.extend(std::iter::repeat_n(0, row_padding as usize));
         }
         std::fs::write(path, buf)
     }

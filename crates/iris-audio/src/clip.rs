@@ -36,7 +36,11 @@ impl AudioClip {
                 samples.len()
             )));
         }
-        Ok(Self { samples: Arc::new(samples), channels, sample_rate })
+        Ok(Self {
+            samples: Arc::new(samples),
+            channels,
+            sample_rate,
+        })
     }
 
     /// 声道数（1 = 单声道，2 = 立体声）。
@@ -91,7 +95,11 @@ impl AudioClip {
             samples.extend_from_slice(clip.samples());
         }
         // 布局一致性已验证：帧数必为声道数的整数倍
-        Ok(Self { samples: Arc::new(samples), channels, sample_rate })
+        Ok(Self {
+            samples: Arc::new(samples),
+            channels,
+            sample_rate,
+        })
     }
 }
 
@@ -131,7 +139,11 @@ mod tests {
     fn clone_shares_buffer() {
         let clip = AudioClip::from_interleaved(vec![0.25; 8], 1, 8_000).expect("合法");
         let cloned = clip.clone();
-        assert_eq!(clipped_ptr(&clip), clipped_ptr(&cloned), "Clone 应共享 Arc 缓冲");
+        assert_eq!(
+            clipped_ptr(&clip),
+            clipped_ptr(&cloned),
+            "Clone 应共享 Arc 缓冲"
+        );
         assert_eq!(clip.samples(), cloned.samples());
     }
 
@@ -147,7 +159,11 @@ mod tests {
         let joined = AudioClip::concat(&[&a, &b]).expect("同布局应可拼");
         assert_eq!((joined.channels(), joined.sample_rate()), (1, 48_000));
         assert_eq!(joined.frame_count(), 5, "帧数应相加");
-        assert_eq!(joined.samples(), &[0.1, 0.2, 0.3, -0.4, -0.5], "采样应按序串联");
+        assert_eq!(
+            joined.samples(),
+            &[0.1, 0.2, 0.3, -0.4, -0.5],
+            "采样应按序串联"
+        );
 
         // 立体声按帧拼接（交错布局不被打乱）；只读视图可逐采样核对
         let l = AudioClip::from_interleaved(vec![1.0, -1.0], 2, 44_100).expect("合法");

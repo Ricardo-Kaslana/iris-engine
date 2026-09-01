@@ -44,6 +44,10 @@ impl SurfaceKit {
         let surface = instance
             .create_surface(window.clone())
             .expect("创建窗口表面失败");
+        // 平台原因（wasm32）：wgpu 的 WebGPU 后端类型内嵌 JS 句柄、非
+        // Send + Sync（同 offscreen.rs 的说明）；wasm 单线程事件循环内
+        // 不会跨线程使用该 Arc，native 语义不变。
+        #[allow(clippy::arc_with_non_send_sync)]
         let gpu = Arc::new(Gpu::with_instance_async(instance, Some(&surface)).await?);
         let size = window.inner_size();
         let caps = surface.get_capabilities(&gpu.adapter);
@@ -109,7 +113,9 @@ impl SurfaceKit {
                 return;
             }
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.renderer.draw(
             world,
             &view,

@@ -38,7 +38,11 @@ pub struct SparseSet<T> {
 
 impl<T> SparseSet<T> {
     pub fn new() -> Self {
-        Self { dense: Vec::new(), entities: Vec::new(), sparse: Vec::new() }
+        Self {
+            dense: Vec::new(),
+            entities: Vec::new(),
+            sparse: Vec::new(),
+        }
     }
 
     /// 插入或覆盖组件，返回旧值（若存在）。
@@ -49,7 +53,10 @@ impl<T> SparseSet<T> {
         }
         let dense_index = self.sparse[index];
         if dense_index != EMPTY && self.entities[dense_index as usize] == entity {
-            return Some(std::mem::replace(&mut self.dense[dense_index as usize], value));
+            return Some(std::mem::replace(
+                &mut self.dense[dense_index as usize],
+                value,
+            ));
         }
         debug_assert!(
             dense_index == EMPTY,
@@ -185,7 +192,9 @@ impl Components {
 
     pub fn insert<C: Component>(&mut self, entity: Entity, value: C) -> Option<C> {
         self.register::<C>();
-        self.borrow_mut::<C>().expect("刚刚注册").insert(entity, value)
+        self.borrow_mut::<C>()
+            .expect("刚刚注册")
+            .insert(entity, value)
     }
 
     pub fn remove<C: Component>(&mut self, entity: Entity) -> Option<C> {
@@ -340,7 +349,7 @@ mod tests {
         for (entity, value) in set.iter() {
             assert_eq!(set.get(entity), Some(value));
         }
-        let remaining: Vec<_> = set.values().iter().copied().collect();
+        let remaining: Vec<_> = set.values().to_vec();
         assert_eq!(remaining, vec![0, 100, 700, 300, 400, 500]);
     }
 

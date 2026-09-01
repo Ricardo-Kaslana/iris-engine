@@ -24,11 +24,11 @@ pub mod scene;
 pub use iris_audio;
 
 pub mod prelude {
+    pub use crate::app::App;
+    pub use crate::audio::Audio;
     pub use iris_core::prelude::*;
     pub use iris_platform::prelude::*;
     pub use iris_render::prelude::*;
-    pub use crate::app::App;
-    pub use crate::audio::Audio;
     // 资产路径解析：默认资产在 cargo run / cargo test 两种 cwd 下都能命中
     pub use crate::assets::asset_path;
     pub use crate::plugin::{
@@ -37,11 +37,11 @@ pub mod prelude {
     };
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记
     pub use crate::scene::{
-        load_scene, save_scene, GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError,
+        GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError, load_scene, save_scene,
     };
     // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）
     pub use iris_audio::{
-        load_wav, noise, parse_wav, sine, square, AudioClip, AudioError, AudioMixer, AudioOutput,
-        SoundId,
+        AudioClip, AudioError, AudioMixer, AudioOutput, SoundId, load_wav, noise, parse_wav, sine,
+        square,
     };
 }

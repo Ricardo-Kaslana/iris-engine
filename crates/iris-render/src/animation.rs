@@ -73,7 +73,11 @@ impl AnimationChannel {
             return;
         }
         // 段查找：i 满足 times[i] <= t < times[i+1]
-        let i = self.times.partition_point(|&tt| tt <= t).saturating_sub(1).min(last - 1);
+        let i = self
+            .times
+            .partition_point(|&tt| tt <= t)
+            .saturating_sub(1)
+            .min(last - 1);
         if self.interpolation == AnimationInterpolation::Step {
             copy_key(i, out);
             return;
@@ -92,10 +96,11 @@ impl AnimationChannel {
             out[..4].copy_from_slice(&[q.x, q.y, q.z, q.w]);
             return;
         }
-        for c in 0..comps {
+        // comps ≤ out.len()（各属性分量数 3 / 4 / 4）：只覆写前 comps 个槽
+        for (c, slot) in out.iter_mut().enumerate().take(comps) {
             let a = self.values[i * comps + c];
             let b = self.values[(i + 1) * comps + c];
-            out[c] = a + (b - a) * f;
+            *slot = a + (b - a) * f;
         }
     }
 
@@ -185,6 +190,10 @@ impl AnimationPlayer {
     }
 }
 
+/// 单个动画根实体的采样任务包（`update_animations` 阶段一产出、阶段二
+/// 消费）：根实体 + 推进后的时间 + 循环标记 + 「目标实体 → 覆写字段」列表。
+type AnimationJob = (Entity, f32, bool, Vec<(Entity, AnimatedField)>);
+
 /// 每帧动画系统：推进所有 [`AnimationPlayer`]，把采样结果覆写到目标实体的
 /// `Transform`。必须在 `propagate_transforms` 之前执行（DefaultPlugins 已保证）；
 /// `Time` 资源缺席时 dt 视为 0（可手动设置 `player.time` 后调用以定位到指定时刻）。
@@ -192,10 +201,13 @@ impl AnimationPlayer {
 /// 只读世界签名（`&World`）：组件写访问走世界内部的尝试型锁，
 /// 因此可注册为**并行系统**（访问集：写 AnimationPlayer / Transform，读 Time）。
 pub fn update_animations(world: &iris_core::world::World) {
-    let dt = world.try_resource::<Time>().map(|t| t.delta_secs()).unwrap_or(0.0);
+    let dt = world
+        .try_resource::<Time>()
+        .map(|t| t.delta_secs())
+        .unwrap_or(0.0);
 
     // 阶段一（只读采样）：推进时间并把每条通道的采样值收集为覆写任务
-    let mut jobs: Vec<(Entity, f32, bool, Vec<(Entity, AnimatedField)>)> = Vec::new();
+    let mut jobs: Vec<AnimationJob> = Vec::new();
     world.query::<(Entity, &AnimationPlayer)>(|(entity, player)| {
         let (time, playing) = player.advanced(dt);
         let Some(clip) = player.clips.get(player.active) else {
@@ -294,8 +306,14 @@ mod tests {
             interpolation: AnimationInterpolation::Linear,
             times: vec![0.0, 1.0],
             values: vec![
-                0.0, 0.0, 0.0, 1.0, // 单位四元数（yaw 0°）
-                0.0, 0.70710678, 0.0, 0.70710678, // yaw 90°
+                0.0,
+                0.0,
+                0.0,
+                1.0, // 单位四元数（yaw 0°）
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2,
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2, // yaw 90°
             ],
         };
         match ch.sample(0.5) {
@@ -327,7 +345,10 @@ mod tests {
         player.time = t;
         player.looping = false;
         let (t, playing) = player.advanced(0.9);
-        assert!((t - 1.0).abs() < 1e-5 && !playing, "非循环应停在末尾，实际 {t}");
+        assert!(
+            (t - 1.0).abs() < 1e-5 && !playing,
+            "非循环应停在末尾，实际 {t}"
+        );
         player.time = t;
         player.playing = playing;
         assert_eq!(player.advanced(0.3), (1.0, false), "暂停不应推进");

@@ -1,0 +1,45 @@
+# CI：三平台测试 + wasm32 编译检查 + fmt/clippy 双目标门禁。
+# 注：项目暂无远端仓库，本文件本地备好即永不触发运行（push 到远端后生效）。
+# GPU 相关测试（iris-render / iris-engine 的离屏渲染集成测试）在无 GPU 的
+# CI 环境自动跳过（OffscreenRenderer 构造返回 None 时测试跳过而非失败，
+# 见 ARCHITECTURE.md §4.10）——CI 上实际跑的是纯 CPU 单测与 headless 集成。
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --quiet
+  wasm:
+    name: check (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --target wasm32-unknown-unknown
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy", targets: wasm32-unknown-unknown }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings

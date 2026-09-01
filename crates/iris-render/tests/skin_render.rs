@@ -46,8 +46,10 @@ fn add_arm_segment(data: &mut MeshData, center: [f32; 3], joint: u32) {
 
 /// 两段臂 + 肘关节 rotZ 0°→90° 动画的 GLB。
 fn skinned_arm_glb() -> Vec<u8> {
-    let mut data = MeshData::default();
-    data.skin = Some(Vec::new());
+    let mut data = MeshData {
+        skin: Some(Vec::new()),
+        ..MeshData::default()
+    };
     add_arm_segment(&mut data, [0.0, 0.5, 0.0], 0); // 下段 y∈[0,1]，绑髋
     add_arm_segment(&mut data, [0.0, 1.5, 0.0], 1); // 上段 y∈[1,2]，绑肘
 
@@ -90,7 +92,10 @@ fn skinned_arm_glb() -> Vec<u8> {
     // 逆绑定矩阵：髋 bind = 恒等；肘 bind 全局 = T(0,1,0) → ibm = T(0,-1,0)
     let ibm_offset = bin.len();
     extend_mat4(&mut bin, glam::Mat4::IDENTITY);
-    extend_mat4(&mut bin, glam::Mat4::from_translation([0.0, -1.0, 0.0].into()));
+    extend_mat4(
+        &mut bin,
+        glam::Mat4::from_translation([0.0, -1.0, 0.0].into()),
+    );
 
     let json = format!(
         r#"{{
@@ -206,12 +211,15 @@ fn skinned_arm_bends_with_joint_animation() {
         player.looping = false;
         player.time = 1.0;
     }
-    update_animations(&mut world);
+    update_animations(&world);
     propagate_transforms(&mut world);
     renderer.render(&world);
     let (left_end, total_end, min_x_end, _) = count_red(&renderer.read_pixels(), w, h);
 
-    assert!(total_start > 200, "bind 姿势下臂应可见，红像素 {total_start}");
+    assert!(
+        total_start > 200,
+        "bind 姿势下臂应可见，红像素 {total_start}"
+    );
     assert!(
         total_end > total_start / 2,
         "弯曲后臂不应消失（{total_start} -> {total_end}）"
@@ -270,7 +278,7 @@ fn skinned_arm_casts_matching_shadow() {
             player.looping = false;
             player.time = 1.0;
         }
-        update_animations(&mut world);
+        update_animations(&world);
         propagate_transforms(&mut world);
         world
     };
@@ -294,8 +302,14 @@ fn skinned_arm_casts_matching_shadow() {
             brightened += 1;
         }
     }
-    assert!(darkened > 30, "蒙皮几何体应向地面投影（变暗像素 {darkened}）");
-    assert!(brightened <= 4, "开阴影不应让任何像素变亮，实际 {brightened}");
+    assert!(
+        darkened > 30,
+        "蒙皮几何体应向地面投影（变暗像素 {darkened}）"
+    );
+    assert!(
+        brightened <= 4,
+        "开阴影不应让任何像素变亮，实际 {brightened}"
+    );
 }
 
 /// 蒙皮实例结构回归（dogfooding II 摩擦①⑦闭合的 GPU 证据）：
@@ -341,7 +355,10 @@ fn skinned_instance_follows_root_translation() {
     let (w, h) = renderer.size();
     let (left_before, total_before, min_x_before, max_x_before) =
         count_red(&renderer.read_pixels(), w, h);
-    assert!(total_before > 200, "bind 姿势下臂应可见，红像素 {total_before}");
+    assert!(
+        total_before > 200,
+        "bind 姿势下臂应可见，红像素 {total_before}"
+    );
     assert!(
         left_before > 0 && min_x_before < w / 2,
         "位移前臂应跨屏幕中线（左半屏有红像素）：left {left_before}，min_x {min_x_before}"
@@ -349,7 +366,8 @@ fn skinned_instance_follows_root_translation() {
 
     // 实例定位到 (1.5, 0, 0)：fov 45°、视距 5.5 → 臂平面半屏宽 ≈ 2.3，
     // 偏移后仍在画面内（右半屏）
-    world.get_mut::<Transform>(instance.roots[0])
+    world
+        .get_mut::<Transform>(instance.roots[0])
         .expect("实例根应有 Transform")
         .position = Vec3::new(1.5, 0.0, 0.0);
     propagate_transforms(&mut world);

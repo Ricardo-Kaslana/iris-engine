@@ -18,7 +18,11 @@ pub struct CpuTexture {
 impl CpuTexture {
     /// 1x1 纯色纹理（常用于无贴图的纯色材质）。
     pub fn solid(color: [u8; 4]) -> Self {
-        Self { width: 1, height: 1, rgba: color.to_vec() }
+        Self {
+            width: 1,
+            height: 1,
+            rgba: color.to_vec(),
+        }
     }
 
     /// 程序化棋盘格纹理。
@@ -27,11 +31,19 @@ impl CpuTexture {
         let mut rgba = Vec::with_capacity((size * size * 4) as usize);
         for y in 0..size {
             for x in 0..size {
-                let c = if ((x / cell) + (y / cell)) % 2 == 0 { a } else { b };
+                let c = if ((x / cell) + (y / cell)) % 2 == 0 {
+                    a
+                } else {
+                    b
+                };
                 rgba.extend_from_slice(&c);
             }
         }
-        Self { width: size, height: size, rgba }
+        Self {
+            width: size,
+            height: size,
+            rgba,
+        }
     }
 }
 
@@ -43,7 +55,9 @@ pub struct TextureStore {
 
 impl Default for TextureStore {
     fn default() -> Self {
-        Self { textures: vec![CpuTexture::solid([255, 255, 255, 255])] }
+        Self {
+            textures: vec![CpuTexture::solid([255, 255, 255, 255])],
+        }
     }
 }
 
@@ -74,15 +88,18 @@ mod tests {
         assert_eq!(tex.rgba.len(), 8 * 8 * 4);
         // 左上角第一格为 a
         assert_eq!(&tex.rgba[0..4], &[0, 0, 0, 255]);
-        // (4,0) 属于第二列 → b
-        let idx = ((0 * 8 + 4) * 4) as usize;
+        // (4,0) 属于第二列 → b（像素起始字节 = (y×8+x)×4 = 16）
+        let idx = 4 * 4;
         assert_eq!(&tex.rgba[idx..idx + 4], &[255, 255, 255, 255]);
     }
 
     #[test]
     fn store_zero_is_white_fallback() {
         let mut store = TextureStore::new();
-        assert_eq!(store.get(TextureHandle(0)).unwrap().rgba, vec![255, 255, 255, 255]);
+        assert_eq!(
+            store.get(TextureHandle(0)).unwrap().rgba,
+            vec![255, 255, 255, 255]
+        );
         let handle = store.add(CpuTexture::solid([255, 0, 0, 255]));
         assert_eq!(handle, TextureHandle(1));
         assert_eq!(store.get(handle).unwrap().rgba, vec![255, 0, 0, 255]);

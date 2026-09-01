@@ -30,7 +30,7 @@ use iris_engine::prelude::{
     App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode, MaterialStore,
     MeshStore, OffscreenRenderer, Plugin, TextureStore, Time,
 };
-use iris_game::{GamePlugin, GameState, Phase, DEFAULT_SCENE_PATH};
+use iris_game::{DEFAULT_SCENE_PATH, GamePlugin, GameState, Phase};
 
 /// 与 tests/headless.rs 同款测试台：虚拟时钟 + Input 注入 + 插件系统链。
 /// 承载于无窗口的 `App`（`App::new` 不建窗口 / 不碰 GPU，`run` 才会）。
@@ -60,7 +60,10 @@ impl Harness {
         GamePlugin::new(DEFAULT_SCENE_PATH).build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
-        harness.app.schedule.run(Stage::Startup, &mut harness.app.world);
+        harness
+            .app
+            .schedule
+            .run(Stage::Startup, &mut harness.app.world);
         harness
     }
 
@@ -78,7 +81,9 @@ impl Harness {
         }
         // 与 App::tick 同序：Update → PostUpdate（层级传播当帧生效）
         self.app.schedule.run(Stage::Update, &mut self.app.world);
-        self.app.schedule.run(Stage::PostUpdate, &mut self.app.world);
+        self.app
+            .schedule
+            .run(Stage::PostUpdate, &mut self.app.world);
         self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
@@ -135,5 +140,7 @@ fn main() {
     renderer.save_bmp("iris_game_after.bmp").expect("写 BMP");
 
     println!("已输出 iris_game_start.bmp / iris_game_after.bmp");
-    println!("拼图：ffmpeg -y -i iris_game_start.bmp -i iris_game_after.bmp -filter_complex hstack docs/game_preview.png");
+    println!(
+        "拼图：ffmpeg -y -i iris_game_start.bmp -i iris_game_after.bmp -filter_complex hstack docs/game_preview.png"
+    );
 }

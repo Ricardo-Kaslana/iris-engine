@@ -55,7 +55,13 @@ pub struct PlayerState {
 
 impl PlayerState {
     fn new() -> Self {
-        Self { x: 0.0, z: 0.0, y: GROUND_Y, y_vel: 0.0, facing: 0.0 }
+        Self {
+            x: 0.0,
+            z: 0.0,
+            y: GROUND_Y,
+            y_vel: 0.0,
+            facing: 0.0,
+        }
     }
 
     /// 前方单位向量（XZ 平面）。与引擎 `Transform::forward` 同约定：
@@ -86,7 +92,11 @@ pub struct MoveInput {
 
 impl MoveInput {
     /// 无输入（静止）。
-    pub const IDLE: Self = Self { x: 0.0, z: 0.0, jump: false };
+    pub const IDLE: Self = Self {
+        x: 0.0,
+        z: 0.0,
+        jump: false,
+    };
 
     /// 是否存在移动期望。
     pub fn is_moving(&self) -> bool {
@@ -118,7 +128,11 @@ impl GameState {
             player: PlayerState::new(),
             pickups: Self::spawn_positions()
                 .into_iter()
-                .map(|(x, z)| PickupState { x, z, collected: false })
+                .map(|(x, z)| PickupState {
+                    x,
+                    z,
+                    collected: false,
+                })
                 .collect(),
             score: 0,
             time_left: duration_secs,
@@ -241,7 +255,10 @@ mod tests {
         let positions = GameState::spawn_positions();
         assert_eq!(positions.len(), 10, "应为 10 枚金币");
         for (i, &(x, z)) in positions.iter().enumerate() {
-            assert!(x.abs() <= ARENA && z.abs() <= ARENA, "金币 {i} ({x},{z}) 越界");
+            assert!(
+                x.abs() <= ARENA && z.abs() <= ARENA,
+                "金币 {i} ({x},{z}) 越界"
+            );
             for &(ox, oz) in positions.iter().take(i) {
                 assert!(
                     Vec2::new(x - ox, z - oz).length() > 2.0,
@@ -257,8 +274,21 @@ mod tests {
         // +X 匀速移动 1 s → x = 5，朝向**逼近** +X（facing = atan2(0, -1) = -π/2）。
         // 转身是指数平滑动画而非瞬时赋值：60 帧（t=0.2/帧）后残差 < 1e-7，
         // 但恒不严格等于目标。
-        run(&mut state, MoveInput { x: 1.0, z: 0.0, jump: false }, 1.0, 1.0 / 60.0);
-        assert!((state.player.x - 5.0).abs() < 1e-4, "x 应为 5，实际 {}", state.player.x);
+        run(
+            &mut state,
+            MoveInput {
+                x: 1.0,
+                z: 0.0,
+                jump: false,
+            },
+            1.0,
+            1.0 / 60.0,
+        );
+        assert!(
+            (state.player.x - 5.0).abs() < 1e-4,
+            "x 应为 5，实际 {}",
+            state.player.x
+        );
         assert!(state.player.z.abs() < 1e-5);
         let want = -std::f32::consts::FRAC_PI_2;
         assert!(
@@ -268,7 +298,16 @@ mod tests {
         );
         // 首帧后应可见转身过程（未到位）：平滑生效的直接证据
         let mut probe = GameState::new(ARENA, DURATION);
-        run(&mut probe, MoveInput { x: 1.0, z: 0.0, jump: false }, 1.0 / 60.0, 1.0 / 60.0);
+        run(
+            &mut probe,
+            MoveInput {
+                x: 1.0,
+                z: 0.0,
+                jump: false,
+            },
+            1.0 / 60.0,
+            1.0 / 60.0,
+        );
         assert!(
             (probe.player.facing - want).abs() > 1e-3,
             "单帧后朝向不应已到位（转身应是渐进的），实际 {}",
@@ -287,7 +326,11 @@ mod tests {
         let mut state = GameState::new(ARENA, DURATION);
         state.player.facing = 170.0_f32.to_radians();
         // 目标朝向 = atan2(-0.176, -1.0) ≈ -170°：与起点夹 20°（经 ±180°）
-        let input = MoveInput { x: 0.1763, z: 1.0, jump: false };
+        let input = MoveInput {
+            x: 0.1763,
+            z: 1.0,
+            jump: false,
+        };
         run(&mut state, input, 0.1, 1.0 / 60.0);
         // 0.1 s（6 帧，平滑累计 ≈ 0.74）后：短路径应停在 ±180° 附近
         // （|facing| > 155°）；长路径会扫到 ≈ -81°，|facing| 远小于 90°
@@ -302,8 +345,7 @@ mod tests {
         // 继续推进到 1 s：应到位并稳定逼近 -170°
         run(&mut state, input, 1.0, 1.0 / 60.0);
         let want = -170.0_f32.to_radians();
-        let end_delta = (state.player.facing - want)
-            .rem_euclid(std::f32::consts::TAU);
+        let end_delta = (state.player.facing - want).rem_euclid(std::f32::consts::TAU);
         let end_delta = end_delta.min(std::f32::consts::TAU - end_delta);
         assert!(
             end_delta < 0.05,
@@ -317,7 +359,16 @@ mod tests {
     fn diagonal_input_is_normalized() {
         let mut state = GameState::new(ARENA, DURATION);
         // 斜向输入 (1,1) 归一化后 1 s 位移仍为 5 m（不是 5√2）
-        run(&mut state, MoveInput { x: 1.0, z: 1.0, jump: false }, 1.0, 1.0 / 60.0);
+        run(
+            &mut state,
+            MoveInput {
+                x: 1.0,
+                z: 1.0,
+                jump: false,
+            },
+            1.0,
+            1.0 / 60.0,
+        );
         let want = 5.0 / std::f32::consts::SQRT_2;
         assert!((state.player.x - want).abs() < 1e-4);
         assert!((state.player.z - want).abs() < 1e-4);
@@ -328,7 +379,14 @@ mod tests {
         let mut state = GameState::new(ARENA, DURATION);
         let dt = 1.0 / 120.0;
         // 起跳一帧后松开
-        state.step(&MoveInput { x: 0.0, z: 0.0, jump: true }, dt);
+        state.step(
+            &MoveInput {
+                x: 0.0,
+                z: 0.0,
+                jump: true,
+            },
+            dt,
+        );
         assert!(state.player.y > 0.0, "起跳后应离地");
         let mut max_y = state.player.y;
         for _ in 0..120 {
@@ -337,22 +395,50 @@ mod tests {
         }
         // 解析顶点 v²/2g = 49/40 = 1.225；显式积分的离散化误差
         // ≈ ½·|g|·t_apex·dt（dt = 1/120 时约 +0.029），放宽覆盖
-        assert!((max_y - 1.225).abs() < 0.05, "最高点应约 1.225 m，实际 {max_y}");
+        assert!(
+            (max_y - 1.225).abs() < 0.05,
+            "最高点应约 1.225 m，实际 {max_y}"
+        );
         assert_eq!(state.player.y, GROUND_Y, "0.7 s 后应已落地");
         assert_eq!(state.player.y_vel, 0.0, "落地后垂直速度归零");
         // 落地后按住跳跃可再次起跳
-        state.step(&MoveInput { x: 0.0, z: 0.0, jump: true }, dt);
+        state.step(
+            &MoveInput {
+                x: 0.0,
+                z: 0.0,
+                jump: true,
+            },
+            dt,
+        );
         assert!(state.player.y > 0.0, "落地后应可再次起跳");
     }
 
     #[test]
     fn boundary_clamps_to_arena() {
         let mut state = GameState::new(ARENA, DURATION);
-        run(&mut state, MoveInput { x: 1.0, z: 1.0, jump: false }, 10.0, 1.0 / 60.0);
+        run(
+            &mut state,
+            MoveInput {
+                x: 1.0,
+                z: 1.0,
+                jump: false,
+            },
+            10.0,
+            1.0 / 60.0,
+        );
         assert_eq!(state.player.x, ARENA, "x 应被钳制在 +arena_half");
         assert_eq!(state.player.z, ARENA, "z 应被钳制在 +arena_half");
         // 越界方向继续输入不会穿墙
-        run(&mut state, MoveInput { x: 1.0, z: 1.0, jump: false }, 5.0, 1.0 / 60.0);
+        run(
+            &mut state,
+            MoveInput {
+                x: 1.0,
+                z: 1.0,
+                jump: false,
+            },
+            5.0,
+            1.0 / 60.0,
+        );
         assert_eq!(state.player.x, ARENA);
     }
 
@@ -403,7 +489,14 @@ mod tests {
     fn timeout_loses() {
         let mut state = GameState::new(ARENA, DURATION);
         state.time_left = 0.05;
-        state.step(&MoveInput { x: 1.0, z: 0.0, jump: false }, 0.1);
+        state.step(
+            &MoveInput {
+                x: 1.0,
+                z: 0.0,
+                jump: false,
+            },
+            0.1,
+        );
         assert_eq!(state.phase, Phase::Lost);
         assert_eq!(state.time_left, 0.0);
         assert_eq!(state.score, 0, "超时结算时未收集任何金币");
@@ -417,7 +510,11 @@ mod tests {
             let before = (state.player.x, state.player.z, state.time_left, state.score);
             run(
                 &mut state,
-                MoveInput { x: 1.0, z: 0.0, jump: true },
+                MoveInput {
+                    x: 1.0,
+                    z: 0.0,
+                    jump: true,
+                },
                 1.0,
                 1.0 / 60.0,
             );

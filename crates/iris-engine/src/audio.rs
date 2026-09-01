@@ -30,7 +30,10 @@ impl Audio {
         match AudioOutput::device() {
             Some(device) => {
                 let mixer = device.mixer_arc();
-                Self { mixer, device: Some(device) }
+                Self {
+                    mixer,
+                    device: Some(device),
+                }
             }
             None => {
                 log::warn!(
@@ -50,7 +53,10 @@ impl Audio {
     /// `Audio` 不会覆盖（设备句柄独占，覆盖即泄漏），即可保证测试全程
     /// 零设备访问；`play / stop / set_volume / mixer` 语义与有设备时一致。
     pub fn headless() -> Self {
-        Self { mixer: Arc::new(Mutex::new(AudioMixer::new())), device: None }
+        Self {
+            mixer: Arc::new(Mutex::new(AudioMixer::new())),
+            device: None,
+        }
     }
 
     /// 是否接有真实输出设备。
@@ -86,7 +92,9 @@ impl Audio {
     /// 混音器可变访问：无设备模式下手动推进混音（离线渲染 / 快照），
     /// 或查询 `active_count` 等状态。
     pub fn mixer(&self) -> MutexGuard<'_, AudioMixer> {
-        self.mixer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -112,7 +120,11 @@ mod tests {
 
         let clip = sine(440.0, 0.05, 48_000);
         let id = audio.play(clip, 0.5, false);
-        assert_eq!(audio.mixer().active_count(), 1, "纯混音器模式下 play 照常入表");
+        assert_eq!(
+            audio.mixer().active_count(),
+            1,
+            "纯混音器模式下 play 照常入表"
+        );
         assert!(audio.set_volume(id, 0.2), "句柄在活跃表内，调整音量应成功");
         assert!(audio.stop(id), "停止应成功");
         assert_eq!(audio.mixer().active_count(), 0);

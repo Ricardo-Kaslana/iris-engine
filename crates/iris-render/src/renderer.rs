@@ -14,17 +14,17 @@ use std::sync::Arc;
 use glam::{Mat4, Vec3};
 use iris_core::prelude::GlobalTransform;
 
-use crate::camera::{view_from_global, ActiveCamera, Camera};
+use crate::SAMPLE_COUNT;
+use crate::camera::{ActiveCamera, Camera, view_from_global};
 use crate::context::Gpu;
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
-use crate::light::{DirectionalLight, PointLight, MAX_POINT_LIGHTS};
+use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight};
 use crate::material::{MaterialHandle, MaterialStore};
-use crate::mesh::{upload_mesh, MeshHandle, MeshStore};
+use crate::mesh::{MeshHandle, MeshStore, upload_mesh};
 use crate::pipeline::create_pipeline;
 use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
-use crate::SAMPLE_COUNT;
 
 /// 与 WGSL `PointLight` 结构对齐（32 字节，POD）。
 #[repr(C)]
@@ -46,14 +46,17 @@ struct GlobalsRaw {
     point_count: [f32; 4],
     point_lights: [PointLightRaw; MAX_POINT_LIGHTS],
     light_view_proj: [[f32; 4]; 4],
-    shadow_params: [f32; 4], // texel_size, bias, strength, enabled
-    env_params: [f32; 4],    // 预滤波最大 mip 级, IBL 强度, 保留
+    shadow_params: [f32; 4],      // texel_size, bias, strength, enabled
+    env_params: [f32; 4],         // 预滤波最大 mip 级, IBL 强度, 保留
     inv_view_proj: [[f32; 4]; 4], // 天空盒射线重建用
     // x: 是否启用点光阴影, y: bias（米）, z: 投影灯 range, w: 保留
     point_shadow_params: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<GlobalsRaw>() == 576, "Globals 必须与 WGSL 布局一致");
+const _: () = assert!(
+    std::mem::size_of::<GlobalsRaw>() == 576,
+    "Globals 必须与 WGSL 布局一致"
+);
 
 /// 与 WGSL `PointFaceParams` 对齐（80 字节，POD）：点光阴影每面独立小 uniform。
 #[repr(C)]
@@ -63,8 +66,10 @@ struct PointFaceParamsRaw {
     light_pos_range: [f32; 4], // xyz: 灯世界位置, w: range
 }
 
-const _: () =
-    assert!(std::mem::size_of::<PointFaceParamsRaw>() == 80, "PointFaceParams 必须与 WGSL 布局一致");
+const _: () = assert!(
+    std::mem::size_of::<PointFaceParamsRaw>() == 80,
+    "PointFaceParams 必须与 WGSL 布局一致"
+);
 
 /// 阴影深度偏移（正交投影 + 正面剔除下的小常数即可抑制 acne）。
 const SHADOW_BIAS: f32 = 0.0015;
@@ -236,7 +241,10 @@ struct BloomParamsRaw {
     b: [f32; 4], // 模糊方向步长
 }
 
-const _: () = assert!(std::mem::size_of::<BloomParamsRaw>() == 32, "BlurParams 必须与 WGSL 布局一致");
+const _: () = assert!(
+    std::mem::size_of::<BloomParamsRaw>() == 32,
+    "BlurParams 必须与 WGSL 布局一致"
+);
 
 /// 与 WGSL `ui_globals` 对齐（16 字节，POD）：xy = 屏幕尺寸（像素），
 /// zw 恒 0（WGSL uniform 地址空间要求根结构体尺寸为 16 的倍数）。
@@ -247,7 +255,10 @@ struct UiGlobalsRaw {
     _pad: [f32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<UiGlobalsRaw>() == 16, "UiGlobals 必须与 WGSL 布局一致");
+const _: () = assert!(
+    std::mem::size_of::<UiGlobalsRaw>() == 16,
+    "UiGlobals 必须与 WGSL 布局一致"
+);
 
 /// 单帧渲染统计。
 #[derive(Clone, Copy, Debug, Default)]
@@ -447,7 +458,10 @@ fn collect_instances(
             return;
         }
         let key = ((m.0 as u64) << 32) | mat.0 as u64;
-        items.push(DrawItem { key, instance: InstanceRaw::from_matrix(model) });
+        items.push(DrawItem {
+            key,
+            instance: InstanceRaw::from_matrix(model),
+        });
     });
     culled
 }
@@ -582,7 +596,11 @@ impl Renderer {
         // 内置 0 号白色兜底纹理：材质未指定贴图时使用
         let white = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.texture.white"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -598,12 +616,22 @@ impl Renderer {
                 aspect: wgpu::TextureAspect::All,
             },
             &[255, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
         let white_gpu = GpuTexture {
             view: white.create_view(&wgpu::TextureViewDescriptor::default()),
-            sampler: gpu.device.create_sampler(&wgpu::SamplerDescriptor::default()),
+            sampler: gpu
+                .device
+                .create_sampler(&wgpu::SamplerDescriptor::default()),
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
@@ -724,7 +752,12 @@ impl Renderer {
             instance_scratch: Vec::new(),
             skinned_scratch: Vec::new(),
             ui_scratch: Vec::new(),
-            clear_color: wgpu::Color { r: 0.055, g: 0.07, b: 0.10, a: 1.0 },
+            clear_color: wgpu::Color {
+                r: 0.055,
+                g: 0.07,
+                b: 0.10,
+                a: 1.0,
+            },
             stats: FrameStats::default(),
         }
     }
@@ -808,7 +841,8 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: crate::pipeline::HDR_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
         };
@@ -824,62 +858,76 @@ impl Renderer {
                 mapped_at_creation: false,
             })
         };
-        let bloom_params: [wgpu::Buffer; 3] =
-            [make_bloom_params(), make_bloom_params(), make_bloom_params()];
+        let bloom_params: [wgpu::Buffer; 3] = [
+            make_bloom_params(),
+            make_bloom_params(),
+            make_bloom_params(),
+        ];
         let bloom_strength = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("iris.bloom.strength"),
             size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bloom_sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let bloom_sampler = self
+            .gpu
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor::default());
         let bloom_bg = |view: &wgpu::TextureView, params: &wgpu::Buffer| {
-            self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("iris.bloom.bg"),
-                layout: &self.bundle.bloom_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: params.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&bloom_sampler),
-                    },
-                ],
-            })
+            self.gpu
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("iris.bloom.bg"),
+                    layout: &self.bundle.bloom_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&bloom_sampler),
+                        },
+                    ],
+                })
         };
         let bloom_threshold_bg = bloom_bg(&resolved_view, &bloom_params[0]);
         let bloom_blur_h_bg = bloom_bg(&bloom_a_view, &bloom_params[1]);
         let bloom_blur_v_bg = bloom_bg(&bloom_b_view, &bloom_params[2]);
-        let blit_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("iris.blit.bg"),
-            layout: &self.bundle.blit_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&resolved_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.gpu.device.create_sampler(
-                        &wgpu::SamplerDescriptor::default(),
-                    )),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&bloom_a_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: bloom_strength.as_entire_binding(),
-                },
-            ],
-        });
+        let blit_bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.blit.bg"),
+                layout: &self.bundle.blit_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&resolved_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(
+                            &self
+                                .gpu
+                                .device
+                                .create_sampler(&wgpu::SamplerDescriptor::default()),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&bloom_a_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: bloom_strength.as_entire_binding(),
+                    },
+                ],
+            });
         self.hdr_size = (width, height);
         self.hdr = Some(HdrTargets {
             msaa,
@@ -902,7 +950,6 @@ impl Renderer {
     pub fn set_clear_color(&mut self, color: wgpu::Color) {
         self.clear_color = color;
     }
-
 
     pub fn stats(&self) -> FrameStats {
         self.stats
@@ -933,14 +980,20 @@ impl Renderer {
                 mounted = Some((view_from_global(gt), *ac, gt.position()));
             }
         });
-        let (view, fov, z_near, z_far, eye) = match mounted.clone() {
+        let (view, fov, z_near, z_far, eye) = match mounted {
             Some((view, ac, eye)) => (view, ac.fov_y_radians, ac.z_near, ac.z_far, eye),
             None => {
                 let Some(camera) = world.try_resource::<Camera>().map(|c| (*c).clone()) else {
                     log::debug!("世界中没有 ActiveCamera 实体也没有 Camera 资源，跳过本帧渲染");
                     return;
                 };
-                (camera.view_matrix(), camera.fov_y_radians, camera.z_near, camera.z_far, camera.eye)
+                (
+                    camera.view_matrix(),
+                    camera.fov_y_radians,
+                    camera.z_near,
+                    camera.z_far,
+                    camera.eye,
+                )
             }
         };
         let aspect = width as f32 / height.max(1) as f32;
@@ -957,7 +1010,7 @@ impl Renderer {
         } else {
             world
                 .try_resource::<Camera>()
-                .map(|c| (*c).target)
+                .map(|c| c.target)
                 .unwrap_or(Vec3::ZERO)
         };
         let light_vp = light.shadow_view_proj(shadow_center, light.shadow_range);
@@ -1004,16 +1057,16 @@ impl Renderer {
             point_count += 1;
         });
         if caster_total > 1 {
-            log::warn!("有 {caster_total} 盏点光开启阴影，v1 只取查询顺序中的第一盏投射 cubemap 阴影");
+            log::warn!(
+                "有 {caster_total} 盏点光开启阴影，v1 只取查询顺序中的第一盏投射 cubemap 阴影"
+            );
         }
         if let Some(slot) = caster_slot {
             point_lights.swap(0, slot);
         }
         // 投影灯交换后必然位于槽位 0；range 直接从 uniform 数据取
         let point_shadow_params = match caster_slot {
-            Some(_) => {
-                [1.0, POINT_SHADOW_BIAS, point_lights[0].color[3], 0.0]
-            }
+            Some(_) => [1.0, POINT_SHADOW_BIAS, point_lights[0].color[3], 0.0],
             None => [0.0, POINT_SHADOW_BIAS, 1.0, 0.0],
         };
         if point_count == MAX_POINT_LIGHTS {
@@ -1130,14 +1183,18 @@ impl Renderer {
             let mut uploaded_bytes = 0u64;
             if rebuilt || self.last_instances.len() != count {
                 // 缓冲刚重建（旧内容随缓冲作废）或实例数变化：全量上传
-                self.gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
+                self.gpu
+                    .queue
+                    .write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
                 uploaded_bytes = count as u64 * instance_bytes;
             } else {
                 let ranges = diff_changed_ranges(&self.last_instances, &instances);
                 let changed: usize = ranges.iter().map(|r| r.len()).sum();
                 if changed as f32 > count as f32 * INSTANCE_DIFF_FULL_FALLBACK_RATIO {
                     // 变化过半：碎段编码开销超过带宽收益，回退全量
-                    self.gpu.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
+                    self.gpu
+                        .queue
+                        .write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
                     uploaded_bytes = count as u64 * instance_bytes;
                 } else if changed > 0 {
                     for range in ranges {
@@ -1176,7 +1233,11 @@ impl Renderer {
         // 4a. 蒙皮资源：网格 / 材质 + 关节矩阵缓冲（动画驱动下每帧覆写）
         for item in &skinned {
             self.ensure_mesh(&mesh_store, MeshHandle(item.mesh));
-            self.ensure_material(&material_store, texture_store.as_deref(), MaterialHandle(item.material));
+            self.ensure_material(
+                &material_store,
+                texture_store.as_deref(),
+                MaterialHandle(item.material),
+            );
         }
         let mut joint_bytes: Vec<u8> = Vec::new();
         for item in &skinned {
@@ -1185,15 +1246,22 @@ impl Renderer {
             for m in &item.joint_matrices {
                 joint_bytes.extend_from_slice(bytemuck::bytes_of(&m.to_cols_array_2d()));
             }
-            let skin = self.skin_gpu.get(&item.skin_entity).expect("蒙皮缓冲已就绪");
-            self.gpu.queue.write_buffer(&skin.joint_buf, 0, &joint_bytes);
+            let skin = self
+                .skin_gpu
+                .get(&item.skin_entity)
+                .expect("蒙皮缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(&skin.joint_buf, 0, &joint_bytes);
         }
 
         // 5. 编码渲染通道：先阴影 pass（光源视角，深度写入颜色附件），后主 pass
         let mut encoder = self
             .gpu
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("iris.frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("iris.frame"),
+            });
         let mut draw_calls = 0u32;
         let mut instances = 0u32;
         if shadow_enabled && total + skinned.len() > 0 {
@@ -1231,7 +1299,10 @@ impl Renderer {
             shadow_pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
             shadow_pass.set_vertex_buffer(
                 1,
-                self.instance_buf.as_ref().expect("实例缓冲已就绪").slice(..),
+                self.instance_buf
+                    .as_ref()
+                    .expect("实例缓冲已就绪")
+                    .slice(..),
             );
             index = 0;
             while index < total {
@@ -1263,7 +1334,8 @@ impl Renderer {
                             .expect("蒙皮网格应有蒙皮属性缓冲")
                             .slice(..),
                     );
-                    shadow_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    shadow_pass
+                        .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     shadow_pass.set_bind_group(1, &skin.bind_group, &[]);
                     let base = (total + i) as u32;
                     shadow_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
@@ -1289,9 +1361,11 @@ impl Renderer {
                         .to_cols_array_2d(),
                     light_pos_range: [light_pos.x, light_pos.y, light_pos.z, range],
                 };
-                self.gpu
-                    .queue
-                    .write_buffer(&self.point_shadow_face_bufs[face], 0, bytemuck::bytes_of(&raw));
+                self.gpu.queue.write_buffer(
+                    &self.point_shadow_face_bufs[face],
+                    0,
+                    bytemuck::bytes_of(&raw),
+                );
             }
             if total + skinned.len() > 0 {
                 let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
@@ -1473,7 +1547,11 @@ impl Renderer {
             .try_resource::<crate::post::BloomSettings>()
             .map(|b| *b)
             .unwrap_or_default();
-        let strength = if bloom.enabled { bloom.strength.max(0.0) } else { 0.0 };
+        let strength = if bloom.enabled {
+            bloom.strength.max(0.0)
+        } else {
+            0.0
+        };
         self.gpu.queue.write_buffer(
             &hdr.bloom_strength,
             0,
@@ -1498,9 +1576,14 @@ impl Renderer {
                 },
             ];
             for (buffer, raw) in hdr.bloom_params.iter().zip(params) {
-                self.gpu.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&raw));
+                self.gpu
+                    .queue
+                    .write_buffer(buffer, 0, bytemuck::bytes_of(&raw));
             }
-            let mut bloom_pass = |label, pipeline: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, view: &wgpu::TextureView| {
+            let mut bloom_pass = |label,
+                                  pipeline: &wgpu::RenderPipeline,
+                                  bg: &wgpu::BindGroup,
+                                  view: &wgpu::TextureView| {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1573,7 +1656,10 @@ impl Renderer {
         ui_vertices.clear();
         crate::ui::collect_ui_vertices(world, &mut ui_vertices);
         if !ui_vertices.is_empty() {
-            let screen = UiGlobalsRaw { screen: [width as f32, height as f32], _pad: [0.0; 2] };
+            let screen = UiGlobalsRaw {
+                screen: [width as f32, height as f32],
+                _pad: [0.0; 2],
+            };
             self.gpu
                 .queue
                 .write_buffer(&self.ui_screen_buf, 0, bytemuck::bytes_of(&screen));
@@ -1638,13 +1724,12 @@ impl Renderer {
             return;
         }
         let capacity = (needed * 2).max(1024);
-        self.ui_vertex_buf =
-            Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("iris.ui.vertices"),
-                size: (capacity * std::mem::size_of::<crate::ui::UiVertex>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
+        self.ui_vertex_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.ui.vertices"),
+            size: (capacity * std::mem::size_of::<crate::ui::UiVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
         self.ui_capacity = capacity;
         log::debug!("UI 顶点缓冲扩容至 {capacity} 顶点");
     }
@@ -1660,7 +1745,12 @@ impl Renderer {
         let (vertex_buf, index_buf, num_indices, skin_buf) = upload_mesh(&self.gpu, data);
         self.mesh_gpu.insert(
             handle.0,
-            GpuMesh { vertex_buf, index_buf, num_indices, skin_buf },
+            GpuMesh {
+                vertex_buf,
+                index_buf,
+                num_indices,
+                skin_buf,
+            },
         );
     }
 
@@ -1678,16 +1768,25 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("iris.skin.bg"),
-            layout: &self.bundle.joints_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: joint_buf.as_entire_binding(),
-            }],
-        });
-        self.skin_gpu
-            .insert(skin_entity, GpuSkin { joint_buf, bind_group, capacity });
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.skin.bg"),
+                layout: &self.bundle.joints_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: joint_buf.as_entire_binding(),
+                }],
+            });
+        self.skin_gpu.insert(
+            skin_entity,
+            GpuSkin {
+                joint_buf,
+                bind_group,
+                capacity,
+            },
+        );
     }
 
     fn ensure_texture(&mut self, store: Option<&TextureStore>, handle: TextureHandle) {
@@ -1742,7 +1841,8 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        self.texture_gpu.insert(handle.0, GpuTexture { view, sampler });
+        self.texture_gpu
+            .insert(handle.0, GpuTexture { view, sampler });
     }
 
     fn ensure_material(
@@ -1779,25 +1879,29 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&params_buf, 0, bytemuck::bytes_of(&raw));
-        let bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("iris.material.bg"),
-            layout: &self.bundle.material_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
-                },
-            ],
-        });
-        self.material_gpu.insert(handle.0, GpuMaterial { bind_group });
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.material.bg"),
+                layout: &self.bundle.material_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&texture.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                    },
+                ],
+            });
+        self.material_gpu
+            .insert(handle.0, GpuMaterial { bind_group });
     }
 }
 
@@ -1842,22 +1946,22 @@ mod tests {
         spawn_plain(&mut world, 3, Some(Visibility::HIDDEN));
 
         // 蒙皮实体一对：可见 + 隐藏（关节实体需带 GlobalTransform）
-        let joint =
-            world.spawn((iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),));
+        let joint = world.spawn((iris_core::prelude::GlobalTransform::from_matrix(
+            glam::Mat4::IDENTITY,
+        ),));
         let skin = Skin::new(vec![joint], vec![glam::Mat4::IDENTITY]);
-        let spawn_skinned =
-            |world: &mut World, material: u32, visibility: Option<Visibility>| {
-                let entity = world.spawn((
-                    iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),
-                    mesh,
-                    MaterialHandle(material),
-                    skin.clone(),
-                ));
-                if let Some(v) = visibility {
-                    world.insert(entity, v);
-                }
-                entity
-            };
+        let spawn_skinned = |world: &mut World, material: u32, visibility: Option<Visibility>| {
+            let entity = world.spawn((
+                iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),
+                mesh,
+                MaterialHandle(material),
+                skin.clone(),
+            ));
+            if let Some(v) = visibility {
+                world.insert(entity, v);
+            }
+            entity
+        };
         spawn_skinned(&mut world, 5, None);
         spawn_skinned(&mut world, 6, Some(Visibility::HIDDEN));
 
@@ -1897,7 +2001,10 @@ mod tests {
 
     #[test]
     fn diff_first_and_last_changes_are_separate_ranges() {
-        assert_eq!(ranges_of(&[1.0, 2.0, 3.0], &[9.0, 2.0, 9.0]), vec![0..1, 2..3]);
+        assert_eq!(
+            ranges_of(&[1.0, 2.0, 3.0], &[9.0, 2.0, 9.0]),
+            vec![0..1, 2..3]
+        );
     }
 
     #[test]

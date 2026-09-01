@@ -45,7 +45,10 @@ impl System {
     where
         F: FnMut(&mut World) + Send + 'static,
     {
-        Self { name, f: Box::new(f) }
+        Self {
+            name,
+            f: Box::new(f),
+        }
     }
 
     pub fn run(&mut self, world: &mut World) {
@@ -58,7 +61,10 @@ where
     F: FnMut(&mut World) + Send + 'static,
 {
     fn from(f: F) -> Self {
-        Self { name: std::any::type_name::<F>(), f: Box::new(f) }
+        Self {
+            name: std::any::type_name::<F>(),
+            f: Box::new(f),
+        }
     }
 }
 
@@ -98,7 +104,9 @@ impl Access {
 
     /// 两个访问集是否冲突（一方写 ∩ 另一方读写 ≠ ∅）。
     fn conflicts(&self, other: &Access) -> bool {
-        self.writes.iter().any(|w| other.reads.contains(w) || other.writes.contains(w))
+        self.writes
+            .iter()
+            .any(|w| other.reads.contains(w) || other.writes.contains(w))
             || other.writes.iter().any(|w| self.reads.contains(w))
     }
 
@@ -124,7 +132,9 @@ impl ParallelSystem {
 
 impl std::fmt::Debug for ParallelSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParallelSystem").field("name", &self.name).finish()
+        f.debug_struct("ParallelSystem")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -175,12 +185,7 @@ impl Schedule {
     /// 注册并行系统：声明组件读写集后，调度器将其与同阶段其他并行系统
     /// 按冲突分批，无冲突者并行执行。系统内不得做结构性修改
     /// （spawn / despawn / insert_resource 需要 `&mut World`，类型系统已排除）。
-    pub fn add_parallel_system<F>(
-        &mut self,
-        stage: Stage,
-        access: Access,
-        f: F,
-    ) -> &mut Self
+    pub fn add_parallel_system<F>(&mut self, stage: Stage, access: Access, f: F) -> &mut Self
     where
         F: Fn(&World) + Send + Sync + 'static,
     {
@@ -277,9 +282,10 @@ impl Schedule {
             .into_iter()
             .map(|batch| match batch {
                 Batch::Solo(i) => (false, vec![Self::name_of(&systems[i])]),
-                Batch::Parallel(v) => {
-                    (true, v.iter().map(|&i| Self::name_of(&systems[i])).collect())
-                }
+                Batch::Parallel(v) => (
+                    true,
+                    v.iter().map(|&i| Self::name_of(&systems[i])).collect(),
+                ),
             })
             .collect()
     }
@@ -319,9 +325,11 @@ fn run_parallel(systems: &[Entry], indices: &[usize], world: &World) {
             Entry::Exclusive(_) => None,
         })
         .collect();
-    let threads = fns
-        .len()
-        .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let threads = fns.len().min(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    );
     if threads <= 1 {
         // 单线程可用：内联顺序执行（wasm 无 std 线程 / native 单核）
         run_inline(&fns, world);
@@ -357,11 +365,15 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    #[derive(Component)] struct Counter(i32);
-    #[derive(Component)] struct MarkerA;
-    #[derive(Component)] struct MarkerB;
+    #[derive(Component)]
+    struct Counter(i32);
+    #[derive(Component)]
+    struct MarkerA;
+    #[derive(Component)]
+    struct MarkerB;
     /// 读者系统的观测记录（并行系统不能 insert_resource，用组件承载结果）。
-    #[derive(Component)] struct Observed(i32);
+    #[derive(Component)]
+    struct Observed(i32);
 
     #[test]
     fn systems_run_in_registration_order() {
@@ -369,11 +381,15 @@ mod tests {
         let entity = world.spawn((Counter(0),));
 
         fn add_ten(world: &mut World) {
-            let mut counter = world.get_mut::<Counter>(world.entities().next().unwrap()).unwrap();
+            let mut counter = world
+                .get_mut::<Counter>(world.entities().next().unwrap())
+                .unwrap();
             counter.0 += 10;
         }
         let add_hundred = |world: &mut World| {
-            let mut counter = world.get_mut::<Counter>(world.entities().next().unwrap()).unwrap();
+            let mut counter = world
+                .get_mut::<Counter>(world.entities().next().unwrap())
+                .unwrap();
             counter.0 += 100;
         };
 
@@ -426,7 +442,11 @@ mod tests {
         assert_eq!(world.get::<Observed>(entity).unwrap().0, 0);
         schedule.run(Stage::Update, &mut world);
         schedule.run(Stage::PostUpdate, &mut world);
-        assert_eq!(world.get::<Observed>(entity).unwrap().0, 7, "PostUpdate 应读到 Update 的结果");
+        assert_eq!(
+            world.get::<Observed>(entity).unwrap().0,
+            7,
+            "PostUpdate 应读到 Update 的结果"
+        );
     }
 
     fn spawn_two_markers(world: &mut World) {
@@ -531,10 +551,17 @@ mod tests {
             .add_parallel_system(Stage::Update, Access::new().write::<MarkerA>(), echo);
 
         let layout = schedule.batch_layout(Stage::Update);
-        assert_eq!(layout.len(), 3, "应为 [并行AB, 独占, 并行A]，实际 {layout:?}");
+        assert_eq!(
+            layout.len(),
+            3,
+            "应为 [并行AB, 独占, 并行A]，实际 {layout:?}"
+        );
         assert_eq!(layout[0], (true, vec![layout[0].1[0], layout[0].1[1]]));
         assert!(!layout[1].0, "第二批应为独占系统");
-        assert!(!layout[2].0 || layout[2].1.len() == 1, "第三批应只含最后一个系统");
+        assert!(
+            !layout[2].0 || layout[2].1.len() == 1,
+            "第三批应只含最后一个系统"
+        );
     }
 
     /// 独占系统屏障：前一批并行的效果对后续系统可见。

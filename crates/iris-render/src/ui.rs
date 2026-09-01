@@ -11,8 +11,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use iris_core::prelude::Entity;
 use iris_core::Component;
+use iris_core::prelude::Entity;
 
 /// UI 矩形：屏幕像素坐标（原点左上、y 向下）。
 ///
@@ -289,7 +289,10 @@ fn cell_uv(cell: u32) -> ([f32; 2], [f32; 2]) {
     let h = ATLAS_HEIGHT as f32;
     (
         [(x + 0.5) / w, (y + 0.5) / h],
-        [(x + GLYPH_SIZE as f32 - 0.5) / w, (y + GLYPH_SIZE as f32 - 0.5) / h],
+        [
+            (x + GLYPH_SIZE as f32 - 0.5) / w,
+            (y + GLYPH_SIZE as f32 - 0.5) / h,
+        ],
     )
 }
 
@@ -300,7 +303,10 @@ fn bit_uv(ch: u8, col: u32, row: u32) -> [f32; 2] {
     let cell = glyph_cell(ch);
     let x = (cell % ATLAS_COLS * GLYPH_SIZE + col) as f32;
     let y = (cell / ATLAS_COLS * GLYPH_SIZE + row) as f32;
-    [(x + 0.5) / ATLAS_WIDTH as f32, (y + 0.5) / ATLAS_HEIGHT as f32]
+    [
+        (x + 0.5) / ATLAS_WIDTH as f32,
+        (y + 0.5) / ATLAS_HEIGHT as f32,
+    ]
 }
 
 /// 构建图集 CPU 像素（RGBA8，行主序）：0 号格纯白不透明（矩形复用），
@@ -351,9 +357,21 @@ impl UiVertex {
         array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
-            wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 }
@@ -380,7 +398,10 @@ fn push_quad(
 pub fn push_rect_vertices(out: &mut Vec<UiVertex>, rect: &UiRect, color: UiColor) {
     let (uv_min, uv_max) = cell_uv(WHITE_CELL);
     let min = rect.position;
-    let max = [rect.position[0] + rect.size[0], rect.position[1] + rect.size[1]];
+    let max = [
+        rect.position[0] + rect.size[0],
+        rect.position[1] + rect.size[1],
+    ];
     push_quad(out, min, max, uv_min, uv_max, color.0);
 }
 
@@ -396,7 +417,7 @@ pub fn push_text_vertices(
 ) {
     static NON_ASCII_WARNED: AtomicBool = AtomicBool::new(false);
     let step = GLYPH_SIZE as f32 * text.scale;
-    if !(step > 0.0) {
+    if step <= 0.0 || step.is_nan() {
         return; // scale <= 0 / NaN：无可绘制内容
     }
     let [mut pen_x, mut pen_y] = origin;
@@ -462,27 +483,31 @@ pub fn text_width(text: &UiText) -> f32 {
 /// 还是文本）不产生顶点；组件缺席视为可见（默认行为零变化）。
 pub(crate) fn collect_ui_vertices(world: &iris_core::world::World, out: &mut Vec<UiVertex>) {
     use crate::visibility::Visibility;
-    world.query::<(Entity, &UiRect, &UiColor, Option<&Visibility>)>(|(entity, rect, color, visibility)| {
-        // 挂有 UiText 的实体上，UiRect 仅充当文本排版原点（定位载体），
-        // 不绘制矩形——否则缺省白矩形会盖住文字；需要面板背景时单独
-        // 生成一个矩形实体（与文本实体解耦）。
-        if visibility.is_some_and(|v| !v.visible) {
-            return;
-        }
-        if world.get::<UiText>(entity).is_none() {
-            push_rect_vertices(out, rect, *color);
-        }
-    });
-    world.query::<(Entity, &UiText, &UiColor, Option<&Visibility>)>(|(entity, text, color, visibility)| {
-        if visibility.is_some_and(|v| !v.visible) {
-            return;
-        }
-        let origin = world
-            .get::<UiRect>(entity)
-            .map(|rect| rect.position)
-            .unwrap_or([0.0, 0.0]);
-        push_text_vertices(out, text, origin, *color);
-    });
+    world.query::<(Entity, &UiRect, &UiColor, Option<&Visibility>)>(
+        |(entity, rect, color, visibility)| {
+            // 挂有 UiText 的实体上，UiRect 仅充当文本排版原点（定位载体），
+            // 不绘制矩形——否则缺省白矩形会盖住文字；需要面板背景时单独
+            // 生成一个矩形实体（与文本实体解耦）。
+            if visibility.is_some_and(|v| !v.visible) {
+                return;
+            }
+            if world.get::<UiText>(entity).is_none() {
+                push_rect_vertices(out, rect, *color);
+            }
+        },
+    );
+    world.query::<(Entity, &UiText, &UiColor, Option<&Visibility>)>(
+        |(entity, text, color, visibility)| {
+            if visibility.is_some_and(|v| !v.visible) {
+                return;
+            }
+            let origin = world
+                .get::<UiRect>(entity)
+                .map(|rect| rect.position)
+                .unwrap_or([0.0, 0.0]);
+            push_text_vertices(out, text, origin, *color);
+        },
+    );
 }
 
 #[cfg(test)]
@@ -495,9 +520,9 @@ mod tests {
 
     fn col_sums(rows: &[u8; 8]) -> [u32; 8] {
         let mut sums = [0u32; 8];
-        for row in rows {
-            for col in 0..8usize {
-                sums[col] += ((row >> col) & 1) as u32;
+        for (col, sum) in sums.iter_mut().enumerate() {
+            for row in rows {
+                *sum += ((row >> col) & 1) as u32;
             }
         }
         sums
@@ -508,10 +533,22 @@ mod tests {
         // 文本实体上的 UiRect 只作定位载体（不绘制矩形），
         // 纯矩形实体照常绘制
         let mut world = iris_core::world::World::new();
-        world.spawn((UiRect { position: [0.0, 0.0], size: [10.0, 10.0] }, UiColor::default()));
         world.spawn((
-            UiRect { position: [20.0, 0.0], size: [100.0, 100.0] },
-            UiText { string: "A".into(), scale: 1.0 },
+            UiRect {
+                position: [0.0, 0.0],
+                size: [10.0, 10.0],
+            },
+            UiColor::default(),
+        ));
+        world.spawn((
+            UiRect {
+                position: [20.0, 0.0],
+                size: [100.0, 100.0],
+            },
+            UiText {
+                string: "A".into(),
+                scale: 1.0,
+            },
             UiColor::default(),
         ));
         let mut out = Vec::new();
@@ -557,7 +594,10 @@ mod tests {
             &[0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00]
         );
         let lit = popcount(glyph_bits(b'A').unwrap());
-        assert!((8..=40).contains(&lit), "'A' 亮像素数应在 8..=40，实际 {lit}");
+        assert!(
+            (8..=40).contains(&lit),
+            "'A' 亮像素数应在 8..=40，实际 {lit}"
+        );
     }
 
     #[test]
@@ -615,7 +655,10 @@ mod tests {
         let mut out = Vec::new();
         push_rect_vertices(
             &mut out,
-            &UiRect { position: [10.0, 20.0], size: [30.0, 40.0] },
+            &UiRect {
+                position: [10.0, 20.0],
+                size: [30.0, 40.0],
+            },
             UiColor([1.0, 0.0, 0.0, 1.0]),
         );
         assert_eq!(out.len(), 6, "矩形 = 2 三角形 6 顶点");
@@ -633,18 +676,27 @@ mod tests {
         let mut out = Vec::new();
         push_text_vertices(
             &mut out,
-            &UiText { string: "A".into(), scale: 1.0 },
+            &UiText {
+                string: "A".into(),
+                scale: 1.0,
+            },
             [0.0, 0.0],
             UiColor::default(),
         );
         assert_eq!(out.len(), popcount(glyph_bits(b'A').unwrap()) as usize * 6);
-        assert!(out.iter().all(|v| (0.0..=8.0).contains(&v.pos[0]) && (0.0..=8.0).contains(&v.pos[1])));
+        assert!(
+            out.iter()
+                .all(|v| (0.0..=8.0).contains(&v.pos[0]) && (0.0..=8.0).contains(&v.pos[1]))
+        );
 
         // scale 2：位数不变、盒放大到 16×16
         let mut scaled = Vec::new();
         push_text_vertices(
             &mut scaled,
-            &UiText { string: "A".into(), scale: 2.0 },
+            &UiText {
+                string: "A".into(),
+                scale: 2.0,
+            },
             [0.0, 0.0],
             UiColor::default(),
         );
@@ -655,7 +707,10 @@ mod tests {
         let mut moved = Vec::new();
         push_text_vertices(
             &mut moved,
-            &UiText { string: "A".into(), scale: 1.0 },
+            &UiText {
+                string: "A".into(),
+                scale: 1.0,
+            },
             [5.0, 7.0],
             UiColor::default(),
         );
@@ -671,23 +726,41 @@ mod tests {
         let mut world = iris_core::world::World::new();
         use crate::visibility::Visibility;
         world.spawn((
-            UiRect { position: [0.0, 0.0], size: [10.0, 10.0] },
+            UiRect {
+                position: [0.0, 0.0],
+                size: [10.0, 10.0],
+            },
             UiColor::default(),
             Visibility::HIDDEN,
         ));
         world.spawn((
-            UiRect { position: [20.0, 0.0], size: [0.0, 0.0] },
-            UiText { string: "HIDE".into(), scale: 1.0 },
+            UiRect {
+                position: [20.0, 0.0],
+                size: [0.0, 0.0],
+            },
+            UiText {
+                string: "HIDE".into(),
+                scale: 1.0,
+            },
             UiColor::default(),
             Visibility::HIDDEN,
         ));
         let visible_rect = world.spawn((
-            UiRect { position: [40.0, 0.0], size: [8.0, 8.0] },
+            UiRect {
+                position: [40.0, 0.0],
+                size: [8.0, 8.0],
+            },
             UiColor::default(),
         ));
         let _visible_text = world.spawn((
-            UiRect { position: [60.0, 0.0], size: [0.0, 0.0] },
-            UiText { string: "A".into(), scale: 1.0 },
+            UiRect {
+                position: [60.0, 0.0],
+                size: [0.0, 0.0],
+            },
+            UiText {
+                string: "A".into(),
+                scale: 1.0,
+            },
             UiColor::default(),
         ));
         // 显式 VISIBLE 与缺席等价
@@ -702,13 +775,19 @@ mod tests {
             "只有可见矩形（6 顶点）+ 可见文本；隐藏的矩形与文本不应产生顶点"
         );
         let min_x = out.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
-        assert!(min_x >= 40.0, "隐藏实体（x=0/20）不应出现，最小 x 应为 40，实际 {min_x}");
+        assert!(
+            min_x >= 40.0,
+            "隐藏实体（x=0/20）不应出现，最小 x 应为 40，实际 {min_x}"
+        );
     }
 
     #[test]
     fn text_width_matches_monospace_layout() {
         let measure = |string: &str, scale: f32| {
-            text_width(&UiText { string: string.into(), scale })
+            text_width(&UiText {
+                string: string.into(),
+                scale,
+            })
         };
         // 单行：8 × scale × 字符数
         assert_eq!(measure("TIME 60", 3.0), 7.0 * 8.0 * 3.0);
@@ -721,14 +800,20 @@ mod tests {
         assert_eq!(measure("éA", 1.0), 2.0 * 8.0);
         // 右对齐用例：x = 屏宽 - 宽度 - 边距后，布局盒右缘恰好落在
         // 右边距上，且全部墨迹都在布局盒内（等宽步进 ≥ 墨迹包围盒）
-        let text = UiText { string: "TIME 59".into(), scale: 3.0 };
+        let text = UiText {
+            string: "TIME 59".into(),
+            scale: 3.0,
+        };
         let width = text_width(&text);
         let origin_x = 1280.0 - width - 24.0;
         assert_eq!(origin_x + width, 1280.0 - 24.0, "布局盒右缘应落在右边距");
         let mut out = Vec::new();
         push_text_vertices(&mut out, &text, [origin_x, 0.0], UiColor::default());
         let max_x = out.iter().map(|v| v.pos[0]).fold(f32::MIN, f32::max);
-        assert!(max_x <= 1280.0 - 24.0, "墨迹不得越过布局盒右缘（实际 {max_x}）");
+        assert!(
+            max_x <= 1280.0 - 24.0,
+            "墨迹不得越过布局盒右缘（实际 {max_x}）"
+        );
     }
 
     #[test]
@@ -737,7 +822,10 @@ mod tests {
         let mut out = Vec::new();
         push_text_vertices(
             &mut out,
-            &UiText { string: "  A".into(), scale: 1.0 },
+            &UiText {
+                string: "  A".into(),
+                scale: 1.0,
+            },
             [0.0, 0.0],
             UiColor::default(),
         );
@@ -749,7 +837,10 @@ mod tests {
         let mut lines = Vec::new();
         push_text_vertices(
             &mut lines,
-            &UiText { string: "A\nA".into(), scale: 2.0 },
+            &UiText {
+                string: "A\nA".into(),
+                scale: 2.0,
+            },
             [0.0, 0.0],
             UiColor::default(),
         );
@@ -760,7 +851,10 @@ mod tests {
         let mut unicode = Vec::new();
         push_text_vertices(
             &mut unicode,
-            &UiText { string: "éA".into(), scale: 1.0 },
+            &UiText {
+                string: "éA".into(),
+                scale: 1.0,
+            },
             [0.0, 0.0],
             UiColor::default(),
         );
@@ -771,7 +865,10 @@ mod tests {
         let mut empty = Vec::new();
         push_text_vertices(
             &mut empty,
-            &UiText { string: "A".into(), scale: 0.0 },
+            &UiText {
+                string: "A".into(),
+                scale: 0.0,
+            },
             [0.0, 0.0],
             UiColor::default(),
         );

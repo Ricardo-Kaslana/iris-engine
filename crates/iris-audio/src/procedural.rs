@@ -31,7 +31,11 @@ pub fn square(freq_hz: f32, duration_secs: f32, sample_rate: u32) -> AudioClip {
 /// 伪随机白噪声：xorshift64\\* 输出取高 24 位均匀映射到 [-1, 1)。
 /// 固定 `seed` 可复现；`seed = 0` 会被非零化（xorshift 全零态锁死）。
 pub fn noise(duration_secs: f32, sample_rate: u32, seed: u64) -> AudioClip {
-    let mut state = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+    let mut state = if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    };
     generate(duration_secs, sample_rate, move |_| {
         let x = next_xorshift(&mut state);
         // 高 24 位 / 2^24 → [0, 1)，× 2 − 1 → [-1, 1)
@@ -53,8 +57,9 @@ fn next_xorshift(state: &mut u64) -> u64 {
 fn generate(duration_secs: f32, sample_rate: u32, mut wave: impl FnMut(f32) -> f32) -> AudioClip {
     let sample_rate = sample_rate.max(1);
     let frame_count = (duration_secs.max(0.0) * sample_rate as f32).round() as usize;
-    let mut samples: Vec<f32> =
-        (0..frame_count).map(|i| wave(i as f32 / sample_rate as f32)).collect();
+    let mut samples: Vec<f32> = (0..frame_count)
+        .map(|i| wave(i as f32 / sample_rate as f32))
+        .collect();
     apply_fade(&mut samples, sample_rate);
     // 生成器内部构造：单声道、帧数必整除，参数恒合法
     AudioClip::from_interleaved(samples, 1, sample_rate).expect("程序化生成参数恒合法")
@@ -78,7 +83,7 @@ mod tests {
 
     /// 与 apply_fade 同式的包络解析解（首尾 fade 帧，末帧精确归零）。
     fn envelope(t: f32, duration: f32, sample_rate: u32) -> f32 {
-        let n = (duration * sample_rate as f32).round() as f32;
+        let n = (duration * sample_rate as f32).round();
         let fade = ((FADE_SECS * sample_rate as f32) as usize).max(1) as f32;
         let i = t * sample_rate as f32;
         (i / fade).min(1.0).min((n - 1.0 - i) / fade).max(0.0)
@@ -94,7 +99,10 @@ mod tests {
         for (i, got) in clip.samples().iter().enumerate() {
             let t = i as f32 / rate as f32;
             let want = (core::f32::consts::TAU * freq * t).sin() * envelope(t, dur, rate);
-            assert!((got - want).abs() < 1e-5, "sine[{i}] = {got}，解析解 {want}");
+            assert!(
+                (got - want).abs() < 1e-5,
+                "sine[{i}] = {got}，解析解 {want}"
+            );
         }
     }
 
@@ -104,9 +112,11 @@ mod tests {
         let clip = square(freq, dur, rate);
         for (i, got) in clip.samples().iter().enumerate() {
             let t = i as f32 / rate as f32;
-            let want = (if (freq * t) % 1.0 < 0.5 { 1.0 } else { -1.0 })
-                * envelope(t, dur, rate);
-            assert!((got - want).abs() < 1e-5, "square[{i}] = {got}，解析解 {want}");
+            let want = (if (freq * t) % 1.0 < 0.5 { 1.0 } else { -1.0 }) * envelope(t, dur, rate);
+            assert!(
+                (got - want).abs() < 1e-5,
+                "square[{i}] = {got}，解析解 {want}"
+            );
         }
     }
 
@@ -125,7 +135,11 @@ mod tests {
             min = min.min(s);
             max = max.max(s);
         }
-        assert!(max - min > 0.5, "白噪声应有明显摆动，实际摆幅 {}", max - min);
+        assert!(
+            max - min > 0.5,
+            "白噪声应有明显摆动，实际摆幅 {}",
+            max - min
+        );
     }
 
     /// 首尾包络：首尾采样精确为 0，淡入结束后恢复满幅（防爆音）。

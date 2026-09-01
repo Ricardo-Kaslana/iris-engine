@@ -24,9 +24,9 @@ pub(crate) fn read_lock<'a, T>(
         Ok(guard) => guard,
         // 线程 panic 毒化的锁照常可读（安全模型不依赖 poison）
         Err(TryLockError::Poisoned(err)) => err.into_inner(),
-        Err(TryLockError::WouldBlock) => panic!(
-            "{what} 已被可变借用（already mutably borrowed）：读/写访问冲突"
-        ),
+        Err(TryLockError::WouldBlock) => {
+            panic!("{what} 已被可变借用（already mutably borrowed）：读/写访问冲突")
+        }
     }
 }
 
@@ -38,9 +38,9 @@ pub(crate) fn write_lock<'a, T>(
     match lock.try_write() {
         Ok(guard) => guard,
         Err(TryLockError::Poisoned(err)) => err.into_inner(),
-        Err(TryLockError::WouldBlock) => panic!(
-            "{what} 已被借用（already borrowed）：重复访问或读/写访问冲突"
-        ),
+        Err(TryLockError::WouldBlock) => {
+            panic!("{what} 已被借用（already borrowed）：重复访问或读/写访问冲突")
+        }
     }
 }
 

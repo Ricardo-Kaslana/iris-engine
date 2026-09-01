@@ -29,17 +29,22 @@ fn main() {
         ambient: Vec3::splat(0.05),
         ..DirectionalLight::default()
     });
-    world.insert_resource(BloomSettings { strength: 0.45, ..BloomSettings::default() });
+    world.insert_resource(BloomSettings {
+        strength: 0.45,
+        ..BloomSettings::default()
+    });
 
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(0.9, 48, 24));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(0.9, 48, 24));
     let glow = |emissive: [f32; 3]| MaterialDef {
         emissive: [emissive[0], emissive[1], emissive[2], 1.0],
         ..MaterialDef::solid(0.0, 0.0, 0.0, 1.0)
     };
     let mats: [([f32; 3], [f32; 3]); 3] = [
-        ([22.0, 9.0, 2.5], [0.0, 1.1, 0.0]),   // 橙
-        ([1.5, 14.0, 18.0], [2.6, 1.0, -0.8]), // 青
-        ([20.0, 3.5, 13.0], [-2.6, 1.0, -0.8]),// 品红
+        ([22.0, 9.0, 2.5], [0.0, 1.1, 0.0]),    // 橙
+        ([1.5, 14.0, 18.0], [2.6, 1.0, -0.8]),  // 青
+        ([20.0, 3.5, 13.0], [-2.6, 1.0, -0.8]), // 品红
     ];
     for (emissive, pos) in mats {
         let mat = world.resource_mut::<MaterialStore>().add(glow(emissive));
@@ -47,7 +52,9 @@ fn main() {
     }
 
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(40.0));
-    let mat_g = world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.12, 0.12, 0.14, 1.0));
+    let mat_g = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.12, 0.12, 0.14, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_g));
 
     {

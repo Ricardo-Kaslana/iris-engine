@@ -30,7 +30,7 @@ use super::base64;
 use crate::animation::{AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath};
 use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
 use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex};
-use crate::skin::{mat4_list_from_flat, Skin};
+use crate::skin::{Skin, mat4_list_from_flat};
 use crate::texture::{CpuTexture, TextureHandle, TextureStore};
 
 /// glTF 加载错误。
@@ -194,8 +194,7 @@ fn default_roughness() -> f32 {
     1.0
 }
 
-#[derive(Deserialize)]
-#[derive(Clone)]
+#[derive(Deserialize, Clone)]
 struct GltfTextureInfo {
     index: usize,
 }
@@ -308,15 +307,17 @@ fn load_document(path: &Path) -> Result<GltfDocument, GltfError> {
     if bytes.len() >= 4 && &bytes[0..4] == GLB_MAGIC {
         parse_glb(&bytes)
     } else {
-        Ok(GltfDocument { json: serde_json::from_slice(&bytes)?, bin: None })
+        Ok(GltfDocument {
+            json: serde_json::from_slice(&bytes)?,
+            bin: None,
+        })
     }
 }
 
 /// 解析 GLB 容器：12 字节文件头 + 若干 chunk（长度 u32 + 类型 u32 + 数据）。
 fn parse_glb(bytes: &[u8]) -> Result<GltfDocument, GltfError> {
-    let u32_at = |i: usize| {
-        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
-    };
+    let u32_at =
+        |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     if bytes.len() < 12 {
         return Err(GltfError::OutOfRange("GLB 文件短于 12 字节头部".into()));
     }
@@ -346,7 +347,9 @@ fn parse_glb(bytes: &[u8]) -> Result<GltfDocument, GltfError> {
             }
             CHUNK_BIN => {
                 if json.is_none() {
-                    return Err(GltfError::OutOfRange("GLB 的 BIN chunk 必须位于 JSON 之后".into()));
+                    return Err(GltfError::OutOfRange(
+                        "GLB 的 BIN chunk 必须位于 JSON 之后".into(),
+                    ));
                 }
                 if bin.is_some() {
                     return Err(GltfError::OutOfRange("GLB 含多个 BIN chunk".into()));
@@ -486,12 +489,14 @@ impl GltfLoader {
             other => {
                 return Err(GltfError::Unsupported(format!(
                     "索引分量类型 {other:#x}（仅支持 u16 / u32）"
-                )))
+                )));
             }
         };
         let end = start + view.byte_length;
         if end > data.len() || (end - start) < acc.count * stride {
-            return Err(GltfError::OutOfRange(format!("索引 accessor #{accessor} 越界")));
+            return Err(GltfError::OutOfRange(format!(
+                "索引 accessor #{accessor} 越界"
+            )));
         }
         let bytes = &data[start..end];
         let indices = match stride {
@@ -533,12 +538,14 @@ impl GltfLoader {
             other => {
                 return Err(GltfError::Unsupported(format!(
                     "JOINTS_0 分量类型 {other:#x}（仅支持 u8 / u16）"
-                )))
+                )));
             }
         };
         let end = start + view.byte_length;
         if end > data.len() || (end - start) < acc.count * 4 * stride {
-            return Err(GltfError::OutOfRange(format!("JOINTS_0 accessor #{accessor} 越界")));
+            return Err(GltfError::OutOfRange(format!(
+                "JOINTS_0 accessor #{accessor} 越界"
+            )));
         }
         let read_component = move |bytes: &[u8]| -> u32 {
             match stride {
@@ -562,7 +569,9 @@ impl GltfLoader {
             .meshes
             .get(mesh_index)
             .and_then(|m| m.primitives.get(prim_index))
-            .ok_or_else(|| GltfError::OutOfRange(format!("mesh #{mesh_index} primitive #{prim_index}")))?;
+            .ok_or_else(|| {
+                GltfError::OutOfRange(format!("mesh #{mesh_index} primitive #{prim_index}"))
+            })?;
 
         let position_accessor = *primitive
             .attributes
@@ -609,14 +618,17 @@ impl GltfLoader {
                     return Err(GltfError::OutOfRange("WEIGHTS_0 必须是 VEC4".into()));
                 }
                 if joints.len() != vertex_count || weights.len() / 4 != vertex_count {
-                    return Err(GltfError::OutOfRange(
-                        "蒙皮属性数量与顶点数量不一致".into(),
-                    ));
+                    return Err(GltfError::OutOfRange("蒙皮属性数量与顶点数量不一致".into()));
                 }
                 Some(
                     (0..vertex_count)
                         .map(|i| {
-                            let w = [weights[i * 4], weights[i * 4 + 1], weights[i * 4 + 2], weights[i * 4 + 3]];
+                            let w = [
+                                weights[i * 4],
+                                weights[i * 4 + 1],
+                                weights[i * 4 + 2],
+                                weights[i * 4 + 3],
+                            ];
                             // 防御非法资产：权重和偏离 1 时归一化
                             let sum = (w[0] + w[1] + w[2] + w[3]).max(1e-9);
                             SkinVertex {
@@ -638,7 +650,10 @@ impl GltfLoader {
         let mut vertices: Vec<Vertex> = (0..vertex_count)
             .map(|i| Vertex {
                 position: [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]],
-                normal: normals.as_ref().map(|n| [n[i * 3], n[i * 3 + 1], n[i * 3 + 2]]).unwrap_or([0.0; 3]),
+                normal: normals
+                    .as_ref()
+                    .map(|n| [n[i * 3], n[i * 3 + 1], n[i * 3 + 2]])
+                    .unwrap_or([0.0; 3]),
                 uv: uvs
                     .as_ref()
                     .map(|d| [d[i * 2], d[i * 2 + 1]])
@@ -661,7 +676,11 @@ impl GltfLoader {
             }
         }
 
-        Ok(MeshData { vertices, indices, skin })
+        Ok(MeshData {
+            vertices,
+            indices,
+            skin,
+        })
     }
 
     /// 读取图片（外部文件或 data URI）并解码为 CPU 纹理。
@@ -675,7 +694,7 @@ impl GltfLoader {
             None => {
                 return Err(GltfError::Unsupported(format!(
                     "image #{image_index}：bufferView 引用图片暂不支持，请使用 uri"
-                )))
+                )));
             }
             Some(uri) if uri.starts_with("data:") => {
                 let payload = uri
@@ -690,7 +709,11 @@ impl GltfLoader {
         let decoded = image::load_from_memory(&bytes)?;
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
-        Ok(CpuTexture { width, height, rgba: rgba.into_raw() })
+        Ok(CpuTexture {
+            width,
+            height,
+            rgba: rgba.into_raw(),
+        })
     }
 
     fn texture(&self, world: &mut World, index: usize) -> Result<TextureHandle, GltfError> {
@@ -873,7 +896,9 @@ impl GltfLoader {
                 "rotation" => AnimationPath::Rotation,
                 "scale" => AnimationPath::Scale,
                 other => {
-                    return Err(GltfError::Unsupported(format!("动画通道路径 {other}（仅支持 translation / rotation / scale）")))
+                    return Err(GltfError::Unsupported(format!(
+                        "动画通道路径 {other}（仅支持 translation / rotation / scale）"
+                    )));
                 }
             };
             let sampler = anim.samplers.get(ch.sampler).ok_or_else(|| {
@@ -883,7 +908,9 @@ impl GltfLoader {
                 None | Some("LINEAR") => AnimationInterpolation::Linear,
                 Some("STEP") => AnimationInterpolation::Step,
                 Some(other) => {
-                    return Err(GltfError::Unsupported(format!("动画插值 {other}（支持 LINEAR / STEP）")))
+                    return Err(GltfError::Unsupported(format!(
+                        "动画插值 {other}（支持 LINEAR / STEP）"
+                    )));
                 }
             };
             let (times, comps) = self.read_floats(sampler.input)?;
@@ -901,9 +928,7 @@ impl GltfLoader {
                 )));
             }
             if values.len() % expected != 0 || values.len() / expected != times.len() {
-                return Err(GltfError::OutOfRange(
-                    "动画关键帧数量与时间轴不一致".into(),
-                ));
+                return Err(GltfError::OutOfRange("动画关键帧数量与时间轴不一致".into()));
             }
             if times.windows(2).any(|w| w[1] < w[0]) {
                 return Err(GltfError::OutOfRange("动画关键帧时间非递减".into()));
@@ -911,7 +936,13 @@ impl GltfLoader {
             if let Some(&last) = times.last() {
                 duration = duration.max(last);
             }
-            channels.push(AnimationChannel { node, path, interpolation, times, values });
+            channels.push(AnimationChannel {
+                node,
+                path,
+                interpolation,
+                times,
+                values,
+            });
         }
         Ok(AnimationClip {
             name: anim.name.clone().unwrap_or_default(),
@@ -1032,7 +1063,9 @@ pub fn spawn_gltf_instance(
             .iter()
             .flat_map(|n| n.children.iter().copied())
             .collect();
-        (0..loader.doc.nodes.len()).filter(|i| !has_parent.contains(i)).collect()
+        (0..loader.doc.nodes.len())
+            .filter(|i| !has_parent.contains(i))
+            .collect()
     } else {
         loader.doc.scenes[loader.doc.scene].nodes.clone()
     };
@@ -1095,8 +1128,12 @@ pub fn spawn_gltf_instance(
         if !absorbed_skins.insert(skin_index) {
             continue;
         }
-        let Some(mesh_entity) =
-            loader.node_entities.borrow().get(node_index).copied().flatten()
+        let Some(mesh_entity) = loader
+            .node_entities
+            .borrow()
+            .get(node_index)
+            .copied()
+            .flatten()
         else {
             continue;
         };
@@ -1113,8 +1150,12 @@ pub fn spawn_gltf_instance(
             })
             .collect();
         for root_index in root_nodes {
-            let Some(root_entity) =
-                loader.node_entities.borrow().get(root_index).copied().flatten()
+            let Some(root_entity) = loader
+                .node_entities
+                .borrow()
+                .get(root_index)
+                .copied()
+                .flatten()
             else {
                 continue;
             };
@@ -1214,7 +1255,11 @@ mod tests {
         assert_eq!(data.vertices.len(), 3);
         assert_eq!(data.indices, vec![0, 1, 2]);
         // 法线自动生成：XY 平面上的三角形朝 +Z
-        assert!(data.vertices.iter().all(|v| (v.normal[2] - 1.0).abs() < 1e-5));
+        assert!(
+            data.vertices
+                .iter()
+                .all(|v| (v.normal[2] - 1.0).abs() < 1e-5)
+        );
         // 默认 UV 填充
         assert!(data.vertices.iter().all(|v| v.uv == [0.0, 0.0]));
 
@@ -1222,7 +1267,7 @@ mod tests {
         let parent = spawned[0];
         let children = world.children(parent);
         assert_eq!(children.len(), 1, "一个 primitive 应挂一个子实体");
-        return Ok(());
+        Ok(())
     }
 
     #[test]
@@ -1278,7 +1323,10 @@ mod tests {
         .unwrap();
         let mut world = world_with_stores();
         let err = spawn_gltf(&mut world, &path).unwrap_err();
-        assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
+        assert!(
+            matches!(err, GltfError::Unsupported(_)),
+            "实际错误：{err:?}"
+        );
     }
 
     /// 三角形网格 + 旋转动画（yaw 0°→90°，1 秒）的 JSON 与 BIN 数据。
@@ -1295,7 +1343,16 @@ mod tests {
         bin.extend_from_slice(&[0.0f32, 1.0].map(f32::to_le_bytes).concat());
         // yaw 0° 与 yaw 90° 的四元数 (x, y, z, w)
         bin.extend_from_slice(&[0.0f32, 0.0, 0.0, 1.0].map(f32::to_le_bytes).concat());
-        bin.extend_from_slice(&[0.0f32, 0.70710678, 0.0, 0.70710678].map(f32::to_le_bytes).concat());
+        bin.extend_from_slice(
+            &[
+                0.0f32,
+                std::f32::consts::FRAC_1_SQRT_2,
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ]
+            .map(f32::to_le_bytes)
+            .concat(),
+        );
         let json = r#"{
                 "asset": {"version": "2.0"},
                 "buffers": [{"byteLength": 84}],
@@ -1354,7 +1411,7 @@ mod tests {
 
     #[test]
     fn animated_node_moves_through_player_system() -> Result<(), GltfError> {
-        use crate::animation::{update_animations, AnimationPlayer};
+        use crate::animation::{AnimationPlayer, update_animations};
         use iris_core::prelude::{Instant, Time};
         use std::time::Duration;
 
@@ -1374,10 +1431,14 @@ mod tests {
         world.insert_resource(Time::default());
         let t0 = Instant::now();
         world.resource_mut::<Time>().begin_frame(t0);
-        world.resource_mut::<Time>().begin_frame(t0 + Duration::from_secs_f64(0.25));
-        update_animations(&mut world);
-        world.resource_mut::<Time>().begin_frame(t0 + Duration::from_secs_f64(0.5));
-        update_animations(&mut world);
+        world
+            .resource_mut::<Time>()
+            .begin_frame(t0 + Duration::from_secs_f64(0.25));
+        update_animations(&world);
+        world
+            .resource_mut::<Time>()
+            .begin_frame(t0 + Duration::from_secs_f64(0.5));
+        update_animations(&world);
         let expected = glam::Quat::from_rotation_y(45f32.to_radians());
         let transform = world.get::<Transform>(root).unwrap();
         assert!(
@@ -1403,7 +1464,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let mut world = world_with_stores();
         let err = spawn_gltf(&mut world, &path).unwrap_err();
-        assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
+        assert!(
+            matches!(err, GltfError::Unsupported(_)),
+            "实际错误：{err:?}"
+        );
     }
 
     #[test]
@@ -1416,7 +1480,10 @@ mod tests {
         std::fs::write(&path, write_glb(&json, &bin)).unwrap();
         let mut world = world_with_stores();
         let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
-        assert!(matches!(err, GltfError::Unsupported(_)), "实际错误：{err:?}");
+        assert!(
+            matches!(err, GltfError::Unsupported(_)),
+            "实际错误：{err:?}"
+        );
         Ok(())
     }
 
@@ -1454,7 +1521,10 @@ mod tests {
         }
         // inverseBindMatrices：hip 恒等；elbow bind 全局 = T(0,1,0) → ibm = T(0,-1,0)
         extend_mat4(&mut bin, glam::Mat4::IDENTITY);
-        extend_mat4(&mut bin, glam::Mat4::from_translation([0.0, -1.0, 0.0].into()));
+        extend_mat4(
+            &mut bin,
+            glam::Mat4::from_translation([0.0, -1.0, 0.0].into()),
+        );
         let json = r#"{
             "asset": {"version": "2.0"},
             "buffers": [{"byteLength": 244}],
@@ -1503,8 +1573,16 @@ mod tests {
         let mesh_root = instance.roots[0];
         let hip = instance.node_entities[1].expect("hip 应已生成");
         let elbow = instance.node_entities[2].expect("elbow 应已生成");
-        assert_eq!(world.parent(hip), Some(mesh_root), "关节树根应收编为 mesh 根的子实体");
-        assert_eq!(world.parent(elbow), Some(hip), "链式关节的父子层级应原样保留");
+        assert_eq!(
+            world.parent(hip),
+            Some(mesh_root),
+            "关节树根应收编为 mesh 根的子实体"
+        );
+        assert_eq!(
+            world.parent(elbow),
+            Some(hip),
+            "链式关节的父子层级应原样保留"
+        );
         assert_eq!(
             world.children(mesh_root).len(),
             2,
@@ -1659,7 +1737,11 @@ mod tests {
 
         let mut world = world_with_stores();
         let instance = spawn_gltf_instance(&mut world, &path)?;
-        assert_eq!(instance.roots.len(), 1, "两个关节根收编后 mesh 根是唯一顶层");
+        assert_eq!(
+            instance.roots.len(),
+            1,
+            "两个关节根收编后 mesh 根是唯一顶层"
+        );
         let mesh_root = instance.roots[0];
         let hip = instance.node_entities[1].expect("hip 应已生成");
         let elbow = instance.node_entities[2].expect("elbow 应已生成");

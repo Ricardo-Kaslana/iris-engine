@@ -79,8 +79,7 @@ impl AudioOutput {
                 }
                 let stream_config = config.config().clone();
                 // SampleRate 是 newtype（.0 为 u32 Hz）
-                let (channels, sample_rate) =
-                    (stream_config.channels, stream_config.sample_rate.0);
+                let (channels, sample_rate) = (stream_config.channels, stream_config.sample_rate.0);
 
                 let stream = device.build_output_stream(
                     &stream_config,
@@ -113,14 +112,21 @@ impl AudioOutput {
             .ok()?;
 
         let (channels, sample_rate) = info_rx.recv().ok()?;
-        Some(Self { mixer, channels, sample_rate, _shutdown: shutdown_tx })
+        Some(Self {
+            mixer,
+            channels,
+            sample_rate,
+            _shutdown: shutdown_tx,
+        })
     }
 
     /// 混音器可变访问（编排 play / stop / set_volume 或手动混音）。
     ///
     /// 锁中毒时仍取回内部数据：音频路径不因一次 panic 永久失声。
     pub fn mixer(&self) -> MutexGuard<'_, AudioMixer> {
-        self.mixer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 共享混音器句柄（iris-engine 的 `Audio` 资源用它统一 play / stop 路径）。
@@ -169,7 +175,9 @@ impl AudioOutput {
 
     /// 与 native 同签名（实际不可达：本类型无法被构造）。
     pub fn mixer(&self) -> MutexGuard<'_, AudioMixer> {
-        self.mixer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 与 native 同签名（实际不可达：本类型无法被构造）。

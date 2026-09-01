@@ -16,16 +16,18 @@ fn scene() -> World {
 
     // 旋转 0.6 弧度的立方体悬在地面上方
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
-    let mat =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.9, 0.3, 0.1, 1.0));
+    let mat = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.9, 0.3, 0.1, 1.0));
     let mut transform = Transform::from_xyz(0.0, 0.6, 0.0);
     transform.rotation = Quat::from_rotation_y(0.6);
     world.spawn((transform, cube, mat));
 
     // 地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(20.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     // 模拟 HierarchyPlugin：主循环之外需要手动执行全局变换传播
@@ -119,7 +121,10 @@ fn offscreen_renders_many_instances() {
     propagate_transforms(&mut world);
     renderer.render(&world);
     let stats = renderer.renderer().stats();
-    assert_eq!(stats.instances, 26, "25 个立方体实例 + 1 个地面实例（全部在视锥内）");
+    assert_eq!(
+        stats.instances, 26,
+        "25 个立方体实例 + 1 个地面实例（全部在视锥内）"
+    );
     // 25 个立方体（同网格同材质）合并为 1 个 draw call + 地面 1 个
     assert_eq!(stats.draw_calls, 2, "26 个实例应只需 2 个 draw call");
 }
@@ -143,7 +148,11 @@ fn frustum_culls_entities_behind_camera() {
         for x in 0..3u32 {
             for z in 0..3u32 {
                 world.spawn((
-                    Transform::from_xyz(2.0 * x as f32, 0.6 + 2.0 * y as f32, 20.0 + 2.0 * z as f32),
+                    Transform::from_xyz(
+                        2.0 * x as f32,
+                        0.6 + 2.0 * y as f32,
+                        20.0 + 2.0 * z as f32,
+                    ),
                     MeshHandle(0),
                     MaterialHandle(1),
                 ));
@@ -157,7 +166,11 @@ fn frustum_culls_entities_behind_camera() {
     assert_eq!(stats.draw_calls, 2, "剔除后 draw call 不应增加");
 
     // 对照组：把其中 1 个立方体放到视锥内 → 应被提交并合入既有批次
-    world.spawn((Transform::from_xyz(0.0, 0.6, -2.0), MeshHandle(0), MaterialHandle(1)));
+    world.spawn((
+        Transform::from_xyz(0.0, 0.6, -2.0),
+        MeshHandle(0),
+        MaterialHandle(1),
+    ));
     propagate_transforms(&mut world);
     renderer.render(&world);
     let stats = renderer.renderer().stats();

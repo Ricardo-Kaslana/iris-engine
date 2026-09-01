@@ -51,7 +51,8 @@ mod tests {
     use super::*;
     use crate::Component;
 
-    #[derive(Component)] struct Tag;
+    #[derive(Component)]
+    struct Tag;
 
     #[test]
     fn entity_named_hits_misses_and_takes_first() {
@@ -72,7 +73,11 @@ mod tests {
     fn entity_named_ignores_unnamed_entities() {
         let mut world = World::new();
         world.spawn((Tag,));
-        assert_eq!(world.entity_named("anything"), None, "无 Name 组件的世界应未命中");
+        assert_eq!(
+            world.entity_named("anything"),
+            None,
+            "无 Name 组件的世界应未命中"
+        );
         let named = world.spawn((Name::from("player"),));
         assert_eq!(world.entity_named("player"), Some(named));
     }

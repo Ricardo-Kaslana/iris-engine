@@ -37,14 +37,18 @@ fn radial_scene(shadows: bool) -> World {
 
     // 地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(30.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     // 投影点光：悬在方块正上方
     world.spawn((
         Transform::from_xyz(0.0, 3.0, 0.0),
-        PointLight { shadows, ..PointLight::default() },
+        PointLight {
+            shadows,
+            ..PointLight::default()
+        },
     ));
 
     propagate_transforms(&mut world);
@@ -72,13 +76,17 @@ fn orientation_scene(shadows: bool) -> World {
     world.spawn((Transform::from_xyz(0.0, 2.2, 1.5), cube, mat));
 
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(30.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     world.spawn((
         Transform::from_xyz(0.0, 3.0, 0.0),
-        PointLight { shadows, ..PointLight::default() },
+        PointLight {
+            shadows,
+            ..PointLight::default()
+        },
     ));
 
     propagate_transforms(&mut world);
@@ -99,13 +107,17 @@ fn empty_scene(shadows: bool) -> World {
     world.insert_resource(DirectionalLight::default());
 
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(30.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     world.spawn((
         Transform::from_xyz(0.0, 3.0, 0.0),
-        PointLight { shadows, ..PointLight::default() },
+        PointLight {
+            shadows,
+            ..PointLight::default()
+        },
     ));
 
     propagate_transforms(&mut world);
@@ -117,16 +129,14 @@ fn project_to_pixel(point: Vec3, camera: &Camera, width: u32, height: u32) -> (f
     let vp = camera.view_proj(width as f32 / height as f32);
     let clip = vp * point.extend(1.0);
     let ndc = clip.truncate() / clip.w;
-    ((ndc.x * 0.5 + 0.5) * width as f32, (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32)
+    (
+        (ndc.x * 0.5 + 0.5) * width as f32,
+        (1.0 - (ndc.y * 0.5 + 0.5)) * height as f32,
+    )
 }
 
 /// 差分统计：返回 (变暗数, 变亮数, 不变数, 变暗掩码)。
-fn diff_pixels(
-    on: &[u8],
-    off: &[u8],
-    width: u32,
-    height: u32,
-) -> (u32, u32, u32, Vec<bool>) {
+fn diff_pixels(on: &[u8], off: &[u8], width: u32, height: u32) -> (u32, u32, u32, Vec<bool>) {
     assert_eq!(on.len(), off.len());
     let mut darkened = 0u32;
     let mut brightened = 0u32;
@@ -154,7 +164,10 @@ fn diff_pixels(
 
 #[test]
 fn face_matrices_cover_all_directions() {
-    let light = PointLight { range: 12.0, ..PointLight::default() };
+    let light = PointLight {
+        range: 12.0,
+        ..PointLight::default()
+    };
     // 灯位置任意化：矩阵必须以灯为原点工作，而非世界原点
     let light_pos = Vec3::new(3.0, -2.0, 4.0);
 

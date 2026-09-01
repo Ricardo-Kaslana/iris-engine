@@ -224,7 +224,10 @@ mod tests {
 
         input.end_frame();
         assert!(!input.any_key_pressed(), "下一帧按下边沿已清除");
-        assert!(input.key(KeyCode::Enter), "按住状态跨帧保持（不参与 any-key）");
+        assert!(
+            input.key(KeyCode::Enter),
+            "按住状态跨帧保持（不参与 any-key）"
+        );
 
         input.release(KeyCode::Enter);
         assert!(!input.any_key_pressed(), "释放不是按下：any-key 仍为假");

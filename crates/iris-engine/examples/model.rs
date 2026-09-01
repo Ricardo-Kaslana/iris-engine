@@ -46,10 +46,14 @@ fn setup(world: &mut World) {
 
     // 地面 + 点光点缀
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(20.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.3, 0.33, 0.4, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
-    world.spawn((Transform::from_xyz(2.0, 1.5, 2.0), PointLight::new(Vec3::ONE, 10.0, 10.0)));
+    world.spawn((
+        Transform::from_xyz(2.0, 1.5, 2.0),
+        PointLight::new(Vec3::ONE, 10.0, 10.0),
+    ));
 }
 
 fn spin_model(world: &mut World) {

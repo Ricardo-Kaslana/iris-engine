@@ -29,25 +29,39 @@ fn setup(world: &mut World) {
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
     let checker = world
         .resource_mut::<TextureStore>()
-        .add(CpuTexture::checkerboard(8, 16, [30, 32, 40, 255], [214, 92, 40, 255]));
+        .add(CpuTexture::checkerboard(
+            8,
+            16,
+            [30, 32, 40, 255],
+            [214, 92, 40, 255],
+        ));
     let mat_cube = world.resource_mut::<MaterialStore>().add(MaterialDef {
         texture: checker,
         metallic: 0.0,
         roughness: 0.25,
         ..Default::default()
     });
-    world.spawn((Transform::from_xyz(0.0, 0.6, 0.0), cube, mat_cube, Spin(1.2)));
+    world.spawn((
+        Transform::from_xyz(0.0, 0.6, 0.0),
+        cube,
+        mat_cube,
+        Spin(1.2),
+    ));
 
     // 地面
     let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(24.0));
-    let mat_ground =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.35, 0.38, 0.45, 1.0));
+    let mat_ground = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.35, 0.38, 0.45, 1.0));
     world.spawn((Transform::IDENTITY, plane, mat_ground));
 
     // 悬浮球体：展示平滑法线与高光
-    let sphere = world.resource_mut::<MeshStore>().add(MeshData::uv_sphere(0.45, 32, 20));
-    let mat_sphere =
-        world.resource_mut::<MaterialStore>().add(MaterialDef::solid(0.25, 0.65, 0.95, 1.0));
+    let sphere = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(0.45, 32, 20));
+    let mat_sphere = world
+        .resource_mut::<MaterialStore>()
+        .add(MaterialDef::solid(0.25, 0.65, 0.95, 1.0));
     world.spawn((Transform::from_xyz(1.9, 0.95, -0.7), sphere, mat_sphere));
 }
 
@@ -82,8 +96,15 @@ fn fly_camera(world: &mut World) {
         if input.key(KeyCode::ShiftLeft) {
             mv.y -= 1.0;
         }
-        let boost = if input.key(KeyCode::ControlLeft) { 3.0 } else { 1.0 };
-        (mv.normalize_or_zero() * 4.0 * boost * dt, input.wheel_delta())
+        let boost = if input.key(KeyCode::ControlLeft) {
+            3.0
+        } else {
+            1.0
+        };
+        (
+            mv.normalize_or_zero() * 4.0 * boost * dt,
+            input.wheel_delta(),
+        )
     };
     let mut camera = world.resource_mut::<Camera>();
     camera.fly(move_vec);

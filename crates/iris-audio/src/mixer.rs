@@ -71,7 +71,10 @@ impl Default for AudioMixer {
 impl AudioMixer {
     /// 创建空混音器。
     pub fn new() -> Self {
-        Self { slots: Vec::new(), free: Vec::new() }
+        Self {
+            slots: Vec::new(),
+            free: Vec::new(),
+        }
     }
 
     /// 播放一段剪辑（立即从开头开始），返回防悬垂句柄。
@@ -80,7 +83,10 @@ impl AudioMixer {
         let index = match self.free.pop() {
             Some(i) => i as usize,
             None => {
-                self.slots.push(VoiceSlot { generation: 0, voice: None });
+                self.slots.push(VoiceSlot {
+                    generation: 0,
+                    voice: None,
+                });
                 self.slots.len() - 1
             }
         };
@@ -149,8 +155,15 @@ impl AudioMixer {
 
         // 逐声音渲染：游标只前进、声音互不干扰
         for slot in &mut self.slots {
-            let Some(voice) = &mut slot.voice else { continue };
-            let Voice { clip, volume, looping, cursor } = voice;
+            let Some(voice) = &mut slot.voice else {
+                continue;
+            };
+            let Voice {
+                clip,
+                volume,
+                looping,
+                cursor,
+            } = voice;
             let frames = clip.frame_count();
             if frames == 0 {
                 continue; // 空剪辑：随后的移除清扫按「已播完」处理
@@ -158,7 +171,11 @@ impl AudioMixer {
             let channels_src = clip.channels() as usize;
             let samples = clip.samples();
             let ratio = clip.sample_rate() as f64 / sample_rate_out as f64;
-            let ratio = if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.0 };
+            let ratio = if ratio.is_finite() && ratio > 0.0 {
+                ratio
+            } else {
+                1.0
+            };
 
             for out_frame in out.chunks_exact_mut(channels_out) {
                 if *looping {
@@ -393,8 +410,8 @@ mod tests {
         assert_eq!(out, [0.5, 0.5, -0.5, -0.5]);
 
         // 立体声 → 立体声：直通
-        let stereo = AudioClip::from_interleaved(vec![0.5, -0.25, -1.0, 0.75], 2, 48_000)
-            .expect("合法");
+        let stereo =
+            AudioClip::from_interleaved(vec![0.5, -0.25, -1.0, 0.75], 2, 48_000).expect("合法");
         let mut mixer = AudioMixer::new();
         mixer.play(stereo, 1.0, false);
         let mut out = [0.0f32; 4];
@@ -402,8 +419,8 @@ mod tests {
         assert_eq!(out, [0.5, -0.25, -1.0, 0.75]);
 
         // 立体声 → 单声道：平均
-        let stereo = AudioClip::from_interleaved(vec![0.5, -0.5, -1.0, 1.0], 2, 48_000)
-            .expect("合法");
+        let stereo =
+            AudioClip::from_interleaved(vec![0.5, -0.5, -1.0, 1.0], 2, 48_000).expect("合法");
         let mut mixer = AudioMixer::new();
         mixer.play(stereo, 1.0, false);
         let mut out = [0.0f32; 2];
@@ -415,7 +432,9 @@ mod tests {
     #[test]
     fn resampling_to_double_rate_preserves_zero_crossings() {
         let zero_crossings = |s: &[f32]| {
-            s.windows(2).filter(|w| (w[0] > 0.0) != (w[1] > 0.0)).count()
+            s.windows(2)
+                .filter(|w| (w[0] > 0.0) != (w[1] > 0.0))
+                .count()
         };
         // 24kHz 源 → 48kHz 输出（比率 0.5 步进的线性插值）
         let mut mixer = AudioMixer::new();
@@ -430,7 +449,10 @@ mod tests {
         // 附近的 ±1 抖动用小窗口吸收，重采样不应改变过零点结构
         assert!((439..=443).contains(&a), "上混输出的过零点数 {a}");
         assert!((439..=443).contains(&b), "参照信号的过零点数 {b}");
-        assert!((a as i32 - b as i32).abs() <= 2, "重采样不应改变过零点数（{a} vs {b}）");
+        assert!(
+            (a as i32 - b as i32).abs() <= 2,
+            "重采样不应改变过零点数（{a} vs {b}）"
+        );
     }
 
     /// 软限幅：两路满幅声音叠加输出钳制在 [-1, 1]，不产生爆表采样。
@@ -444,7 +466,10 @@ mod tests {
         mixer.play(deep.clone(), 0.5, false);
         let mut out = [0.0f32; 8];
         mixer.mix(&mut out, 1, 48_000);
-        assert!(out.iter().all(|s| *s == 1.0), "2.0 叠加应钳制为 1.0：{out:?}");
+        assert!(
+            out.iter().all(|s| *s == 1.0),
+            "2.0 叠加应钳制为 1.0：{out:?}"
+        );
         assert!(out.iter().all(|s| s.abs() <= 1.0));
 
         let mut mixer = AudioMixer::new();

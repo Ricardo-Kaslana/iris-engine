@@ -1,8 +1,8 @@
 //! 插件系统：以可组合的方式向 `App` 注入资源与配置。
 
+use iris_core::prelude::Time;
 use iris_platform::input::Input;
 use iris_platform::window::WindowConfig;
-use iris_core::prelude::Time;
 use iris_render::prelude::{Camera, DirectionalLight, MaterialStore, MeshStore, TextureStore};
 
 use crate::app::App;
@@ -83,8 +83,10 @@ pub struct HierarchyPlugin;
 
 impl Plugin for HierarchyPlugin {
     fn build(&self, app: &mut App) {
-        app.schedule
-            .add_system(iris_core::prelude::Stage::PostUpdate, iris_core::hierarchy::propagate_transforms);
+        app.schedule.add_system(
+            iris_core::prelude::Stage::PostUpdate,
+            iris_core::hierarchy::propagate_transforms,
+        );
     }
 }
 
@@ -154,7 +156,9 @@ pub struct DefaultPlugins {
 
 impl DefaultPlugins {
     pub fn new(title: impl Into<String>) -> Self {
-        Self { window: WindowConfig::new(title, 1280, 720) }
+        Self {
+            window: WindowConfig::new(title, 1280, 720),
+        }
     }
 
     /// 自定义窗口尺寸。
@@ -172,7 +176,10 @@ impl DefaultPlugins {
 
 impl Plugin for DefaultPlugins {
     fn build(&self, app: &mut App) {
-        WindowPlugin { config: self.window.clone() }.build(app);
+        WindowPlugin {
+            config: self.window.clone(),
+        }
+        .build(app);
         TimePlugin.build(app);
         InputPlugin.build(app);
         RenderPlugin.build(app);

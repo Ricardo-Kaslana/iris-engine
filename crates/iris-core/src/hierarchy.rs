@@ -99,7 +99,9 @@ impl World {
 
     /// 子实体列表（无子时为空）。
     pub fn children(&self, parent: Entity) -> Vec<Entity> {
-        self.get::<Children>(parent).map(|c| c.0.clone()).unwrap_or_default()
+        self.get::<Children>(parent)
+            .map(|c| c.0.clone())
+            .unwrap_or_default()
     }
 
     /// 级联销毁：销毁实体及其全部后代。
@@ -203,8 +205,14 @@ mod tests {
 
         propagate_transforms(&mut world);
 
-        assert_eq!(world.get::<GlobalTransform>(root).unwrap().position(), Vec3::X);
-        assert_eq!(world.get::<GlobalTransform>(mid).unwrap().position(), Vec3::new(2.0, 0.0, 0.0));
+        assert_eq!(
+            world.get::<GlobalTransform>(root).unwrap().position(),
+            Vec3::X
+        );
+        assert_eq!(
+            world.get::<GlobalTransform>(mid).unwrap().position(),
+            Vec3::new(2.0, 0.0, 0.0)
+        );
         assert_eq!(
             world.get::<GlobalTransform>(leaf).unwrap().position(),
             Vec3::new(3.0, 0.0, 0.0)
@@ -213,7 +221,6 @@ mod tests {
 
     #[test]
     fn parent_rotation_carries_child() {
-
         let mut world = World::new();
         // 父绕 Y 转 180°，子本地位于 +X → 世界位于 -X
         let root = world.spawn((Transform::from_rotation_y(std::f32::consts::PI),));
@@ -222,7 +229,10 @@ mod tests {
 
         propagate_transforms(&mut world);
         let pos = world.get::<GlobalTransform>(child).unwrap().position();
-        assert!(pos.x < 0.0 && pos.x > -1.01 && pos.x < -0.99, "子应被父旋转带到 -X：{pos:?}");
+        assert!(
+            pos.x < 0.0 && pos.x > -1.01 && pos.x < -0.99,
+            "子应被父旋转带到 -X：{pos:?}"
+        );
     }
 
     #[test]
@@ -236,7 +246,10 @@ mod tests {
         propagate_transforms(&mut world);
 
         // 孤儿按根重建：全局 == 本地
-        assert_eq!(world.get::<GlobalTransform>(child).unwrap().position(), Vec3::ZERO);
+        assert_eq!(
+            world.get::<GlobalTransform>(child).unwrap().position(),
+            Vec3::ZERO
+        );
     }
 
     #[test]

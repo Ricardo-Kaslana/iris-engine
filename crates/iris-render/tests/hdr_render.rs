@@ -10,7 +10,7 @@
 use glam::Vec3;
 use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Transform, World};
-use iris_render::asset::{encode_hdr, load_hdr, parse_hdr, HdrImage};
+use iris_render::asset::{HdrImage, encode_hdr, load_hdr, parse_hdr};
 use iris_render::prelude::*;
 
 /// 合成红/蓝 fixture 并走完整资产链（往返 → 临时文件 → load_hdr）。
@@ -18,7 +18,15 @@ fn red_blue_fixture() -> HdrImage {
     let mut image = HdrImage::new(8, 4);
     for y in 0..4u32 {
         for x in 0..8u32 {
-            image.set_pixel(x, y, if y < 2 { [4.0, 0.0, 0.0] } else { [0.0, 0.0, 4.0] });
+            image.set_pixel(
+                x,
+                y,
+                if y < 2 {
+                    [4.0, 0.0, 0.0]
+                } else {
+                    [0.0, 0.0, 4.0]
+                },
+            );
         }
     }
     let bytes = encode_hdr(&image);

@@ -29,7 +29,11 @@ pub struct HdrImage {
 impl HdrImage {
     /// 构造指定尺寸的全零图。
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, rgb: vec![0.0; (width * height * 3) as usize] }
+        Self {
+            width,
+            height,
+            rgb: vec![0.0; (width * height * 3) as usize],
+        }
     }
 
     /// 读取 (x, y) 处的线性 RGB。
@@ -101,8 +105,8 @@ pub fn parse_hdr(bytes: &[u8]) -> Result<HdrImage, HdrError> {
         }
     }
     // 分辨率行：-Y <h> +X <w>
-    let res_line = next_line(bytes, &mut pos)
-        .ok_or_else(|| HdrError::Format("缺少分辨率行".into()))?;
+    let res_line =
+        next_line(bytes, &mut pos).ok_or_else(|| HdrError::Format("缺少分辨率行".into()))?;
     let text = String::from_utf8_lossy(res_line).into_owned();
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let (height_str, width_str) = match tokens.as_slice() {
@@ -110,7 +114,7 @@ pub fn parse_hdr(bytes: &[u8]) -> Result<HdrImage, HdrError> {
         _ => {
             return Err(HdrError::Unsupported(format!(
                 "分辨率行仅支持 `-Y <h> +X <w>`，实际 {text:?}"
-            )))
+            )));
         }
     };
     let height: u32 = height_str
@@ -164,9 +168,7 @@ fn next_line<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
 fn decode_scanline(data: &[u8], pos: &mut usize, width: usize) -> Result<Vec<u8>, HdrError> {
     // 新式 RLE：扫描线以 [2, 2, hi, lo] 开头且 hi:lo == width。
     // 宽度校验是新旧格式的关键判别（旧式像素恰为 [2,2,·,·] 时不得误判）。
-    if data.get(*pos..*pos + 4)
-        == Some(&[2u8, 2, (width >> 8) as u8, (width & 0xff) as u8])
-    {
+    if data.get(*pos..*pos + 4) == Some(&[2u8, 2, (width >> 8) as u8, (width & 0xff) as u8]) {
         *pos += 4;
         let mut out = Vec::with_capacity(width * 4);
         for _ in 0..4 {
@@ -193,7 +195,12 @@ fn decode_scanline(data: &[u8], pos: &mut usize, width: usize) -> Result<Vec<u8>
 
 /// 解码一条 RLE 通道游程：count > 128 为重复游程（下一字节重复 count-128 次），
 /// 否则为 count 字节字面量。通道解码长度必须恰为 width。
-fn rle_channel(data: &[u8], pos: &mut usize, width: usize, out: &mut Vec<u8>) -> Result<(), HdrError> {
+fn rle_channel(
+    data: &[u8],
+    pos: &mut usize,
+    width: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), HdrError> {
     let start = out.len();
     while out.len() - start < width {
         let Some(&count) = data.get(*pos) else {
@@ -238,9 +245,7 @@ fn rgbe_to_rgb(r: u8, g: u8, b: u8, e: u8) -> [f32; 3] {
 /// 把线性 RGB 全景图编码为 Radiance `.hdr` 字节（旧式平面扫描线）。
 /// 供示例生成器与测试使用；文件体积敏感时可自行改写为 RLE。
 pub fn encode_hdr(image: &HdrImage) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        64 + image.width as usize * image.height as usize * 4,
-    );
+    let mut out = Vec::with_capacity(64 + image.width as usize * image.height as usize * 4);
     out.extend_from_slice(b"#?RADIANCE\n");
     out.extend_from_slice(b"FORMAT=32-bit_rle_rgbe\n");
     out.push(b'\n');
@@ -258,13 +263,13 @@ pub fn encode_hdr(image: &HdrImage) -> Vec<u8> {
 /// 以最大通道定共享指数，尾数截断到 8 位。
 fn rgbe_from(r: f32, g: f32, b: f32) -> [u8; 4] {
     let max = r.max(g).max(b);
-    if !(max > 0.0) {
+    if max <= 0.0 || max.is_nan() {
         return [0, 0, 0, 0]; // 0 / NaN / 负值兜底为编码黑
     }
     let (frac, exp) = frexp(max);
     let scale = frac * 256.0 / max;
     // 截断；浮点舍入可能恰好触及 256.0，钳制防御
-    let byte = |v: f32| (v * scale).min(255.0).max(0.0) as u8;
+    let byte = |v: f32| (v * scale).clamp(0.0, 255.0) as u8;
     [byte(r), byte(g), byte(b), (exp + 128) as u8]
 }
 
@@ -277,7 +282,10 @@ fn frexp(v: f32) -> (f32, i32) {
         let (frac, exp) = frexp(v * 4_294_967_296.0);
         return (frac, exp - 32);
     }
-    (f32::from_bits((bits & 0x807f_ffff) | (126 << 23)), raw_exp - 126)
+    (
+        f32::from_bits((bits & 0x807f_ffff) | (126 << 23)),
+        raw_exp - 126,
+    )
 }
 
 #[cfg(test)]
@@ -332,7 +340,9 @@ mod tests {
         bytes.extend_from_slice(&[4, 129, 129, 129, 129]);
         // 第二条扫描线：与第一条相同
         bytes.extend_from_slice(&[2, 2, 0, 4]);
-        bytes.extend_from_slice(&[132, 128, 4, 0, 0, 0, 0, 129, 200, 3, 0, 0, 0, 4, 129, 129, 129, 129]);
+        bytes.extend_from_slice(&[
+            132, 128, 4, 0, 0, 0, 0, 129, 200, 3, 0, 0, 0, 4, 129, 129, 129, 129,
+        ]);
         bytes.push(b'\n');
 
         let image = parse_hdr(&bytes).expect("解析应成功");
@@ -340,11 +350,17 @@ mod tests {
         for y in 0..2u32 {
             for x in 0..4u32 {
                 let [r, g, b] = image.pixel(x, y);
-                assert!((r - 128.0 * 2f32.powi(129 - 136)).abs() < 1e-5, "R({x},{y})={r}");
+                assert!(
+                    (r - 128.0 * 2f32.powi(129 - 136)).abs() < 1e-5,
+                    "R({x},{y})={r}"
+                );
                 assert_eq!(g, 0.0);
                 // B 通道混合编码：x=0 来自重复游程，x=1..4 来自字面量补零
                 if x == 0 {
-                    assert!((b - 200.0 * 2f32.powi(129 - 136)).abs() < 1e-5, "B({x},{y})={b}");
+                    assert!(
+                        (b - 200.0 * 2f32.powi(129 - 136)).abs() < 1e-5,
+                        "B({x},{y})={b}"
+                    );
                 } else {
                     assert_eq!(b, 0.0, "B({x},{y})={b}");
                 }
@@ -367,7 +383,12 @@ mod tests {
             let a = image.pixel(x, 0);
             let b = parsed.pixel(x, 0);
             for c in 0..3 {
-                assert!((a[c] - b[c]).abs() < 1e-5, "通道 {c} 往返失真：{} vs {}", a[c], b[c]);
+                assert!(
+                    (a[c] - b[c]).abs() < 1e-5,
+                    "通道 {c} 往返失真：{} vs {}",
+                    a[c],
+                    b[c]
+                );
             }
         }
         // (1,0,0) 的 RGBE 字节应为 Radiance 标准编码 [128, 0, 0, 129]

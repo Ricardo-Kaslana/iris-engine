@@ -21,9 +21,21 @@ impl Vertex {
         array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
-            wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: 12,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: 24,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x2,
+            },
         ],
     };
 }
@@ -45,8 +57,16 @@ impl SkinVertex {
         array_stride: std::mem::size_of::<SkinVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 10, format: wgpu::VertexFormat::Uint32x4 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 11, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 10,
+                format: wgpu::VertexFormat::Uint32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 11,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 }
@@ -105,16 +125,37 @@ pub mod primitives {
     fn add_face(data: &mut MeshData, center: [f32; 3], normal: [f32; 3], u: [f32; 3], v: [f32; 3]) {
         let base = data.vertices.len() as u32;
         let corners = [
-            [center[0] - u[0] - v[0], center[1] - u[1] - v[1], center[2] - u[2] - v[2]],
-            [center[0] + u[0] - v[0], center[1] + u[1] - v[1], center[2] + u[2] - v[2]],
-            [center[0] + u[0] + v[0], center[1] + u[1] + v[1], center[2] + u[2] + v[2]],
-            [center[0] - u[0] + v[0], center[1] - u[1] + v[1], center[2] - u[2] + v[2]],
+            [
+                center[0] - u[0] - v[0],
+                center[1] - u[1] - v[1],
+                center[2] - u[2] - v[2],
+            ],
+            [
+                center[0] + u[0] - v[0],
+                center[1] + u[1] - v[1],
+                center[2] + u[2] - v[2],
+            ],
+            [
+                center[0] + u[0] + v[0],
+                center[1] + u[1] + v[1],
+                center[2] + u[2] + v[2],
+            ],
+            [
+                center[0] - u[0] + v[0],
+                center[1] - u[1] + v[1],
+                center[2] - u[2] + v[2],
+            ],
         ];
         let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         for (c, uv) in corners.into_iter().zip(uvs) {
-            data.vertices.push(Vertex { position: c, normal, uv });
+            data.vertices.push(Vertex {
+                position: c,
+                normal,
+                uv,
+            });
         }
-        data.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        data.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
     /// 单位立方体（边长 1，中心在原点）：24 顶点 / 36 索引。
@@ -122,14 +163,50 @@ pub mod primitives {
         let mut data = MeshData::default();
         let h = 0.5;
         // +Z / -Z
-        add_face(&mut data, [0.0, 0.0, h], [0.0, 0.0, 1.0], [h, 0.0, 0.0], [0.0, h, 0.0]);
-        add_face(&mut data, [0.0, 0.0, -h], [0.0, 0.0, -1.0], [-h, 0.0, 0.0], [0.0, h, 0.0]);
+        add_face(
+            &mut data,
+            [0.0, 0.0, h],
+            [0.0, 0.0, 1.0],
+            [h, 0.0, 0.0],
+            [0.0, h, 0.0],
+        );
+        add_face(
+            &mut data,
+            [0.0, 0.0, -h],
+            [0.0, 0.0, -1.0],
+            [-h, 0.0, 0.0],
+            [0.0, h, 0.0],
+        );
         // +X / -X
-        add_face(&mut data, [h, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -h], [0.0, h, 0.0]);
-        add_face(&mut data, [-h, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, h], [0.0, h, 0.0]);
+        add_face(
+            &mut data,
+            [h, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -h],
+            [0.0, h, 0.0],
+        );
+        add_face(
+            &mut data,
+            [-h, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, h],
+            [0.0, h, 0.0],
+        );
         // +Y / -Y
-        add_face(&mut data, [0.0, h, 0.0], [0.0, 1.0, 0.0], [h, 0.0, 0.0], [0.0, 0.0, -h]);
-        add_face(&mut data, [0.0, -h, 0.0], [0.0, -1.0, 0.0], [h, 0.0, 0.0], [0.0, 0.0, h]);
+        add_face(
+            &mut data,
+            [0.0, h, 0.0],
+            [0.0, 1.0, 0.0],
+            [h, 0.0, 0.0],
+            [0.0, 0.0, -h],
+        );
+        add_face(
+            &mut data,
+            [0.0, -h, 0.0],
+            [0.0, -1.0, 0.0],
+            [h, 0.0, 0.0],
+            [0.0, 0.0, h],
+        );
         data
     }
 
@@ -137,7 +214,13 @@ pub mod primitives {
     pub fn plane(size: f32) -> MeshData {
         let mut data = MeshData::default();
         let h = size * 0.5;
-        add_face(&mut data, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [h, 0.0, 0.0], [0.0, 0.0, -h]);
+        add_face(
+            &mut data,
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [h, 0.0, 0.0],
+            [0.0, 0.0, -h],
+        );
         data
     }
 
@@ -297,16 +380,20 @@ pub(crate) fn upload_mesh(
             "蒙皮属性数量必须与顶点数量一致"
         );
     }
-    let vertex_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("iris.mesh.vbo"),
-        contents: bytemuck::cast_slice(&data.vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let index_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("iris.mesh.ibo"),
-        contents: bytemuck::cast_slice(&data.indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
+    let vertex_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("iris.mesh.vbo"),
+            contents: bytemuck::cast_slice(&data.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+    let index_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("iris.mesh.ibo"),
+            contents: bytemuck::cast_slice(&data.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
     let skin_buf = data.skin.as_ref().map(|skin| {
         gpu.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -334,7 +421,11 @@ mod tests {
             assert!((len - 1.0).abs() < 1e-5);
         }
         // 索引必须在顶点范围内
-        assert!(cube.indices.iter().all(|&i| (i as usize) < cube.vertices.len()));
+        assert!(
+            cube.indices
+                .iter()
+                .all(|&i| (i as usize) < cube.vertices.len())
+        );
         // 包围盒为 [-0.5, 0.5]^3
         let (min, max) = cube.bounds().unwrap();
         assert!(min.iter().all(|&x| (x + 0.5).abs() < 1e-5));
@@ -396,14 +487,24 @@ mod tests {
         // 侧面 2 行 × (segments+1) 闭合环 + 两个帽面各 (segments+1) 环 + 各 1 中心
         assert_eq!(cyl.vertices.len(), 2 * 9 + 2 * 9 + 2);
         // 侧面 segments 个 quad（6 索引）+ 两帽各 segments 个三角（3 索引）
-        assert_eq!(cyl.indices.len(), (CYL_SEGMENTS * 6 + CYL_SEGMENTS * 3 * 2) as usize);
+        assert_eq!(
+            cyl.indices.len(),
+            (CYL_SEGMENTS * 6 + CYL_SEGMENTS * 3 * 2) as usize
+        );
         // 索引全部在顶点范围内
-        assert!(cyl.indices.iter().all(|&i| (i as usize) < cyl.vertices.len()));
+        assert!(
+            cyl.indices
+                .iter()
+                .all(|&i| (i as usize) < cyl.vertices.len())
+        );
         // 包围盒：XZ 压在 ±radius、Y 压在 ±height/2
         let (min, max) = cyl.bounds().unwrap();
         for i in 0..3 {
             let limit = if i == 1 { height * 0.5 } else { radius };
-            assert!(min[i] >= -limit - 1e-5 && max[i] <= limit + 1e-5, "轴 {i} 超界");
+            assert!(
+                min[i] >= -limit - 1e-5 && max[i] <= limit + 1e-5,
+                "轴 {i} 超界"
+            );
         }
     }
 
@@ -424,7 +525,10 @@ mod tests {
                     cap_centers += 1;
                     assert_eq!(v.position[1], if n[1] > 0.0 { half } else { -half });
                 } else {
-                    assert!((horizontal - radius).abs() < 1e-5, "帽缘应在半径 {radius} 上");
+                    assert!(
+                        (horizontal - radius).abs() < 1e-5,
+                        "帽缘应在半径 {radius} 上"
+                    );
                 }
             } else {
                 // 侧面：法线径向（无 Y 分量）且位置在柱面上
@@ -456,7 +560,10 @@ mod tests {
             ];
             let normal = cyl.vertices[tri[0] as usize].normal;
             let dot = cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2];
-            assert!(dot > 0.0, "三角形应从外侧看为 CCW（法线 {normal:?}，叉积 {cross:?}）");
+            assert!(
+                dot > 0.0,
+                "三角形应从外侧看为 CCW（法线 {normal:?}，叉积 {cross:?}）"
+            );
         }
     }
 
@@ -471,7 +578,10 @@ mod tests {
         assert_eq!((attrs[0].shader_location, attrs[0].offset), (10, 0));
         assert_eq!((attrs[1].shader_location, attrs[1].offset), (11, 16));
         // 位级往返（Pod 契约）
-        let v = SkinVertex { joints: [7, 0, 3, 1], weights: [0.5, 0.25, 0.125, 0.125] };
+        let v = SkinVertex {
+            joints: [7, 0, 3, 1],
+            weights: [0.5, 0.25, 0.125, 0.125],
+        };
         let bytes: &[u8] = bytemuck::bytes_of(&v);
         let back: SkinVertex = *bytemuck::from_bytes(bytes);
         assert_eq!(back, v);
@@ -488,7 +598,10 @@ mod tests {
             vertices: primitives::cube().vertices,
             indices: primitives::cube().indices,
             skin: Some(vec![
-                SkinVertex { joints: [0; 4], weights: [0.0; 4] };
+                SkinVertex {
+                    joints: [0; 4],
+                    weights: [0.0; 4]
+                };
                 3
             ]),
         };

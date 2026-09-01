@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
-use crate::clip::AudioClip;
 use crate::AudioError;
+use crate::clip::AudioClip;
 
 /// `fmt ` 块中本实现关心的字段。
 struct FmtChunk {
@@ -50,9 +50,12 @@ pub fn parse_wav(bytes: &[u8]) -> Result<AudioClip, AudioError> {
     let mut pos = 12usize;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let size =
-            u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-                as usize;
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let start = pos + 8;
         // 声明长度超出文件时截断到文件尾（容错损坏的长度字段）
         let end = start.saturating_add(size).min(bytes.len());
@@ -103,8 +106,7 @@ fn parse_fmt(payload: &[u8]) -> Result<FmtChunk, AudioError> {
         )));
     }
     let channels = u16_at(2);
-    let sample_rate =
-        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let sample_rate = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let bits = u16_at(14);
     if bits != 16 {
         return Err(AudioError::Unsupported(format!(
@@ -119,7 +121,10 @@ fn parse_fmt(payload: &[u8]) -> Result<FmtChunk, AudioError> {
     if sample_rate == 0 {
         return Err(AudioError::Format("采样率为 0".into()));
     }
-    Ok(FmtChunk { channels, sample_rate })
+    Ok(FmtChunk {
+        channels,
+        sample_rate,
+    })
 }
 
 #[cfg(test)]
