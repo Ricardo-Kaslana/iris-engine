@@ -2,31 +2,52 @@
 //!
 //! 职责划分：
 //! - **Startup**：`setup_resources`（兜底插入引擎资源 + 游戏资源）→
-//!   `build_scene`（地面 / 围墙 / 灯光 / 玩家 + 子实体相机 / 金币 / HUD）；
+//!   `build_scene`（[`load_scene`] 载入 `GamePlugin::scene_path` 指向的 JSON
+//!   关卡文件：地面 / 围墙 / 障碍柱 / 灯光全部来自场景；玩家三层结构 +
+//!   子实体相机 / 金币 / HUD 为代码生成——它们携带游戏私有组件，不进
+//!   场景文件）；
 //! - **Update**：`update_gameplay`（读 `Input` + `Time` → `GameState::step`
-//!   → 写玩家 `Transform` + 触发音效）→ `animate_coins`（金币自转浮动，
-//!   已收集者切 `Visibility::HIDDEN`）→ `update_hud`（SCORE / TIME / 横幅，
-//!   HUD 文本实体经 `Name` 按名定位）。
+//!   → **运动学角色控制器**（静态推离查询，只取水平分量）→ 写玩家
+//!   `Transform` + 触发音效）→ `animate_coins`（金币自转浮动，已收集者切
+//!   `Visibility::HIDDEN`）→ `update_hud`（SCORE / TIME / 横幅，HUD 文本
+//!   实体经 `Name` 按名定位）。
 //! - **层级传播**：交给 `DefaultPlugins` 的 `HierarchyPlugin`（PostUpdate
 //!   阶段）——Update 写局部变换、PostUpdate 传播、渲染读取，本插件不再
 //!   自行补传播（引擎加入 PostUpdate 阶段前的旧绕行已删除）。
 //!
-//! 本插件**只使用引擎公开 API**（dogfooding）：不依赖引擎内部路径。
-//! 场景搭建走 `World::spawn` + `MeshStore` / `MaterialStore`，相机挂在
-//! 玩家子实体上验证层级跟随（`ActiveCamera` 优先于 `Camera` 资源），
-//! 音效走程序化生成的 `AudioClip` + `Audio` 资源。
+//! # 运动学角色控制器（游戏 × 物理库的推荐组合）
 //!
-//! 复用方式：窗口程序 `App::add_plugin(GamePlugin)`；headless 测试 /
-//! 离屏快照直接 `GamePlugin.build_schedule(&mut Schedule)` 后手动
-//! `schedule.run(Stage::Startup / Update / PostUpdate, &mut world)`——
-//! 与 `DefaultPlugins` 的注册方式一致（资源兜底插入已并入 Startup 首系统，
-//! PostUpdate 由调用方注册 `HierarchyPlugin` 或等价的
+//! 玩家的移动积分仍归 `logic::step`（纯逻辑、可单测）；物理库只作**查询**
+//! 参与：`resolve_against_statics` 以玩家球体（半径 = 半高，球心即实体
+//! 位置、固定在地面高度）对场景静态体（地面 / 围墙 / 障碍柱的 `Collider`，
+//! 「仅 Collider 无 RigidBody = 静态」语义）求推离修正，本系统只把修正的
+//! **水平分量**回馈给 `GameState.player.x/z`。推离只沿接触法线 → 切向速度
+//! 天然保留 = 贴墙滑行；地面法线 ±Y 在水平分量上恒 0，天然无作用。
+//! `logic::step` 的 ±arena_half 钳制保留为安全网（场景缺失 / 加载失败时
+//! 的最后防线；正常对局由墙体 collider 在 ±17.05 挡住，远早于钳制）。
+//!
+//! 本插件**只使用引擎公开 API**（dogfooding）：不依赖引擎内部路径。
+//! 场景搭建走 `load_scene` + `MeshStore` / `MaterialStore`（玩家 / 金币），
+//! 相机挂在玩家子实体上验证层级跟随（`ActiveCamera` 优先于 `Camera`
+//! 资源），音效走程序化生成的 `AudioClip` + `Audio` 资源。
+//!
+//! 复用方式：窗口程序 `App::add_plugin(GamePlugin::default())`；headless
+//! 测试 / 离屏快照直接 `GamePlugin::new(fixture_path).build_schedule(&mut
+//! Schedule)` 后手动 `schedule.run(Stage::Startup / Update / PostUpdate,
+//! &mut world)`——与 `DefaultPlugins` 的注册方式一致（资源兜底插入已并入
+//! Startup 首系统，PostUpdate 由调用方注册 `HierarchyPlugin` 或等价的
 //! `propagate_transforms`，两条路径编排保持一致）。
 
-use iris_core::prelude::{Access, Entity, Name, Schedule, Stage};
+use std::path::{Path, PathBuf};
+
+use iris_core::physics::resolve_against_statics;
+use iris_core::prelude::{Access, ColliderShape, Entity, Name, Schedule, Stage};
 use iris_engine::prelude::*;
 
 use crate::logic::{GameState, MoveInput, Phase};
+
+/// 默认关卡文件（相对工作目录：`cargo run` 的 cwd 是 workspace 根）。
+pub const DEFAULT_SCENE_PATH: &str = "assets/collect_arena.scene.json";
 
 /// 适配：把纯逻辑类型接入引擎资源存储。
 ///
@@ -68,16 +89,16 @@ pub struct Coin(pub usize);
 
 /// 对局时长（秒）。
 pub const DURATION_SECS: f32 = 60.0;
-/// 竞技场半边长（米）：地面 40 m、内壁贴 ±18 m。
+/// 竞技场半边长（米）：传给逻辑的边界钳制**安全网**（±18）。正式关卡的
+/// 墙体 collider 内缘在 ±17.5，玩家球体（半径 0.45）最远到 ±17.05——
+/// 钳制只在场景缺失 / 加载失败（无墙可撞）时兜底，见 [`GamePlugin`]。
 pub const ARENA_HALF: f32 = 18.0;
 
-/// 地面网格边长（米），略大于围墙外缘。
-const GROUND_SIZE: f32 = 40.0;
-/// 围墙：高 1 m、厚 1 m。
-const WALL_HEIGHT: f32 = 1.0;
-const WALL_THICKNESS: f32 = 1.0;
 /// 玩家方块：边 0.7 × 0.9 × 0.7（半高 0.45，落地时贴地）。
 const PLAYER_HALF_HEIGHT: f32 = 0.45;
+/// 玩家碰撞形状：球体，半径 = 半高——球心即实体位置（贴地时 y = 0.45），
+/// 控制器推离以它对场景静态体查询（见模块文档「运动学角色控制器」）。
+const PLAYER_SHAPE: ColliderShape = ColliderShape::Sphere { radius: PLAYER_HALF_HEIGHT };
 /// 金币视觉基线高度与浮动幅度。
 const COIN_BASE_Y: f32 = 0.35;
 const COIN_BOB_AMPLITUDE: f32 = 0.12;
@@ -88,23 +109,46 @@ pub const SCORE_TEXT_NAME: &str = "hud/score";
 pub const TIME_TEXT_NAME: &str = "hud/time";
 pub const BANNER_TEXT_NAME: &str = "hud/banner";
 
-/// 收集小游戏插件：Startup 搭场景 + Update 推进逻辑与表现。
-#[derive(Default)]
-pub struct GamePlugin;
+/// 收集小游戏插件：Startup 载入场景 + Update 推进逻辑与表现。
+///
+/// [`Default`] 的关卡路径是 [`DEFAULT_SCENE_PATH`]（`assets/
+/// collect_arena.scene.json`）；测试 / 示例用 [`GamePlugin::new`] 注入任意
+/// 路径（headless 测试写临时 fixture 关卡）。
+#[derive(Debug, Clone)]
+pub struct GamePlugin {
+    /// Startup 时 [`load_scene`] 的场景文件路径（关卡数据与代码分离）。
+    pub scene_path: PathBuf,
+}
+
+impl Default for GamePlugin {
+    fn default() -> Self {
+        Self { scene_path: PathBuf::from(DEFAULT_SCENE_PATH) }
+    }
+}
 
 impl GamePlugin {
+    /// 以指定场景文件构造（测试注入 fixture 关卡、示例显式给默认路径）。
+    pub fn new(scene_path: impl Into<PathBuf>) -> Self {
+        Self { scene_path: scene_path.into() }
+    }
+
     /// 把本插件的全部系统注册到调度器。
     ///
     /// 与 `DefaultPlugins` 的编排方式一致（Startup 一次、Update 每帧）；
     /// 独立暴露是为了 headless 测试与离屏快照在不建 `App` / 窗口 / GPU
     /// 的前提下复用同一条推进路径。
     pub fn build_schedule(&self, schedule: &mut Schedule) {
+        // 场景路径捕获进 Startup 闭包（系统即「闭包或函数」）
+        let scene_path = self.scene_path.clone();
         schedule
             .add_system(Stage::Startup, setup_resources)
-            .add_system(Stage::Startup, build_scene)
+            .add_system(Stage::Startup, move |world: &mut World| {
+                build_scene(world, &scene_path)
+            })
             // Update 内的顺序即注册顺序（读写集冲突者分批保序）：
             // 逻辑推进 → 金币表现 → HUD；层级传播在 PostUpdate
-            // （窗口路径由 HierarchyPlugin 注册，headless 路径见其文档）
+            // （窗口路径由 HierarchyPlugin 注册，headless 路径见其文档）。
+            // 读 Collider：运动学角色控制器的静态推离查询需要场景碰撞体
             .add_parallel_system(
                 Stage::Update,
                 Access::new()
@@ -113,6 +157,7 @@ impl GamePlugin {
                     .read::<Audio>()
                     .read::<GameAssets>()
                     .read::<GameEntities>()
+                    .read::<Collider>()
                     .write::<GameState>()
                     .write::<Transform>(),
                 update_gameplay,
@@ -145,12 +190,15 @@ impl Plugin for GamePlugin {
 
 /// Startup 1：资源兜底插入。
 ///
-/// 引擎资源（Store / 相机 / 灯光 / 泛光 / 音频）按 DefaultPlugins 的
+/// 引擎资源（Store / 相机 / 泛光 / 音频）按 DefaultPlugins 的
 /// ResourcePlugin 语义**缺席才插入**——窗口程序里 RenderPlugin /
 /// AudioPlugin 已就位，不得覆盖（音频设备句柄是独占的）；headless /
 /// 离屏路径则由这里补齐。headless 测试请预插入 `Audio::headless()`（同样
 /// 不会被这里覆盖），避免 `cargo test` 间歇性打开真实设备。游戏资源
 /// （`GameState` / `GameAssets`）由本插件独占，直接插入。
+///
+/// 方向光不再由代码搭建——它属于关卡氛围，来自场景文件的环境段
+/// （`build_scene` 的 `load_scene` 写入；加载失败时的兜底见该函数）。
 fn setup_resources(world: &mut World) {
     if !world.contains_resource::<MeshStore>() {
         world.insert_resource(MeshStore::new());
@@ -163,13 +211,6 @@ fn setup_resources(world: &mut World) {
     }
     if !world.contains_resource::<Camera>() {
         world.insert_resource(Camera::default());
-    }
-    if !world.contains_resource::<DirectionalLight>() {
-        // 微弱日光打底（点光是主光）；阴影照开，围墙阴影落向场地一侧
-        world.insert_resource(DirectionalLight {
-            intensity: 0.6,
-            ..DirectionalLight::default()
-        });
     }
     if !world.contains_resource::<BloomSettings>() {
         world.insert_resource(BloomSettings::default());
@@ -184,24 +225,36 @@ fn setup_resources(world: &mut World) {
     });
 }
 
-/// Startup 2：搭建场景。
+/// Startup 2：载入关卡场景 + 搭建游戏私有实体。
+///
+/// **关卡来自场景文件**（[`load_scene`]）：环境段（微弱日光打底）+ 地面 /
+/// 四面围墙（内缘 ±17.5，静态 Box collider）/ 三根障碍柱（静态 collider，
+/// 压在金币环行进路线上制造绕行）/ 场地中央点光（cubemap 阴影）。
+/// 加载失败不 panic：`log::error` 后继续——玩家 / 金币 / HUD 照常生成，
+/// 游戏仍可玩（无墙 + 逻辑 ±18 钳制兜底；headless 测试的 fixture 文件
+/// 总是存在，正常路径不受影响），仅在光照缺席时补默认方向光以免全黑。
 ///
 /// 玩家实体是根（位置 + 朝向由逻辑写入），**相机作为玩家子实体**
 /// （局部 (0, 4.5, 8) + 绕 X 俯视 -25°，挂 `ActiveCamera`）——层级传播
 /// 让相机逐帧跟随玩家；渲染器优先使用 `ActiveCamera` 实体。
-fn build_scene(world: &mut World) {
-    // ---- 网格与材质 ----
-    let ground_mesh = world.resource_mut::<MeshStore>().add(MeshData::plane(GROUND_SIZE));
+fn build_scene(world: &mut World, scene_path: &Path) {
+    // ---- 场景文件：环境 + 地面 / 围墙 / 障碍柱 / 点光（含静态 collider）----
+    if let Err(error) = load_scene(world, scene_path) {
+        log::error!(
+            "GamePlugin：场景文件 {} 加载失败（{error}）——以无场景模式继续\
+             （玩家 / 金币 / HUD 照常，边界由逻辑钳制兜底）",
+            scene_path.display()
+        );
+        if !world.contains_resource::<DirectionalLight>() {
+            world.insert_resource(DirectionalLight::default());
+        }
+    }
+
+    // ---- 玩家 / 金币的网格与材质（游戏私有，不进场景文件）----
     let cube_mesh = world.resource_mut::<MeshStore>().add(MeshData::cube());
     let coin_mesh = world
         .resource_mut::<MeshStore>()
         .add(MeshData::uv_sphere(1.0, 24, 12));
-    let ground_mat = world
-        .resource_mut::<MaterialStore>()
-        .add(MaterialDef::solid(0.25, 0.34, 0.22, 1.0));
-    let wall_mat = world
-        .resource_mut::<MaterialStore>()
-        .add(MaterialDef::solid(0.46, 0.43, 0.40, 1.0));
     let player_mat = world
         .resource_mut::<MaterialStore>()
         .add(MaterialDef::solid(0.25, 0.50, 0.95, 1.0));
@@ -213,47 +266,6 @@ fn build_scene(world: &mut World) {
         roughness: 0.35,
         ..MaterialDef::default()
     });
-
-    // ---- 地面 ----
-    world.spawn((Transform::IDENTITY, ground_mesh, ground_mat));
-
-    // ---- 四面围墙：内缘贴 ±ARENA_HALF，转角互相搭接 ----
-    let wall_span = ARENA_HALF * 2.0 + WALL_THICKNESS * 2.0;
-    for (position, scale) in [
-        (
-            Vec3::new(ARENA_HALF + WALL_THICKNESS * 0.5, WALL_HEIGHT * 0.5, 0.0),
-            Vec3::new(WALL_THICKNESS, WALL_HEIGHT, wall_span),
-        ),
-        (
-            Vec3::new(-ARENA_HALF - WALL_THICKNESS * 0.5, WALL_HEIGHT * 0.5, 0.0),
-            Vec3::new(WALL_THICKNESS, WALL_HEIGHT, wall_span),
-        ),
-        (
-            Vec3::new(0.0, WALL_HEIGHT * 0.5, ARENA_HALF + WALL_THICKNESS * 0.5),
-            Vec3::new(wall_span, WALL_HEIGHT, WALL_THICKNESS),
-        ),
-        (
-            Vec3::new(0.0, WALL_HEIGHT * 0.5, -ARENA_HALF - WALL_THICKNESS * 0.5),
-            Vec3::new(wall_span, WALL_HEIGHT, WALL_THICKNESS),
-        ),
-    ] {
-        world.spawn((
-            Transform { position, scale, ..Transform::IDENTITY },
-            cube_mesh,
-            wall_mat,
-        ));
-    }
-
-    // ---- 灯光：场地中央点光（cubemap 阴影）+ 微弱日光 ----
-    world.spawn((
-        Transform::from_xyz(0.0, 6.0, 0.0),
-        PointLight {
-            color: Vec3::new(1.0, 0.97, 0.88),
-            intensity: 28.0,
-            range: 40.0,
-            shadows: true,
-        },
-    ));
 
     // ---- 玩家三层结构：根实体只承载位置（rotation 恒恒等），
     // 朝向写在模型子实体上，相机子实体与朝向解耦——若把转身写进根
@@ -330,7 +342,8 @@ fn build_scene(world: &mut World) {
     world.insert_resource(GameEntities { player, player_model, camera, coins });
 }
 
-/// Update 1：读输入与时间 → 推进纯逻辑 → 写玩家实体 → 触发音效。
+/// Update 1：读输入与时间 → 推进纯逻辑 → 静态推离（角色控制器）→
+/// 写玩家实体 → 触发音效。
 fn update_gameplay(world: &World) {
     let dt = world
         .try_resource::<Time>()
@@ -374,6 +387,19 @@ fn update_gameplay(world: &World) {
     let was_playing = game.phase == Phase::Playing;
     let score_before = game.score;
     game.step(&move_input, dt);
+
+    // ---- 运动学角色控制器：逻辑位置对场景静态体推离，只取水平分量 ----
+    // logic::step 已积分并钳制到 ±arena_half（**安全网**：正常对局由墙体
+    // collider 挡在 ±17.05 = 内缘 17.5 − 玩家半径 0.45，远早于钳制；场景
+    // 缺失 / 加载失败时钳制是唯一边界）。推离查询的球心固定在地面高度
+    // （跳跃由 logic 的 y 积分管，与水平碰撞解耦）；修正只回馈 x/z。
+    // 推离只沿接触法线 → 切向速度天然保留 = 贴墙滑行；地面即使带
+    // collider，其 ±Y 法线的水平分量恒 0，天然无作用。
+    let ball_center = Vec3::new(game.player.x, PLAYER_HALF_HEIGHT, game.player.z);
+    let push = resolve_against_statics(world, ball_center, &PLAYER_SHAPE);
+    game.player.x += push.x;
+    game.player.z += push.z;
+
     let picked = game.score > score_before;
     let finished = was_playing && game.phase != Phase::Playing;
 

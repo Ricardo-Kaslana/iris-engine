@@ -6,7 +6,9 @@
 //!
 //! 结构：
 //! - [`logic`]：纯逻辑状态机（只依赖 glam、零引擎依赖、全部可单测）；
-//! - [`plugin`]：[`GamePlugin`]——场景搭建、输入/时间 → 逻辑 → 实体/HUD/
+//! - [`plugin`]：[`GamePlugin`]——场景文件载入关卡（`assets/
+//!   collect_arena.scene.json`，墙体 / 障碍柱带静态 Collider）、输入/时间 →
+//!   逻辑 → **运动学角色控制器**（静态推离查询，贴墙滑行）→ 实体/HUD/
 //!   音效的每帧接线，系统编排可经
 //!   [`GamePlugin::build_schedule`](plugin::GamePlugin::build_schedule)
 //!   供 headless 测试与离屏快照复用。
@@ -17,7 +19,7 @@
 //!
 //! App::new()
 //!     .add_plugins(DefaultPlugins::new("Iris Collect"))
-//!     .add_plugin(GamePlugin)
+//!     .add_plugin(GamePlugin::default())   // 或 GamePlugin::new("关卡.json")
 //!     .run();
 //! ```
 //!
@@ -31,6 +33,6 @@ pub use logic::{
     MOVE_SPEED, PICKUP_MAX_Y, PICKUP_RADIUS,
 };
 pub use plugin::{
-    Coin, GameAssets, GameEntities, GamePlugin, BANNER_TEXT_NAME, DURATION_SECS, SCORE_TEXT_NAME,
-    TIME_TEXT_NAME,
+    Coin, GameAssets, GameEntities, GamePlugin, BANNER_TEXT_NAME, DEFAULT_SCENE_PATH,
+    DURATION_SECS, SCORE_TEXT_NAME, TIME_TEXT_NAME,
 };

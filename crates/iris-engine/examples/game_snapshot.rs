@@ -2,9 +2,12 @@
 //!
 //! 用与 headless 测试**完全相同的方式**驱动真实游戏世界（GamePlugin 系统
 //! 链 + `Time::advance` 确定性推进 + `Input::press / release` 脚本化按键
-//! 注入 + PostUpdate 层级传播，不建窗口、不依赖 winit 类型），分别渲染：
+//! 注入 + PostUpdate 层级传播，不建窗口、不依赖 winit 类型），关卡来自
+//! 场景文件（`assets/collect_arena.scene.json`：四围墙 + 障碍柱 + 中央
+//! 点光经 `load_scene` 载入），分别渲染：
 //!
-//! - 左：开局——玩家在场地中心，10 枚金币的金环可见，HUD "SCORE 0/10"；
+//! - 左：开局——玩家在场地中心，围墙与障碍柱在位，10 枚金币的金环可见，
+//!   HUD "SCORE 0/10"；
 //! - 右：直行拾取 1 枚 + 标记 2 枚已收（模拟拾取 3 枚后）——已收金币切
 //!   `Visibility::HIDDEN`（渲染跳过）、HUD 变为 "SCORE 3/10"、玩家与相机
 //!   （子实体层级跟随）已移动。
@@ -27,7 +30,7 @@ use iris_engine::prelude::{
     App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode, MaterialStore,
     MeshStore, OffscreenRenderer, Plugin, TextureStore, Time,
 };
-use iris_game::{GamePlugin, GameState, Phase};
+use iris_game::{GamePlugin, GameState, Phase, DEFAULT_SCENE_PATH};
 
 /// 与 tests/headless.rs 同款测试台：虚拟时钟 + Input 注入 + 插件系统链。
 /// 承载于无窗口的 `App`（`App::new` 不建窗口 / 不碰 GPU，`run` 才会）。
@@ -53,7 +56,8 @@ impl Harness {
         // 层级传播：HierarchyPlugin 注册的 PostUpdate 阶段（与 DefaultPlugins
         // 同一插件——Update 写局部变换 → PostUpdate 传播 → 渲染读取）
         HierarchyPlugin.build(&mut app);
-        GamePlugin.build_schedule(&mut app.schedule);
+        // 关卡来自场景文件（显式给默认路径——示例的 cwd 即 workspace 根）
+        GamePlugin::new(DEFAULT_SCENE_PATH).build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
         harness.app.schedule.run(Stage::Startup, &mut harness.app.world);

@@ -1,0 +1,72 @@
+{
+  "environment": {
+    "directional_light": {
+      "direction": [-0.5, -1.0, -0.4],
+      "color": [1.0, 0.98, 0.92],
+      "intensity": 0.6,
+      "ambient": [0.14, 0.14, 0.14],
+      "shadows": true
+    }
+  },
+  "entities": [
+    {
+      "name": "ground",
+      "mesh": { "primitive": { "kind": "plane", "size": 40.0 } },
+      "material": { "color": [0.25, 0.34, 0.22, 1.0], "roughness": 0.9 }
+    },
+    {
+      "name": "wall-east",
+      "transform": { "position": [18.0, 0.5, 0.0], "scale": [1.0, 1.0, 38.0] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.46, 0.43, 0.4, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [0.5, 0.5, 19.0] } }, "static": true }
+    },
+    {
+      "name": "wall-west",
+      "transform": { "position": [-18.0, 0.5, 0.0], "scale": [1.0, 1.0, 38.0] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.46, 0.43, 0.4, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [0.5, 0.5, 19.0] } }, "static": true }
+    },
+    {
+      "name": "wall-north",
+      "transform": { "position": [0.0, 0.5, -18.0], "scale": [38.0, 1.0, 1.0] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.46, 0.43, 0.4, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [19.0, 0.5, 0.5] } }, "static": true }
+    },
+    {
+      "name": "wall-south",
+      "transform": { "position": [0.0, 0.5, 18.0], "scale": [38.0, 1.0, 1.0] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.46, 0.43, 0.4, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [19.0, 0.5, 0.5] } }, "static": true }
+    },
+    {
+      "name": "pillar-1",
+      "transform": { "position": [7.281, 1.2, 5.29] },
+      "mesh": { "primitive": { "kind": "cylinder", "radius": 0.6, "height": 2.4, "segments": 32 } },
+      "material": { "color": [0.52, 0.32, 0.26, 1.0], "roughness": 0.6 },
+      "collider": { "shape": { "box": { "half_extents": [0.6, 1.2, 0.6] } }, "static": true }
+    },
+    {
+      "name": "pillar-2",
+      "transform": { "position": [-9.0, 1.2, 0.0] },
+      "mesh": { "primitive": { "kind": "cylinder", "radius": 0.6, "height": 2.4, "segments": 32 } },
+      "material": { "color": [0.52, 0.32, 0.26, 1.0], "roughness": 0.6 },
+      "collider": { "shape": { "box": { "half_extents": [0.6, 1.2, 0.6] } }, "static": true }
+    },
+    {
+      "name": "pillar-3",
+      "transform": { "position": [7.281, 1.2, -5.29] },
+      "mesh": { "primitive": { "kind": "cylinder", "radius": 0.6, "height": 2.4, "segments": 32 } },
+      "material": { "color": [0.52, 0.32, 0.26, 1.0], "roughness": 0.6 },
+      "collider": { "shape": { "box": { "half_extents": [0.6, 1.2, 0.6] } }, "static": true }
+    },
+    {
+      "name": "arena-lamp",
+      "transform": { "position": [0.0, 6.0, 0.0] },
+      "point_light": { "color": [1.0, 0.97, 0.88], "intensity": 28.0, "range": 40.0, "shadows": true }
+    }
+  ]
+}

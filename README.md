@@ -36,7 +36,7 @@ fn gameplay(world: &mut World) {
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
-| **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → O(n²) 检测 → 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致 |
+| **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → O(n²) 检测 → 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」 |
 | **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
 | **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
@@ -166,7 +166,7 @@ flowchart TB
 
 ```
 iris-engine/
-├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成）
+├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成；collect_arena.scene.json 为手写关卡）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
 │   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞
@@ -306,22 +306,32 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 
 **Dogfooding 验证**——`crates/iris-game` 是引擎的第一个「真实用户」：只用公开
 API（`iris-engine` 门面 + glam）拼出一个完整的第三人称限时收集游戏（10 枚金币、
-60 秒倒计时、围墙竞技场、跳跃拾取、HUD、程序化音效），**引擎侧零改动**。纯逻辑
-状态机（`logic.rs`，只依赖 glam、零引擎依赖）与插件接线（`GamePlugin`）分离：
-Startup 搭场景并让**相机作为玩家子实体**（层级跟随验证 `ActiveCamera`），Update
-把 `Input` + `Time` 翻译进逻辑再把结果写回实体 / HUD / `Audio`——金币自发光供
-泛光、点光 cubemap 阴影、位图字体 HUD 全部来自引擎既有能力；同一套插件系统链经
-`GamePlugin::build_schedule` 在无窗口无 GPU 的 headless 测试与离屏快照中复用。
-这次实践撞到的 7 条 API 缺口（可见性开关 / 阶段排序 / 并行发事件 / 按名查实体 /
-Input 注入 / Audio headless / Time·UI·图元小项）已在后续「引擎 API 打磨」轮全部
-修复，游戏内的绕行代码同步替换为新 API（清单见 ARCHITECTURE.md §8.12）。
+60 秒倒计时、围墙竞技场、跳跃拾取、HUD、程序化音效），**引擎侧零改动**。
+纯逻辑状态机（`logic.rs`，只依赖 glam、零引擎依赖）与插件接线（`GamePlugin`）
+分离：**关卡来自 JSON 场景文件**——Startup 经 `load_scene` 载入
+`assets/collect_arena.scene.json`（微弱日光环境段 + 地面、四面围墙（静态
+Collider，内缘 ±17.5）、三根障碍柱（压在金币环路线上制造绕行）、中央点光），
+玩家 / 金币 / HUD 为代码生成，相机作为玩家子实体（层级跟随验证
+`ActiveCamera`）；Update 把 `Input` + `Time` 翻译进逻辑（移动积分 / 拾取 /
+胜负全部可单测的纯函数）后，用物理库的**静态推离查询**实现运动学角色控制
+器——玩家球体对场景静态体求推离、只回馈水平分量：墙体把玩家挡在 17.05
+（= 内缘 17.5 − 半径 0.45，远早于 ±18 的逻辑钳制安全网），推离只沿法线 →
+切向速度天然保留 = **贴墙滑行**；随后把结果写回实体 / HUD / `Audio`——
+金币自发光供泛光、点光 cubemap 阴影、位图字体 HUD 全部来自引擎既有能力。
+同一套插件系统链经 `GamePlugin::build_schedule` 在无窗口无 GPU 的 headless
+测试与离屏快照中复用（测试经 `GamePlugin::new` 注入临时目录的 fixture 关卡，
+全部测试跑在真实场景加载路径上）。这次实践撞到的 7 条 API 缺口（可见性开关 /
+阶段排序 / 并行发事件 / 按名查实体 / Input 注入 / Audio headless /
+Time·UI·图元小项）已在后续「引擎 API 打磨」轮全部修复，游戏内的绕行代码
+同步替换为新 API；角色控制器也已由物理查询实现（清单见 ARCHITECTURE.md §8.12）。
 
 ![收集小游戏双时刻验收](docs/game_preview.png)
 
 实测（`docs/game_preview.png`，左：开局 / 右：拾取 3 枚后，同一世界用 headless
-方式驱动到两个时刻各自离屏渲染）：左图玩家居中、金币环带泛光、SCORE 0/10；
-右图 SCORE 3/10、TIME 开始倒数、金币减少、玩家与子实体相机已随输入移动——
-层级跟随、点光阴影、泛光、HUD 在真实游戏负载下完整工作。
+方式驱动到两个时刻各自离屏渲染）：左图玩家居中、围墙与障碍柱在位、金币环
+带泛光、SCORE 0/10；右图 SCORE 3/10、TIME 开始倒数、金币减少、玩家与子实体
+相机已随输入移动——场景文件关卡、层级跟随、点光阴影、泛光、HUD 在真实游戏
+负载下完整工作，玩家与墙体 / 障碍柱无穿插。
 
 ```sh
 cargo run -p iris-game --release   # 玩游戏（WASD 移动 / Space 跳跃）
@@ -331,7 +341,7 @@ cargo run --example game_snapshot --release   # 双时刻离屏验收图
 ## 测试
 
 ```sh
-cargo test --workspace   # 260 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 266 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -356,15 +366,19 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 跳过、坏魔数 / 非 16-bit / 非 PCM / 声道数报错）与程序化音效（正弦 / 方波
 对照解析解逐采样 1e-5 容差、噪声固定 seed 可复现、首尾防爆音包络）、
 **headless 游戏集成（iris-game：不建窗口不建 GPU，`GamePlugin` 完整系统链 +
-`Time::advance` 确定性推进 + `Input::press / release` 脚本化按键注入驱动真实
-游戏世界——静止 / 移动积分与朝向 / 单次跳跃弧线 / 相机子实体层级跟随 /
-脚本路线拾取与计分 / 金币可见性隐藏 / HUD 文本刷新 / 全收集胜利与终局冻结 /
-超时落败）**、
+`Time::advance` 确定性推进 + `Input::press / release` 脚本化按键注入 +
+临时 fixture 场景文件注入驱动真实游戏世界——静止 / 移动积分与朝向 / 单次
+跳跃弧线 / 相机子实体层级跟随 / 脚本路线拾取与计分 / 金币可见性隐藏 /
+HUD 文本刷新 / 全收集胜利与终局冻结 / 超时落败 /
+**墙体 Collider 阻挡（玩家稳定贴墙 17.05，小于钳制上限 18——是物理而非
+clamp 在挡）/ 贴墙滑行（法向被挡、切向持续滑行）**）**、
 **物理与碰撞（球-球 / 球-AABB（顶面 / 侧向 / 角点 / 盒内退出）/ AABB-AABB
 接触几何与反弹 / 摩擦均值的纯函数断言；自由落体对照 y(t)=h-½gt² 的 60Hz 离散
 容差、gravity_scale 缩放、e=0.8 回弹顶点 ≈ 初高×0.64 且逐次衰减、e=0 落地静止
 穿透 <1e-3 不抖、摩擦切向衰减对比、线性阻尼对照 v₀e^(-λt)、静态体 bit 级不动、
-双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、Time 缺席零步长）**、
+双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、Time 缺席零步长；
+静态推离查询：单墙推离量精确且只沿法线（切向保留）/ 正交双墙顺序累加 /
+空静态表恒等 / 世界封装跳过动态体并遵循静态缺席语义）**、
 **场景序列化（最小场景与字段缺省值 = 引擎默认、未知字段容错、坏 JSON /
 缺 entities / 缺文件 → 错误枚举各归其位；实体段逐字段进组件（Name / Visibility /
 Transform 四元数 / 材质数值 / 点光 / 碰撞体 / 刚体）、静态体缺席语义、

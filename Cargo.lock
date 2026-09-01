@@ -927,6 +927,7 @@ dependencies = [
  "glam",
  "iris-core",
  "iris-engine",
+ "log",
 ]
 
 [[package]]

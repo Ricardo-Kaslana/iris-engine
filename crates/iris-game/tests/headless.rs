@@ -8,10 +8,15 @@
 //!   便捷注入并在 prelude 重导出 winit 类型后，本测试已无 winit 依赖）；
 //! - `Audio`：预插入 `Audio::headless()`（纯混音器，绝不打开设备），
 //!   插件的 Startup 兜底逻辑遇到已存在资源不覆盖；
+//! - **场景**：Harness 把内联 JSON 写进临时目录的 fixture 关卡（最小布局：
+//!   四面围墙 + 一根障碍柱，无地面 collider——垂直面归逻辑 y 积分管），
+//!   经 `GamePlugin::new` 注入——全部测试（含墙体阻挡 / 贴墙滑行）都跑在
+//!   真实的场景加载路径上；
 //! - 层级传播：`HierarchyPlugin` 注册的 PostUpdate 阶段（与窗口程序同一
 //!   编排来源），每帧时序镜像 `App::tick`：advance → Update →
 //!   PostUpdate → clear_events → input.end_frame。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use iris_core::prelude::Stage;
@@ -26,6 +31,61 @@ use iris_game::{
 
 /// 标准容差：1/60 s 步长下 30 帧位移的浮点误差量级。
 const EPS: f32 = 1e-3;
+
+/// 最小 fixture 关卡：与正式关卡（`assets/collect_arena.scene.json`）同一
+/// 几何约定——四面围墙的静态 Box collider 内缘 ±17.5（玩家球体半径 0.45 →
+/// 贴墙位置 17.05），外加一根障碍柱。**地面省略 collider**：垂直面由逻辑
+/// 的 y 积分管，且推离只取水平分量（地面法线 ±Y 的水平投影恒 0），摆一个
+/// 永不生效的地面碰撞盒不如省略诚实。柱子压在金币环缺口（环上两枚金币的
+/// 中点），与任何金币 / 直行拾取路线不重叠——既有拾取 / 胜负测试的语义
+/// 在该关卡下保持不变。无需环境段（Harness 已预插默认方向光）。
+const FIXTURE_SCENE: &str = r#"{
+    "entities": [
+        {
+            "name": "wall-east",
+            "transform": { "position": [18.0, 0.5, 0.0], "scale": [1.0, 1.0, 38.0] },
+            "mesh": { "primitive": { "kind": "cube" } },
+            "collider": { "shape": { "box": { "half_extents": [0.5, 0.5, 19.0] } }, "static": true }
+        },
+        {
+            "name": "wall-west",
+            "transform": { "position": [-18.0, 0.5, 0.0], "scale": [1.0, 1.0, 38.0] },
+            "mesh": { "primitive": { "kind": "cube" } },
+            "collider": { "shape": { "box": { "half_extents": [0.5, 0.5, 19.0] } }, "static": true }
+        },
+        {
+            "name": "wall-north",
+            "transform": { "position": [0.0, 0.5, -18.0], "scale": [38.0, 1.0, 1.0] },
+            "mesh": { "primitive": { "kind": "cube" } },
+            "collider": { "shape": { "box": { "half_extents": [19.0, 0.5, 0.5] } }, "static": true }
+        },
+        {
+            "name": "wall-south",
+            "transform": { "position": [0.0, 0.5, 18.0], "scale": [38.0, 1.0, 1.0] },
+            "mesh": { "primitive": { "kind": "cube" } },
+            "collider": { "shape": { "box": { "half_extents": [19.0, 0.5, 0.5] } }, "static": true }
+        },
+        {
+            "name": "pillar",
+            "transform": { "position": [-2.781, 1.2, 8.56] },
+            "mesh": { "primitive": { "kind": "cylinder", "radius": 0.6, "height": 2.4, "segments": 24 } },
+            "collider": { "shape": { "box": { "half_extents": [0.6, 1.2, 0.6] } }, "static": true }
+        }
+    ]
+}"#;
+
+/// 把 fixture 关卡写进临时目录（内容恒定，`Once` 防并行测试重复写），
+/// 返回路径供 `GamePlugin::new` 注入。
+fn fixture_scene_path() -> PathBuf {
+    static WRITE_ONCE: std::sync::Once = std::sync::Once::new();
+    let dir = std::env::temp_dir().join("iris-game-headless");
+    std::fs::create_dir_all(&dir).expect("创建临时目录");
+    let path = dir.join("fixture.scene.json");
+    WRITE_ONCE.call_once(|| {
+        std::fs::write(&path, FIXTURE_SCENE).expect("写 fixture 场景文件");
+    });
+    path
+}
 
 /// headless 测试台：世界 + GamePlugin 系统链 + 虚拟时钟。
 struct Harness {
@@ -50,7 +110,9 @@ impl Harness {
         // 层级传播：HierarchyPlugin 注册的 PostUpdate 阶段（与 DefaultPlugins
         // 同一插件，PostUpdate 每帧在 Update 之后执行一次）
         HierarchyPlugin.build(&mut app);
-        GamePlugin.build_schedule(&mut app.schedule);
+        // 场景：临时 fixture 关卡经 GamePlugin::new 注入（Startup 走真实的
+        // load_scene 路径——墙体 / 障碍柱的静态 Collider 由场景文件提供）
+        GamePlugin::new(fixture_scene_path()).build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
         // Startup：资源兜底插入 + 场景搭建（与 App 主循环一致，先于首帧）
@@ -335,4 +397,48 @@ fn timeout_shows_time_up_banner() {
     assert_eq!(harness.player_position(), before_pos);
     let game = harness.game();
     assert_eq!(game.phase, Phase::Lost, "终局后阶段不再变化");
+}
+
+/// 墙体阻挡（物理而非钳制）：把玩家挪到 +X 墙内侧（x = 17.0）按住 D
+/// 推进 → x 稳定在 17.05 = 墙内缘 17.5 − 玩家半径 0.45，且**严格小于**
+/// 逻辑钳制上限 18——挡路的是场景静态体的推离查询，不是边界 clamp。
+#[test]
+fn wall_collider_blocks_player_before_clamp() {
+    let mut harness = Harness::new();
+    harness.app.world.resource_mut::<GameState>().player.x = 17.0;
+    harness.frames(60, &[KeyCode::KeyD]);
+    let x = harness.game().player.x;
+    assert!((x - 17.05).abs() <= 0.05, "x 应被墙体 Collider 挡在 17.05，实际 {x}");
+    assert!(x < 17.9, "x 应小于钳制上限 18（证明在挡的是 Collider）");
+    // 表现实体同步：玩家 Transform 已按修正后的逻辑坐标回写
+    assert!(
+        (harness.player_position().x - 17.05).abs() <= 0.05,
+        "玩家实体应停在 17.05，实际 {:?}",
+        harness.player_position()
+    );
+    // 持续推进 60 帧仍稳定贴墙：不隧穿、不缓慢渗入
+    harness.frames(60, &[KeyCode::KeyD]);
+    let x2 = harness.game().player.x;
+    assert!((x2 - 17.05).abs() <= 0.05, "持续推进应稳定贴墙，实际 {x2}");
+}
+
+/// 贴墙滑行：玩家贴 +X 墙同时按 D+W → x 被墙挡住（法向分量被推离清零），
+/// z 持续减小（切向速度保留）——滑行的数学基础是推离只沿接触法线。
+#[test]
+fn wall_slide_keeps_tangential_motion() {
+    let mut harness = Harness::new();
+    harness.app.world.resource_mut::<GameState>().player.x = 17.0;
+    // 斜向输入归一化：每轴 5/√2 m/s，30 帧 ≈ 2.5 m 的切向滑行
+    harness.frames(30, &[KeyCode::KeyD, KeyCode::KeyW]);
+    let game = harness.game();
+    assert!(
+        (game.player.x - 17.05).abs() <= 0.05,
+        "法向应被墙挡在 17.05，实际 {}",
+        game.player.x
+    );
+    assert!(
+        game.player.z < -1.5,
+        "切向应持续滑行（30 帧约 -2.5 m），实际 z = {}",
+        game.player.z
+    );
 }

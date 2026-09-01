@@ -13,6 +13,8 @@ authors.workspace = true
 iris-core = { workspace = true }
 iris-engine = { workspace = true }
 glam = { workspace = true }
+# 场景加载失败的 log::error 告警（log 已在全 workspace 依赖树内，无新 crate）
+log = { workspace = true }
 
 # headless 测试需要脚本化注入按键：此前 Input::on_key 的参数类型
 # （PhysicalKey / ElementState）不在引擎 prelude，测试被迫依赖 winit；

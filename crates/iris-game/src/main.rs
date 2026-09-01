@@ -17,6 +17,8 @@ use iris_game::GamePlugin;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins::new("Iris Collect"))
-        .add_plugin(GamePlugin)
+        // 关卡来自 assets/collect_arena.scene.json（相对工作目录）；
+        // GamePlugin::new 可注入任意场景路径（测试 fixture / 变体关卡）
+        .add_plugin(GamePlugin::default())
         .run();
 }

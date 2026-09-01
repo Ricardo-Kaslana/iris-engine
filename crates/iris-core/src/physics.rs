@@ -40,6 +40,15 @@
 //! 模拟逐采样 bit 级一致（单测守护）。引擎侧配 `Time::advance` /
 //! 固定步长驱动即可做确定性回放 / 联机同步。
 //!
+//! # 静态推离查询（运动学角色控制器）
+//!
+//! [`resolve_static_push`] / [`resolve_against_statics`]：**查询**而非系统
+//! ——不积分、不写任何组件，把给定位置上的形状从全部静态体的重叠中沿
+//! 法线推出，返回修正向量。消费方式完全由调用方决定（iris-game 的玩家
+//! 控制器只取水平分量）：推离只沿接触法线 → 切向速度天然保留——这正是
+//! 「贴墙滑行」手感的数学基础，也是游戏逻辑与物理库组合的推荐姿势
+//! （kinematic 实体自管积分，物理库只回答「这里被什么挡住了」）。
+//!
 //! # v1 限制（诚实清单）
 //!
 //! - **AABB 不随实体旋转**：[`ColliderShape::Box`] 是世界轴对齐包围盒，
@@ -277,6 +286,34 @@ pub fn solve_contact(contact: Contact, a: BodyParams, b: BodyParams) -> ContactR
     ContactResponse { delta_pos_a, delta_pos_b, delta_vel_a, delta_vel_b }
 }
 
+/// 静态推离查询（纯函数）：把 `pos` 处的 `shape` 从全部静态体的重叠中
+/// 推出，返回累计修正向量。
+///
+/// 对每个静态体调 [`detect_pair`] 求（法线, 穿透），**顺序累加**推离
+/// ——逐个用推离后的位置重测（Gauss-Seidel 风格）；角点处同一静态体
+/// 的重复推离可接受（v1 简化：顺序单遍而非联合求解，分离性优先于精确性）。
+/// 无穿透（含 `statics` 为空）返回零向量。
+///
+/// 推离只沿接触法线：调用方保留自己的切向速度即可实现「贴墙滑行」。
+/// 世界封装见 [`resolve_against_statics`]。
+pub fn resolve_static_push(
+    mut pos: Vec3,
+    shape: &ColliderShape,
+    statics: &[(Vec3, ColliderShape)],
+) -> Vec3 {
+    let mut push = Vec3::ZERO;
+    for (static_pos, static_shape) in statics {
+        // 法线从查询方指向静态体：静态体不动，查询方沿 -法线退出穿透量
+        let Some(contact) = detect_pair(pos, shape, *static_pos, static_shape) else {
+            continue;
+        };
+        let correction = -contact.normal * contact.penetration;
+        pos += correction; // 后续静态体用修正后的位置重测
+        push += correction;
+    }
+    push
+}
+
 /// 球-球检测：法线从 a 指向 b。
 fn sphere_sphere(a_pos: Vec3, a_radius: f32, b_pos: Vec3, b_radius: f32) -> Option<Contact> {
     let d = b_pos - a_pos;
@@ -498,6 +535,25 @@ pub fn step_physics(world: &World) {
             rigid.velocity = velocity;
         }
     }
+}
+
+/// 世界封装的静态推离查询：把 `pos` 处的 `shape` 从世界中全部静态体的
+/// 重叠中推出，返回累计修正向量（[`resolve_static_push`] 的收集 + 调用）。
+///
+/// 「静态体」判定与 [`step_physics`] 一致：有 [`Collider`] 且
+/// `is_static` **或无** [`RigidBody`]（组件缺席语义：只有 Collider =
+/// 静态）。两阶段中的收集阶段照 `step_physics` 同款模式（只读查询一次
+/// 收齐），随后不写任何组件——纯查询，可与任何系统并存。
+pub fn resolve_against_statics(world: &World, pos: Vec3, shape: &ColliderShape) -> Vec3 {
+    let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
+    world.query::<(&Transform, &Collider, Option<&RigidBody>)>(
+        |(transform, collider, rigid)| {
+            if collider.is_static || rigid.is_none() {
+                statics.push((transform.position, collider.shape));
+            }
+        },
+    );
+    resolve_static_push(pos, shape, &statics)
 }
 
 #[cfg(test)]
@@ -1029,5 +1085,101 @@ mod tests {
         step_physics(&world);
         assert_eq!(ball_position(&world, ball), pos, "dt = 0 不应积分位移");
         assert_eq!(ball_velocity(&world, ball), Vec3::new(1.0, 0.0, 0.0), "dt = 0 不应改速度");
+    }
+
+    // ---- 静态推离查询：resolve_static_push / resolve_against_statics ----
+
+    /// 单墙阻挡量精确：推离后球心到墙面恰为半径，且修正只沿法线
+    /// （y / z 分量为零——切向分量保留是「贴墙滑行」的数学基础）。
+    #[test]
+    fn static_push_single_wall_exact_and_normal_only() {
+        let sphere = ColliderShape::Sphere { radius: 0.45 };
+        // +X 侧墙：内缘 x = 17.5（盒心 18.0、半边 0.5），z 向长条；
+        // 玩家从场地内侧（x < 17.5）逼近
+        let wall = ColliderShape::Box { half_extents: Vec3::new(0.5, 0.5, 19.0) };
+        let statics = [(Vec3::new(18.0, 0.5, 0.0), wall)];
+        // 球心 17.4 距内缘 0.1（球面已侵入 0.35）：推离应恰好把球心送回
+        // 「内缘 − 半径」= 17.05，且不带任何切向修正
+        let pos = Vec3::new(17.4, 0.45, 5.0);
+        let push = resolve_static_push(pos, &sphere, &statics);
+        assert!((push.x + 0.35).abs() < 1e-5, "推离量应 = 穿透 0.35（−X 向），实际 {push:?}");
+        assert_eq!(push.y, 0.0, "修正只沿法线（−X），不应有 y 分量");
+        assert_eq!(push.z, 0.0, "切向 z 分量保留（不把玩家往墙中段推）");
+        assert!((pos.x + push.x - 17.05).abs() < 1e-5, "推离后球心到墙面应为半径 0.45");
+    }
+
+    /// 两正交墙夹角：顺序累加、逐个用推离后的位置重测——两轴修正互不
+    /// 干扰，合计把球从角点推离；无重叠时恒零。
+    #[test]
+    fn static_push_two_orthogonal_walls_accumulate() {
+        let sphere = ColliderShape::Sphere { radius: 0.45 };
+        let statics = [
+            (
+                Vec3::new(18.0, 0.5, 0.0),
+                ColliderShape::Box { half_extents: Vec3::new(0.5, 0.5, 19.0) },
+            ),
+            (
+                Vec3::new(0.0, 0.5, 18.0),
+                ColliderShape::Box { half_extents: Vec3::new(19.0, 0.5, 0.5) },
+            ),
+        ];
+        // 角点内侧球面各侵入两墙 0.1 m：先对 +X 墙推离 0.35（原位置重测），
+        // 再对 +Z 墙用推离后的位置重测再推 0.35
+        let push = resolve_static_push(Vec3::new(17.4, 0.45, 17.4), &sphere, &statics);
+        assert!(
+            (push.x + 0.35).abs() < 1e-5 && (push.z + 0.35).abs() < 1e-5,
+            "两墙应各贡献 0.35 的正交推离，实际 {push:?}"
+        );
+        // 场地中央无重叠：零向量
+        let clear = resolve_static_push(Vec3::new(0.0, 0.45, 0.0), &sphere, &statics);
+        assert_eq!(clear, Vec3::ZERO, "无穿透应返回零向量");
+    }
+
+    /// 空静态表恒等：没有任何静态体时返回零向量（位置原样可用）。
+    #[test]
+    fn static_push_empty_statics_is_identity() {
+        let sphere = ColliderShape::Sphere { radius: 0.45 };
+        let push = resolve_static_push(Vec3::new(3.0, 0.45, -4.0), &sphere, &[]);
+        assert_eq!(push, Vec3::ZERO);
+    }
+
+    /// 世界封装：收集遵循「仅 Collider 无 RigidBody = 静态」缺席语义——
+    /// 挡路的是静态墙；路径上的动态球（完整刚体）不参与推离，
+    /// `is_static = true` 的实体（即使带 RigidBody）同样静态。
+    #[test]
+    fn resolve_against_statics_skips_dynamic_bodies() {
+        let mut world = World::new();
+        // 静态墙：只有 Collider（组件缺席 = 静态）
+        world.spawn((
+            Transform::from_xyz(18.0, 0.5, 0.0),
+            Collider::static_box(Vec3::new(0.5, 0.5, 19.0)),
+        ));
+        // 动态球停在推离路径上（与查询球明显重叠）：完整刚体——
+        // 若被错误计入，下方断言的推离量将不止墙的 0.35
+        world.spawn((
+            Transform::from_xyz(17.3, 0.45, 0.0),
+            Collider::dynamic_sphere(0.45, 0.0),
+            RigidBody::default(),
+        ));
+        let sphere = ColliderShape::Sphere { radius: 0.45 };
+        // 球心 17.4（球面侵入内缘 0.35）：只应被静态墙推回 0.35——
+        // 若把路径上的动态球错误计入，推离量将明显更多
+        let push = resolve_against_statics(&world, Vec3::new(17.4, 0.45, 0.0), &sphere);
+        assert!((push.x + 0.35).abs() < 1e-5, "只应被静态墙推离，实际 {push:?}");
+
+        // is_static = true + RigidBody：取或语义，同样静态、同样推离。
+        // （摆在第一面墙的 z 跨度之外——同轴重叠的两个静态体会被先后
+        // 各推一次，即文档所述 v1 的角点重复推离简化，测试不依赖它。）
+        world.spawn((
+            Transform::from_xyz(28.0, 0.5, 4.0),
+            Collider {
+                shape: ColliderShape::Box { half_extents: Vec3::new(0.5, 0.5, 19.0) },
+                is_static: true,
+                restitution: 0.0,
+            },
+            RigidBody { velocity: Vec3::new(1.0, 0.0, 0.0), ..RigidBody::default() },
+        ));
+        let push2 = resolve_against_statics(&world, Vec3::new(27.4, 0.45, 4.0), &sphere);
+        assert!((push2.x + 0.35).abs() < 1e-5, "is_static = true 应同样参与推离，实际 {push2:?}");
     }
 }
