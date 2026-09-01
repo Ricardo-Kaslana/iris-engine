@@ -17,6 +17,7 @@
 pub mod app;
 pub mod audio;
 pub mod plugin;
+pub mod scene;
 
 // 纯音频库随门面一并可用：`iris_engine::iris_audio::...` 全路径直达
 pub use iris_audio;
@@ -30,6 +31,10 @@ pub mod prelude {
     pub use crate::plugin::{
         AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, PhysicsPlugin, Plugin,
         RenderPlugin, TimePlugin, WindowPlugin,
+    };
+    // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记
+    pub use crate::scene::{
+        load_scene, save_scene, GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError,
     };
     // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）
     pub use iris_audio::{

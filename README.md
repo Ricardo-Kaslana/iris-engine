@@ -37,6 +37,7 @@ fn gameplay(world: &mut World) {
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → O(n²) 检测 → 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致 |
+| **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
 | **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
@@ -107,6 +108,11 @@ cargo run --example game_snapshot --release
 # t=3s 静止（球心 y>0、两两不穿透、总速度 < 2 m/s 三重断言）
 cargo run -p iris-engine --example physics_snapshot --release
 
+# 场景序列化验收（内容工作流示范）：load_scene 加载手写的 assets/arena.scene.json
+# （地面 + 围墙竞技场 + 台面/圆柱 + 金属/漫反射静态球 + 悬空动态球 + 点光），
+# 装 PhysicsPlugin 模拟 1.5s（动态球落到台面静置）后离屏渲染，输出 scene_snapshot.bmp
+cargo run -p iris-engine --example scene_snapshot --release
+
 # 外部 HDR 环境贴图验收场景（先 gen_asset 生成日落全景），输出 iris_hdr.bmp：
 # Radiance .hdr equirectangular → IBL + 天空盒，铬球反射暖色天空与太阳
 cargo run --example gen_asset --release
@@ -160,15 +166,15 @@ flowchart TB
 
 ```
 iris-engine/
-├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr，gen_asset 生成）
+├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
 │   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
-│   ├── iris-engine/     # App 门面、插件系统、主循环 + 示例
-│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / physics_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 示例
+│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / physics_snapshot / scene_snapshot / web（wasm 专用入口，见「Web 构建」）
 │   └── iris-game/       # 引擎下游示范游戏：第三人称限时收集（见「用 Iris 做的游戏」）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
@@ -284,6 +290,18 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 
 ![物理与碰撞](docs/physics_preview.png)
 
+场景序列化实测（`docs/scene_preview.png`）：手写 JSON 关卡文件
+`assets/arena.scene.json`（环境段方向光 + 12 个实体：地面、四围墙、中央台面、
+台上圆柱、金属 / 漫反射两颗静态球、悬空动态球、点光、隐藏的逻辑标记实体）经
+`load_scene` 整体载入世界——示例代码零场景搭建；装上 `PhysicsPlugin` 确定性
+模拟 1.5 s 后离屏渲染：所有物体在位、材质区分清晰（金属球带高光反射、漫反射
+球哑光）、方向光 + 点光阴影正常；动态球精确落到台面静息高度（球心 y = 1.500、
+速度 0.033 m/s，headless 断言）。mesh 来源（图元参数）由 `SceneAssetRegistry`
+登记表在 load 时登记、save 时还原，`load(save(load(f)))` 与 `load(f)` 实体
+组件语义等价且二次保存逐字节一致（往返不变量单测守护）。
+
+![场景序列化](docs/scene_preview.png)
+
 ## 用 Iris 做的游戏：Iris Collect
 
 **Dogfooding 验证**——`crates/iris-game` 是引擎的第一个「真实用户」：只用公开
@@ -313,7 +331,7 @@ cargo run --example game_snapshot --release   # 双时刻离屏验收图
 ## 测试
 
 ```sh
-cargo test --workspace   # 239 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 260 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -346,7 +364,15 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 接触几何与反弹 / 摩擦均值的纯函数断言；自由落体对照 y(t)=h-½gt² 的 60Hz 离散
 容差、gravity_scale 缩放、e=0.8 回弹顶点 ≈ 初高×0.64 且逐次衰减、e=0 落地静止
 穿透 <1e-3 不抖、摩擦切向衰减对比、线性阻尼对照 v₀e^(-λt)、静态体 bit 级不动、
-双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、Time 缺席零步长）**。
+双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、Time 缺席零步长）**、
+**场景序列化（最小场景与字段缺省值 = 引擎默认、未知字段容错、坏 JSON /
+缺 entities / 缺文件 → 错误枚举各归其位；实体段逐字段进组件（Name / Visibility /
+Transform 四元数 / 材质数值 / 点光 / 碰撞体 / 刚体）、静态体缺席语义、
+glTF 引用挂载子实体树 + GltfMounted 标记、GLB 容器引用、方向光环境资源
+（缺席不改）、sky_source 合成 HDR → EquirectHdr + 路径登记、材质贴图文件
+载入 + 登记；往返：丰富场景（全组件 + glTF + 贴图）save → load → save
+二次保存逐字节一致且逐实体语义等价、glTF 内部实体不泄漏进场景文件、
+非场景来源 mesh / 材质优雅降级告警、默认材质段省略）**。
 
 ## 跨平台矩阵
 
@@ -399,6 +425,7 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] 音频子系统（纯软件混音器 + cpal 设备层 + WAV 加载 + 程序化音效生成，wasm32 降级为纯混音器）
 - [x] 实例缓冲 GPU 持久化与增量更新（帧级比对：静态场景零上传，动态实体仅传变化段）
 - [x] 物理与碰撞 v1（Sphere/AABB 刚体：积分 / 检测 / 响应 / 迭代松弛，纯函数确定性求解器）
+- [x] 场景序列化（JSON 双向：环境段 + 实体段 ↔ 世界实体，登记表驱动的资源来源往返）
 
 ### Web 端到端实测
 

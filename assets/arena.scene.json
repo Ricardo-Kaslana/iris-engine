@@ -1,0 +1,93 @@
+{
+  "environment": {
+    "directional_light": {
+      "direction": [-0.5, -1.0, -0.4],
+      "color": [1.0, 0.98, 0.92],
+      "intensity": 1.0,
+      "ambient": [0.14, 0.14, 0.14],
+      "shadows": true
+    }
+  },
+  "entities": [
+    {
+      "name": "ground",
+      "transform": { "position": [0.0, -0.5, 0.0] },
+      "mesh": { "primitive": { "kind": "plane", "size": 40.0 } },
+      "material": { "color": [0.35, 0.35, 0.38, 1.0], "roughness": 0.85 },
+      "collider": { "shape": { "box": { "half_extents": [20.0, 0.5, 20.0] } }, "static": true }
+    },
+    {
+      "name": "wall-north",
+      "transform": { "position": [0.0, 1.0, -10.0], "scale": [20.5, 2.0, 0.5] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.52, 0.46, 0.4, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [10.25, 1.0, 0.25] } }, "static": true }
+    },
+    {
+      "name": "wall-south",
+      "transform": { "position": [0.0, 1.0, 10.0], "scale": [20.5, 2.0, 0.5] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.52, 0.46, 0.4, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [10.25, 1.0, 0.25] } }, "static": true }
+    },
+    {
+      "name": "wall-east",
+      "transform": { "position": [10.0, 1.0, 0.0], "scale": [0.5, 2.0, 20.5] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.46, 0.42, 0.38, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [0.25, 1.0, 10.25] } }, "static": true }
+    },
+    {
+      "name": "wall-west",
+      "transform": { "position": [-10.0, 1.0, 0.0], "scale": [0.5, 2.0, 20.5] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.46, 0.42, 0.38, 1.0], "roughness": 0.8 },
+      "collider": { "shape": { "box": { "half_extents": [0.25, 1.0, 10.25] } }, "static": true }
+    },
+    {
+      "name": "table",
+      "transform": { "position": [0.0, 0.5, 0.0], "scale": [4.0, 1.0, 4.0] },
+      "mesh": { "primitive": { "kind": "cube" } },
+      "material": { "color": [0.42, 0.3, 0.22, 1.0], "roughness": 0.7 },
+      "collider": { "shape": { "box": { "half_extents": [2.0, 0.5, 2.0] } }, "static": true }
+    },
+    {
+      "name": "pedestal",
+      "transform": { "position": [0.0, 1.6, 0.0] },
+      "mesh": { "primitive": { "kind": "cylinder", "radius": 0.6, "height": 1.2, "segments": 32 } },
+      "material": { "color": [0.75, 0.72, 0.68, 1.0], "roughness": 0.4 },
+      "collider": { "shape": { "sphere": { "radius": 0.6 } }, "static": true }
+    },
+    {
+      "name": "ball-metal",
+      "transform": { "position": [4.0, 0.5, 4.0] },
+      "mesh": { "primitive": { "kind": "sphere", "radius": 0.5, "segments": 48, "rings": 24 } },
+      "material": { "color": [0.95, 0.8, 0.35, 1.0], "metallic": 1.0, "roughness": 0.08 },
+      "collider": { "shape": { "sphere": { "radius": 0.5 } }, "static": true }
+    },
+    {
+      "name": "ball-diffuse",
+      "transform": { "position": [-4.0, 0.7, 3.5] },
+      "mesh": { "primitive": { "kind": "sphere", "radius": 0.7, "segments": 48, "rings": 24 } },
+      "material": { "color": [0.2, 0.55, 0.5, 1.0], "roughness": 0.6 },
+      "collider": { "shape": { "sphere": { "radius": 0.7 } }, "static": true }
+    },
+    {
+      "name": "ball-dynamic",
+      "transform": { "position": [1.2, 5.0, 0.5] },
+      "mesh": { "primitive": { "kind": "sphere", "radius": 0.5, "segments": 48, "rings": 24 } },
+      "material": { "color": [0.9, 0.25, 0.2, 1.0], "roughness": 0.45 },
+      "collider": { "shape": { "sphere": { "radius": 0.5 } }, "restitution": 0.25 },
+      "rigidbody": { "gravity_scale": 1.0, "friction": 0.4, "linear_damping": 0.4 }
+    },
+    {
+      "name": "lamp",
+      "transform": { "position": [0.0, 6.5, 0.0] },
+      "point_light": { "color": [1.0, 0.85, 0.65], "intensity": 60.0, "range": 45.0, "shadows": true }
+    },
+    {
+      "name": "waypoint-spawn",
+      "visible": false
+    }
+  ]
+}

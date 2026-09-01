@@ -908,12 +908,15 @@ name = "iris-engine"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "image",
  "iris-audio",
  "iris-core",
  "iris-game",
  "iris-platform",
  "iris-render",
  "log",
+ "serde",
+ "serde_json",
  "winit",
 ]
 

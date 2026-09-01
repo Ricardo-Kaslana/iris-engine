@@ -34,7 +34,9 @@ iris-game（下游示范游戏，引擎 dogfooding）
 - **iris-audio**：不依赖任何 iris 内部 crate 的纯音频库（软件混音核心 + WAV + 程序化音效），
   可脱离引擎独立使用；混音数学全部纯函数（§4.14），cpal 设备层为 native 专属依赖，
   wasm32 下优雅降级为纯混音器。
-- **iris-engine**：App 框架、插件、winit `ApplicationHandler` 主循环，把三者粘合。
+- **iris-engine**：App 框架、插件、winit `ApplicationHandler` 主循环，把三者粘合；
+  另承载**场景序列化**（§4.15——场景横跨 mesh / material / 灯光 / 物理，
+  属门面层的编排职责）。
 - **iris-game**：引擎的最下游消费者（示范游戏 Iris Collect，第三人称限时收集）——
   只依赖 iris-engine 门面（+ glam），是「只用公开 API 能否拼出完整游戏」的
   dogfooding 验证（§8.12 起的引擎缺口清单即来自这次实践）。纯逻辑状态机
@@ -604,6 +606,69 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
   （iris-engine，包装共享混音器 + Option\<设备\>）自动降级为纯混音器，
   play / stop / set_volume 语义不变，只是不发声。
 
+### 4.15 场景序列化（iris-engine/scene）
+
+**关卡数据与游戏代码分离**：JSON 场景描述文件 ↔ 世界实体（`load_scene` /
+`save_scene`，iris-engine 门面层——场景横跨 mesh / material / 灯光 / 物理，
+正好是门面的职责）。serde derive（零新依赖：serde / serde_json / image 均在
+iris-render 的 glTF 管线依赖树内，Cargo.lock 无新版本号）。
+
+**格式设计（全蛇形命名）**：两类内容——
+
+- **环境段**（场景级资源形态，非实体）：`directional_light`（方向 / 颜色 /
+  强度 / 环境光 / 阴影开关，各字段可选、缺省 = 引擎默认；`shadow_range` v1
+  不序列化）与 `sky_source`（Radiance `.hdr` 相对路径 → `SkySource::equirect_hdr`，
+  缺席 = 程序化天空）。缺席的环境段**不改动**既有资源（方向光常由代码按关卡
+  氛围覆盖）。
+- **实体段**（必需，逐实体可选字段，缺省值全部与引擎默认一致——`Transform`
+  恒等、材质 `MaterialDef::default`、点光照 `PointLight::default`，手写关卡
+  只写与默认不同的字段）：`name` → `Name`；`visible: false` → `Visibility::HIDDEN`
+  （缺省可见，不插组件——与可见性的缺席语义一致）；`transform`（位置 /
+  四元数 (x,y,z,w) / 缩放）；`material`（color / metallic / roughness /
+  emissive（RGB，引擎侧 alpha 恒 1）/ texture 路径）；`point_light`；
+  `collider`（`shape`: `{"sphere": {radius}}` / `{"box": {half_extents}}` +
+  `static` + `restitution`）；`rigidbody`（gravity_scale / friction /
+  linear_damping）。serde 默认忽略未知字段——新版本文件在旧引擎上可加载
+  （前向兼容，单测守护）。
+
+**mesh 三态**：`{"primitive": {kind: cube|plane(size)|sphere(radius, segments,
+rings)|cylinder(radius, height, segments)}}`（图元直通 `primitives` 生成器，
+分段数低于生成器断言下限提前报 `OutOfRange` 而非 panic）；`{"gltf": 路径}`
+整实例挂载——`spawn_gltf_instance` 的顶层实体作为该实体**子实体**（本实体
+transform 作用于整棵子树），实例生成的全部实体打 `GltfMounted` 标记；缺 mesh
+= 纯逻辑 / 灯光实体。渲染收集查询要求 `(MeshHandle, MaterialHandle)` 成对，
+无材质段的图元实体挂默认材质 `MaterialHandle(0)`（0 号槽位 = 纯白兜底）。
+
+**登记表往返机制**：`MeshStore / MaterialStore / TextureStore` 只存数值与像素，
+没有「这份数据来自哪个文件」的概念——`SceneAssetRegistry`（World 资源）在
+load 时登记「场景创建的句柄 ↔ 场景文件内的来源」（图元参数 / glTF 路径 /
+贴图路径 / 天空源路径），save 时据此还原资源段：
+
+- mesh 句柄有登记 → 还原 `{"primitive": ...}` / `{"gltf": ...}`；无登记
+  （用户代码 `MeshStore::add`）→ mesh 段省略 + 数量统计告警（降级而非失败，
+  其余实体照写、产出文件可再加载）；
+- material：句柄 0（默认材质，隐式）整段省略；有登记 → 数值字段照
+  `MaterialDef` 现读（保存「当前值」）+ 登记的贴图路径；无登记 → 数值照写 +
+  贴图路径丢失告警（纯数值材质无损）；
+- 天空源为 `EquirectHdr` 且登记了路径 → 写 `sky_source`；无登记（手工挂入）
+  → 省略 + 告警（HDR 图像内容不回写文件）。
+
+**往返不变量**：实体顺序 = 组件存储序（spawn 序，稳定）；`save(load(f))`
+再 save 一次**逐字节一致**（同输入确定性输出），`load(save(load(f)))` 与
+`load(f)` 实体组件语义等价（数值 1e-6 容差、mesh ref 相等——单测以丰富场景
+（全组件 + glTF + 贴图）守护）。glTF 内部实体带标记被 save 跳过——它们由
+glTF 段在下次加载时整体重建，不属于场景文件本身。错误收敛为 `SceneError`
+（Io / Json / Missing / Unsupported / OutOfRange，风格同 `GltfError`；
+glTF / HDR 错误经 `From` 映射保上下文）。
+
+**v1 不含（诚实清单）**：UI 组件（HUD 属游戏逻辑）与相机（资源级）不进
+场景文件；克隆 / 预设 / 组件插件扩展点；`RigidBody.velocity` 与
+`DirectionalLight.shadow_range` 不序列化（物体从静止开始）；同一 glTF 文件
+被多次引用时每引用重新解析（各得独立实体树与网格句柄——句柄级去重需跨实例
+复制异构组件树或共享实体，后者会被 `add_child` 重挂载破坏，v1 不做）；
+无热重载（§8.4）；文件读写走 `std::fs`（wasm32 编译可用、web 运行时不可用，
+与引擎资产管线平台约定一致）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -682,7 +747,8 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
    全量重建，海量静态实体场景可考虑脏标记增量传播。
 3. **批处理粒度**：按 (网格, 材质) 合批，无深度排序（不透明物体绘制顺序无关紧要，
    半透明需额外排序，暂未处理）。
-4. **无热重载**：CPU 目录句柄不可变，资产修改需重建。
+4. **无热重载**：CPU 目录句柄不可变，资产修改需重建；场景文件为手工编写，
+   热重载未做（`load_scene` 加载完成后与文件的关联即断开，修改后需重新加载）。
 5. **Web 目标（wasm32）**：全 workspace 编译零警告，Instant / 线程 / 异步
    GPU 初始化平台封装就位；**端到端验证通过**——无头 Chrome（152）冒烟
    「winit 窗口创建 + canvas 附加 DOM + 适配器请求发出 + 无适配器时优雅
