@@ -3,6 +3,8 @@
 //! - `assets/cube.gltf` + `cube0.bin`：外部 buffer 的标准 glTF（`model` 示例加载）
 //! - `assets/anim_cube.glb`：GLB 容器，带旋转 + 浮动动画（`anim_snapshot` 示例加载）
 //! - `assets/skin_arm.glb`：GLB 容器，两段式蒙皮手臂 + 肘关节挥舞动画（`skin_snapshot` 示例加载）
+//! - `assets/enemy_worm.glb`：GLB 容器，三段式蒙皮蠕虫（iris-arena 敌人）
+//!   + 关节反相扭动循环动画
 //! - `assets/sunset.hdr`：equirectangular 日落全景 Radiance 文件（`hdr_snapshot` 示例加载）
 //!
 //! ```sh
@@ -18,8 +20,9 @@ fn main() {
     write_gltf_cube("assets/cube.gltf", "cube0.bin", &cube);
     write_animated_cube_glb("assets/anim_cube.glb", &cube);
     write_skinned_arm_glb("assets/skin_arm.glb");
+    write_enemy_worm_glb("assets/enemy_worm.glb");
     write_sunset_hdr("assets/sunset.hdr");
-    println!("已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb 与 assets/sunset.hdr");
+    println!("已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb、assets/enemy_worm.glb 与 assets/sunset.hdr");
 }
 
 /// 把单位立方体数据写成 glTF（JSON + 外部二进制 buffer）。
@@ -385,6 +388,189 @@ fn write_skinned_arm_glb(path: &str) {
         ibm_off = ibm_off,
         a_vtx = a_vtx, a_idx = a_idx,
         g_vtx = g_vtx, g_idx = g_idx,
+    );
+
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).expect("创建 assets 目录");
+    }
+    std::fs::write(path, write_glb(&json, &bin)).expect("写入 GLB");
+}
+
+/// 三段式蒙皮蠕虫（iris-arena 敌人）：箱体段沿 -X 排成蠕虫、逐段缩小，
+/// 关节链 hip(0,0,0) → j1(-0.8) → j2(j1 局部 -0.8，全局 -1.6)，全段蒙皮
+/// （首段绑 hip、中段绑 j1、末段绑 j2），扭动动画 1.2 s 循环（j1 yaw
+/// +25°→−25°→+25°，j2 反相），材质暗红 + 微光 emissive。iris-arena 的
+/// 敌人池实例化。
+///
+/// 节点树：0=WormRoot(mesh+skin) 1=hip 2=j1(T(-0.8,0,0)) 3=j2(T(-0.8,0,0))；
+/// skin.joints=[1,2,3]，ibm=[I, T(0.8,0,0), T(1.6,0,0)]（j2 的 ibm 用
+/// 绑定姿势的**全局** T(1.6)——节点平移是父局部，ibm 是全局的逆）。
+fn write_enemy_worm_glb(path: &str) {
+    // 蠕虫网格：三段箱体（沿 -X 排布，段间略缩；底面落在 y = 0）
+    let mut worm = MeshData { skin: Some(Vec::new()), ..MeshData::default() };
+    let add_segment = |data: &mut MeshData, center: [f32; 3], half: [f32; 3], joint: u32| {
+        let base = data.vertices.len() as u32;
+        let cube = primitives::cube();
+        for v in &cube.vertices {
+            data.vertices.push(Vertex {
+                position: [
+                    v.position[0] * half[0] + center[0],
+                    v.position[1] * half[1] + center[1],
+                    v.position[2] * half[2] + center[2],
+                ],
+                normal: v.normal,
+                uv: v.uv,
+            });
+        }
+        data.indices.extend(cube.indices.iter().map(|i| i + base));
+        data.skin
+            .as_mut()
+            .unwrap()
+            .extend(std::iter::repeat_n(
+                SkinVertex { joints: [joint, 0, 0, 0], weights: [1.0, 0.0, 0.0, 0.0] },
+                cube.vertices.len(),
+            ));
+    };
+    // （中心, 全边长, 关节）——头部在原点，躯干与尾巴依次向 -X 排开。
+    // 图元立方体跨度为 ±0.5，缩放系数即全边长；段间恰好相接：头 [−0.45,
+    // 0.45] × 躯干中心 −0.85（跨 [−1.25, −0.45]）× 尾中心 −1.6（即 j2，
+    // 跨 [−1.95, −1.25]），端点两两重合。
+    add_segment(&mut worm, [0.0, 0.35, 0.0], [0.9, 0.7, 0.7], 0);
+    add_segment(&mut worm, [-0.85, 0.30, 0.0], [0.8, 0.6, 0.6], 1);
+    add_segment(&mut worm, [-1.6, 0.25, 0.0], [0.7, 0.5, 0.5], 2);
+
+    let mut bin: Vec<u8> = Vec::new();
+    let put_vertices = |bin: &mut Vec<u8>, mesh: &MeshData| -> (usize, usize, usize, usize, usize) {
+        let pos_off = bin.len();
+        for v in &mesh.vertices {
+            bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
+        }
+        let normal_off = bin.len();
+        for v in &mesh.vertices {
+            bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
+        }
+        let uv_off = bin.len();
+        for v in &mesh.vertices {
+            bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        (pos_off, normal_off, uv_off, mesh.vertices.len(), mesh.indices.len())
+    };
+    let (w_pos, w_nrm, w_uv, w_vtx, w_idx) = put_vertices(&mut bin, &worm);
+    let w_idx_off = bin.len();
+    for i in &worm.indices {
+        bin.extend_from_slice(&(*i as u16).to_le_bytes());
+    }
+    let w_idx_len = bin.len() - w_idx_off;
+    while bin.len() % 4 != 0 {
+        bin.push(0);
+    }
+    let w_joint_off = bin.len();
+    for s in worm.skin.as_ref().unwrap() {
+        bin.extend_from_slice(&s.joints.map(|j| (j as u16).to_le_bytes()).concat());
+    }
+    let w_joint_len = bin.len() - w_joint_off;
+    let w_weight_off = bin.len();
+    for s in worm.skin.as_ref().unwrap() {
+        bin.extend_from_slice(&s.weights.map(f32::to_le_bytes).concat());
+    }
+    let w_weight_len = bin.len() - w_weight_off;
+    // 扭动动画：j1 yaw +25° → −25° → +25°（1.2 s 三关键帧循环），j2 反相
+    // （yaw θ 的四元数 = (0, sin(θ/2), 0, cos(θ/2))，两个采样器共用时间轴）
+    let times_off = bin.len();
+    bin.extend_from_slice(&[0.0f32, 0.6, 1.2].map(f32::to_le_bytes).concat());
+    let quats_j1_off = bin.len();
+    for deg in [25.0f32, -25.0, 25.0] {
+        let (s, c) = (deg * 0.5).to_radians().sin_cos();
+        bin.extend_from_slice(&[0.0f32, s, 0.0, c].map(f32::to_le_bytes).concat());
+    }
+    let quats_j2_off = bin.len();
+    for deg in [-25.0f32, 25.0, -25.0] {
+        let (s, c) = (deg * 0.5).to_radians().sin_cos();
+        bin.extend_from_slice(&[0.0f32, s, 0.0, c].map(f32::to_le_bytes).concat());
+    }
+    // 逆绑定矩阵：hip 恒等；j1 / j2 的 bind 全局 = T(-0.8,0,0) / T(-1.6,0,0)
+    let ibm_off = bin.len();
+    for m in [
+        iris_core::prelude::Mat4::IDENTITY,
+        iris_core::prelude::Mat4::from_translation([0.8, 0.0, 0.0].into()),
+        iris_core::prelude::Mat4::from_translation([1.6, 0.0, 0.0].into()),
+    ] {
+        for col in m.to_cols_array_2d() {
+            bin.extend_from_slice(&col.map(f32::to_le_bytes).concat());
+        }
+    }
+
+    let json = format!(
+        r#"{{
+  "asset": {{ "version": "2.0", "generator": "iris gen_asset" }},
+  "buffers": [{{ "byteLength": {buffer_len} }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {w_pos}, "byteLength": {w_pos_len} }},
+    {{ "buffer": 0, "byteOffset": {w_nrm}, "byteLength": {w_nrm_len} }},
+    {{ "buffer": 0, "byteOffset": {w_uv}, "byteLength": {w_uv_len} }},
+    {{ "buffer": 0, "byteOffset": {w_idx_off}, "byteLength": {w_idx_len} }},
+    {{ "buffer": 0, "byteOffset": {w_joint_off}, "byteLength": {w_joint_len} }},
+    {{ "buffer": 0, "byteOffset": {w_weight_off}, "byteLength": {w_weight_len} }},
+    {{ "bufferView": 6, "buffer": 0, "byteOffset": {times_off}, "byteLength": 12 }},
+    {{ "bufferView": 7, "buffer": 0, "byteOffset": {quats_j1_off}, "byteLength": 48 }},
+    {{ "bufferView": 8, "buffer": 0, "byteOffset": {quats_j2_off}, "byteLength": 48 }},
+    {{ "bufferView": 9, "buffer": 0, "byteOffset": {ibm_off}, "byteLength": 192 }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": {w_vtx}, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": {w_vtx}, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5126, "count": {w_vtx}, "type": "VEC2" }},
+    {{ "bufferView": 3, "componentType": 5123, "count": {w_idx}, "type": "SCALAR" }},
+    {{ "bufferView": 4, "componentType": 5123, "count": {w_vtx}, "type": "VEC4" }},
+    {{ "bufferView": 5, "componentType": 5126, "count": {w_vtx}, "type": "VEC4" }},
+    {{ "bufferView": 6, "componentType": 5126, "count": 3, "type": "SCALAR" }},
+    {{ "bufferView": 7, "componentType": 5126, "count": 3, "type": "VEC4" }},
+    {{ "bufferView": 8, "componentType": 5126, "count": 3, "type": "VEC4" }},
+    {{ "bufferView": 9, "componentType": 5126, "count": 3, "type": "MAT4" }}
+  ],
+  "materials": [
+    {{ "pbrMetallicRoughness": {{ "baseColorFactor": [0.45, 0.08, 0.08, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.6 }}, "emissiveFactor": [0.35, 0.05, 0.05] }}
+  ],
+  "meshes": [
+    {{ "name": "Worm", "primitives": [{{ "attributes": {{ "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2, "JOINTS_0": 4, "WEIGHTS_0": 5 }}, "indices": 3, "material": 0 }}] }}
+  ],
+  "skins": [{{ "name": "WormSkin", "joints": [1, 2, 3], "inverseBindMatrices": 9 }}],
+  "nodes": [
+    {{ "name": "WormRoot", "mesh": 0, "skin": 0 }},
+    {{ "name": "hip", "children": [2] }},
+    {{ "name": "j1", "translation": [-0.8, 0.0, 0.0], "children": [3] }},
+    {{ "name": "j2", "translation": [-0.8, 0.0, 0.0] }}
+  ],
+  "scenes": [{{ "nodes": [0, 1] }}],
+  "scene": 0,
+  "animations": [
+    {{ "name": "wiggle",
+       "channels": [
+         {{ "sampler": 0, "target": {{ "node": 2, "path": "rotation" }} }},
+         {{ "sampler": 1, "target": {{ "node": 3, "path": "rotation" }} }}
+       ],
+       "samplers": [
+         {{ "input": 6, "output": 7, "interpolation": "LINEAR" }},
+         {{ "input": 6, "output": 8, "interpolation": "LINEAR" }}
+       ]
+    }}
+  ]
+}}"#,
+        buffer_len = bin.len(),
+        w_pos = w_pos, w_pos_len = w_nrm - w_pos,
+        w_nrm = w_nrm, w_nrm_len = w_uv - w_nrm,
+        w_uv = w_uv, w_uv_len = w_idx_off - w_uv,
+        w_idx_off = w_idx_off, w_idx_len = w_idx_len,
+        w_joint_off = w_joint_off, w_joint_len = w_joint_len,
+        w_weight_off = w_weight_off, w_weight_len = w_weight_len,
+        times_off = times_off,
+        quats_j1_off = quats_j1_off,
+        quats_j2_off = quats_j2_off,
+        ibm_off = ibm_off,
+        w_vtx = w_vtx, w_idx = w_idx,
     );
 
     if let Some(parent) = std::path::Path::new(path).parent() {

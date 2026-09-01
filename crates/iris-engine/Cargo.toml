@@ -22,6 +22,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 [dev-dependencies]
 env_logger = { workspace = true }
-# game_snapshot 示例复用下游游戏 crate（dev 依赖允许与 iris-game 的
-# 正常依赖形成环：cargo 保证普通依赖单向、dev 依赖可回指）
+# game_snapshot / arena_snapshot 示例复用下游游戏 crate（dev 依赖允许与
+# iris-game / iris-arena 的正常依赖形成环：cargo 保证普通依赖单向、
+# dev 依赖可回指）
 iris-game = { workspace = true }
+iris-arena = { workspace = true }

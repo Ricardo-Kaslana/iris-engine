@@ -23,7 +23,7 @@ iris-render ───────┘               │
     ↑                              │
 iris-engine（门面，用户唯一入口）────┘
     ↑
-iris-game（下游示范游戏，引擎 dogfooding）
+iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -44,6 +44,16 @@ iris-game（下游示范游戏，引擎 dogfooding）
   `Input`/`Time` 翻译进逻辑并写回实体 / HUD / 音频，系统编排经
   `GamePlugin::build_schedule` 暴露，headless 集成测试与离屏快照在不建
   `App` / 窗口 / GPU 的前提下复用同一条推进路径。
+- **iris-arena**：与 iris-game 同层的第二作（示范游戏 Iris Arena，波次生存
+  竞技场）——同一依赖纪律（iris-engine 门面 + glam），把 dogfooding 推进到
+  高强度真实用法：**蒙皮动画 × 对象池**（15 蒙皮敌人实例 + 40 弹道实体
+  启动时预热、`Visibility` 待命、按逻辑侧稳定 id 取用 / 归还，零运行期
+  spawn）、**根实体移动 × 蒙皮子树 × 关节动画叠加**、弹道投影体 + 追击 AI、
+  Title / Playing / GameOver 多游戏状态。纯逻辑核心同样只依赖 glam（含本地
+  XZ 平面静态推离，与 §3.8 的静态推离查询水平投影语义近似、刻意解耦——
+  俯视玩法垂直方向无需引擎参与），插件层 Startup 把场景 `Collider` 一次性
+  转换为逻辑形状、Update 每帧零查询；音效由逻辑侧单调事件计数器的差分触发。
+  第二轮撞到的 API 摩擦与绕行见 §8.13。
 
 ## 3. ECS 设计（iris-core）
 
@@ -364,6 +374,13 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 - **加载器**：`skins`/`skin` 节点字段、MAT4 accessor、IBM 缺省时为
   恒等（规范允许）；权重和偏离 1 时归一化（防御非法资产）；
   JOINTS_0 与 WEIGHTS_0 必须成对出现，否则报 `Missing`。
+- **移动蒙皮实体的资产约定（iris-arena dogfooding II 补充）**：
+  `J_i` 中的 `global(joint_i)` 来自关节实体的全局变换——多顶层节点的蒙皮
+  glTF（mesh 根与关节树根为兄弟，如 gen_asset 生成的 `enemy_worm.glb`）
+  在加载后**必须把关节树挂回 mesh 根**（`world.add_child`），否则关节树
+  恒在世界原点，移动 mesh 根不改变渲染位置（静态展示不暴露，游戏内移动
+  即散架，见 §8.13）。单顶层节点蒙皮 glTF（关节树本就是 mesh 根的后代）
+  无此问题。
 - **限制**：关节非均匀缩放下法线变换不精确（按刚性处理）；蒙皮网格
   无视锥剔除；多 primitive 共享蒙皮时关节矩阵每 primitive 各上传一份。
 
@@ -867,6 +884,51 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       对场景静态体求推离、只回馈水平分量（贴墙滑行）；玩家被墙挡在
       17.05 = 内缘 17.5 − 半径 0.45（headless 测试断言 x 稳定在 17.05 且
       小于钳制上限 18——「是 Collider 而非 clamp 在挡」的直接证据）。
+13. **dogfooding II 发现的 API 摩擦（iris-arena 实践反馈）**——第二轮以
+    「波次生存竞技场」压榨蒙皮动画 × 对象池 × 弹道 × 多游戏状态时撞到的
+    摩擦。本轮原则：**引擎侧零改动**，全部记录 + 游戏内绕行。
+    - **`AnimationPlugin` 未列入 `iris-engine` prelude**：`HierarchyPlugin`
+      等同批插件都在 prelude，唯独动画插件缺席——headless 测试 / 离屏
+      快照无法 `AnimationPlugin.build(&mut app)`，只能绕行：按其实现原样
+      `schedule.add_parallel_system(..., update_animations)`（同一系统同一
+      访问集）。建议补一行 prelude 重导出。
+      → 游戏侧绕行：iris-arena 的 headless 测试与 `arena_snapshot` 内联
+      注册；文档注明「本插件刻意不自带动画注册，避免窗口路径重复注册
+      双倍速」。
+    - **资产路径是工作目录相对，`cargo test` 下失效**：`cargo run` 的 cwd
+      是 workspace 根（窗口程序开箱即用），但 `cargo test` 的 cwd 是
+      **crate 目录**——插件内写死的 `assets/enemy_worm.glb` 在测试里加载
+      失败且错误被 `log::error` 吞掉（测试默认无 logger），池静默缩容为
+      0，只有断言「池应有 15 槽位」才暴露。建议：引擎提供「资产根」约定
+      （如 `CARGO_MANIFEST_DIR` 兜底）或 `Result` 外露加载错误。
+      → 游戏侧绕行：敌人模型路径提升为 `ArenaPlugin.enemy_model_path`
+      字段（可注入），测试用 `env!("CARGO_MANIFEST_DIR")` 拼绝对路径。
+    - **`spawn_gltf_instance` 的蒙皮实例关节树不随 mesh 根移动**：多顶层
+      节点的蒙皮 glTF（mesh 根与关节树根是**兄弟**）生成的实体树无法整体
+      移动——蒙皮矩阵 `J = inv(mesh 全局) × global(joint) × ibm`，关节树
+      留在世界原点时移动 mesh 根，蠕虫永远渲染在原点绑定姿势（静态展示
+      的 skin_arm 不会暴露，一动就散架）。建议：单根蒙皮场景约定或加载时
+      自动收编兄弟顶层节点。
+      → 游戏侧绕行：spawn 后 `world.add_child(root, 关节树根)` 把兄弟
+      顶层节点收编为 mesh 根的子树（公开 API 层级操作即可表达）。
+    - **`Input` 无按键枚举 / any-key 查询**：标题画面的「任意键开始」只能
+      白名单探测常用键的 `key_pressed`（漏掉按键 = 玩家卡在标题屏）。
+      建议提供 `Input::any_pressed()` 或按帧记录的按键迭代器。
+      → 游戏侧绕行：8 键白名单（WASD / Space / Enter / Shift / R）。
+    - **程序化音效无法拼接 / 变调**：`sine / square / noise` 只生成单段
+      常频剪辑，`AudioClip` 采样不公开读取——「开波双音」只能绕开生成器，
+      用公开的 `AudioClip::from_interleaved` 手写采样拼接（含首尾 5 ms
+      包络防爆音）。建议公开采样读取或提供 `concat / mix` 组合子。
+    - **差分事件在状态复位时会下溢**（游戏侧自伤，非引擎缺口，记录为
+      陷阱）：逻辑侧单调计数器（total_shots 等）在 restart 时归零，插件
+      的 `after − before` 差分在 debug 构建 overflow panic。修法用
+      `saturating_sub`——「资源承载可复位状态 + 差分触发表现」的组合
+      应默认防下溢。
+    - **蒙皮资产制作陷阱**（gen_asset 侧，记录给后续资产管线）：图元立方体
+      跨度是 ±0.5（缩放系数 = 全边长）；关节节点平移是**父局部**偏移而
+      ibm 是**绑定姿势全局**的逆——两者混用会让末端关节错位一倍。蒙皮
+      数值正确性目前只能靠离屏渲染目检守护，CPU 侧 `skin_vertex` 参考实现
+      可单测但未覆盖「GLB 文件 → 关节矩阵」全链路。
 
 ## 9. 关键设计取舍记录
 

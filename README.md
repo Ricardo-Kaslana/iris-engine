@@ -103,6 +103,11 @@ cargo run --example skin_snapshot --release
 # iris_game_start.bmp / iris_game_after.bmp（headless 同款驱动 + 离屏渲染）
 cargo run --example game_snapshot --release
 
+# 波次生存竞技场双时刻验收图（左：wave 2 混战 / 右：GAME OVER），输出
+# docs/arena_preview.png 拼图源（headless 同款驱动 + 离屏渲染，蒙皮蠕虫
+# 敌人两时刻扭动相位不同）
+cargo run -p iris-engine --example arena_snapshot --release
+
 # 物理与碰撞验收场景（离屏渲染 + headless 终态断言），输出 iris_physics_midair.bmp /
 # iris_physics_rest.bmp：10 颗不同弹性的刚体球落到静态台面与地面——t=0.3s 半空 /
 # t=3s 静止（球心 y>0、两两不穿透、总速度 < 2 m/s 三重断言）
@@ -166,7 +171,7 @@ flowchart TB
 
 ```
 iris-engine/
-├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成；collect_arena.scene.json 为手写关卡）
+├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成；collect_arena.scene.json / arena_battle.scene.json 为手写关卡，enemy_worm.glb 由 gen_asset 生成）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
 │   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞
@@ -174,8 +179,9 @@ iris-engine/
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
 │   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 示例
-│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / physics_snapshot / scene_snapshot / web（wasm 专用入口，见「Web 构建」）
-│   └── iris-game/       # 引擎下游示范游戏：第三人称限时收集（见「用 Iris 做的游戏」）
+│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / scene_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
+│   └── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -302,11 +308,16 @@ font8x8（ASCII 96 字形，等宽 8×scale 步进，逐亮位展开、形状由
 
 ![场景序列化](docs/scene_preview.png)
 
-## 用 Iris 做的游戏：Iris Collect
+## 用 Iris 做的游戏
 
-**Dogfooding 验证**——`crates/iris-game` 是引擎的第一个「真实用户」：只用公开
-API（`iris-engine` 门面 + glam）拼出一个完整的第三人称限时收集游戏（10 枚金币、
-60 秒倒计时、围墙竞技场、跳跃拾取、HUD、程序化音效），**引擎侧零改动**。
+引擎的「真实用户」验证——只用公开 API（`iris-engine` 门面 + glam）拼完整游戏，
+**引擎侧零改动**。两作递进：Iris Collect 验证「能不能拼出来」，Iris Arena
+压榨「蒙皮动画 × 对象池 × 弹道 × 多游戏状态」的高强度真实用法。
+
+### I. Iris Collect（`crates/iris-game`）——第三人称限时收集
+
+**Dogfooding I**——10 枚金币、60 秒倒计时、围墙竞技场、跳跃拾取、HUD、
+程序化音效。
 纯逻辑状态机（`logic.rs`，只依赖 glam、零引擎依赖）与插件接线（`GamePlugin`）
 分离：**关卡来自 JSON 场景文件**——Startup 经 `load_scene` 载入
 `assets/collect_arena.scene.json`（微弱日光环境段 + 地面、四面围墙（静态
@@ -338,10 +349,51 @@ cargo run -p iris-game --release   # 玩游戏（WASD 移动 / Space 跳跃）
 cargo run --example game_snapshot --release   # 双时刻离屏验收图
 ```
 
+### II. Iris Arena（`crates/iris-arena`）——波次生存竞技场
+
+**Dogfooding II**——俯视 3/4 视角竞技场：WASD 移动（屏幕相对 + 贴墙滑行）、
+**Shift 冲刺**（0.15 s 高速 + 0.25 s 无敌帧）、**自动开火**（每 0.25 s 朝
+14 m 内最近敌人发射弹道，无敌人不开火）。蒙皮蠕虫敌人（`enemy_worm.glb`，
+三段箱体关节链扭动循环）从场边刷新成波次（第 n 波 3 + 2n 只、追击速度逐波
++0.15）；接触掉 1 血 + 击退 + 连击清零；弹道命中 -1 HP + 小击退。清空一波
+→ 3 s 间歇 → 下一波；玩家 5 HP 归零 GAME OVER，R 直接重开。连击：击杀 +1、
+受伤或 3 s 无击杀清零，得分 = 25 × 连击数。
+
+相比 Iris Collect 高强度压榨的引擎面：**蒙皮动画 × 对象池**——启动时一次
+spawn 15 个蒙皮蠕虫实例（`spawn_gltf_instance` + `AnimationPlayer` 自动
+循环扭动）与 40 个自发光弹道小球，全部 `Visibility::HIDDEN` 待命，波次间
+按逻辑侧稳定 id 取用 / 归还槽位，**零运行期 spawn / despawn**（池不超发由
+单测守护）；**根实体移动 × 蒙皮子树**——插件只写 glTF 根的
+Transform，关节子树随层级传播跟随、动画逐帧覆写关节旋转，两者在同一实体
+树上叠加；纯逻辑核心（`logic.rs`，只 glam、零引擎依赖、17 项单测含逐采样
+确定性）内置本地 XZ 静态推离（与引擎 `resolve_static_push` 水平投影语义
+近似、刻意解耦），插件层在 Startup 把场景 `Collider` 一次性转换为逻辑形状
+（Update 每帧零查询）；多游戏状态 Title / Playing / GameOver + 波次间歇；
+音效由逻辑侧单调事件计数器的前后差分触发（射击 / 命中 / 受伤 / 开波双音，
+全部程序化生成）。headless 集成测试（8 项）复用与窗口程序同一编排的插件
+系统链，覆盖池取用 / 归还 / 跨波复用、动画推进、HUD 刷新、弹道池封顶、
+终局重开闭环与混战 draw calls 记录性断言（13 敌 + 20 弹 + 场景 + HUD 一帧
+**25 次 draw call**）；本次实践撞到的 API 摩擦（AnimationPlugin 未入
+prelude / 资产路径工作目录相对 / 蒙皮实例关节树不随根移动等）见
+ARCHITECTURE.md §8.13。
+
+![波次生存竞技场双时刻验收](docs/arena_preview.png)
+
+实测（`docs/arena_preview.png`，左：wave 2 混战 / 右：GAME OVER，同一世界
+用 headless 方式驱动到两个时刻各自离屏渲染）：左图 5 只蒙皮蠕虫从场边
+围拢玩家、自动开火弹道在飞、HUD（WAVE 2 / SCORE / HP 条）完整；右图蠕虫
+围拢倒地的玩家、HP 条清空、GAME OVER 横幅——两时刻相隔真实推进的帧，
+蒙皮扭动相位肉眼可见地不同（动画在跑）。玩家与障碍柱 / 墙体无穿插。
+
+```sh
+cargo run -p iris-arena --release   # 玩游戏（WASD 移动 / Shift 冲刺 / 自动开火）
+cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏验收图
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 266 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 292 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -371,7 +423,11 @@ Radiance .hdr 解析器（平面 / RLE 扫描线、RGBE 指数编解码、f16 �
 跳跃弧线 / 相机子实体层级跟随 / 脚本路线拾取与计分 / 金币可见性隐藏 /
 HUD 文本刷新 / 全收集胜利与终局冻结 / 超时落败 /
 **墙体 Collider 阻挡（玩家稳定贴墙 17.05，小于钳制上限 18——是物理而非
-clamp 在挡）/ 贴墙滑行（法向被挡、切向持续滑行）**）**、
+clamp 在挡）/ 贴墙滑行（法向被挡、切向持续滑行）**）、
+**headless 竞技场集成（iris-arena：同款驱动 + 双池预热断言 + 蒙皮动画推进 +
+任意键开局取池 + 波次间池槽位复用（第 2 波复用第 1 波全部 5 槽）+ HUD
+四要素刷新 + 弹道池封顶与槽位回收 + GAME OVER → R 重开闭环（旧 id 全释放、
+事件计数复位）+ 混战 draw calls < 300 记录性断言（实测 25））**、
 **物理与碰撞（球-球 / 球-AABB（顶面 / 侧向 / 角点 / 盒内退出）/ AABB-AABB
 接触几何与反弹 / 摩擦均值的纯函数断言；自由落体对照 y(t)=h-½gt² 的 60Hz 离散
 容差、gravity_scale 缩放、e=0.8 回弹顶点 ≈ 初高×0.64 且逐次衰减、e=0 落地静止

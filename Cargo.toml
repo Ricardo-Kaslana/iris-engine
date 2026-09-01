@@ -8,6 +8,7 @@ members = [
     "crates/iris-audio",
     "crates/iris-engine",
     "crates/iris-game",
+    "crates/iris-arena",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ iris-platform = { path = "crates/iris-platform", version = "0.1.0" }
 iris-audio = { path = "crates/iris-audio", version = "0.1.0" }
 iris-engine = { path = "crates/iris-engine", version = "0.1.0" }
 iris-game = { path = "crates/iris-game", version = "0.1.0" }
+iris-arena = { path = "crates/iris-arena", version = "0.1.0" }
 
 # 数学：SIMD 优化的线性代数库
 glam = "0.33"
