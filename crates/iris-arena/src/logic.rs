@@ -4,7 +4,7 @@
 //! 接触伤害与无敌帧 / 连击计分 / 波次推进 / 胜负）都在这个模块里以纯函数
 //! 推进：输入 [`ArenaInput`]、步长 `dt` 与静态体列表，输出状态变化——
 //! 不读时钟、不做随机、不触碰引擎。因此：
-//! - 全部规则可毫秒级单测（本模块底部 16 项）；
+//! - 全部规则可毫秒级单测（本模块底部 18 项）；
 //! - 插件层（`crate::plugin`）只负责把 `Input` / `Time` / 场景 `Collider`
 //!   翻译成本模块类型，再把结果写回实体组件与对象池；
 //! - headless 测试与离屏快照共享同一条确定性推进路径。
@@ -12,10 +12,13 @@
 //! # 与引擎物理的关系（近似性说明）
 //!
 //! 竞技场是俯视玩法，全部碰撞发生在 XZ 平面：本模块自带一个**本地简化版
-//! 静态推离**（`resolve` / `overlaps_static`：圆-圆与圆-AABB、Gauss-Seidel
-//! 顺序累加）——语义与 `iris_core::physics::resolve_static_push` 在水平面
-//! 上的投影近似（同为「沿接触法线推离穿透量、逐个用修正后的位置重测」），
-//! 但刻意**解耦**：纯核心不依赖引擎类型，[`StaticShape`] 是本地的轻量形状
+//! 静态推离**（`resolve`：圆-圆与圆-AABB、Gauss-Seidel 顺序累加）与
+//! **扫掠命中判定**（`segment_blocked` / `segment_hits_circle`：弹道本帧
+//! 的 prev → pos 线段对目标的扫掠测试）——推离语义与
+//! `iris_core::physics::resolve_static_push` 在水平面上的投影近似（同为
+//! 「沿接触法线推离穿透量、逐个用修正后的位置重测」），扫掠语义与
+//! `iris_core::physics::segment_hits_shape` 一致（防高速穿模），但刻意
+//! **解耦**：纯核心不依赖引擎类型，[`StaticShape`] 是本地的轻量形状
 //! （位置里的 y 分量被忽略）。插件层负责把场景 `Collider` 转换过来；实体
 //! 全部贴地平面运动，垂直方向无需引擎参与。
 //!
@@ -359,8 +362,11 @@ impl ArenaState {
             self.player.dash_timer = DASH_TIME;
             self.player.dash_cd = DASH_COOLDOWN;
             self.player.invuln = self.player.invuln.max(DASH_INVULN);
-            self.player.dash_dir =
-                if move_dir != Vec2::ZERO { move_dir } else { self.player.forward() };
+            self.player.dash_dir = if move_dir != Vec2::ZERO {
+                move_dir
+            } else {
+                self.player.forward()
+            };
         }
         let velocity = if self.player.dash_timer > 0.0 {
             self.player.dash_dir * DASH_SPEED
@@ -408,19 +414,25 @@ impl ArenaState {
         }
 
         // ---- 弹道推进：寿命 → 静态体阻挡 → 命中敌人（一弹至多一敌）----
+        // 命中 / 阻挡都用本帧扫掠线段（prev → pos）判定：弹速 × dt 的步长
+        // 可大于敌人 / 障碍直径，当帧点判定会**穿模漏检**（引擎
+        // `segment_hits_shape` 同款语义，XZ 平面本地实现保持纯核心零引擎依赖）
         let mut dead_projectiles: Vec<u32> = Vec::new();
         for projectile in &mut self.projectiles {
+            let prev = projectile.pos;
             projectile.pos += projectile.vel * dt;
             projectile.life -= dt;
-            if projectile.life <= 0.0 || overlaps_static(projectile.pos, PROJECTILE_RADIUS, statics)
+            if projectile.life <= 0.0
+                || segment_blocked(prev, projectile.pos, PROJECTILE_RADIUS, statics)
             {
                 dead_projectiles.push(projectile.id);
                 continue;
             }
-            // 命中判定按敌人列表序取首个（确定性）；半径求和判交
+            // 命中判定按敌人列表序取首个（确定性）；扫掠半径 = 半径求和
+            let hit_radius = ENEMY_RADIUS + PROJECTILE_RADIUS;
             let dir = projectile.vel.normalize_or_zero();
             for enemy in &mut self.enemies {
-                if enemy.pos.distance(projectile.pos) <= ENEMY_RADIUS + PROJECTILE_RADIUS {
+                if segment_hits_circle(prev, projectile.pos, enemy.pos, hit_radius) {
                     enemy.hp -= 1;
                     enemy.hit_flash = ENEMY_HIT_FLASH;
                     enemy.kb += dir * ENEMY_KNOCKBACK;
@@ -437,7 +449,8 @@ impl ArenaState {
                 }
             }
         }
-        self.projectiles.retain(|p| !dead_projectiles.contains(&p.id));
+        self.projectiles
+            .retain(|p| !dead_projectiles.contains(&p.id));
         self.enemies.retain(|e| e.hp > 0);
 
         // ---- 敌人追击：朝玩家方向 + 击退速度积分，随后对静态体推离 ----
@@ -500,7 +513,7 @@ impl ArenaState {
         let mut best: Option<(f32, &EnemyState)> = None;
         for enemy in &self.enemies {
             let d = enemy.pos.distance(self.player.pos);
-            if d <= FIRE_RANGE && best.map_or(true, |(bd, _)| d < bd) {
+            if d <= FIRE_RANGE && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, enemy));
             }
         }
@@ -546,15 +559,62 @@ fn resolve(pos: Vec2, radius: f32, statics: &[(Vec3, StaticShape)]) -> Vec2 {
     push
 }
 
-/// 弹道是否与任一静态体重叠（命中即消亡，不做推离）。
-fn overlaps_static(pos: Vec2, radius: f32, statics: &[(Vec3, StaticShape)]) -> bool {
+/// 弹道本帧扫掠线段（`from → to`，半径 `radius`）是否撞上任意静态体
+/// （命中即消亡，不做推离）。替代旧的当帧点判定 `overlaps_static`——
+/// 弹速 × dt 步长可大于障碍直径，点判定会穿模漏检（见模块文档）。
+fn segment_blocked(from: Vec2, to: Vec2, radius: f32, statics: &[(Vec3, StaticShape)]) -> bool {
     statics.iter().any(|(center, shape)| {
         let c = Vec2::new(center.x, center.z);
         match *shape {
-            StaticShape::Sphere { radius: r } => circle_circle(pos, radius, c, r).is_some(),
-            StaticShape::Box { half_x, half_z } => circle_box(pos, radius, half_x, half_z, c).is_some(),
+            StaticShape::Sphere { radius: r } => segment_hits_circle(from, to, c, r + radius),
+            StaticShape::Box { half_x, half_z } => {
+                // 盒按半边长 + 弹半径扩张（方角近似 Minkowski 和的圆角，
+                // 角点处至多多判 r·(√2−1) ≈ 0.1 m——弹道消亡语义下可接受）
+                segment_hits_box(from, to, c, half_x + radius, half_z + radius)
+            }
         }
     })
+}
+
+/// 线段-圆判交（XZ 平面）：线段 `from → to` 上到 `center` 的最近点距
+/// ≤ `radius` 即相交（参数钳到 [0,1] 的最近点，纯几何无迭代）。
+fn segment_hits_circle(from: Vec2, to: Vec2, center: Vec2, radius: f32) -> bool {
+    let d = to - from;
+    let len_sq = d.length_squared();
+    if len_sq <= 1e-12 {
+        // 零长度线段退化为点判定
+        return from.distance_squared(center) <= radius * radius;
+    }
+    let t = ((center - from).dot(d) / len_sq).clamp(0.0, 1.0);
+    let closest = from + d * t;
+    closest.distance_squared(center) <= radius * radius
+}
+
+/// 线段-矩形判交（XZ 轴对齐，slab 法）：线段 `from → to` 是否进入以
+/// `center` 为心、半边长 `(half_x, half_z)` 的矩形（t 归一到 [0,1]）。
+/// 分母近零的轴按「起点在界内则不裁剪、界外则未命中」处理。
+fn segment_hits_box(from: Vec2, to: Vec2, center: Vec2, half_x: f32, half_z: f32) -> bool {
+    let d = to - from;
+    let local = from - center;
+    let mut t_min = 0.0f32;
+    let mut t_max = 1.0f32;
+    for (delta, offset, half) in [(d.x, local.x, half_x), (d.y, local.y, half_z)] {
+        if delta.abs() <= 1e-12 {
+            if offset.abs() > half {
+                return false;
+            }
+            continue;
+        }
+        let t1 = (-half - offset) / delta;
+        let t2 = (half - offset) / delta;
+        let (near, far) = if t1 <= t2 { (t1, t2) } else { (t2, t1) };
+        t_min = t_min.max(near);
+        t_max = t_max.min(far);
+        if t_min > t_max {
+            return false;
+        }
+    }
+    true
 }
 
 /// 圆-圆重叠：返回（从 a 指向 b 的法线，穿透量）。
@@ -576,7 +636,10 @@ fn circle_circle(a: Vec2, ra: f32, b: Vec2, rb: f32) -> Option<(Vec2, f32)> {
 /// 圆-矩形（XZ 轴对齐）重叠：法线从圆指向矩形，穿透量 = 半径 − 最近点距。
 fn circle_box(a: Vec2, radius: f32, half_x: f32, half_z: f32, center: Vec2) -> Option<(Vec2, f32)> {
     let local = a - center;
-    let closest = Vec2::new(local.x.clamp(-half_x, half_x), local.y.clamp(-half_z, half_z));
+    let closest = Vec2::new(
+        local.x.clamp(-half_x, half_x),
+        local.y.clamp(-half_z, half_z),
+    );
     let delta = closest - local;
     let dist_sq = delta.length_squared();
     if dist_sq > radius * radius {
@@ -628,14 +691,27 @@ mod tests {
     /// 开局到第 1 波（restart 复位 + 生成 5 只敌人）。
     fn started() -> ArenaState {
         let mut state = ArenaState::new(ARENA);
-        state.step(&ArenaInput { confirm: true, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                confirm: true,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         assert_eq!(state.phase, Phase::Playing);
         state
     }
 
     /// 布置一只测试敌人（字段公开，构造中间态用）。
     fn enemy(id: u32, pos: Vec2, hp: i32) -> EnemyState {
-        EnemyState { id, pos, hp, hit_flash: 0.0, kb: Vec2::ZERO }
+        EnemyState {
+            id,
+            pos,
+            hp,
+            hit_flash: 0.0,
+            kb: Vec2::ZERO,
+        }
     }
 
     #[test]
@@ -644,16 +720,34 @@ mod tests {
         assert_eq!(state.phase, Phase::Title);
         assert_eq!(state.wave, 0);
         // 无确认键：保持标题、什么都不动（移动输入也被忽略）
-        run(&mut state, ArenaInput { move_x: 1.0, ..ArenaInput::IDLE }, 0.5, &[]);
+        run(
+            &mut state,
+            ArenaInput {
+                move_x: 1.0,
+                ..ArenaInput::IDLE
+            },
+            0.5,
+            &[],
+        );
         assert_eq!(state.phase, Phase::Title);
         assert!(state.enemies.is_empty());
         assert_eq!(state.player.pos, Vec2::ZERO, "标题阶段玩家不动");
         // 任意确认键：开局 + 第 1 波 = 3 + 2×1 = 5 只
-        state.step(&ArenaInput { confirm: true, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                confirm: true,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         assert_eq!(state.phase, Phase::Playing);
         assert_eq!(state.wave, 1);
         assert_eq!(state.enemies.len(), 5, "第 1 波应为 3 + 2×1 = 5 只");
-        assert_eq!(state.enemy_speed, ENEMY_BASE_SPEED, "第 1 波速度 = 基础速度");
+        assert_eq!(
+            state.enemy_speed, ENEMY_BASE_SPEED,
+            "第 1 波速度 = 基础速度"
+        );
     }
 
     #[test]
@@ -661,8 +755,12 @@ mod tests {
         // 两名敌人：近敌 6 m、远敌 12 m（同方向，都在射程内）→ 只射最近
         let mut state = started();
         state.enemies.clear();
-        state.enemies.push(enemy(100, Vec2::new(6.0, 0.0), ENEMY_MAX_HP));
-        state.enemies.push(enemy(101, Vec2::new(12.0, 0.0), ENEMY_MAX_HP));
+        state
+            .enemies
+            .push(enemy(100, Vec2::new(6.0, 0.0), ENEMY_MAX_HP));
+        state
+            .enemies
+            .push(enemy(101, Vec2::new(12.0, 0.0), ENEMY_MAX_HP));
         state.player.fire_timer = 0.0;
         state.step(&ArenaInput::IDLE, DT, &[]);
         assert_eq!(state.total_shots, 1, "射程内有敌人应开火");
@@ -684,7 +782,9 @@ mod tests {
         // 全部敌人移出射程：不开火
         let mut state = started();
         state.enemies.clear();
-        state.enemies.push(enemy(200, Vec2::new(FIRE_RANGE + 1.0, 0.0), ENEMY_MAX_HP));
+        state
+            .enemies
+            .push(enemy(200, Vec2::new(FIRE_RANGE + 1.0, 0.0), ENEMY_MAX_HP));
         state.player.fire_timer = 0.0;
         state.step(&ArenaInput::IDLE, DT, &[]);
         assert_eq!(state.total_shots, 0, "射程外不应开火");
@@ -702,7 +802,9 @@ mod tests {
     fn projectile_hits_enemy_once_applies_hp_knockback_then_despawns() {
         let mut state = started();
         state.enemies.clear();
-        state.enemies.push(enemy(300, Vec2::new(6.0, 0.0), ENEMY_MAX_HP));
+        state
+            .enemies
+            .push(enemy(300, Vec2::new(6.0, 0.0), ENEMY_MAX_HP));
         state.player.fire_timer = 0.0;
         state.step(&ArenaInput::IDLE, DT, &[]);
         let projectile_id = state.projectiles[0].id;
@@ -718,11 +820,73 @@ mod tests {
         }
         let frame = hit_frame.expect("弹道应在 1 s 内命中");
         assert!(frame < 25, "6 m 相向应 ~15 帧命中，实际 {frame} 帧");
-        assert!(!state.projectiles.iter().any(|p| p.id == projectile_id), "命中后弹道应消失");
+        assert!(
+            !state.projectiles.iter().any(|p| p.id == projectile_id),
+            "命中后弹道应消失"
+        );
         let enemy_state = &state.enemies[0];
         assert_eq!(enemy_state.hp, ENEMY_MAX_HP - 1, "命中应 -1 HP");
         assert_eq!(enemy_state.hit_flash, ENEMY_HIT_FLASH, "受击闪烁应重置");
         assert!(enemy_state.kb.x > 0.0, "应沿弹道方向（+X）获得击退速度");
+    }
+
+    /// 穿模回归：弹速调到「每帧位移 > 敌人直径的 2 倍」（160 m/s × dt ≈
+    /// 2.67 m > 2 × 1.1 m），且弹道采样点恰好跨过敌人（两端点距敌人都
+    /// > 判定半径 0.8）——旧的当帧点判定必漏检，扫掠线段判定应命中。
+    #[test]
+    fn high_speed_projectile_cannot_tunnel_through_enemies() {
+        let mut state = started();
+        state.enemies.clear();
+        state
+            .enemies
+            .push(enemy(1100, Vec2::new(6.0, 0.0), ENEMY_MAX_HP));
+        // 关闭自动开火（长冷却）：只观察注入的高速弹道
+        state.player.fire_timer = 100.0;
+        state.projectiles.push(ProjectileState {
+            id: 6000,
+            pos: Vec2::new(-6.0, 0.0),
+            vel: Vec2::new(160.0, 0.0),
+            life: 1.0,
+        });
+
+        // 场景自检：步长 > 敌人直径 2 倍、> 判定直径（2 × 判定半径）
+        let step_len = 160.0 * DT;
+        let hit_radius = ENEMY_RADIUS + PROJECTILE_RADIUS;
+        assert!(
+            step_len > 2.0 * 2.0 * ENEMY_RADIUS,
+            "步长 {step_len} 应 > 敌人直径的 2 倍 {}（穿模条件成立）",
+            2.0 * 2.0 * ENEMY_RADIUS
+        );
+        assert!(
+            step_len > 2.0 * hit_radius,
+            "步长应 > 判定直径（存在跨过窗口）"
+        );
+        // 逐帧采样点自检（确定性复算）：命中前每帧的弹道位置与敌人位置
+        // （敌人以波次速度 2.2 m/s 相向追击）的距离都 > 判定半径——
+        // 即旧点判定在整个飞行过程中**一次都不会触发**
+        for k in 0..5 {
+            let p = -6.0 + 160.0 * DT * k as f32;
+            let e = 6.0 - ENEMY_BASE_SPEED * DT * k as f32;
+            assert!(
+                (p - e).abs() > hit_radius,
+                "第 {k} 帧采样点距敌人 {p} vs {e} 应 > {hit_radius}（点判定必漏的前提）"
+            );
+        }
+
+        // 12 m 行程 @ 相向 ~162 m/s ≈ 4~5 帧命中
+        let mut hit_frame = None;
+        for i in 0..60 {
+            state.step(&ArenaInput::IDLE, DT, &[]);
+            if state.total_hits == 1 {
+                hit_frame = Some(i);
+                break;
+            }
+        }
+        let frame = hit_frame.expect("高速弹道应在 1 s 内命中（扫掠判定防穿模）");
+        assert!(frame < 10, "12 m @ 160 m/s 应 ~4 帧命中，实际 {frame} 帧");
+        assert!(state.projectiles.is_empty(), "命中后弹道应消失");
+        assert_eq!(state.enemies[0].hp, ENEMY_MAX_HP - 1, "敌人应被命中扣血");
+        assert!(state.enemies[0].kb.x > 0.0, "击退方向沿弹道（+X）");
     }
 
     #[test]
@@ -759,7 +923,11 @@ mod tests {
         }
         assert_eq!(state.total_kills, 2);
         assert_eq!(state.combo, 2);
-        assert_eq!(state.score, SCORE_PER_KILL + SCORE_PER_KILL * 2, "第二杀 25 × 2");
+        assert_eq!(
+            state.score,
+            SCORE_PER_KILL + SCORE_PER_KILL * 2,
+            "第二杀 25 × 2"
+        );
     }
 
     #[test]
@@ -801,13 +969,28 @@ mod tests {
         // 敌人挡在 +X 方向 2 m 处；玩家向 +X 冲刺（方向锁进 dash_dir）穿过它
         state.enemies.push(enemy(600, Vec2::new(2.0, 0.0), 9999));
         let hp_before = state.player.hp;
-        state.step(&ArenaInput { dash: true, move_x: 1.0, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                dash: true,
+                move_x: 1.0,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         assert!(state.player.invuln > 0.0, "冲刺应立即进入无敌");
         assert_eq!(state.player.dash_timer, DASH_TIME, "冲刺计时开始走表");
-        assert!((state.player.dash_dir.x - 1.0).abs() < EPS, "移动中冲刺应锁定移动方向（+X）");
+        assert!(
+            (state.player.dash_dir.x - 1.0).abs() < EPS,
+            "移动中冲刺应锁定移动方向（+X）"
+        );
         // 继续推进：松开输入，冲刺沿锁定的 +X 穿过敌人并滑行
         run(&mut state, ArenaInput::IDLE, 0.12, &[]);
-        assert!(state.player.pos.x > 2.0, "冲刺应穿过敌人位置（x ≥ 2 m），实际 x = {}", state.player.pos.x);
+        assert!(
+            state.player.pos.x > 2.0,
+            "冲刺应穿过敌人位置（x ≥ 2 m），实际 x = {}",
+            state.player.pos.x
+        );
         assert_eq!(state.player.hp, hp_before, "冲刺无敌穿过敌人不应掉血");
         assert_eq!(state.total_damage, 0, "无敌窗口内接触不掉血");
     }
@@ -816,17 +999,42 @@ mod tests {
     fn dash_has_cooldown_and_static_or_forward_direction() {
         let mut state = started();
         // 移动中冲刺：沿移动方向（+X）
-        state.step(&ArenaInput { dash: true, move_x: 1.0, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                dash: true,
+                move_x: 1.0,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         assert!(state.player.dash_timer > 0.0);
-        assert!((state.player.dash_dir.x - 1.0).abs() < EPS, "移动中冲刺应沿移动方向");
+        assert!(
+            (state.player.dash_dir.x - 1.0).abs() < EPS,
+            "移动中冲刺应沿移动方向"
+        );
         // 冷却期内再按冲刺：不触发（无新无敌）
         state.player.dash_timer = 0.0;
         state.player.invuln = 0.0;
-        state.step(&ArenaInput { dash: true, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                dash: true,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         assert_eq!(state.player.invuln, 0.0, "冷却期内冲刺不应触发");
         // 冷却结束后（无输入）：沿朝向前方冲刺
         state.player.dash_cd = 0.0;
-        state.step(&ArenaInput { dash: true, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                dash: true,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         assert!(state.player.invuln > 0.0, "冷却结束应可再次冲刺");
         assert!(
             (state.player.dash_dir.length() - 1.0).abs() < EPS,
@@ -850,7 +1058,10 @@ mod tests {
             assert!(d < previous + 1e-6, "追击距离应单调递减：{previous} → {d}");
             previous = d;
         }
-        assert!(previous < 1.0, "2 s 追击（4.4 m）后应贴近玩家，实际 {previous}");
+        assert!(
+            previous < 1.0,
+            "2 s 追击（4.4 m）后应贴近玩家，实际 {previous}"
+        );
     }
 
     #[test]
@@ -864,7 +1075,11 @@ mod tests {
         // 推进间歇全程：下一波自动开始
         run(&mut state, ArenaInput::IDLE, BREATHER_TIME + 0.1, &[]);
         assert_eq!(state.wave, 2, "间歇结束应进入第 2 波");
-        assert_eq!(state.enemies.len(), (WAVE_BASE + WAVE_SCALE * 2) as usize, "第 2 波应为 7 只");
+        assert_eq!(
+            state.enemies.len(),
+            (WAVE_BASE + WAVE_SCALE * 2) as usize,
+            "第 2 波应为 7 只"
+        );
         assert_eq!(state.breather, 0.0);
         let want_speed = ENEMY_BASE_SPEED + ENEMY_SPEED_PER_WAVE;
         assert!(
@@ -900,11 +1115,19 @@ mod tests {
         let snapshot = (state.player.pos, state.score, state.wave);
         run(
             &mut state,
-            ArenaInput { move_x: 1.0, dash: true, ..ArenaInput::IDLE },
+            ArenaInput {
+                move_x: 1.0,
+                dash: true,
+                ..ArenaInput::IDLE
+            },
             1.0,
             &[],
         );
-        assert_eq!((state.player.pos, state.score, state.wave), snapshot, "终局应冻结");
+        assert_eq!(
+            (state.player.pos, state.score, state.wave),
+            snapshot,
+            "终局应冻结"
+        );
         assert_eq!(state.phase, Phase::GameOver);
     }
 
@@ -923,7 +1146,14 @@ mod tests {
             life: 1.0,
         });
         state.phase = Phase::GameOver;
-        state.step(&ArenaInput { restart: true, ..ArenaInput::IDLE }, DT, &[]);
+        state.step(
+            &ArenaInput {
+                restart: true,
+                ..ArenaInput::IDLE
+            },
+            DT,
+            &[],
+        );
         // 与「标题任意键开局」逐字段一致：完整复位（两条路径同一 restart）
         let fresh = started();
         assert_eq!(state.phase, fresh.phase);
@@ -932,7 +1162,12 @@ mod tests {
         assert!(state.projectiles.is_empty(), "弹道应清空");
         assert_eq!((state.wave, state.score, state.combo), (fresh.wave, 0, 0));
         assert_eq!(
-            (state.total_shots, state.total_hits, state.total_kills, state.total_damage),
+            (
+                state.total_shots,
+                state.total_hits,
+                state.total_kills,
+                state.total_damage
+            ),
             (0, 0, 0, 0),
             "事件计数应归零"
         );
@@ -944,8 +1179,16 @@ mod tests {
         let mut state = started();
         state.enemies.clear();
         // 一堵墙（XZ 矩形）+ 墙后的敌人
-        let statics = [(Vec3::new(5.0, 0.0, 0.0), StaticShape::Box { half_x: 0.5, half_z: 3.0 })];
-        state.enemies.push(enemy(900, Vec2::new(8.0, 0.0), ENEMY_MAX_HP));
+        let statics = [(
+            Vec3::new(5.0, 0.0, 0.0),
+            StaticShape::Box {
+                half_x: 0.5,
+                half_z: 3.0,
+            },
+        )];
+        state
+            .enemies
+            .push(enemy(900, Vec2::new(8.0, 0.0), ENEMY_MAX_HP));
         state.player.fire_timer = 0.0;
         state.step(&ArenaInput::IDLE, DT, &statics);
         assert_eq!(state.projectiles.len(), 1);
@@ -973,11 +1216,26 @@ mod tests {
     fn wall_blocks_player_with_tangential_slide() {
         let mut state = started();
         // +X 侧墙：内缘 x = 23.5（墙心 24、半边 0.5）
-        let statics = [(Vec3::new(24.0, 0.0, 0.0), StaticShape::Box { half_x: 0.5, half_z: ARENA })];
+        let statics = [(
+            Vec3::new(24.0, 0.0, 0.0),
+            StaticShape::Box {
+                half_x: 0.5,
+                half_z: ARENA,
+            },
+        )];
         state.player.pos = Vec2::new(23.0, 0.0);
         // 斜向推 1 s：法向被挡在 23.05 = 内缘 23.5 − 半径 0.45，
         // 切向持续滑行（推离只沿法线 = 贴墙滑行）
-        run(&mut state, ArenaInput { move_x: 1.0, move_z: 1.0, ..ArenaInput::IDLE }, 1.0, &statics);
+        run(
+            &mut state,
+            ArenaInput {
+                move_x: 1.0,
+                move_z: 1.0,
+                ..ArenaInput::IDLE
+            },
+            1.0,
+            &statics,
+        );
         let want_x = 23.5 - PLAYER_RADIUS;
         assert!(
             (state.player.pos.x - want_x).abs() <= 0.02,
@@ -1039,7 +1297,10 @@ mod tests {
         state.step(&ArenaInput::IDLE, DT, &[]);
         let wave1_max = *wave1_ids.iter().max().unwrap();
         for e in &state.enemies {
-            assert!(e.id > wave1_max, "第 2 波 id 应大于第 1 波全部 id（不复用）");
+            assert!(
+                e.id > wave1_max,
+                "第 2 波 id 应大于第 1 波全部 id（不复用）"
+            );
         }
     }
 
@@ -1048,24 +1309,74 @@ mod tests {
         // 混合场景：两面墙 + 圆柱 + 方柱 + 完整脚本（移动 / 冲刺 / 挨打 /
         // 击杀 / 过波）两遍推进，逐帧采样全部关键字段比对。
         let statics = [
-            (Vec3::new(24.0, 0.0, 0.0), StaticShape::Box { half_x: 0.5, half_z: ARENA }),
-            (Vec3::new(0.0, 0.0, -24.0), StaticShape::Box { half_x: ARENA, half_z: 0.5 }),
-            (Vec3::new(6.0, 0.0, 6.0), StaticShape::Sphere { radius: 0.7 }),
-            (Vec3::new(-8.0, 0.0, 4.0), StaticShape::Box { half_x: 0.7, half_z: 0.7 }),
+            (
+                Vec3::new(24.0, 0.0, 0.0),
+                StaticShape::Box {
+                    half_x: 0.5,
+                    half_z: ARENA,
+                },
+            ),
+            (
+                Vec3::new(0.0, 0.0, -24.0),
+                StaticShape::Box {
+                    half_x: ARENA,
+                    half_z: 0.5,
+                },
+            ),
+            (
+                Vec3::new(6.0, 0.0, 6.0),
+                StaticShape::Sphere { radius: 0.7 },
+            ),
+            (
+                Vec3::new(-8.0, 0.0, 4.0),
+                StaticShape::Box {
+                    half_x: 0.7,
+                    half_z: 0.7,
+                },
+            ),
         ];
         fn trace(statics: &[(Vec3, StaticShape)]) -> Vec<(Vec2, f32, u32, u32, u32, usize, usize)> {
             let mut state = ArenaState::new(ARENA);
-            state.step(&ArenaInput { confirm: true, ..ArenaInput::IDLE }, DT, statics);
+            state.step(
+                &ArenaInput {
+                    confirm: true,
+                    ..ArenaInput::IDLE
+                },
+                DT,
+                statics,
+            );
             // 玩家挪到出生环附近：几秒内必然接敌（脚本不是空转）
             state.player.pos = Vec2::new(16.0, 6.0);
             let script: [ArenaInput; 8] = [
-                ArenaInput { move_x: 1.0, move_z: 0.0, ..ArenaInput::IDLE },
-                ArenaInput { move_x: 0.4, move_z: -1.0, dash: true, ..ArenaInput::IDLE },
+                ArenaInput {
+                    move_x: 1.0,
+                    move_z: 0.0,
+                    ..ArenaInput::IDLE
+                },
+                ArenaInput {
+                    move_x: 0.4,
+                    move_z: -1.0,
+                    dash: true,
+                    ..ArenaInput::IDLE
+                },
                 ArenaInput::IDLE,
-                ArenaInput { move_x: -1.0, move_z: 0.3, ..ArenaInput::IDLE },
-                ArenaInput { move_x: 0.0, move_z: 1.0, dash: true, ..ArenaInput::IDLE },
+                ArenaInput {
+                    move_x: -1.0,
+                    move_z: 0.3,
+                    ..ArenaInput::IDLE
+                },
+                ArenaInput {
+                    move_x: 0.0,
+                    move_z: 1.0,
+                    dash: true,
+                    ..ArenaInput::IDLE
+                },
                 ArenaInput::IDLE,
-                ArenaInput { move_x: 0.7, move_z: -0.7, ..ArenaInput::IDLE },
+                ArenaInput {
+                    move_x: 0.7,
+                    move_z: -0.7,
+                    ..ArenaInput::IDLE
+                },
                 ArenaInput::IDLE,
             ];
             let mut samples = Vec::new();
@@ -1096,7 +1407,13 @@ mod tests {
         // 玩家离开了出发点（接触 / 移动确实发生了）；接触与击杀的语义已由
         // 上方专项测试覆盖
         assert!(trace_a.iter().any(|s| s.6 > 0), "脚本期间应有弹道在场");
-        let moved = trace_a.iter().map(|s| s.0.distance(Vec2::new(16.0, 6.0))).fold(0.0f32, f32::max);
-        assert!(moved > 0.5, "10 s 脚本后玩家应曾离开出发点，最大位移 {moved}");
+        let moved = trace_a
+            .iter()
+            .map(|s| s.0.distance(Vec2::new(16.0, 6.0)))
+            .fold(0.0f32, f32::max);
+        assert!(
+            moved > 0.5,
+            "10 s 脚本后玩家应曾离开出发点，最大位移 {moved}"
+        );
     }
 }

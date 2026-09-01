@@ -36,7 +36,7 @@ fn gameplay(world: &mut World) {
 | **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（包围球 × 归一化平面）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1` |
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
-| **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → O(n²) 检测 → 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」 |
+| **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → **均匀网格 broadphase 候选筛选**（BTreeMap 字典序 = 确定性；候选升序 + `j > i` 过滤使配对遍历序与 O(n²) 完全一致，bit 级确定性测试无需改动即守护等价性）→ 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」；**射线 / 线段查询**（`raycast` / `raycast_filtered` / `segment_hits_shape`——最近命中优先、`t` 并列取存储序先遍历者，线段扫掠判定防高速穿模）；**球扫掠 shapecast**（`sphere_sweep` / `sphere_sweep_statics`——保守推进二分求首次碰撞分数与阻挡法线，角色控制器地基） |
 | **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
 | **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
@@ -365,9 +365,12 @@ spawn 15 个蒙皮蠕虫实例（`spawn_gltf_instance` + `AnimationPlayer` 自�
 按逻辑侧稳定 id 取用 / 归还槽位，**零运行期 spawn / despawn**（池不超发由
 单测守护）；**根实体移动 × 蒙皮子树**——插件只写 glTF 根的
 Transform，关节子树随层级传播跟随、动画逐帧覆写关节旋转，两者在同一实体
-树上叠加；纯逻辑核心（`logic.rs`，只 glam、零引擎依赖、17 项单测含逐采样
+树上叠加；纯逻辑核心（`logic.rs`，只 glam、零引擎依赖、18 项单测含逐采样
 确定性）内置本地 XZ 静态推离（与引擎 `resolve_static_push` 水平投影语义
-近似、刻意解耦），插件层在 Startup 把场景 `Collider` 一次性转换为逻辑形状
+近似、刻意解耦）与弹道扫掠命中判定（本帧 `prev → pos` 线段对敌人 / 静态体
+测试，与引擎 `segment_hits_shape` 同款防穿模语义——弹速 × dt 步长可大于
+敌人直径，当帧点判定会漏检；含「每帧位移 > 敌人直径 2 倍仍 1 s 内命中」的
+穿模回归测试），插件层在 Startup 把场景 `Collider` 一次性转换为逻辑形状
 （Update 每帧零查询）；多游戏状态 Title / Playing / GameOver + 波次间歇；
 音效由逻辑侧单调事件计数器的前后差分触发（射击 / 命中 / 受伤 / 开波双音，
 全部程序化生成）。headless 集成测试（9 项）复用与窗口程序同一编排的插件
@@ -394,7 +397,7 @@ cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏�
 ## 测试
 
 ```sh
-cargo test --workspace   # 302 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 316 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -433,9 +436,17 @@ clamp 在挡）/ 贴墙滑行（法向被挡、切向持续滑行）**）、
 接触几何与反弹 / 摩擦均值的纯函数断言；自由落体对照 y(t)=h-½gt² 的 60Hz 离散
 容差、gravity_scale 缩放、e=0.8 回弹顶点 ≈ 初高×0.64 且逐次衰减、e=0 落地静止
 穿透 <1e-3 不抖、摩擦切向衰减对比、线性阻尼对照 v₀e^(-λt)、静态体 bit 级不动、
-双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、Time 缺席零步长；
+双世界逐采样 bit 级确定性、7 球堆叠两两不穿透、100 球密集阵求解后两两不重叠
+（broadphase 候选保守性回归）、Time 缺席零步长；
 静态推离查询：单墙推离量精确且只沿法线（切向保留）/ 正交双墙顺序累加 /
-空静态表恒等 / 世界封装跳过动态体并遵循静态缺席语义）**、
+空静态表恒等 / 世界封装跳过动态体并遵循静态缺席语义；
+射线与线段查询：球面命中 t/法线精确值 / 未命中与背面 / 球内起点 t=0 /
+盒面命中 / 盒内起点最浅出面 / 斜射角点法线取主轴 / 线段步长大于目标直径
+仍命中（穿模防护）/ 世界级最近命中优先 + filter 排除发射者 + max_t 裁剪 +
+空世界 None；球扫掠：畅通 None / 正碰 t 分数与法线精确 / 斜向滑过角点
+不误报 / 起点重叠 t=0 / 世界封装跳过动态体；均匀网格：插入查询往返 /
+负坐标 floor / 同输入两次 candidates 相等（BTreeMap 确定性）/ 确定性 LCG
+生成 ~200 AABB 的保守超集断言（凡真重叠对都出现在双方候选里））**、
 **场景序列化（最小场景与字段缺省值 = 引擎默认、未知字段容错、坏 JSON /
 缺 entities / 缺文件 → 错误枚举各归其位；实体段逐字段进组件（Name / Visibility /
 Transform 四元数 / 材质数值 / 点光 / 碰撞体 / 刚体）、静态体缺席语义、
@@ -497,6 +508,7 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] 实例缓冲 GPU 持久化与增量更新（帧级比对：静态场景零上传，动态实体仅传变化段）
 - [x] 物理与碰撞 v1（Sphere/AABB 刚体：积分 / 检测 / 响应 / 迭代松弛，纯函数确定性求解器）
 - [x] 场景序列化（JSON 双向：环境段 + 实体段 ↔ 世界实体，登记表驱动的资源来源往返）
+- [x] 物理查询 API（射线 / 线段 raycast + 球扫掠 shapecast）与均匀网格 broadphase（候选升序 + `j > i` ⇒ 配对遍历序与 O(n²) 完全一致，bit 级确定性不破坏）
 
 ### Web 端到端实测
 

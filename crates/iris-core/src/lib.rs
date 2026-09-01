@@ -14,6 +14,7 @@
 // 让 `#[derive(Component)]` 生成的 `::iris_core::...` 路径在本 crate 内部测试同样可用。
 extern crate self as iris_core;
 
+pub mod broadphase;
 pub mod component;
 pub mod entity;
 pub mod event;
@@ -39,11 +40,11 @@ pub mod prelude {
     pub use crate::component::Component;
     pub use crate::entity::Entity;
     pub use crate::event::{AppExit, Event, Events};
-    pub use crate::hierarchy::{propagate_transforms, ChildOf, Children, GlobalTransform};
+    pub use crate::hierarchy::{ChildOf, Children, GlobalTransform, propagate_transforms};
     // 跨平台时间点封装（wasm 上 std::time::Instant 会运行时 panic，见 instant.rs）
     pub use crate::instant::Instant;
     pub use crate::name::Name;
-    pub use crate::physics::{PHYSICS_GRAVITY, Collider, ColliderShape, RigidBody, step_physics};
+    pub use crate::physics::{Collider, ColliderShape, PHYSICS_GRAVITY, RigidBody, step_physics};
     pub use crate::query::QueryPart;
     pub use crate::resource::Resource;
     pub use crate::schedule::{Access, Schedule, Stage, System};
