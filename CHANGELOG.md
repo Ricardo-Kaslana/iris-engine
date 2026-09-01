@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+### Added（R23：透明渲染——alpha 混合材质 + 视深排序透明 pass）
+
+- **材质透明模式**（`iris-render/material.rs`）：`AlphaMode { Opaque, Blend }`
+  （`Default = Opaque`）；`MaterialDef` 新增 `alpha_mode` 字段（旧构造路径
+  与既有示例不受影响）；玻璃类构造辅助 `MaterialDef::glass(r, g, b, a)`
+  （alpha 混合 + 低粗糙度绝缘体，混合系数取 `base_color.a`）。
+- **管线变体**（`iris-render/pipeline.rs`）：透明普通 + 透明蒙皮两条管线，
+  与不透明变体共用同一份 WGSL / 顶点布局 / 背面剔除 / 深度格式，仅两点
+  不同——`BlendState::ALPHA_BLENDING`（`src α, 1 − src α`，α = 着色器输出
+  alpha）+ 深度**测试开（Less）、写入关**：写入会把深度序更远但尚未绘制
+  的透明面错误裁掉（共面透明对必然丢失其一），只测不写则透明仍被不透明
+  几何正确遮挡。
+- **收集与排序**（`iris-render/renderer.rs`）：`collect_instances` 按材质
+  `alpha_mode` 分区——不透明路径语义完全不变；透明实例区间追加在全部
+  不透明之后（实例缓冲 `[不透明普通 | 不透明蒙皮 | 透明普通 | 透明蒙皮]`）。
+  透明项按**视深降序（远 → 近，back-to-front）**排序：深度 = 包围球中心
+  经视图矩阵后的 `-z`（无 bounds 回退模型平移列；透明蒙皮取关节变换并集
+  AABB 中心），深度并列按实体 bits 升序（比较器全序，结果与查询顺序
+  无关）；深度序中相邻同 (网格, 材质) 键合并为 run 批。无透明实例时
+  透明 pass 整体跳过（零开销）。
+- **透明 pass**：位于不透明主 pass 之后、泛光 / 色调映射之前，写同一
+  HDR MSAA 目标（`LoadOp::Load` 继续混合）——透明参与 HDR / 泛光 /
+  ACES；深度附件同样 Load，保留不透明遮挡（主 pass 深度附件因此从
+  `Discard` 改 `Store`——`Discard` 后附件内容未定义，DX12 实测透明整体
+  消失，教训见 ARCHITECTURE §4.16）。**透明不进方向光 / 点光阴影 pass**
+  （收集期分区排除）；视锥剔除与 FrameStats 对透明同样生效
+  （instances / culled / triangles 口径含透明）。
+- **接入**：glTF 材质 `alphaMode: "BLEND"` → `Blend`（`"MASK"` 需 alpha
+  cutoff，v1 按不透明处理）；场景 JSON 材质段新增 `alpha_mode` 字段，
+  旧场景缺席反序列化为 `Opaque`（向后兼容），不透明序列化省略（旧文件
+  重存字节级不变）。
+- **测试**（GPU 集成 `transparent_render.rs` + CPU 单测）：混合正确性
+  （自发光材质使 HDR 合成值可解析断言，参考渲染法）、排序正确性（远蓝 /
+  中绿 / 近红三层 α=0.5 合成 = `(αE, α²E, α³E)`，顺序颠倒 r/b 通道互换
+  必挂）、深度写关（透过近板见后方不透明物与更远透明板；共面透明对
+  两块都必须参与混合）、不投影（透明版开 / 关阴影差分 ≈ 0 + 不透明对照
+  版差分成片排除假阴性）、run 合批（FrameStats 断言）、分区与视深排序
+  CPU 单测（renderer.rs）、旧场景兼容与 Blend 往返（scene.rs）。无 GPU
+  环境优雅跳过。验收图 `docs/transparent.png`（`transparent_snapshot`
+  示例：玻璃罩内核 + 三色板纵深混合）。
+- **文档**：ARCHITECTURE §4.16 透明渲染小节（分区 / 排序 / 深度写关 /
+  不投影语义），§4.1 帧流程、§4.4.1 FrameStats 口径、§4.7 阴影、§8
+  已知限制同步；README 渲染特性行与示例列表补透明渲染。
+
 ### Added（R22：蒙皮保守视锥剔除 + FrameStats 统计扩展 + culling_bench 基准）
 
 - **蒙皮实例保守视锥剔除**（`iris-render/renderer.rs` `collect_instances`）：

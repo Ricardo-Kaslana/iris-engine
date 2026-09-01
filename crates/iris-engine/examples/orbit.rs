@@ -35,6 +35,7 @@ fn setup(world: &mut World) {
         metallic: 0.0,
         roughness: 0.5,
         texture: TextureHandle(0),
+        ..Default::default()
     });
     let mut sun_transform = Transform::IDENTITY;
     sun_transform.scale = Vec3::splat(2.0);

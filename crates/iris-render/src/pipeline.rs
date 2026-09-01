@@ -9,12 +9,16 @@ pub const POINT_SHADOW_MAP_SIZE: u32 = 512;
 /// HDR 中间缓冲格式（线性、单采样，供色调映射 pass 采样）。
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// 主管线、蒙皮管线、阴影管线（常规 + 蒙皮变体）、天空盒、泛光管线
-/// （提取 + 模糊）与色调映射管线，以及全部绑定组布局。
+/// 主管线、蒙皮管线、透明管线（常规 + 蒙皮变体）、阴影管线（常规 + 蒙皮
+/// 变体）、天空盒、泛光管线（提取 + 模糊）与色调映射管线，以及全部绑定组布局。
 pub(crate) struct PipelineBundle {
     pub pipeline: wgpu::RenderPipeline,
     /// 蒙皮变体：顶点多一路蒙皮缓冲，组 2 绑定关节矩阵 storage。
     pub skinned_pipeline: wgpu::RenderPipeline,
+    /// 透明变体：alpha 混合 + 深度只测不写（透明 pass，见 renderer.rs）。
+    pub transparent_pipeline: wgpu::RenderPipeline,
+    /// 透明蒙皮变体：组 2 绑定关节矩阵，混合语义同上。
+    pub transparent_skinned_pipeline: wgpu::RenderPipeline,
     pub sky_pipeline: wgpu::RenderPipeline,
     pub shadow_pipeline: wgpu::RenderPipeline,
     /// 阴影蒙皮变体（组 1 绑定关节矩阵，保证阴影随骨骼变形）。
@@ -198,52 +202,7 @@ pub(crate) fn create_pipeline(
         immediate_size: 0,
     });
 
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("iris.pipeline.standard"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[
-                Some(crate::mesh::Vertex::LAYOUT),
-                Some(crate::instance::InstanceRaw::LAYOUT),
-            ],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            // 场景渲染到线性 HDR 中间缓冲（色调映射在 blit 完成）
-            targets: &[Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
-            front_face: wgpu::FrontFace::Ccw,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: sample_count,
-            ..Default::default()
-        },
-        multiview_mask: None,
-        cache: None,
-    });
-
-    // 蒙皮主管线：顶点输入 = [常规顶点, 蒙皮属性, 实例]，
-    // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
+    // 蒙皮管线布局：组 2 多绑关节矩阵 storage（顶点着色器 vs_skinned）。
     let skinned_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("iris.skinned.pipeline.layout"),
         bind_group_layouts: &[
@@ -253,49 +212,112 @@ pub(crate) fn create_pipeline(
         ],
         immediate_size: 0,
     });
-    let skinned_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("iris.pipeline.skinned"),
-        layout: Some(&skinned_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_skinned"),
-            compilation_options: Default::default(),
-            buffers: &[
+
+    // 主 pass 几何管线族构造：不透明 / 透明 × 普通 / 蒙皮共四条，顶点布局、
+    // 拓扑（背面剔除 Ccw/Cull Back）、深度格式与绑定组全部一致，只有
+    // 混合状态与深度写入按变体区分——
+    // - 不透明：REPLACE + 深度写入（Less）；
+    // - 透明：`ALPHA_BLENDING`（src α, 1 − src α，与 UI 管线一致）+
+    //   深度只测不写（Less 测试保留、写入关闭）——写入会让后画的远透明面
+    //   被先画的近透明面错误裁掉（共面透明对必然丢失其一），只测不写则
+    //   透明仍被不透明几何正确遮挡。
+    let make_mesh_pipeline = |label: &'static str,
+                              entry_point: &'static str,
+                              layout: &wgpu::PipelineLayout,
+                              skinned: bool,
+                              blend: wgpu::BlendState,
+                              depth_write: bool|
+     -> wgpu::RenderPipeline {
+        let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
+            &[
                 Some(crate::mesh::Vertex::LAYOUT),
                 Some(crate::mesh::SkinVertex::LAYOUT),
                 Some(crate::instance::InstanceRaw::LAYOUT),
-            ],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
-            front_face: wgpu::FrontFace::Ccw,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: sample_count,
-            ..Default::default()
-        },
-        multiview_mask: None,
-        cache: None,
-    });
+            ]
+        } else {
+            &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ]
+        };
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                // 场景渲染到线性 HDR 中间缓冲（色调映射在 blit 完成）
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+
+    let pipeline = make_mesh_pipeline(
+        "iris.pipeline.standard",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::REPLACE,
+        true,
+    );
+    // 蒙皮主管线：顶点输入 = [常规顶点, 蒙皮属性, 实例]，
+    // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
+    let skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::REPLACE,
+        true,
+    );
+    // 透明变体（普通 + 蒙皮）：alpha 混合 + 深度只测不写，
+    // 绘制在不透明主 pass 之后、按视深降序（见 renderer.rs 透明 pass）。
+    let transparent_pipeline = make_mesh_pipeline(
+        "iris.pipeline.transparent",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+    );
+    let transparent_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.transparent_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+    );
 
     // 天空盒：全屏三角形按像素射线采样预滤波环境贴图 0 级 mip（= 原始天空）。
     // 主 pass 内最先绘制；深度只测不写（Always + write false），几何体随后覆盖。
@@ -810,6 +832,8 @@ pub(crate) fn create_pipeline(
     PipelineBundle {
         pipeline,
         skinned_pipeline,
+        transparent_pipeline,
+        transparent_skinned_pipeline,
         sky_pipeline,
         shadow_pipeline,
         skinned_shadow_pipeline,

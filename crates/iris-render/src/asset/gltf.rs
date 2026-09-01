@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use super::base64;
 use crate::animation::{AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath};
-use crate::material::{MaterialDef, MaterialHandle, MaterialStore};
+use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
 use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex};
 use crate::skin::{Skin, mat4_list_from_flat};
 use crate::texture::{CpuTexture, TextureHandle, TextureStore};
@@ -161,6 +161,11 @@ struct GltfMaterial {
     pbr_metallic_roughness: Option<GltfPbr>,
     #[serde(default)]
     emissive_factor: [f32; 3],
+    /// glTF `alphaMode`：`"OPAQUE"`（默认）/ `"MASK"` / `"BLEND"`。
+    /// `"BLEND"` 映射 [`AlphaMode::Blend`]（透明 pass）；`"MASK"` 需要
+    /// alpha cutoff 逐像素裁剪，v1 按不透明处理（与数值直通约定一致）。
+    #[serde(default)]
+    alpha_mode: String,
 }
 
 impl GltfMaterial {
@@ -751,6 +756,12 @@ impl GltfLoader {
                     metallic: pbr.metallic_factor.clamp(0.0, 1.0),
                     roughness: pbr.roughness_factor.clamp(0.0, 1.0),
                     texture,
+                    // alphaMode "BLEND" → 透明 pass；OPAQUE / MASK（v1）→ 不透明
+                    alpha_mode: if mat.alpha_mode.eq_ignore_ascii_case("BLEND") {
+                        AlphaMode::Blend
+                    } else {
+                        AlphaMode::Opaque
+                    },
                 }
             }
         };

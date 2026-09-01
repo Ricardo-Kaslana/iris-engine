@@ -22,7 +22,8 @@
 //!       "mesh":    { "primitive": { "kind": "cube" } },   // 三态之一（见下）
 //!       "material": { "color": [0.8,0.2,0.1,1], "metallic": 0.0,
 //!                     "roughness": 0.5, "emissive": [0,0,0],
-//!                     "texture": "assets/tex.png" },      // 全可选
+//!                     "texture": "assets/tex.png",
+//!                     "alpha_mode": "Blend" },       // 全可选；缺省 Opaque
 //!       "point_light": { "color": [1,1,1], "intensity": 20, "range": 30,
 //!                        "shadows": false },
 //!       "collider":  { "shape": { "sphere": { "radius": 0.5 } },
@@ -92,8 +93,9 @@ use iris_core::prelude::{Entity, Quat, Transform, Vec3, World};
 use iris_core::{Component, Resource};
 use iris_render::asset::{GltfError, HdrError, load_hdr, spawn_gltf_instance};
 use iris_render::prelude::{
-    CpuTexture, DirectionalLight, MaterialDef, MaterialHandle, MaterialStore, MeshData, MeshHandle,
-    MeshStore, PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore, Visibility,
+    AlphaMode, CpuTexture, DirectionalLight, MaterialDef, MaterialHandle, MaterialStore, MeshData,
+    MeshHandle, MeshStore, PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore,
+    Visibility,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -448,7 +450,9 @@ impl PrimitiveSection {
 }
 
 /// 材质段：全缺省 = [`MaterialDef::default`]。`emissive` 为 RGB 三元组
-/// （引擎侧 alpha 恒为 1.0）；`texture` 为场景文件内的相对路径（PNG / JPEG）。
+/// （引擎侧 alpha 恒为 1.0）；`texture` 为场景文件内的相对路径（PNG / JPEG）；
+/// `alpha_mode` 缺省 = `Opaque`（R23 之前的旧场景文件没有该字段，
+/// 反序列化回退不透明——向后兼容）；`Blend` 走透明 pass（R23）。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 struct MaterialSection {
@@ -457,6 +461,9 @@ struct MaterialSection {
     roughness: f32,
     emissive: [f32; 3],
     texture: Option<String>,
+    /// 序列化省略不透明（旧场景文件往返字节级不变，见下方断言函数）。
+    #[serde(skip_serializing_if = "alpha_mode_is_opaque")]
+    alpha_mode: AlphaMode,
 }
 
 impl Default for MaterialSection {
@@ -467,8 +474,15 @@ impl Default for MaterialSection {
             roughness: 0.5,
             emissive: [0.0; 3],
             texture: None,
+            alpha_mode: AlphaMode::Opaque,
         }
     }
+}
+
+/// `alpha_mode` 序列化省略条件：不透明（与引擎默认一致）。
+/// 旧场景（无该字段）重存后文件保持不含该字段（往返字节级稳定）。
+fn alpha_mode_is_opaque(mode: &AlphaMode) -> bool {
+    matches!(mode, AlphaMode::Opaque)
 }
 
 impl MaterialSection {
@@ -479,6 +493,7 @@ impl MaterialSection {
             metallic: self.metallic,
             roughness: self.roughness,
             texture,
+            alpha_mode: self.alpha_mode,
         }
     }
 
@@ -489,6 +504,7 @@ impl MaterialSection {
             roughness: def.roughness,
             emissive: [def.emissive[0], def.emissive[1], def.emissive[2]],
             texture,
+            alpha_mode: def.alpha_mode,
         }
     }
 }
@@ -1855,6 +1871,73 @@ mod tests {
             doc.entities.unwrap()[0].material.is_none(),
             "句柄 0 整段省略"
         );
+    }
+
+    /// 材质 alpha_mode 序列化（R23）：旧场景文件（无该字段）加载回退
+    /// `Opaque`；显式 `"Blend"` 加载为 `Blend` 且 save ↔ load 往返保持；
+    /// 不透明材质 save 时省略该字段（旧文件重存字节级不变）。
+    #[test]
+    fn alpha_mode_legacy_default_and_blend_roundtrip() {
+        // 旧格式：无 alpha_mode 字段 → Opaque
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "legacy_opaque.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [0.8, 0.2, 0.1, 1.0] }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.alpha_mode, AlphaMode::Opaque, "旧文件缺字段 = Opaque");
+        // 重存：字段应被省略（与旧格式字节级一致）
+        let out = test_dir().join("legacy_opaque_out.json");
+        save_scene(&mut world, &out).expect("保存旧格式场景");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            !text.contains("alpha_mode"),
+            "不透明材质 save 省略 alpha_mode，旧文件重存保持字节级稳定"
+        );
+
+        // 新格式：显式 Blend → 加载为 Blend，且 save → load 往返保持
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "blend_mat.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [0.6, 0.8, 1.0, 0.4], "alpha_mode": "Blend" }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.alpha_mode, AlphaMode::Blend);
+        assert_eq!(def.base_color, [0.6, 0.8, 1.0, 0.4]);
+        let out_a = test_dir().join("blend_mat_out_a.json");
+        save_scene(&mut world, &out_a).expect("保存 Blend 场景");
+        let text = std::fs::read_to_string(&out_a).unwrap();
+        assert!(text.contains(r#""alpha_mode": "Blend""#), "Blend 必须写出");
+
+        // 二次加载：往返后材质仍为 Blend（load(save(load(f))) 语义等价）
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out_a).expect("二次加载");
+        let handle_b = *world_b.get::<MaterialHandle>(entities_b[0]).unwrap();
+        let def_b = world_b
+            .resource::<MaterialStore>()
+            .get(handle_b)
+            .unwrap()
+            .clone();
+        assert_eq!(def_b.alpha_mode, AlphaMode::Blend, "往返后仍为 Blend");
+        assert_eq!(def_b.base_color, [0.6, 0.8, 1.0, 0.4]);
     }
 
     /// 错误 Display 风格与 GltfError 一致（含上下文、可作 dyn Error）。

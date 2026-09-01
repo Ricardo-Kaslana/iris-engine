@@ -20,7 +20,7 @@ use crate::context::Gpu;
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
 use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight};
-use crate::material::{MaterialHandle, MaterialStore};
+use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
 use crate::mesh::{MeshHandle, MeshStore, upload_mesh};
 use crate::pipeline::create_pipeline;
 use crate::skin::Skin;
@@ -116,6 +116,25 @@ struct SkinnedItem {
     joint_matrices: Vec<glam::Mat4>,
 }
 
+/// 一帧内收集到的透明绘制项：不透明项额外携带视深排序键。
+/// 排序 = 视深降序（远 → 近）+ 实体 bits 升序并列断言（见 `draw`）。
+struct TransparentItem {
+    /// (网格, 材质) 批键，与不透明 `DrawItem::key` 同构；
+    /// 深度序中相邻同 key 的项合并为一个 run 批绘制。
+    key: u64,
+    /// 视深：包围球中心经视图矩阵变换后的 -z（相机前方为正，越大越远）。
+    depth: f32,
+    /// 实体位标识（深度并列时的确定性次序）。
+    entity: u64,
+    instance: InstanceRaw,
+}
+
+/// 透明蒙皮绘制项：不透明蒙皮项 + 视深排序键（透明排序语义同上）。
+struct TransparentSkinnedItem {
+    skinned: SkinnedItem,
+    depth: f32,
+}
+
 struct GpuTexture {
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -199,6 +218,9 @@ pub struct Renderer {
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
     skinned_scratch: Vec<SkinnedItem>,
+    /// 透明项收集暂存（普通 + 蒙皮，跨帧复用）。
+    transparent_scratch: Vec<TransparentItem>,
+    transparent_skinned_scratch: Vec<TransparentSkinnedItem>,
     /// UI 顶点组装暂存（跨帧复用，避免每帧堆分配）。
     ui_scratch: Vec<crate::ui::UiVertex>,
     clear_color: wgpu::Color,
@@ -260,24 +282,25 @@ const _: () = assert!(
     "UiGlobals 必须与 WGSL 布局一致"
 );
 
-/// 单帧渲染统计。除注明外均为**主 pass 口径**：UI pass 只计入
-/// `draw_calls` 的单批，阴影 pass（复用主 pass 实例区间，见 §4.1）与
-/// 天空 / 后处理 pass 全部不计。
+/// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass + 透明 pass，
+/// 见 ARCHITECTURE §4.16）：UI pass 只计入 `draw_calls` 的单批，阴影 pass
+/// （复用不透明实例区间，透明项不进阴影）与天空 / 后处理 pass 全部不计。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
-    /// 主 pass draw call 数：普通批每批 1 + 蒙皮每实体 1 + UI 顶点非空时 1。
+    /// 主几何 draw call 数：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 +
+    /// 透明蒙皮每实体 1 + UI 顶点非空时 1。
     pub draw_calls: u32,
-    /// 主 pass 提交的实例数（可见实例，普通 + 蒙皮合计）。
+    /// 主几何提交的实例数（可见实例，普通 + 蒙皮 + 透明普通 + 透明蒙皮合计）。
     pub instances: u32,
     /// 本帧实例缓冲实际 `write_buffer` 的字节数。0 = 与上一帧逐实例比对
     /// 完全一致、整帧跳过实例上传（静态场景零上传）。
     pub instance_upload_bytes: u64,
-    /// 本帧被视锥剔除的实例数（普通 + 蒙皮合计）。`Visibility::HIDDEN`
+    /// 本帧被视锥剔除的实例数（普通 + 蒙皮 + 透明合计）。`Visibility::HIDDEN`
     /// 的过滤不算剔除（不进入 `instances` 也不进入本字段）。
     pub culled_instances: u32,
-    /// 主 pass 实际提交的三角形总数：可见项的网格索引数 / 3 累加（普通批
-    /// × 批实例数，蒙皮逐项）。**主 pass 口径**——不含 UI pass 与阴影 pass
-    /// （阴影 pass 复用主 pass 实例区间，几何与主 pass 完全一致）。
+    /// 主几何实际提交的三角形总数：可见项的网格索引数 / 3 累加（普通批
+    /// × 批实例数，蒙皮逐项；透明同口径计入）。**主几何口径**——不含 UI
+    /// pass 与阴影 pass（阴影 pass 只复用不透明实例区间，透明项不投影）。
     pub triangles_drawn: u32,
 }
 
@@ -385,33 +408,110 @@ fn build_globals_bind_group(
     })
 }
 
-/// `collect_instances` 的收集结果（普通 + 蒙皮合计）。
+/// `collect_instances` 的收集结果（普通 + 蒙皮 + 透明合计）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CollectCounts {
-    /// 进入本帧绘制的实例数（`items.len() + skinned.len()`）。
+    /// 进入本帧绘制的实例数（四个列表长度合计）。
     visible: usize,
     /// 被视锥剔除的实例数。
     culled: u32,
 }
 
-/// 收集本帧待绘制实例：普通批处理项 + 蒙皮项（每实体一项，不参与批处理）。
+/// 材质的透明模式（目录缺席按 `Opaque`——0 号默认材质即不透明）。
+fn alpha_of(materials: &MaterialStore, handle: MaterialHandle) -> AlphaMode {
+    materials
+        .get(handle)
+        .map(|def| def.alpha_mode)
+        .unwrap_or(AlphaMode::Opaque)
+}
+
+/// 透明排序视深：网格包围球中心（无 bounds 时回退模型平移列）经视图
+/// 矩阵变换后的 -z（相机前方为正，值越大离相机越远）。包围球中心是
+/// 排序启发式——逐像素排序不可行，中心视深对凸体与薄板是精确序。
+fn view_depth(view: &Mat4, mesh_store: &MeshStore, mesh: MeshHandle, model: Mat4) -> f32 {
+    let center_world = match mesh_store.get(mesh).and_then(|data| data.bounds()) {
+        Some((min, max)) => model.transform_point3((Vec3::from(min) + Vec3::from(max)) * 0.5),
+        // 无 CPU 包围盒数据：退回模型平移列（实例原点的视深）
+        None => model.w_axis.truncate(),
+    };
+    -view.transform_point3(center_world).z
+}
+
+/// 蒙皮几何的保守世界 AABB（R22）：绑定姿势 AABB 的 8 个角点经**每个**
+/// 关节矩阵 Jᵢ 变换到当前网格局部、再经实例 model 矩阵到世界
+/// （world = model·Jᵢ·corner）后的并集。`None` = 网格无 CPU 数据 /
+/// 空包围盒（不剔除、视深退回模型平移列）。
 ///
-/// [`crate::visibility::Visibility`] 过滤在全部收集路径生效（主 pass、
-/// 方向光阴影与点光阴影 pass 共用同一份实例区间）：挂 `HIDDEN` 的实体
-/// 跳过，组件缺席视为可见（默认行为零变化）。普通实体做包围球视锥剔除；
-/// 蒙皮实体做**保守并集 AABB 视锥剔除**（见下方蒙皮路径注释）。返回
-/// 可见 / 被剔除的实例数（日志与 `FrameStats` 用）；排序由调用方在
-/// `items` 上完成。
+/// 数学正确性（保守性保证）：LBS 顶点 v′ = model·(Σᵢ wᵢ·Jᵢ·v)，权重
+/// 非负且和为 1（加载时归一化）——蒙皮后的顶点落在各刚体变换结果
+/// { Jᵢ·v } 的**凸组合**内；凸组合必属于各结果的凸包，而凸包又含于
+/// 「逐关节变换后 8 角点并集的 AABB」（Jᵢ 仿射，绑定 AABB 的像必落在
+/// 其变换后角点的包围盒内）。故该世界 AABB 是蒙皮几何的**保守上界**：
+/// 据此剔除只可能多画、不可能漏画。误用绑定姿势包围盒会在关节把几何
+/// 移出原位时误杀（回归测试
+/// `culling_render.rs::skinned_culling_tracks_joint_transformed_geometry`）。
+/// 规模：每蒙皮实例额外 关节数 × 8 次点变换 + 一次 AABB 相交测试
+/// （Arena 15 只蠕虫 × ~5 关节量级，CPU 开销可忽略）。
+fn skin_world_aabb(
+    mesh_store: &MeshStore,
+    mesh: MeshHandle,
+    model: &Mat4,
+    joints: &[glam::Mat4],
+) -> Option<(Vec3, Vec3)> {
+    let (min, max) = mesh_store.get(mesh).and_then(|data| data.bounds())?;
+    let min = Vec3::from(min);
+    let max = Vec3::from(max);
+    let mut world_min = Vec3::splat(f32::INFINITY);
+    let mut world_max = Vec3::splat(f32::NEG_INFINITY);
+    for corner in 0..8u32 {
+        let corner = Vec3::new(
+            if corner & 1 != 0 { max.x } else { min.x },
+            if corner & 2 != 0 { max.y } else { min.y },
+            if corner & 4 != 0 { max.z } else { min.z },
+        );
+        for joint in joints {
+            let world = model.transform_point3(joint.transform_point3(corner));
+            world_min = world_min.min(world);
+            world_max = world_max.max(world);
+        }
+    }
+    Some((world_min, world_max))
+}
+
+/// 收集本帧待绘制实例，并按材质 `alpha_mode` 分区：
+/// - 不透明项 → `items`（(网格, 材质) 键排序成批）与 `skinned`（每实体
+///   一项）——语义与透明支持之前完全一致；
+/// - 透明项（`AlphaMode::Blend`）→ `transparent` / `transparent_skinned`，
+///   由调用方按**视深降序（远 → 近）**排序后在独立透明 pass 绘制。
+///
+/// **透明不进阴影**：方向光与点光阴影 pass 只遍历 `items` / `skinned`，
+/// 收集期分区天然排除透明项——半透明几何不应在地面上投出实心黑影
+/// （alpha 混合几何的阴影贡献需要分离投影，v1 不做）。
+///
+/// [`crate::visibility::Visibility`] 过滤在全部收集路径生效；普通实体做
+/// 包围球视锥剔除；蒙皮实体做**保守并集 AABB 视锥剔除**（见
+/// `skin_world_aabb`）。视锥剔除与剔除计数对透明同样生效。返回可见 /
+/// 被剔除的实例数（日志与 `FrameStats` 用）；排序由调用方完成。
+// 四个输出列表各自类型不同、语义独立（跨帧复用的 scratch 缓冲逐个传入），
+// 收拢成结构体反而多一层拆装；参数多但全为引用/裸缓冲，与 scene.rs
+// `build_entity_section` 同理豁免。
+#[allow(clippy::too_many_arguments)]
 fn collect_instances(
     world: &iris_core::world::World,
     mesh_store: &MeshStore,
+    material_store: &MaterialStore,
+    view: &Mat4,
     frustum: &Frustum,
     items: &mut Vec<DrawItem>,
     skinned: &mut Vec<SkinnedItem>,
+    transparent: &mut Vec<TransparentItem>,
+    transparent_skinned: &mut Vec<TransparentSkinnedItem>,
 ) -> CollectCounts {
     use crate::visibility::Visibility;
     items.clear();
     skinned.clear();
+    transparent.clear();
+    transparent_skinned.clear();
     let mut culled = 0u32;
     // 全部蒙皮实体位标识（含被剔除的）：普通路径据此跳过，避免同实体
     // 被两条路径重复处理（剔除计数 / 绘制都只算一次）
@@ -419,8 +519,10 @@ fn collect_instances(
 
     // 蒙皮实体独立收集：关节矩阵在此即时计算（J = inv(mesh) ×
     // global(joint) × ibm，蒙皮定义在网格局部空间，随父级整体移动）。
-    // 视锥剔除用「关节矩阵变换后的角点并集 AABB」（保守界，见函数内注释）；
-    // 网格无 CPU 数据 / 空包围盒时退化为不剔除（宁可多画）。
+    // 视锥剔除用「关节矩阵变换后的角点并集 AABB」（保守界，见
+    // `skin_world_aabb` 的凸组合论证）；网格无 CPU 数据 / 空包围盒时
+    // 退化为不剔除（宁可多画）。透明蒙皮的视深取该并集 AABB 的中心
+    // （跟随骨骼实际位移，比绑定姿势中心更接近真实视深）。
     world.query::<(
         iris_core::prelude::Entity,
         &GlobalTransform,
@@ -435,57 +537,29 @@ fn collect_instances(
         skinned_entities.insert(e.to_bits());
         let mut joint_matrices = Vec::with_capacity(skin.joints.len());
         skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
-        // 蒙皮保守视锥剔除（R22）：
-        //
-        // 取绑定姿势 AABB 的 8 个角点，经**每个**关节矩阵 Jᵢ 变换到当前
-        // 网格局部、再经实例 model 矩阵到世界（world = model·Jᵢ·corner），
-        // 全部（关节数 × 8）点的并集 AABB 与视锥做 intersects_aabb 测试。
-        //
-        // 数学正确性（本方案成立的核心）：LBS 顶点 v′ = model·(Σᵢ wᵢ·Jᵢ·v)，
-        // 权重非负且和为 1（加载时归一化）——蒙皮后的顶点落在各刚体变换
-        // 结果 { Jᵢ·v } 的**凸组合**内；凸组合必属于各结果的凸包，而凸包
-        // 又含于「逐关节变换后的 8 角点并集的 AABB」（Jᵢ 仿射，绑定 AABB
-        // 的像必落在变换后角点的包围盒内）。故该世界 AABB 是蒙皮几何的
-        // **保守上界**：据此剔除只可能多画、不可能漏画。误用绑定姿势
-        // 包围盒剔除会在关节把几何移出原位时误杀（回归测试
-        // culling_render.rs::skinned_culling_tracks_joint_transformed_geometry）。
-        //
-        // 规模：每蒙皮实例额外 关节数 × 8 次点变换 + 一次 AABB 相交测试
-        // （Arena 15 只蠕虫 × ~5 关节量级，CPU 开销可忽略）。
-        let culled_now = mesh_store
-            .get(*m)
-            .and_then(|data| data.bounds())
-            .is_some_and(|(min, max)| {
-                let min = Vec3::from(min);
-                let max = Vec3::from(max);
-                let model = gt.matrix();
-                let mut world_min = Vec3::splat(f32::INFINITY);
-                let mut world_max = Vec3::splat(f32::NEG_INFINITY);
-                for corner in 0..8u32 {
-                    let corner = Vec3::new(
-                        if corner & 1 != 0 { max.x } else { min.x },
-                        if corner & 2 != 0 { max.y } else { min.y },
-                        if corner & 4 != 0 { max.z } else { min.z },
-                    );
-                    for joint in &joint_matrices {
-                        let world = model.transform_point3(joint.transform_point3(corner));
-                        world_min = world_min.min(world);
-                        world_max = world_max.max(world);
-                    }
-                }
-                !frustum.intersects_aabb(world_min, world_max)
-            });
-        if culled_now {
+        let model = gt.matrix();
+        let world_aabb = skin_world_aabb(mesh_store, *m, &model, &joint_matrices);
+        if world_aabb.is_some_and(|(min, max)| !frustum.intersects_aabb(min, max)) {
             culled += 1;
             return;
         }
-        skinned.push(SkinnedItem {
+        let item = SkinnedItem {
             skin_entity: e.to_bits(),
             mesh: m.0,
             material: mat.0,
-            instance: InstanceRaw::from_matrix(gt.matrix()),
+            instance: InstanceRaw::from_matrix(model),
             joint_matrices,
-        });
+        };
+        if alpha_of(material_store, *mat) == AlphaMode::Blend {
+            let center_world =
+                world_aabb.map_or(model.w_axis.truncate(), |(min, max)| (min + max) * 0.5);
+            transparent_skinned.push(TransparentSkinnedItem {
+                depth: -view.transform_point3(center_world).z,
+                skinned: item,
+            });
+        } else {
+            skinned.push(item);
+        }
     });
 
     world.query::<(
@@ -526,13 +600,22 @@ fn collect_instances(
             return;
         }
         let key = ((m.0 as u64) << 32) | mat.0 as u64;
-        items.push(DrawItem {
-            key,
-            instance: InstanceRaw::from_matrix(model),
-        });
+        if alpha_of(material_store, *mat) == AlphaMode::Blend {
+            transparent.push(TransparentItem {
+                key,
+                depth: view_depth(view, mesh_store, *m, model),
+                entity: e.to_bits(),
+                instance: InstanceRaw::from_matrix(model),
+            });
+        } else {
+            items.push(DrawItem {
+                key,
+                instance: InstanceRaw::from_matrix(model),
+            });
+        }
     });
     CollectCounts {
-        visible: items.len() + skinned.len(),
+        visible: items.len() + skinned.len() + transparent.len() + transparent_skinned.len(),
         culled,
     }
 }
@@ -822,6 +905,8 @@ impl Renderer {
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
             skinned_scratch: Vec::new(),
+            transparent_scratch: Vec::new(),
+            transparent_skinned_scratch: Vec::new(),
             ui_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
@@ -1186,17 +1271,49 @@ impl Renderer {
             .queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        // 2. 收集实例（ECS 查询 -> Visibility 过滤 + 视锥剔除 -> 排序成批）
+        // 2. 收集实例（ECS 查询 -> Visibility 过滤 + 视锥剔除 + alpha 分区
+        //    -> 排序：不透明按 (网格, 材质) 键，透明按视深降序）
         let frustum = Frustum::from_view_proj(&vp);
         let mut items = std::mem::take(&mut self.scratch);
         let mut skinned = std::mem::take(&mut self.skinned_scratch);
-        let counts = collect_instances(world, &mesh_store, &frustum, &mut items, &mut skinned);
+        let mut transparent = std::mem::take(&mut self.transparent_scratch);
+        let mut transparent_skinned = std::mem::take(&mut self.transparent_skinned_scratch);
+        let counts = collect_instances(
+            world,
+            &mesh_store,
+            &material_store,
+            &view,
+            &frustum,
+            &mut items,
+            &mut skinned,
+            &mut transparent,
+            &mut transparent_skinned,
+        );
         items.sort_unstable_by_key(|item| item.key);
+        // 透明排序：视深降序（远 → 近，back-to-front）——alpha 混合不满足
+        // 交换律，必须先画远的，近面才能以自身 alpha 正确叠加在远面结果上。
+        // 深度并列按实体 bits 升序断言：比较器因此是全序，`sort_unstable`
+        // 的结果不依赖输入顺序（确定性）；并列深度的绘制先后只影响并列项
+        // 之间的叠放，两者视深相同、任一顺序在视觉上等价。
+        // `total_cmp` 给出全序比较（NaN 也有确定位置），并列再比实体。
+        transparent.sort_unstable_by(|a, b| {
+            b.depth
+                .total_cmp(&a.depth)
+                .then_with(|| a.entity.cmp(&b.entity))
+        });
+        transparent_skinned.sort_unstable_by(|a, b| {
+            b.depth
+                .total_cmp(&a.depth)
+                .then_with(|| a.skinned.skin_entity.cmp(&b.skinned.skin_entity))
+        });
         let total = items.len();
+        let skinned_total = skinned.len();
+        let transparent_total = transparent.len();
+        let instance_total = total + skinned_total + transparent_total + transparent_skinned.len();
         self.stats.culled_instances = counts.culled;
         if counts.culled > 0 {
             log::trace!(
-                "视锥剔除 {} / {} 实例（普通 + 蒙皮）",
+                "视锥剔除 {} / {} 实例（普通 + 蒙皮，含透明）",
                 counts.culled,
                 counts.visible + counts.culled as usize
             );
@@ -1241,18 +1358,23 @@ impl Renderer {
         };
 
         // 3. 实例缓冲（容量不足时重建）+ 跨帧增量上传：剔除排序键后按
-        //    112B 紧凑布局写入，蒙皮实例追加在普通实例之后（实例区间
-        //    [total, total+skinned)）。
+        //    112B 紧凑布局写入。实例区间布局（后续绘制按下标引用）：
+        //    [0, total) 不透明普通 → [total, total+skinned) 不透明蒙皮 →
+        //    [.., ..+transparent) 透明普通（视深降序）→ 末段透明蒙皮
+        //    （视深降序）。透明实例与不透明共用同一缓冲：阴影 pass 只
+        //    绘制前两段（透明不投影），透明 pass 绘制后两段。
         //    实例缓冲跨帧持久：GPU 缓冲不因帧切换失效，上一帧上传内容由
         //    `last_instances` 镜像记录，本帧组装完成后逐实例比对——完全
         //    一致则整帧跳过上传（静态场景零上传），存在变化则只写连续
         //    变化段，缓冲重建 / 实例数变化 / 变化过半时回退全量。
-        if total + skinned.len() > 0 {
-            let rebuilt = self.ensure_instance_capacity(total + skinned.len());
+        if instance_total > 0 {
+            let rebuilt = self.ensure_instance_capacity(instance_total);
             let mut instances = std::mem::take(&mut self.instance_scratch);
             instances.clear();
             instances.extend(items.iter().map(|item| item.instance));
             instances.extend(skinned.iter().map(|item| item.instance));
+            instances.extend(transparent.iter().map(|item| item.instance));
+            instances.extend(transparent_skinned.iter().map(|t| t.skinned.instance));
             let count = instances.len();
             let instance_bytes = std::mem::size_of::<InstanceRaw>() as u64;
             let buffer = self.instance_buf.as_ref().expect("实例缓冲已就绪");
@@ -1306,8 +1428,12 @@ impl Renderer {
             self.ensure_material(&material_store, texture_store.as_deref(), material);
             index += count;
         }
-        // 4a. 蒙皮资源：网格 / 材质 + 关节矩阵缓冲（动画驱动下每帧覆写）
-        for item in &skinned {
+        // 4a. 蒙皮资源：网格 / 材质 + 关节矩阵缓冲（动画驱动下每帧覆写）。
+        // 不透明蒙皮与透明蒙皮同构处理，只是分属两个实例区间 / 两条管线。
+        for item in skinned
+            .iter()
+            .chain(transparent_skinned.iter().map(|t| &t.skinned))
+        {
             self.ensure_mesh(&mesh_store, MeshHandle(item.mesh));
             self.ensure_material(
                 &material_store,
@@ -1316,7 +1442,10 @@ impl Renderer {
             );
         }
         let mut joint_bytes: Vec<u8> = Vec::new();
-        for item in &skinned {
+        for item in skinned
+            .iter()
+            .chain(transparent_skinned.iter().map(|t| &t.skinned))
+        {
             self.ensure_skin(item.skin_entity, item.joint_matrices.len());
             joint_bytes.clear();
             for m in &item.joint_matrices {
@@ -1330,8 +1459,18 @@ impl Renderer {
                 .queue
                 .write_buffer(&skin.joint_buf, 0, &joint_bytes);
         }
+        // 4b. 透明普通项的网格 / 材质懒上传（透明蒙皮已在 4a 覆盖）。
+        for item in &transparent {
+            self.ensure_mesh(&mesh_store, MeshHandle((item.key >> 32) as u32));
+            self.ensure_material(
+                &material_store,
+                texture_store.as_deref(),
+                MaterialHandle(item.key as u32),
+            );
+        }
 
-        // 5. 编码渲染通道：先阴影 pass（光源视角，深度写入颜色附件），后主 pass
+        // 5. 编码渲染通道：先阴影 pass（光源视角，深度写入颜色附件；
+        //     只画不透明实例区间——透明项不投影），后主 pass 与透明 pass
         let mut encoder = self
             .gpu
             .device
@@ -1341,7 +1480,10 @@ impl Renderer {
         let mut draw_calls = 0u32;
         let mut instances = 0u32;
         let mut triangles_drawn = 0u32;
-        if shadow_enabled && total + skinned.len() > 0 {
+        // 阴影 pass 的几何量 = 不透明普通 + 不透明蒙皮（收集期分区排除
+        // 了透明项，透明蒙皮同样不投影）
+        let opaque_total = total + skinned_total;
+        if shadow_enabled && opaque_total > 0 {
             let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.shadow"),
@@ -1444,7 +1586,7 @@ impl Renderer {
                     bytemuck::bytes_of(&raw),
                 );
             }
-            if total + skinned.len() > 0 {
+            if opaque_total > 0 {
                 let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
                 for face in 0..6 {
                     let mut point_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1548,7 +1690,11 @@ impl Renderer {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
+                        // 深度必须 Store：主 pass 结束后透明 pass 以 LoadOp::Load
+                        // 读取同一深度附件做遮挡测试（透明被不透明几何挡住仍不可见）。
+                        // Discard 会让附件内容变未定义（DX12 实测为 0，Less 全挂，
+                        // 透明整体消失）——该教训固化在 ARCHITECTURE §4.16。
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
@@ -1562,7 +1708,7 @@ impl Renderer {
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.bundle.pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            if total + skinned.len() > 0 {
+            if instance_total > 0 {
                 pass.set_vertex_buffer(
                     1,
                     self.instance_buf
@@ -1623,6 +1769,102 @@ impl Renderer {
                     draw_calls += 1;
                     instances += 1;
                     // 蒙皮逐项累加：索引数 / 3（网格缺席按 0，同普通批注释）
+                    triangles_drawn += mesh_store
+                        .get(MeshHandle(item.mesh))
+                        .map_or(0, |data| data.indices.len() as u32 / 3);
+                }
+            }
+        }
+        // 透明 pass：主 pass（天空 + 不透明 + 蒙皮）之后、泛光 / 后处理之前，
+        // 写同一 HDR MSAA 颜色目标——LoadOp::Load 载入主 pass 结果继续混合，
+        // pass 结束的 resolve 与主 pass 同一目标（MSAA 内容保留完整，再次
+        // resolve 的结果 = 主 pass 结果 + 透明混合）。深度附件同样 Load：
+        // 保留不透明几何的深度做遮挡测试（透明被墙挡住仍不可见），
+        // 管线侧深度只测不写（见 pipeline.rs 透明管线注释）。
+        // 无透明实例时整个 pass 跳过（零开销）。
+        if transparent_total + transparent_skinned.len() > 0 {
+            let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.transparent"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &hdr.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&hdr.resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.bundle.transparent_pipeline);
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_vertex_buffer(1, instance_buf.slice(..));
+            // 透明普通项：深度序中相邻同 (网格, 材质) 键合并为一个 run 批
+            // （实例按深度序连续存放于区间 [opaque_total, +transparent_total)）
+            let base = opaque_total as u32;
+            let mut t = 0usize;
+            while t < transparent_total {
+                let key = transparent[t].key;
+                let mut count = 1;
+                while t + count < transparent_total && transparent[t + count].key == key {
+                    count += 1;
+                }
+                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                let material = &self.material_gpu[&(key as u32)];
+                pass.set_bind_group(1, &material.bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(
+                    0..mesh.num_indices,
+                    0,
+                    base + t as u32..base + (t + count) as u32,
+                );
+                draw_calls += 1;
+                instances += count as u32;
+                // 三角形统计与不透明普通批同口径：索引数 / 3 × run 实例数
+                triangles_drawn += mesh_store
+                    .get(MeshHandle((key >> 32) as u32))
+                    .map_or(0, |data| data.indices.len() as u32 / 3)
+                    * count as u32;
+                t += count;
+            }
+            // 透明蒙皮：透明管线 + 组 2 关节矩阵，每实体一次 draw，
+            // 实例区间 [opaque_total + transparent_total, +len)
+            if !transparent_skinned.is_empty() {
+                pass.set_pipeline(&self.bundle.transparent_skinned_pipeline);
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, t) in transparent_skinned.iter().enumerate() {
+                    let item = &t.skinned;
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let material = &self.material_gpu[&item.material];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_bind_group(2, &skin.bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    let start = (opaque_total + transparent_total + i) as u32;
+                    pass.draw_indexed(0..mesh.num_indices, 0, start..start + 1);
+                    draw_calls += 1;
+                    instances += 1;
                     triangles_drawn += mesh_store
                         .get(MeshHandle(item.mesh))
                         .map_or(0, |data| data.indices.len() as u32 / 3);
@@ -1786,6 +2028,8 @@ impl Renderer {
         self.stats.triangles_drawn = triangles_drawn;
         self.scratch = items;
         self.skinned_scratch = skinned;
+        self.transparent_scratch = transparent;
+        self.transparent_skinned_scratch = transparent_skinned;
     }
 
     /// 实例缓冲容量复用：足够则零开销返回 `false`；不足时按 2 倍扩容
@@ -2005,6 +2249,31 @@ mod tests {
         r
     }
 
+    /// `collect_instances` 的测试便捷封装：视图恒等、材质目录只有 0 号
+    /// 默认材质（句柄缺席按不透明，与既有测试语义一致），透明列表丢弃。
+    fn collect_opaque(
+        world: &iris_core::world::World,
+        mesh_store: &MeshStore,
+        frustum: &Frustum,
+        items: &mut Vec<DrawItem>,
+        skinned: &mut Vec<SkinnedItem>,
+    ) -> CollectCounts {
+        let materials = MaterialStore::new();
+        let mut transparent = Vec::new();
+        let mut transparent_skinned = Vec::new();
+        collect_instances(
+            world,
+            mesh_store,
+            &materials,
+            &glam::Mat4::IDENTITY,
+            frustum,
+            items,
+            skinned,
+            &mut transparent,
+            &mut transparent_skinned,
+        )
+    }
+
     /// Visibility 过滤：隐藏实体不出现在实例收集结果（主 pass 与全部
     /// 阴影 pass 共用这份收集，故一条测试覆盖三个 pass 的过滤语义）。
     /// 组件缺席 = 可见；蒙皮路径同样生效。
@@ -2059,7 +2328,7 @@ mod tests {
         let frustum = Frustum::from_view_proj(&glam::Mat4::IDENTITY);
         let mut items = Vec::new();
         let mut skinned = Vec::new();
-        let counts = collect_instances(&world, &mesh_store, &frustum, &mut items, &mut skinned);
+        let counts = collect_opaque(&world, &mesh_store, &frustum, &mut items, &mut skinned);
 
         assert_eq!(counts.culled, 0);
         assert_eq!(counts.visible, items.len() + skinned.len());
@@ -2115,7 +2384,7 @@ mod tests {
         });
         let mut items = Vec::new();
         let mut skinned = Vec::new();
-        let counts = collect_instances(&world, &mesh_store, &toward, &mut items, &mut skinned);
+        let counts = collect_opaque(&world, &mesh_store, &toward, &mut items, &mut skinned);
         assert_eq!(counts.visible, 1, "蒙皮几何被关节移入视锥，必须可见");
         assert_eq!(counts.culled, 0);
         assert_eq!(skinned.len(), 1);
@@ -2137,10 +2406,113 @@ mod tests {
         });
         items.clear();
         skinned.clear();
-        let counts = collect_instances(&world, &mesh_store, &away, &mut items, &mut skinned);
+        let counts = collect_opaque(&world, &mesh_store, &away, &mut items, &mut skinned);
         assert_eq!(counts.visible, 0, "背对时蒙皮实例应被剔除");
         assert_eq!(counts.culled, 1);
         assert!(skinned.is_empty());
+    }
+
+    /// 透明分区与视深排序（CPU 级）：Blend 材质进透明列表、Opaque 进不透明
+    /// 列表；视深 = 包围球中心经视图变换后的 -z；排序降序（远 → 近）、
+    /// 深度并列按实体 bits 升序。蒙皮 Blend 实体进透明蒙皮列表（不透明
+    /// 蒙皮列表不受影响）。
+    #[test]
+    fn transparent_items_partition_and_sort_by_view_depth() {
+        use crate::material::MaterialDef;
+        use crate::mesh::primitives;
+        use iris_core::prelude::Transform;
+        use iris_core::world::World;
+
+        let mut mesh_store = MeshStore::new();
+        let mesh = mesh_store.add(primitives::cube()); // 包围球中心 = 实例位置
+        let mut material_store = MaterialStore::new();
+        let opaque_mat = material_store.add(MaterialDef::solid(1.0, 1.0, 1.0, 1.0));
+        let blend_mat = material_store.add(MaterialDef::glass(0.5, 0.5, 1.0, 0.5));
+
+        let mut world = World::new();
+        // 相机在 +Z 看向原点：z 越小越远（视深 = 20 - z，降序 = z 升序）
+        let view =
+            glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 20.0), Vec3::ZERO, Vec3::Y);
+
+        // 三个透明立方体：近 z=2 / 中 z=0 / 远 z=-2（生成顺序故意与深度序
+        // 相反——排序必须与查询顺序无关）
+        let spawn = |world: &mut World, z: f32, mat| {
+            world.spawn((Transform::from_xyz(0.0, 0.0, z), mesh, mat))
+        };
+        spawn(&mut world, 2.0, blend_mat); // 近
+        spawn(&mut world, -2.0, blend_mat); // 远
+        spawn(&mut world, 0.0, blend_mat); // 中
+        // 一个不透明立方体混在其间：必须留在不透明列表
+        spawn(&mut world, 1.0, opaque_mat);
+        // 蒙皮透明实体：进透明蒙皮列表（关节恒等 → 并集 AABB = 绑定 AABB）
+        let joint = world.spawn((Transform::IDENTITY,));
+        let skin = Skin::new(vec![joint], vec![glam::Mat4::IDENTITY]);
+        world.spawn((Transform::from_xyz(0.0, 0.0, 0.5), mesh, blend_mat, skin));
+        iris_core::hierarchy::propagate_transforms(&mut world);
+
+        let frustum = Frustum::from_view_proj(&{
+            let proj = glam::camera::rh::proj::directx::perspective(
+                std::f32::consts::FRAC_PI_4,
+                1.0,
+                0.1,
+                1000.0,
+            );
+            proj * view
+        });
+        let mut items = Vec::new();
+        let mut skinned = Vec::new();
+        let mut transparent = Vec::new();
+        let mut transparent_skinned = Vec::new();
+        let counts = collect_instances(
+            &world,
+            &mesh_store,
+            &material_store,
+            &view,
+            &frustum,
+            &mut items,
+            &mut skinned,
+            &mut transparent,
+            &mut transparent_skinned,
+        );
+        assert_eq!(counts.visible, 5);
+        assert_eq!(counts.culled, 0);
+        assert_eq!(items.len(), 1, "不透明实体留在普通列表");
+        assert!(skinned.is_empty(), "Blend 蒙皮实体不进不透明蒙皮列表");
+        assert_eq!(transparent.len(), 3, "三个 Blend 普通实体进透明列表");
+        assert_eq!(transparent_skinned.len(), 1, "Blend 蒙皮实体进透明蒙皮列表");
+
+        // 视深数值：中心 z 经视图变换后的 -z（相机在 z=20，视深 = 20 - z）。
+        // 逐项断言（不假设查询顺序）：三个深度值与解析值一一对应
+        let mut depths: Vec<f32> = transparent.iter().map(|t| t.depth).collect();
+        depths.sort_by(|a, b| a.total_cmp(b));
+        let expected = {
+            let mut e = vec![18.0f32, 20.0, 22.0]; // 20 - {2, 0, -2}
+            e.sort_by(|a, b| a.total_cmp(b));
+            e
+        };
+        for (got, want) in depths.iter().zip(&expected) {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "视深集合应为 {expected:?}，实际 {depths:?}"
+            );
+        }
+        // 蒙皮透明视深取并集 AABB 中心：恒等关节下 J = inv(model)，
+        // 蒙皮几何被拉回原点（蒙皮定义在网格局部空间），中心 = (0,0,0)
+        let ts = &transparent_skinned[0];
+        assert!((ts.depth - 20.0).abs() < 1e-4);
+
+        // 排序（与 draw() 同款比较器）：远 → 近
+        transparent.sort_unstable_by(|a, b| {
+            b.depth
+                .total_cmp(&a.depth)
+                .then_with(|| a.entity.cmp(&b.entity))
+        });
+        let sorted_depths: Vec<f32> = transparent.iter().map(|t| t.depth).collect();
+        assert_eq!(
+            sorted_depths,
+            vec![22.0, 20.0, 18.0],
+            "透明项应按视深降序（远 → 近）排列"
+        );
     }
 
     fn slice(xs: &[f32]) -> Vec<InstanceRaw> {
