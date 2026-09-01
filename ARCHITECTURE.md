@@ -317,7 +317,9 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 - **加载即场景**：`spawn_gltf_instance` 把节点层级映射为实体树——
   有 mesh 的节点生成父实体（携带节点 TRS），每个 primitive 挂一个子实体
   （独立材质批次，复用父变换）；返回 [`GltfInstance`]（顶层实体 +
-  节点索引→实体映射 + 全部动画剪辑）。`spawn_gltf` 为只取实体树的便捷包装。
+  节点索引→实体映射 + 全部动画剪辑；蒙皮实例的兄弟顶层关节树在加载
+  完成时自动收编为蒙皮节点的子树，§4.6.2）。`spawn_gltf` 为只取实体树
+  的便捷包装。
 - **GLB 容器**：按内容嗅探（magic "glTF"），校验版本（仅 2）、chunk 边界与
   顺序（JSON 首位、BIN 仅一个且在 JSON 后）；BIN chunk 作为无 uri 的
   buffer 0 数据源。`write_glb` 为对称的容器组装工具（gen_asset 示例使用）。
@@ -374,13 +376,15 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 - **加载器**：`skins`/`skin` 节点字段、MAT4 accessor、IBM 缺省时为
   恒等（规范允许）；权重和偏离 1 时归一化（防御非法资产）；
   JOINTS_0 与 WEIGHTS_0 必须成对出现，否则报 `Missing`。
-- **移动蒙皮实体的资产约定（iris-arena dogfooding II 补充）**：
-  `J_i` 中的 `global(joint_i)` 来自关节实体的全局变换——多顶层节点的蒙皮
-  glTF（mesh 根与关节树根为兄弟，如 gen_asset 生成的 `enemy_worm.glb`）
-  在加载后**必须把关节树挂回 mesh 根**（`world.add_child`），否则关节树
-  恒在世界原点，移动 mesh 根不改变渲染位置（静态展示不暴露，游戏内移动
-  即散架，见 §8.13）。单顶层节点蒙皮 glTF（关节树本就是 mesh 根的后代）
-  无此问题。
+- **蒙皮实例自动收编（iris-arena dogfooding II 发现，「引擎 API 打磨 II」
+  轮修复）**：`J_i` 中的 `global(joint_i)` 来自关节实体的全局变换——多
+  顶层节点的蒙皮 glTF（mesh 根与关节树根为兄弟，如 gen_asset 生成的
+  `enemy_worm.glb`）若关节树留在外面，移动 mesh 根不改变渲染位置
+  （关节全局不含蒙皮节点变换，静态展示不暴露，游戏内移动即散架）。
+  `spawn_gltf_instance` 加载完成时自动把关节树根收编为蒙皮节点的子树
+  （求 joints 集合中不被集合内任何其他节点的 child 边指向的根，
+  `add_child` 挂回；关节树已是蒙皮节点后代的单顶层节点资产保持原层级，
+  见 §8.13）——移动实例根即移动整只蒙皮角色，调用方无须再做层级操作。
 - **限制**：关节非均匀缩放下法线变换不精确（按刚性处理）；蒙皮网格
   无视锥剔除；多 primitive 共享蒙皮时关节矩阵每 primitive 各上传一份。
 
@@ -887,6 +891,9 @@ glTF / HDR 错误经 `From` 映射保上下文）。
 13. **dogfooding II 发现的 API 摩擦（iris-arena 实践反馈）**——第二轮以
     「波次生存竞技场」压榨蒙皮动画 × 对象池 × 弹道 × 多游戏状态时撞到的
     摩擦。本轮原则：**引擎侧零改动**，全部记录 + 游戏内绕行。
+    （更新：**七条已全部修复于「引擎 API 打磨 II」轮**，iris-arena 的
+    绕行代码已同步删除并改用新 API 作闭合证明——headless 测试对 Default
+    资产路径零注入直接通过；条目按原文保留作为 dogfooding 记录。）
     - **`AnimationPlugin` 未列入 `iris-engine` prelude**：`HierarchyPlugin`
       等同批插件都在 prelude，唯独动画插件缺席——headless 测试 / 离屏
       快照无法 `AnimationPlugin.build(&mut app)`，只能绕行：按其实现原样
@@ -895,6 +902,10 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       → 游戏侧绕行：iris-arena 的 headless 测试与 `arena_snapshot` 内联
       注册；文档注明「本插件刻意不自带动画注册，避免窗口路径重复注册
       双倍速」。
+      → **已修复**：`iris-engine` prelude 导出 `AnimationPlugin`（与
+      `HierarchyPlugin` 等同批插件一致）。游戏侧：headless 测试与
+      `arena_snapshot` 删除内联注册，改为 `AnimationPlugin.build(&mut
+      app)`——headless 路径与窗口路径的编排来源完全同一。
     - **资产路径是工作目录相对，`cargo test` 下失效**：`cargo run` 的 cwd
       是 workspace 根（窗口程序开箱即用），但 `cargo test` 的 cwd 是
       **crate 目录**——插件内写死的 `assets/enemy_worm.glb` 在测试里加载
@@ -903,6 +914,12 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       （如 `CARGO_MANIFEST_DIR` 兜底）或 `Result` 外露加载错误。
       → 游戏侧绕行：敌人模型路径提升为 `ArenaPlugin.enemy_model_path`
       字段（可注入），测试用 `env!("CARGO_MANIFEST_DIR")` 拼绝对路径。
+      → **已修复**：`iris_engine::asset_path(relative) -> PathBuf`——
+      按序尝试 CWD 相对（存在）→ 工作区根相对（编译期 `CARGO_MANIFEST_DIR`
+      上溯两级，存在）→ 都不存在返回 CWD 相对（让后续 load 报出调用方
+      熟悉的相对路径错误，解析层不吞错）。`GamePlugin` / `ArenaPlugin`
+      的 Default 场景与敌模路径经它解析，字段注入能力保留（测试 fixture
+      仍走显式路径）；游戏侧 `CARGO_MANIFEST_DIR` 注入删除。
     - **`spawn_gltf_instance` 的蒙皮实例关节树不随 mesh 根移动**：多顶层
       节点的蒙皮 glTF（mesh 根与关节树根是**兄弟**）生成的实体树无法整体
       移动——蒙皮矩阵 `J = inv(mesh 全局) × global(joint) × ibm`，关节树
@@ -911,24 +928,57 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       自动收编兄弟顶层节点。
       → 游戏侧绕行：spawn 后 `world.add_child(root, 关节树根)` 把兄弟
       顶层节点收编为 mesh 根的子树（公开 API 层级操作即可表达）。
+      → **已修复**：`spawn_gltf_instance` 加载完成时自动收编——对每个
+      skin 求关节树根（joints 集合中不被集合内任何其他节点的 child 边
+      指向者），`add_child(蒙皮节点, 关节树根)`；关节树已是蒙皮节点
+      后代的（单顶层节点资产）保持原层级，不拆动中间非关节节点的变换链。
+      正确性论证：蒙皮公式 `verts = mesh全局 × (inv(mesh全局) ×
+      joint全局 × ibm) × v = joint全局 × ibm × v`——mesh全局相消，几何体
+      **跟随关节**；收编后 joint全局含蒙皮节点变换 ⇒ 移动实例根即移动
+      整只蒙皮角色（收编时 glTF 蒙皮资产的 mesh 节点变换为恒等，不改变
+      初始全局变换）。游戏侧绕行删除；守护：glTF 单测（链式 / 多根
+      关节树根识别、收编后父子层级、收编后 propagate 关节全局含实例
+      位移）+ GPU 回归测试 `skinned_instance_follows_root_translation`
+      （实例定位 (1.5, 0, 0) 渲染：断言全部角色像素整体右移越过位移前
+      最右端、位移前的屏幕位置零红像素、像素总量同数量级——收编失效时
+      关节矩阵会把几何体拉向反方向）。headless 侧补「逻辑移动敌人 →
+      槽位根移动 → 关节子树全局跟随」端到端断言。
     - **`Input` 无按键枚举 / any-key 查询**：标题画面的「任意键开始」只能
       白名单探测常用键的 `key_pressed`（漏掉按键 = 玩家卡在标题屏）。
       建议提供 `Input::any_pressed()` 或按帧记录的按键迭代器。
       → 游戏侧绕行：8 键白名单（WASD / Space / Enter / Shift / R）。
+      → **已修复**：`Input::any_key_pressed() -> bool`——本帧任意键刚
+      按下（与 `key_pressed` 同款边沿语义，系统自动重复不重触发）。
+      游戏侧：8 键白名单删除，标题画面改用 any-key 查询。
     - **程序化音效无法拼接 / 变调**：`sine / square / noise` 只生成单段
       常频剪辑，`AudioClip` 采样不公开读取——「开波双音」只能绕开生成器，
       用公开的 `AudioClip::from_interleaved` 手写采样拼接（含首尾 5 ms
       包络防爆音）。建议公开采样读取或提供 `concat / mix` 组合子。
+      → **已修复**：`AudioClip::concat(&[&AudioClip]) -> Result<
+      AudioClip, AudioError>`——声道数 / 采样率一致才可拼（不一致报
+      `Unsupported`，静默重采样会隐藏调用方参数错误），顺序串联；
+      采样只读视图 `samples()` 原有。游戏侧：开波双音改为
+      `sine(660) + 静音段 + sine(990)` 三段 `concat`（各段包络由生成器
+      自带），手写采样缓冲删除。
     - **差分事件在状态复位时会下溢**（游戏侧自伤，非引擎缺口，记录为
       陷阱）：逻辑侧单调计数器（total_shots 等）在 restart 时归零，插件
       的 `after − before` 差分在 debug 构建 overflow panic。修法用
       `saturating_sub`——「资源承载可复位状态 + 差分触发表现」的组合
       应默认防下溢。
+      → **改写为模式警示**（无引擎代码改动）：这是游戏代码模式问题而非
+      引擎缺陷——引擎资源可以承载**可复位**的游戏状态，引擎无从（也
+      不应）阻止 restart 把计数器归零。凡「资源承载可复位状态 + 帧间
+      差分触发表现」的组合，差分处必须用 `saturating_sub`（或改用有符号
+      差值），把「计数器被复位」当作正常输入而非算术异常；iris-arena
+      已按此实现（重开帧静音，不补播旧对局的事件）。
     - **蒙皮资产制作陷阱**（gen_asset 侧，记录给后续资产管线）：图元立方体
       跨度是 ±0.5（缩放系数 = 全边长）；关节节点平移是**父局部**偏移而
       ibm 是**绑定姿势全局**的逆——两者混用会让末端关节错位一倍。蒙皮
       数值正确性目前只能靠离屏渲染目检守护，CPU 侧 `skin_vertex` 参考实现
       可单测但未覆盖「GLB 文件 → 关节矩阵」全链路。
+      → **陷阱原文保留**（资产管线守则）；「GLB 文件 → 关节矩阵」全链路
+      的自动化守护已由 GPU 回归测试补上（`skinned_instance_follows_root_
+      translation` 的像素级断言，见上上条）。
 
 ## 9. 关键设计取舍记录
 

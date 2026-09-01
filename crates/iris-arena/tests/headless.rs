@@ -20,12 +20,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use iris_core::prelude::{Access, Stage};
+use iris_core::prelude::Stage;
 use iris_core::resource::{ResourceRef, ResourceRefMut};
 use iris_engine::prelude::{
-    AnimationPlayer, App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode,
-    MaterialStore, MeshStore, OffscreenRenderer, Plugin, TextureStore, Time, Transform, UiRect,
-    UiText, Visibility, update_animations,
+    AnimationPlugin, AnimationPlayer, App, Audio, Camera, DirectionalLight, GlobalTransform,
+    HierarchyPlugin, Input, KeyCode, MaterialStore, MeshStore, OffscreenRenderer, Plugin,
+    TextureStore, Time, Transform, UiRect, UiText, Visibility,
 };
 use iris_arena::{
     ArenaPlugin, ArenaState, EnemyPool, Phase, ProjectilePool, BANNER_TEXT_NAME, COMBO_TEXT_NAME,
@@ -114,35 +114,19 @@ impl Harness {
         app.world.insert_resource(DirectionalLight::default());
         app.world.insert_resource(Audio::headless());
 
-        // 层级传播（PostUpdate）——与窗口路径的 DefaultPlugins 同一插件；
-        // 注册顺序 = DefaultPlugins 在前游戏插件在后（动画先于游戏系统推进）
-        HierarchyPlugin.build(&mut app);
-        // 动画推进（Update）：绕行（dogfooding 摩擦，已记录）——
-        // AnimationPlugin 未列入 iris-engine prelude，headless 无法
-        // `AnimationPlugin.build(&mut app)`；按该插件的实现原样注册
-        // （同一系统 update_animations + 同一访问集），语义与窗口路径一致。
+        // 层级传播（PostUpdate，HierarchyPlugin）+ 动画推进（Update，
+        // AnimationPlugin——已列入 iris-engine prelude，headless 直接
+        // build，与窗口路径的 DefaultPlugins 同一插件同一编排；
         // ArenaPlugin 刻意不自带动画注册：窗口路径 DefaultPlugins 已注册，
-        // 重复注册会让动画双倍速。
-        app.schedule.add_parallel_system(
-            Stage::Update,
-            Access::new()
-                .write::<AnimationPlayer>()
-                .write::<Transform>()
-                .read::<Time>(),
-            update_animations,
-        );
-        // 场景：临时 fixture 关卡；敌人模型：workspace 根资产（cargo test
-        // 的 cwd 是 crate 目录，故用 CARGO_MANIFEST_DIR 拼绝对路径注入——
-        // 资产路径工作目录相对的 dogfooding 摩擦点，见 ArenaPlugin 文档）
-        let enemy_model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(iris_arena::ENEMY_MODEL_PATH);
-        ArenaPlugin {
-            scene_path: fixture_scene_path(),
-            enemy_model_path: enemy_model,
-        }
-        .build_schedule(&mut app.schedule);
+        // 重复注册会让动画双倍速）。注册顺序 = DefaultPlugins 在前游戏
+        // 插件在后（动画先于游戏系统推进）。
+        HierarchyPlugin.build(&mut app);
+        AnimationPlugin.build(&mut app);
+        // 场景：临时 fixture 关卡；敌人模型走 Default 的 asset_path 解析
+        // （cargo test 的 cwd 是 crate 目录，CWD 候选未命中回退 workspace
+        // 根——资产路径摩擦闭合后无须再注入 CARGO_MANIFEST_DIR 绝对路径）
+        ArenaPlugin { scene_path: fixture_scene_path(), ..Default::default() }
+            .build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
         // Startup：资源兜底插入 + 场景搭建 + 双池预热（与 App 主循环一致）
@@ -427,6 +411,64 @@ fn skinned_animation_plays_and_advances_on_pool_slots() {
     harness.frames(200);
     let (_, playing_c, _) = harness.first_enemy_animation();
     assert!(playing_c, "第 2 波复用的槽位应继续自动播放");
+}
+
+/// 蒙皮实例收编的端到端证据（引擎 API 打磨 II 闭合①）：加载器已把兄弟
+/// 顶层关节树收编为槽位根实体的子树——逻辑侧移动敌人 → 表现系统写根
+/// 实体 Transform → 层级传播当帧把 primitive 部分与关节子树一起带走。
+/// 收编缺失时（旧引擎缺陷）关节全局恒在世界原点，根移动后蒙皮角色会被
+/// 关节矩阵拉向反方向。
+#[test]
+fn enemy_root_translation_carries_joint_subtree() {
+    let mut harness = Harness::new();
+    harness.start();
+    let (id, slot) = harness.enemy_pool().active().first().expect("应有活跃敌人槽位").clone();
+    // 收编层级：槽位根实体 = mesh 节点，子实体应含 primitive 部分与
+    // 关节树根（蠕虫 GLB：1 个 primitive + hip）
+    let children = harness.app.world.children(slot);
+    assert!(
+        children.len() >= 2,
+        "槽位根应有 primitive 部分 + 收编的关节树根，实际 {} 个子实体",
+        children.len()
+    );
+    assert!(
+        children.iter().all(|&child| harness.app.world.parent(child) == Some(slot)),
+        "全部子实体的父级都应是槽位根实体"
+    );
+
+    // 逻辑侧把敌人挪到远处：表现系统写根实体，层级传播当帧合成子树全局
+    let target = glam::Vec2::new(10.0, -8.0);
+    {
+        let mut game = harness.game_mut();
+        let enemy =
+            game.enemies.iter_mut().find(|enemy| enemy.id == id).expect("敌人应在场");
+        enemy.pos = target;
+    }
+    harness.frame(&[], &[]);
+    let root_position = harness
+        .app
+        .world
+        .get::<Transform>(slot)
+        .expect("槽位根应有 Transform")
+        .position;
+    assert!(
+        (root_position.x - target.x).abs() < 0.1 && (root_position.z - target.y).abs() < 0.1,
+        "敌人根应已被表现系统挪到目标附近：{root_position:?} vs {target:?}"
+    );
+    // 关键断言：全部子实体（primitive 部分 + 关节）的世界位置跟随根——
+    // 子实体局部均为恒等，全局位置应与根一致
+    for &child in &children {
+        let global = harness
+            .app
+            .world
+            .get::<GlobalTransform>(child)
+            .expect("子实体应有 GlobalTransform")
+            .position();
+        assert!(
+            (global.x - root_position.x).abs() < EPS && (global.z - root_position.z).abs() < EPS,
+            "子实体全局位置应跟随根移动：{global:?} vs 根 {root_position:?}"
+        );
+    }
 }
 
 /// 弹道池封顶：逻辑侧 40 上限 ↔ 池 40 槽位一一对应，池满不开火、

@@ -15,6 +15,7 @@
 //! ```
 
 pub mod app;
+pub mod assets;
 pub mod audio;
 pub mod plugin;
 pub mod scene;
@@ -28,9 +29,11 @@ pub mod prelude {
     pub use iris_render::prelude::*;
     pub use crate::app::App;
     pub use crate::audio::Audio;
+    // 资产路径解析：默认资产在 cargo run / cargo test 两种 cwd 下都能命中
+    pub use crate::assets::asset_path;
     pub use crate::plugin::{
-        AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, PhysicsPlugin, Plugin,
-        RenderPlugin, TimePlugin, WindowPlugin,
+        AnimationPlugin, AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, PhysicsPlugin,
+        Plugin, RenderPlugin, TimePlugin, WindowPlugin,
     };
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记
     pub use crate::scene::{

@@ -143,12 +143,13 @@ fn skinned_arm_glb() -> Vec<u8> {
     write_glb(&json, &bin)
 }
 
-/// 统计「左半屏红像素」「全屏红像素」与「最左红像素列号」
+/// 统计「左半屏红像素」「全屏红像素」与红像素的最左/最右列号
 /// （自发光红材质，与蓝天空背景易区分）。
-fn count_red(px: &[u8], w: u32, h: u32) -> (u32, u32, u32) {
+fn count_red(px: &[u8], w: u32, h: u32) -> (u32, u32, u32, u32) {
     let mut left = 0u32;
     let mut total = 0u32;
     let mut min_x = u32::MAX;
+    let mut max_x = 0u32;
     for y in 0..h {
         for x in 0..w {
             let i = ((y * w + x) * 4) as usize;
@@ -159,10 +160,11 @@ fn count_red(px: &[u8], w: u32, h: u32) -> (u32, u32, u32) {
                     left += 1;
                 }
                 min_x = min_x.min(x);
+                max_x = max_x.max(x);
             }
         }
     }
-    (left, total, min_x)
+    (left, total, min_x, max_x)
 }
 
 #[test]
@@ -196,7 +198,7 @@ fn skinned_arm_bends_with_joint_animation() {
     propagate_transforms(&mut world);
     renderer.render(&world);
     let (w, h) = renderer.size();
-    let (left_start, total_start, min_x_start) = count_red(&renderer.read_pixels(), w, h);
+    let (left_start, total_start, min_x_start, _) = count_red(&renderer.read_pixels(), w, h);
 
     // t = 1.0：肘 rotZ 90°，上段水平指向 -X（左半屏）
     {
@@ -207,7 +209,7 @@ fn skinned_arm_bends_with_joint_animation() {
     update_animations(&mut world);
     propagate_transforms(&mut world);
     renderer.render(&world);
-    let (left_end, total_end, min_x_end) = count_red(&renderer.read_pixels(), w, h);
+    let (left_end, total_end, min_x_end, _) = count_red(&renderer.read_pixels(), w, h);
 
     assert!(total_start > 200, "bind 姿势下臂应可见，红像素 {total_start}");
     assert!(
@@ -294,4 +296,74 @@ fn skinned_arm_casts_matching_shadow() {
     }
     assert!(darkened > 30, "蒙皮几何体应向地面投影（变暗像素 {darkened}）");
     assert!(brightened <= 4, "开阴影不应让任何像素变亮，实际 {brightened}");
+}
+
+/// 蒙皮实例结构回归（dogfooding II 摩擦①⑦闭合的 GPU 证据）：
+/// 兄弟顶层关节树的蒙皮 GLB（mesh 根与 hip 是场景顶层兄弟，`skinned_arm_glb`
+/// 正是此布局）生成的实例定位到 (1.5, 0, 0) 后，**整只角色**应渲染在偏移后
+/// 的屏幕位置。收编缺失时蒙皮矩阵 `J = inv(mesh全局) × global(joint) × ibm`
+/// 中关节全局恒在世界原点，移动 mesh 根会把几何体拉向反方向——臂会出现在
+/// 左半屏而不是右半屏。断言覆盖「GLB 文件 → 关节实体 → 关节矩阵 → GPU
+/// 顶点位移」全链路：
+/// 1. 位移前角色跨屏幕中线（左半屏有红像素）；
+/// 2. 位移后全部红像素整体右移越过原角色的最右端，且左半屏（原位置）无
+///    红像素——位移前后差分；
+/// 3. 红像素总量同数量级（角色没有被蒙皮矩阵撕碎或抛出画面）。
+#[test]
+fn skinned_instance_follows_root_translation() {
+    let dir = std::env::temp_dir().join("iris-skin-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("arm_follow.glb");
+    std::fs::write(&path, skinned_arm_glb()).unwrap();
+
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+
+    let mut world = World::new();
+    world.insert_resource(MeshStore::new());
+    world.insert_resource(MaterialStore::new());
+    world.insert_resource(TextureStore::new());
+    world.insert_resource(Camera {
+        eye: Vec3::new(0.0, 1.0, 5.5),
+        target: Vec3::new(0.0, 1.0, 0.0),
+        ..Camera::default()
+    });
+    world.insert_resource(DirectionalLight::default());
+
+    let instance = spawn_gltf_instance(&mut world, &path).expect("GLB 应加载成功");
+    assert_eq!(instance.roots.len(), 1, "收编后 mesh 根应是唯一顶层实体");
+
+    // 位移前：bind 姿势臂竖直居中，跨屏幕中线
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let (w, h) = renderer.size();
+    let (left_before, total_before, min_x_before, max_x_before) =
+        count_red(&renderer.read_pixels(), w, h);
+    assert!(total_before > 200, "bind 姿势下臂应可见，红像素 {total_before}");
+    assert!(
+        left_before > 0 && min_x_before < w / 2,
+        "位移前臂应跨屏幕中线（左半屏有红像素）：left {left_before}，min_x {min_x_before}"
+    );
+
+    // 实例定位到 (1.5, 0, 0)：fov 45°、视距 5.5 → 臂平面半屏宽 ≈ 2.3，
+    // 偏移后仍在画面内（右半屏）
+    world.get_mut::<Transform>(instance.roots[0])
+        .expect("实例根应有 Transform")
+        .position = Vec3::new(1.5, 0.0, 0.0);
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let (left_after, total_after, min_x_after, _) = count_red(&renderer.read_pixels(), w, h);
+
+    assert!(
+        total_after > total_before / 2,
+        "位移后角色应完整可见（{total_before} -> {total_after}）"
+    );
+    assert!(
+        min_x_after > max_x_before,
+        "整只角色应跟随实例根右移：位移前最右红像素列 {max_x_before}，\
+         位移后最左红像素列 {min_x_after}（收编失效时几何体被关节矩阵拉向反方向）"
+    );
+    assert_eq!(left_after, 0, "原位置（左半屏）不应再有红像素");
 }

@@ -36,7 +36,12 @@ fn red_blue_fixture() -> HdrImage {
     let dir = std::env::temp_dir().join("iris_hdr_render_tests");
     std::fs::create_dir_all(&dir).expect("创建临时目录");
     let path = dir.join("red_blue_equirect.hdr");
-    std::fs::write(&path, &bytes).expect("写入临时 .hdr");
+    // 内容恒定，Once 防并行测试重复写（两用例共用同一 fixture 路径，
+    // 并发覆写会让对方读到被截断的半截文件——偶发竞态）
+    static WRITE_ONCE: std::sync::Once = std::sync::Once::new();
+    WRITE_ONCE.call_once(|| {
+        std::fs::write(&path, &bytes).expect("写入临时 .hdr");
+    });
     load_hdr(&path).expect("fixture 文件加载应成功")
 }
 

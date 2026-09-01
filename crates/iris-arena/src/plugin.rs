@@ -24,8 +24,10 @@
 //! # 敌人根实体 × 蒙皮子树
 //!
 //! 敌人的移动由插件写在 glTF 实例**根实体**的 `Transform` 上；蒙皮关节
-//! （hip → j1 → j2）是根的后代实体，`AnimationPlayer` 每帧覆写关节的局部
-//! 旋转——「根平移 × 子树蒙皮动画」在同一实体树上叠加，层级传播当帧合成。
+//! （hip → j1 → j2）是根的后代实体（`spawn_gltf_instance` 加载时自动把
+//! 兄弟顶层关节树收编为根实体的子树），`AnimationPlayer` 每帧覆写关节的
+//! 局部旋转——「根平移 × 子树蒙皮动画」在同一实体树上叠加，层级传播
+//! 当帧合成。
 //! 蠕虫模型头部朝本地 +X，而引擎朝向约定 `facing = 0` 前方是 -Z，故敌人
 //! 朝向写根旋转时补偿 +90°（[`MODEL_YAW_OFFSET`]）。
 //!
@@ -49,7 +51,8 @@ use crate::logic::{
     MAX_ENEMIES, MAX_PROJECTILES, PLAYER_MAX_HP,
 };
 
-/// 默认关卡文件（相对工作目录：`cargo run` 的 cwd 是 workspace 根）。
+/// 默认关卡文件（仓库相对路径，经 [`asset_path`] 解析——CWD 未命中时
+/// 回退 workspace 根，`cargo run` / `cargo test` 皆可用）。
 pub const DEFAULT_SCENE_PATH: &str = "assets/arena_battle.scene.json";
 /// 蒙皮蠕虫敌人模型（`gen_asset` 的 `write_enemy_worm_glb` 生成）。
 pub const ENEMY_MODEL_PATH: &str = "assets/enemy_worm.glb";
@@ -229,11 +232,11 @@ impl ProjectilePool {
 /// 波次生存竞技场插件：Startup 载入场景 + 建池，Update 推进逻辑与表现。
 ///
 /// [`Default`] 的关卡路径是 [`DEFAULT_SCENE_PATH`]、敌人模型路径是
-/// [`ENEMY_MODEL_PATH`]（均为**工作目录相对**——`cargo run` 的 cwd 是
-/// workspace 根，窗口程序开箱即用；但 `cargo test` 的 cwd 是 **crate
-/// 目录**，测试须用 `CARGO_MANIFEST_DIR` 拼绝对路径注入——dogfooding
-/// 摩擦点，已记录）。测试用 [`ArenaPlugin::new`] 注入任意场景路径
-/// （headless 测试写临时 fixture 关卡）。
+/// [`ENEMY_MODEL_PATH`]——均经 [`asset_path`] 解析（CWD 相对优先、
+/// workspace 根相对回退）：`cargo run` 与 `cargo test` 两种工作目录下
+/// 都能命中仓库资产，无须按入口注入绝对路径。测试用
+/// [`ArenaPlugin::new`] 注入任意场景路径（headless 测试写临时 fixture
+/// 关卡；显式路径优先于默认解析）。
 #[derive(Debug, Clone)]
 pub struct ArenaPlugin {
     /// Startup 时 [`load_scene`] 的场景文件路径（关卡数据与代码分离）。
@@ -245,8 +248,8 @@ pub struct ArenaPlugin {
 impl Default for ArenaPlugin {
     fn default() -> Self {
         Self {
-            scene_path: PathBuf::from(DEFAULT_SCENE_PATH),
-            enemy_model_path: PathBuf::from(ENEMY_MODEL_PATH),
+            scene_path: asset_path(DEFAULT_SCENE_PATH),
+            enemy_model_path: asset_path(ENEMY_MODEL_PATH),
         }
     }
 }
@@ -450,15 +453,9 @@ fn build_scene(world: &mut World, scene_path: &Path, enemy_model_path: &Path) {
         match spawn_gltf_instance(world, enemy_model_path) {
             Ok(instance) => {
                 let root = instance.roots[0];
-                // 关节树收编（dogfooding 摩擦点，已记录）：多顶层节点的蒙皮
-                // glTF（mesh 根与关节树根是**兄弟**）在移动的蒙皮实体下必须
-                // 把关节树挂回 mesh 根——蒙皮矩阵 J = inv(mesh 全局) ×
-                // global(joint) × ibm，关节树不随根移动时 global(joint) 恒在
-                // 世界原点，蠕虫会永远渲染在原点的绑定姿势。收编后
-                // global(joint) 含根变换，J 回到绑定姿势且随根平移/旋转。
-                for extra in &instance.roots[1..] {
-                    world.add_child(root, *extra);
-                }
+                // 蒙皮实例结构：加载器已把兄弟顶层关节树收编为根实体的
+                // 子树（引擎 API 打磨 II），移动槽位根实体整只蠕虫跟随，
+                // 游戏内不再需要手动 add_child（旧绕行已删）
                 world.insert(root, instance.player());
                 // 待命即隐藏：全部渲染 pass 跳过（组件缺席 = 可见，故必须
                 // 在 spawn 后立刻插入 HIDDEN，池化翻转由表现系统 get_mut）
@@ -568,33 +565,20 @@ fn hp_bar_width(hp: i32) -> f32 {
     HP_BAR_WIDTH * (hp.max(0) as f32 / PLAYER_MAX_HP as f32)
 }
 
-/// 开波双音：660 Hz 短音 + 间隙 + 990 Hz 长音（逐采样拼接，段内首尾 5 ms
-/// 线性包络防爆音）。`AudioClip` 采样不公开读取，故直接从解析式生成。
+/// 开波双音：660 Hz 短音 + 间隙 + 990 Hz 长音。各段用程序化生成器产出
+/// （自带首尾 5 ms 包络防爆音），[`AudioClip::concat`] 顺序拼接——
+/// 采样访问与拼接公开后无须再手写采样缓冲（dogfooding 摩擦⑤已闭合）。
 fn double_beep(sample_rate: u32) -> AudioClip {
     const TONE_A: f32 = 0.12;
     const GAP: f32 = 0.06;
     const TONE_B: f32 = 0.18;
-    const FADE: usize = 240; // 5 ms @ 48 kHz
-    let total = ((TONE_A + GAP + TONE_B) * sample_rate as f32) as usize;
-    let a_len = (TONE_A * sample_rate as f32) as usize;
-    let b_start = (TONE_A + GAP) * sample_rate as f32;
-    let mut samples = vec![0.0f32; total];
-    for (i, sample) in samples.iter_mut().enumerate() {
-        let t = i as f32 / sample_rate as f32;
-        if i < a_len {
-            // 段 A：660 Hz，段内 5 ms 淡入淡出
-            let fade = (i as f32 / FADE as f32).min(1.0)
-                .min((a_len - i) as f32 / FADE as f32).min(1.0);
-            *sample = (std::f32::consts::TAU * 660.0 * t).sin() * fade;
-        } else if t >= b_start {
-            let j = i - (b_start * sample_rate as f32) as usize;
-            let b_len = total - (b_start * sample_rate as f32) as usize;
-            let fade = (j as f32 / FADE as f32).min(1.0)
-                .min((b_len - j) as f32 / FADE as f32).min(1.0);
-            *sample = (std::f32::consts::TAU * 990.0 * (t - b_start)).sin() * fade;
-        }
-    }
-    AudioClip::from_interleaved(samples, 1, sample_rate).expect("程序化生成参数恒合法")
+    let tone_a = sine(660.0, TONE_A, sample_rate);
+    let tone_b = sine(990.0, TONE_B, sample_rate);
+    let gap = (GAP * sample_rate as f32) as usize;
+    let silence =
+        AudioClip::from_interleaved(vec![0.0; gap], 1, sample_rate).expect("程序化参数恒合法");
+    AudioClip::concat(&[&tone_a, &silence, &tone_b])
+        .expect("同参数生成的剪辑布局必然一致")
 }
 
 /// Update 1：读输入与时间 → 推进纯逻辑 → 差分事件计数触发音效。
@@ -608,7 +592,7 @@ fn run_arena(world: &World) {
         .unwrap_or(0.0);
 
     // ---- 输入翻译：WASD 世界系移动（相机方位恒定 → 屏幕相对一致）、
-    // Shift 边沿冲刺、R 重开、确认键白名单探测「任意键」----
+    // Shift 边沿冲刺、R 重开、any-key 探测「任意键」----
     let input = world
         .try_resource::<Input>()
         .map(|keys| {
@@ -616,23 +600,14 @@ fn run_arena(world: &World) {
                 (keys.key(KeyCode::KeyD) as i32 - keys.key(KeyCode::KeyA) as i32) as f32;
             let move_z =
                 (keys.key(KeyCode::KeyS) as i32 - keys.key(KeyCode::KeyW) as i32) as f32;
-            // 任意键 = 常用键白名单（引擎 Input 无按键枚举 / any-key 查询）
-            const CONFIRM_KEYS: [KeyCode; 8] = [
-                KeyCode::KeyW,
-                KeyCode::KeyA,
-                KeyCode::KeyS,
-                KeyCode::KeyD,
-                KeyCode::Space,
-                KeyCode::Enter,
-                KeyCode::ShiftLeft,
-                KeyCode::KeyR,
-            ];
             ArenaInput {
                 move_x,
                 move_z,
                 dash: keys.key_pressed(KeyCode::ShiftLeft)
                     || keys.key_pressed(KeyCode::ShiftRight),
-                confirm: CONFIRM_KEYS.iter().any(|&key| keys.key_pressed(key)),
+                // 任意键：Input::any_key_pressed（引擎 API 打磨 II 闭合——
+                // 旧 8 键白名单会漏掉白名单外的按键，玩家卡在标题屏）
+                confirm: keys.any_key_pressed(),
                 restart: keys.key_pressed(KeyCode::KeyR),
             }
         })

@@ -1,10 +1,10 @@
 //! 工具：Iris Arena（iris-arena）双时刻视觉验收（离屏渲染）。
 //!
 //! 用与 headless 测试**完全相同的方式**驱动真实游戏世界（ArenaPlugin 系统
-//! 链 + `AnimationPlugin` 等价注册 + `HierarchyPlugin` + `Time::advance`
-//! 确定性推进 + `Input::press / release` 脚本化按键注入 + PostUpdate 层级
-//! 传播，不建窗口），关卡来自 `assets/arena_battle.scene.json`（地面 /
-//! 四面围墙 / 七根障碍柱 / 中央点光经 `load_scene` 载入），分别渲染：
+//! 链 + `AnimationPlugin` / `HierarchyPlugin` 插件注册 + `Time::advance`
+//! 确定性推进 + `Input::press / release` 脚本化按键注入，不建窗口），关卡
+//! 来自 `assets/arena_battle.scene.json`（地面 / 四面围墙 / 七根障碍柱 /
+//! 中央点光经 `load_scene` 载入），分别渲染：
 //!
 //! - 左：**wave 2 混战**——开局后脚本驱敌清掉第 1 波、间歇进入第 2 波
 //!   （7 只蒙皮蠕虫从场边围拢），自动开火弹道在飞，HUD（WAVE / SCORE /
@@ -28,11 +28,10 @@
 
 use std::time::Duration;
 
-use iris_core::prelude::{Access, Stage, Vec2};
+use iris_core::prelude::{Stage, Vec2};
 use iris_engine::prelude::{
-    AnimationPlayer, App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode,
-    MaterialStore, MeshStore, OffscreenRenderer, Plugin, TextureStore, Time, Transform,
-    update_animations,
+    AnimationPlugin, App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode,
+    MaterialStore, MeshStore, OffscreenRenderer, Plugin, TextureStore, Time,
 };
 use iris_arena::{ArenaPlugin, ArenaState};
 
@@ -58,17 +57,10 @@ impl Harness {
         app.world.insert_resource(Audio::headless());
 
         // 层级传播（PostUpdate，HierarchyPlugin）+ 动画推进（Update，
-        // AnimationPlugin 的注册原样内联——该插件未列入 iris-engine
-        // prelude，headless 路径无法直接 build，见 ARCHITECTURE §8.13）
+        // AnimationPlugin——已列入 iris-engine prelude，headless 直接
+        // build，与窗口路径的 DefaultPlugins 同一插件同一编排）
         HierarchyPlugin.build(&mut app);
-        app.schedule.add_parallel_system(
-            Stage::Update,
-            Access::new()
-                .write::<AnimationPlayer>()
-                .write::<Transform>()
-                .read::<Time>(),
-            update_animations,
-        );
+        AnimationPlugin.build(&mut app);
         // 关卡来自场景文件（显式给默认路径——示例的 cwd 即 workspace 根）
         ArenaPlugin::default().build_schedule(&mut app.schedule);
 

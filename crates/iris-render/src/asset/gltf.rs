@@ -9,6 +9,7 @@
 //! - 材质：`baseColorFactor`、`emissiveFactor`；`roughness` 映射为高光锐度；
 //!   `baseColorTexture` 支持外部图片文件或 data URI（PNG / JPEG）；
 //! - 节点 TRS 与 children 层级 → Iris 实体树（父节点实体 + 每 primitive 一个子实体）；
+//!   蒙皮实例自动收编兄弟顶层关节树（移动实例根即移动整只蒙皮角色）；
 //! - 动画剪辑（translation / rotation / scale 通道，LINEAR / STEP 插值）
 //!   → [`AnimationClip`]，配合 [`AnimationPlayer`] 播放。
 //!
@@ -18,7 +19,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -971,10 +972,32 @@ impl GltfInstance {
     }
 }
 
+/// 判断 `entity` 是否为 `ancestor` 的后代（或其本身）——沿父链上溯。
+/// 蒙皮实例收编用：关节树根已是蒙皮节点后代时不再重挂。
+fn is_descendant_or_self(
+    world: &World,
+    entity: iris_core::prelude::Entity,
+    ancestor: iris_core::prelude::Entity,
+) -> bool {
+    let mut current = Some(entity);
+    while let Some(current_entity) = current {
+        if current_entity == ancestor {
+            return true;
+        }
+        current = world.parent(current_entity);
+    }
+    false
+}
+
 /// 从 glTF / GLB 文件生成实体树，返回完整场景实例（实体 + 节点映射 + 动画）。
 ///
 /// 节点层级映射为 Iris 层级：有 mesh 的节点生成一个父实体，
 /// 其每个 primitive 挂一个子实体（共享父节点的变换）。
+///
+/// 引用蒙皮的节点会在加载完成时把**兄弟顶层关节树收编**为自己的子树
+/// （关节全局变换因此含蒙皮节点变换，移动实例根即移动整只蒙皮角色；
+/// 见函数内注释的正确性论证）。收编后 [`GltfInstance::roots`] 只保留
+/// 真正的场景顶层实体。
 pub fn spawn_gltf_instance(
     world: &mut World,
     path: impl AsRef<Path>,
@@ -1050,6 +1073,65 @@ pub fn spawn_gltf_instance(
             world.insert(part, skin.clone());
         }
     }
+
+    // ---- 蒙皮实例收编（dogfooding II 摩擦①）：多顶层节点的蒙皮 glTF
+    // （mesh 根与关节树根是**兄弟**）生成的实体树原本无法整体移动——
+    // 关节树留在场景顶层时，global(joint) 不含蒙皮节点变换，移动蒙皮
+    // 节点后几何体不跟随（Iris Arena 的蠕虫敌人被迫在游戏内 add_child
+    // 收编）。正确性论证（收编之所以成立的全部理由）：
+    //   verts = mesh全局 × (inv(mesh全局) × joint全局 × ibm) × v
+    //         = joint全局 × ibm × v
+    // 蒙皮公式中 mesh全局相消，几何体**跟随关节**；收编后关节全局含
+    // 蒙皮节点变换 ⇒ 移动实例根即移动整只蒙皮角色。收编在加载完成时
+    // 执行：glTF 蒙皮资产的 mesh 节点变换按规范为恒等（蒙皮定义在网格
+    // 空间），收编不改变任何实体的初始全局变换。
+    let mut reparented: HashSet<iris_core::prelude::Entity> = HashSet::new();
+    let mut absorbed_skins: HashSet<usize> = HashSet::new();
+    for (node_index, node) in loader.doc.nodes.iter().enumerate() {
+        let Some(skin_index) = node.skin else {
+            continue;
+        };
+        // 多个 mesh 节点共享同一 skin 时关节树只能挂在一处（首见者收编）
+        if !absorbed_skins.insert(skin_index) {
+            continue;
+        }
+        let Some(mesh_entity) =
+            loader.node_entities.borrow().get(node_index).copied().flatten()
+        else {
+            continue;
+        };
+        // 关节树根：joints 集合中不被集合内任何其他节点的 child 边指向者
+        // （父链经过非关节节点——如「Armature」包装节点——的关节也算根）
+        let joints = &loader.doc.skins[skin_index].joints;
+        let root_nodes: Vec<usize> = joints
+            .iter()
+            .copied()
+            .filter(|&joint| {
+                joints.iter().all(|&other| {
+                    other == joint || !loader.doc.nodes[other].children.contains(&joint)
+                })
+            })
+            .collect();
+        for root_index in root_nodes {
+            let Some(root_entity) =
+                loader.node_entities.borrow().get(root_index).copied().flatten()
+            else {
+                continue;
+            };
+            // 已是蒙皮节点的后代（单顶层节点资产，关节树本就在 mesh 子树
+            // 内）：保持原层级——拆出重挂会丢失中间非关节节点的变换链
+            if is_descendant_or_self(world, root_entity, mesh_entity) {
+                continue;
+            }
+            world.add_child(mesh_entity, root_entity);
+            reparented.insert(root_entity);
+        }
+    }
+
+    // 收编过的关节树根已不是场景顶层：从 roots 中移除（roots 语义 =
+    // 「active scene 的顶层实体」；场景挂载等消费者按顶层逐个 add_child，
+    // 残留会把刚收编的关节再拆出去）
+    roots.retain(|root| !reparented.contains(root));
 
     Ok(GltfInstance {
         roots,
@@ -1415,17 +1497,29 @@ mod tests {
 
         let mut world = world_with_stores();
         let instance = spawn_gltf_instance(&mut world, &path)?;
-        assert_eq!(instance.roots.len(), 2, "mesh 节点与 hip 都应在场景顶层");
-
-        // 关节实体解析正确
+        // 蒙皮实例收编：关节树根（hip）已挂到 mesh 根实体下，roots 只剩
+        // 场景顶层（收编前的兄弟顶层关节树不再是顶层）
+        assert_eq!(instance.roots.len(), 1, "收编后 mesh 根是唯一顶层实体");
+        let mesh_root = instance.roots[0];
         let hip = instance.node_entities[1].expect("hip 应已生成");
         let elbow = instance.node_entities[2].expect("elbow 应已生成");
+        assert_eq!(world.parent(hip), Some(mesh_root), "关节树根应收编为 mesh 根的子实体");
+        assert_eq!(world.parent(elbow), Some(hip), "链式关节的父子层级应原样保留");
+        assert_eq!(
+            world.children(mesh_root).len(),
+            2,
+            "mesh 根应有 2 个子实体：primitive 部分 + 关节树根"
+        );
 
-        // mesh 节点的 primitive 子实体应挂上 Skin
-        let parts = world.children(instance.roots[0]);
-        assert_eq!(parts.len(), 1);
+        // mesh 节点的 primitive 子实体应挂上 Skin（子实体中无 Skin 的是关节树根）
+        let parts = world.children(mesh_root);
         let skin = world
-            .get::<Skin>(parts[0])
+            .get::<Skin>(
+                *parts
+                    .iter()
+                    .find(|&&child| world.get::<Skin>(child).is_some())
+                    .expect("应有挂 Skin 的 primitive 子实体"),
+            )
             .expect("蒙皮网格实体应有 Skin 组件")
             .clone();
         assert_eq!(skin.joints, vec![hip, elbow]);
@@ -1466,5 +1560,116 @@ mod tests {
         let mut world = world_with_stores();
         let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
         assert!(matches!(err, GltfError::Missing(_)), "实际错误：{err:?}");
+    }
+
+    /// 收编后移动实例根：层级传播把实例位移带进关节全局变换——
+    /// 「移动实例根即移动整只蒙皮角色」的语义级证据（像素级证据见
+    /// iris-render/tests/skin_render.rs 的根位移 GPU 回归测试）。
+    #[test]
+    fn absorbed_joint_globals_follow_instance_root() -> Result<(), GltfError> {
+        use iris_core::hierarchy::propagate_transforms;
+        use iris_core::prelude::GlobalTransform;
+
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = skinned_triangle_parts();
+        let path = dir.join("skinned_follow.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        let mesh_root = instance.roots[0];
+        let hip = instance.node_entities[1].expect("hip 应已生成");
+        let elbow = instance.node_entities[2].expect("elbow 应已生成");
+
+        // 实例定位到 (4, 0, 0)：收编后的关节全局变换应含实例位移
+        world.get_mut::<Transform>(mesh_root).unwrap().position = [4.0, 0.0, 0.0].into();
+        propagate_transforms(&mut world);
+        assert_eq!(
+            world.get::<GlobalTransform>(hip).unwrap().position(),
+            glam::Vec3::new(4.0, 0.0, 0.0),
+            "关节树根的全局变换应跟随实例根"
+        );
+        assert_eq!(
+            world.get::<GlobalTransform>(elbow).unwrap().position(),
+            glam::Vec3::new(4.0, 1.0, 0.0),
+            "子关节应在实例位移上叠加自身局部偏移"
+        );
+        Ok(())
+    }
+
+    /// 多根关节树识别：两个孤立关节（互无父子边）都是关节树根，应各自
+    /// 收编到蒙皮节点下——根识别对「多根」集合的覆盖（链式识别由
+    /// loads_skinned_glb_and_binds_skin 的父子层级断言覆盖）。
+    #[test]
+    fn multi_root_joint_trees_are_all_absorbed() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // fixture：两个孤立关节（hip / elbow 无 children 边）+ 蒙皮三角
+        // （BIN 布局与 skinned_triangle_parts 相同：positions | indices |
+        // pad→44 | joints | weights | ibm）
+        let mut bin: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            bin.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        bin.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        while bin.len() < 44 {
+            bin.push(0);
+        }
+        for j in [[0u16, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]] {
+            bin.extend_from_slice(&j.map(u16::to_le_bytes).concat());
+        }
+        for w in [[1.0f32, 0.0, 0.0, 0.0]; 3] {
+            bin.extend_from_slice(&w.map(f32::to_le_bytes).concat());
+        }
+        extend_mat4(&mut bin, glam::Mat4::IDENTITY);
+        extend_mat4(&mut bin, glam::Mat4::IDENTITY);
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "buffers": [{"byteLength": 244}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 6},
+                {"buffer": 0, "byteOffset": 44, "byteLength": 24},
+                {"buffer": 0, "byteOffset": 68, "byteLength": 48},
+                {"buffer": 0, "byteOffset": 116, "byteLength": 128}
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+                {"bufferView": 2, "componentType": 5123, "count": 3, "type": "VEC4"},
+                {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC4"},
+                {"bufferView": 4, "componentType": 5126, "count": 2, "type": "MAT4"}
+            ],
+            "meshes": [{"primitives": [{
+                "attributes": {"POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3}, "indices": 1
+            }]}],
+            "skins": [{"joints": [1, 2], "inverseBindMatrices": 4}],
+            "nodes": [
+                {"mesh": 0, "skin": 0},
+                {"name": "hip"},
+                {"name": "elbow", "translation": [0.0, 1.0, 0.0]}
+            ],
+            "scenes": [{"nodes": [0, 1, 2]}],
+            "scene": 0
+        }"#;
+        let path = dir.join("multi_root_joints.glb");
+        std::fs::write(&path, write_glb(json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        assert_eq!(instance.roots.len(), 1, "两个关节根收编后 mesh 根是唯一顶层");
+        let mesh_root = instance.roots[0];
+        let hip = instance.node_entities[1].expect("hip 应已生成");
+        let elbow = instance.node_entities[2].expect("elbow 应已生成");
+        assert_eq!(world.parent(hip), Some(mesh_root), "孤立关节 1 应收编");
+        assert_eq!(world.parent(elbow), Some(mesh_root), "孤立关节 2 应收编");
+        assert_eq!(
+            world.children(mesh_root).len(),
+            3,
+            "mesh 根应有 3 个子实体：primitive + 两个关节根"
+        );
+        Ok(())
     }
 }

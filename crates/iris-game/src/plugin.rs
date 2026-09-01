@@ -111,9 +111,10 @@ pub const BANNER_TEXT_NAME: &str = "hud/banner";
 
 /// 收集小游戏插件：Startup 载入场景 + Update 推进逻辑与表现。
 ///
-/// [`Default`] 的关卡路径是 [`DEFAULT_SCENE_PATH`]（`assets/
-/// collect_arena.scene.json`）；测试 / 示例用 [`GamePlugin::new`] 注入任意
-/// 路径（headless 测试写临时 fixture 关卡）。
+/// [`Default`] 的关卡路径是 [`DEFAULT_SCENE_PATH`]（经 [`asset_path`]
+/// 解析：`cargo run` 与 `cargo test` 两种工作目录下都能命中 workspace
+/// 根资产）；测试 / 示例用 [`GamePlugin::new`] 注入任意路径（headless
+/// 测试写临时 fixture 关卡，显式路径优先于默认解析）。
 #[derive(Debug, Clone)]
 pub struct GamePlugin {
     /// Startup 时 [`load_scene`] 的场景文件路径（关卡数据与代码分离）。
@@ -122,7 +123,7 @@ pub struct GamePlugin {
 
 impl Default for GamePlugin {
     fn default() -> Self {
-        Self { scene_path: PathBuf::from(DEFAULT_SCENE_PATH) }
+        Self { scene_path: asset_path(DEFAULT_SCENE_PATH) }
     }
 }
 

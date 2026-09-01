@@ -17,8 +17,8 @@ use iris_arena::ArenaPlugin;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins::new("Iris Arena"))
-        // 关卡来自 assets/arena_battle.scene.json（相对工作目录）；
-        // ArenaPlugin::new 可注入任意场景路径（测试 fixture / 变体关卡）
+        // 关卡与敌人模型路径经 asset_path 解析（CWD 相对优先，workspace 根
+        // 相对回退）；ArenaPlugin::new 可注入任意场景路径（测试 / 变体关卡）
         .add_plugin(ArenaPlugin::default())
         .run();
 }

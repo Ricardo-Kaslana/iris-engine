@@ -41,6 +41,13 @@ impl Input {
         self.keys_pressed.contains(&code)
     }
 
+    /// 本帧是否有**任意键**刚被按下（「任意键开始」标题画面 / 跳过过场）。
+    /// 语义等同对全键位遍历 [`Input::key_pressed`]——刚按下集合非空即真；
+    /// 系统自动重复不重触发（与 `key_pressed` 的边沿语义一致）。
+    pub fn any_key_pressed(&self) -> bool {
+        !self.keys_pressed.is_empty()
+    }
+
     /// 键是否在本帧刚被释放（仅本帧为真）。
     pub fn key_released(&self, code: KeyCode) -> bool {
         self.keys_released.contains(&code)
@@ -201,6 +208,27 @@ mod tests {
         input.on_key(key(KeyCode::Space), ElementState::Pressed);
         assert!(!input.key_pressed(KeyCode::Space));
         assert!(input.key(KeyCode::Space));
+    }
+
+    /// any-key 查询：本帧任意键刚按下为真；下一帧（end_frame 清除一次性
+    /// 状态）为假；释放动作本身不产生按下边沿，仍为假。
+    #[test]
+    fn any_key_pressed_tracks_frame_edges() {
+        let mut input = Input::new();
+        assert!(!input.any_key_pressed(), "空闲帧不应有任意键按下");
+        input.press(KeyCode::Enter);
+        assert!(input.any_key_pressed(), "本帧刚按下应为真");
+        // 同帧再多按一键：仍为真（集合语义）
+        input.press(KeyCode::KeyX);
+        assert!(input.any_key_pressed());
+
+        input.end_frame();
+        assert!(!input.any_key_pressed(), "下一帧按下边沿已清除");
+        assert!(input.key(KeyCode::Enter), "按住状态跨帧保持（不参与 any-key）");
+
+        input.release(KeyCode::Enter);
+        assert!(!input.any_key_pressed(), "释放不是按下：any-key 仍为假");
+        assert!(input.key_released(KeyCode::Enter));
     }
 
     /// press / release 便捷注入：与 on_key 语义一致，但无须手构

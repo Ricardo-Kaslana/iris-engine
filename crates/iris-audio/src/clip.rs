@@ -63,6 +63,36 @@ impl AudioClip {
     pub fn samples(&self) -> &[f32] {
         &self.samples
     }
+
+    /// 顺序拼接多个剪辑：采样串联为单条剪辑（程序化音效的组合子——
+    /// 双音报时、音效前后缀等无须再手写采样缓冲）。所有剪辑的声道数与
+    /// 采样率必须一致，否则报 [`AudioError::Unsupported`]（布局不同的
+    /// 剪辑本就不该串联，静默重采样会隐藏调用方的参数错误）；空列表报
+    /// [`AudioError::Format`]。
+    pub fn concat(clips: &[&AudioClip]) -> Result<AudioClip, AudioError> {
+        let Some(first) = clips.first() else {
+            return Err(AudioError::Format("concat 至少需要一个剪辑".into()));
+        };
+        let (channels, sample_rate) = (first.channels(), first.sample_rate());
+        if let Some(bad) = clips
+            .iter()
+            .find(|clip| clip.channels() != channels || clip.sample_rate() != sample_rate)
+        {
+            return Err(AudioError::Unsupported(format!(
+                "拼接剪辑布局不一致：{} Hz × {} 声道 vs {} Hz × {} 声道",
+                sample_rate,
+                channels,
+                bad.sample_rate(),
+                bad.channels()
+            )));
+        }
+        let mut samples = Vec::with_capacity(clips.iter().map(|clip| clip.samples().len()).sum());
+        for clip in clips {
+            samples.extend_from_slice(clip.samples());
+        }
+        // 布局一致性已验证：帧数必为声道数的整数倍
+        Ok(Self { samples: Arc::new(samples), channels, sample_rate })
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +137,45 @@ mod tests {
 
     fn clipped_ptr(clip: &AudioClip) -> *const f32 {
         clip.samples().as_ptr()
+    }
+
+    /// 拼接：长度相加、内容按序串联、布局继承首剪辑。
+    #[test]
+    fn concat_joins_samples_in_order() {
+        let a = AudioClip::from_interleaved(vec![0.1, 0.2, 0.3], 1, 48_000).expect("合法");
+        let b = AudioClip::from_interleaved(vec![-0.4, -0.5], 1, 48_000).expect("合法");
+        let joined = AudioClip::concat(&[&a, &b]).expect("同布局应可拼");
+        assert_eq!((joined.channels(), joined.sample_rate()), (1, 48_000));
+        assert_eq!(joined.frame_count(), 5, "帧数应相加");
+        assert_eq!(joined.samples(), &[0.1, 0.2, 0.3, -0.4, -0.5], "采样应按序串联");
+
+        // 立体声按帧拼接（交错布局不被打乱）；只读视图可逐采样核对
+        let l = AudioClip::from_interleaved(vec![1.0, -1.0], 2, 44_100).expect("合法");
+        let r = AudioClip::from_interleaved(vec![0.5, -0.5], 2, 44_100).expect("合法");
+        let stereo = AudioClip::concat(&[&l, &r]).expect("同布局应可拼");
+        assert_eq!(stereo.channels(), 2);
+        assert_eq!(stereo.samples(), &[1.0, -1.0, 0.5, -0.5]);
+        let view: &[f32] = stereo.samples();
+        assert_eq!(view.len(), stereo.frame_count() * 2);
+    }
+
+    /// 布局不一致（声道数或采样率任一不同）报 Unsupported；空列表报 Format。
+    #[test]
+    fn concat_rejects_mismatched_layouts() {
+        let mono = AudioClip::from_interleaved(vec![0.0; 4], 1, 48_000).expect("合法");
+        let stereo = AudioClip::from_interleaved(vec![0.0; 4], 2, 48_000).expect("合法");
+        let other_rate = AudioClip::from_interleaved(vec![0.0; 4], 1, 44_100).expect("合法");
+        assert!(matches!(
+            AudioClip::concat(&[&mono, &stereo]),
+            Err(AudioError::Unsupported(_))
+        ));
+        assert!(matches!(
+            AudioClip::concat(&[&mono, &other_rate]),
+            Err(AudioError::Unsupported(_))
+        ));
+        assert!(matches!(AudioClip::concat(&[]), Err(AudioError::Format(_))));
+        // 单剪辑拼接 = 原样复制
+        let single = AudioClip::concat(&[&mono]).expect("单剪辑恒可拼");
+        assert_eq!(single.samples(), mono.samples());
     }
 }

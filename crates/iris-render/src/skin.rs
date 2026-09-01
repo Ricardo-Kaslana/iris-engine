@@ -13,7 +13,8 @@
 //!
 //! ```ignore
 //! let instance = spawn_gltf_instance(&mut world, "assets/character.glb")?;
-//! // 加载器已为蒙皮网格实体挂好 Skin；挂上播放器即可驱动关节动画
+//! // 加载器已为蒙皮网格实体挂好 Skin，并把兄弟顶层关节树收编为根实体
+//! // 的子树（移动根即移动整只蒙皮角色）；挂上播放器即可驱动关节动画
 //! world.insert(instance.roots[0], instance.player());
 //! ```
 

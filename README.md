@@ -370,12 +370,13 @@ Transform，关节子树随层级传播跟随、动画逐帧覆写关节旋转�
 近似、刻意解耦），插件层在 Startup 把场景 `Collider` 一次性转换为逻辑形状
 （Update 每帧零查询）；多游戏状态 Title / Playing / GameOver + 波次间歇；
 音效由逻辑侧单调事件计数器的前后差分触发（射击 / 命中 / 受伤 / 开波双音，
-全部程序化生成）。headless 集成测试（8 项）复用与窗口程序同一编排的插件
+全部程序化生成）。headless 集成测试（9 项）复用与窗口程序同一编排的插件
 系统链，覆盖池取用 / 归还 / 跨波复用、动画推进、HUD 刷新、弹道池封顶、
-终局重开闭环与混战 draw calls 记录性断言（13 敌 + 20 弹 + 场景 + HUD 一帧
-**25 次 draw call**）；本次实践撞到的 API 摩擦（AnimationPlugin 未入
-prelude / 资产路径工作目录相对 / 蒙皮实例关节树不随根移动等）见
-ARCHITECTURE.md §8.13。
+终局重开闭环、蒙皮实例根位移带动关节子树与混战 draw calls 记录性断言
+（13 敌 + 20 弹 + 场景 + HUD 一帧 **25 次 draw call**）；本次实践撞到的
+API 摩擦（AnimationPlugin 未入 prelude / 资产路径工作目录相对 /
+蒙皮实例关节树不随根移动等）已在「引擎 API 打磨 II」轮全部修复，
+游戏内绕行代码同步删除改用新 API（清单见 ARCHITECTURE.md §8.13）。
 
 ![波次生存竞技场双时刻验收](docs/arena_preview.png)
 
@@ -393,7 +394,7 @@ cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏�
 ## 测试
 
 ```sh
-cargo test --workspace   # 292 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 302 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
