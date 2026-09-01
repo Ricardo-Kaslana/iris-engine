@@ -260,14 +260,25 @@ const _: () = assert!(
     "UiGlobals 必须与 WGSL 布局一致"
 );
 
-/// 单帧渲染统计。
+/// 单帧渲染统计。除注明外均为**主 pass 口径**：UI pass 只计入
+/// `draw_calls` 的单批，阴影 pass（复用主 pass 实例区间，见 §4.1）与
+/// 天空 / 后处理 pass 全部不计。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
+    /// 主 pass draw call 数：普通批每批 1 + 蒙皮每实体 1 + UI 顶点非空时 1。
     pub draw_calls: u32,
+    /// 主 pass 提交的实例数（可见实例，普通 + 蒙皮合计）。
     pub instances: u32,
     /// 本帧实例缓冲实际 `write_buffer` 的字节数。0 = 与上一帧逐实例比对
     /// 完全一致、整帧跳过实例上传（静态场景零上传）。
     pub instance_upload_bytes: u64,
+    /// 本帧被视锥剔除的实例数（普通 + 蒙皮合计）。`Visibility::HIDDEN`
+    /// 的过滤不算剔除（不进入 `instances` 也不进入本字段）。
+    pub culled_instances: u32,
+    /// 主 pass 实际提交的三角形总数：可见项的网格索引数 / 3 累加（普通批
+    /// × 批实例数，蒙皮逐项）。**主 pass 口径**——不含 UI pass 与阴影 pass
+    /// （阴影 pass 复用主 pass 实例区间，几何与主 pass 完全一致）。
+    pub triangles_drawn: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -374,28 +385,42 @@ fn build_globals_bind_group(
     })
 }
 
+/// `collect_instances` 的收集结果（普通 + 蒙皮合计）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CollectCounts {
+    /// 进入本帧绘制的实例数（`items.len() + skinned.len()`）。
+    visible: usize,
+    /// 被视锥剔除的实例数。
+    culled: u32,
+}
+
 /// 收集本帧待绘制实例：普通批处理项 + 蒙皮项（每实体一项，不参与批处理）。
 ///
 /// [`crate::visibility::Visibility`] 过滤在全部收集路径生效（主 pass、
 /// 方向光阴影与点光阴影 pass 共用同一份实例区间）：挂 `HIDDEN` 的实体
 /// 跳过，组件缺席视为可见（默认行为零变化）。普通实体做包围球视锥剔除；
-/// 蒙皮实体不剔除（关节可把顶点移出绑定姿势包围盒，保守全收）。
-/// 返回被视锥剔除的普通实体数（日志用）；排序由调用方在 `items` 上完成。
+/// 蒙皮实体做**保守并集 AABB 视锥剔除**（见下方蒙皮路径注释）。返回
+/// 可见 / 被剔除的实例数（日志与 `FrameStats` 用）；排序由调用方在
+/// `items` 上完成。
 fn collect_instances(
     world: &iris_core::world::World,
     mesh_store: &MeshStore,
     frustum: &Frustum,
     items: &mut Vec<DrawItem>,
     skinned: &mut Vec<SkinnedItem>,
-) -> u32 {
+) -> CollectCounts {
     use crate::visibility::Visibility;
     items.clear();
     skinned.clear();
     let mut culled = 0u32;
+    // 全部蒙皮实体位标识（含被剔除的）：普通路径据此跳过，避免同实体
+    // 被两条路径重复处理（剔除计数 / 绘制都只算一次）
+    let mut skinned_entities: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    // 蒙皮实体独立收集：不参与视锥剔除（关节可把顶点移出绑定姿势
-    // 包围盒，v1 保守全画）；关节矩阵在此即时计算（J = inv(mesh) ×
-    // global(joint) × ibm，蒙皮定义在网格局部空间，随父级整体移动）
+    // 蒙皮实体独立收集：关节矩阵在此即时计算（J = inv(mesh) ×
+    // global(joint) × ibm，蒙皮定义在网格局部空间，随父级整体移动）。
+    // 视锥剔除用「关节矩阵变换后的角点并集 AABB」（保守界，见函数内注释）；
+    // 网格无 CPU 数据 / 空包围盒时退化为不剔除（宁可多画）。
     world.query::<(
         iris_core::prelude::Entity,
         &GlobalTransform,
@@ -407,8 +432,53 @@ fn collect_instances(
         if visibility.is_some_and(|v| !v.visible) {
             return;
         }
+        skinned_entities.insert(e.to_bits());
         let mut joint_matrices = Vec::with_capacity(skin.joints.len());
         skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
+        // 蒙皮保守视锥剔除（R22）：
+        //
+        // 取绑定姿势 AABB 的 8 个角点，经**每个**关节矩阵 Jᵢ 变换到当前
+        // 网格局部、再经实例 model 矩阵到世界（world = model·Jᵢ·corner），
+        // 全部（关节数 × 8）点的并集 AABB 与视锥做 intersects_aabb 测试。
+        //
+        // 数学正确性（本方案成立的核心）：LBS 顶点 v′ = model·(Σᵢ wᵢ·Jᵢ·v)，
+        // 权重非负且和为 1（加载时归一化）——蒙皮后的顶点落在各刚体变换
+        // 结果 { Jᵢ·v } 的**凸组合**内；凸组合必属于各结果的凸包，而凸包
+        // 又含于「逐关节变换后的 8 角点并集的 AABB」（Jᵢ 仿射，绑定 AABB
+        // 的像必落在变换后角点的包围盒内）。故该世界 AABB 是蒙皮几何的
+        // **保守上界**：据此剔除只可能多画、不可能漏画。误用绑定姿势
+        // 包围盒剔除会在关节把几何移出原位时误杀（回归测试
+        // culling_render.rs::skinned_culling_tracks_joint_transformed_geometry）。
+        //
+        // 规模：每蒙皮实例额外 关节数 × 8 次点变换 + 一次 AABB 相交测试
+        // （Arena 15 只蠕虫 × ~5 关节量级，CPU 开销可忽略）。
+        let culled_now = mesh_store
+            .get(*m)
+            .and_then(|data| data.bounds())
+            .is_some_and(|(min, max)| {
+                let min = Vec3::from(min);
+                let max = Vec3::from(max);
+                let model = gt.matrix();
+                let mut world_min = Vec3::splat(f32::INFINITY);
+                let mut world_max = Vec3::splat(f32::NEG_INFINITY);
+                for corner in 0..8u32 {
+                    let corner = Vec3::new(
+                        if corner & 1 != 0 { max.x } else { min.x },
+                        if corner & 2 != 0 { max.y } else { min.y },
+                        if corner & 4 != 0 { max.z } else { min.z },
+                    );
+                    for joint in &joint_matrices {
+                        let world = model.transform_point3(joint.transform_point3(corner));
+                        world_min = world_min.min(world);
+                        world_max = world_max.max(world);
+                    }
+                }
+                !frustum.intersects_aabb(world_min, world_max)
+            });
+        if culled_now {
+            culled += 1;
+            return;
+        }
         skinned.push(SkinnedItem {
             skin_entity: e.to_bits(),
             mesh: m.0,
@@ -417,8 +487,6 @@ fn collect_instances(
             joint_matrices,
         });
     });
-    let skinned_entities: std::collections::HashSet<u64> =
-        skinned.iter().map(|s| s.skin_entity).collect();
 
     world.query::<(
         iris_core::prelude::Entity,
@@ -463,7 +531,10 @@ fn collect_instances(
             instance: InstanceRaw::from_matrix(model),
         });
     });
-    culled
+    CollectCounts {
+        visible: items.len() + skinned.len(),
+        culled,
+    }
 }
 
 impl Renderer {
@@ -1119,11 +1190,16 @@ impl Renderer {
         let frustum = Frustum::from_view_proj(&vp);
         let mut items = std::mem::take(&mut self.scratch);
         let mut skinned = std::mem::take(&mut self.skinned_scratch);
-        let culled = collect_instances(world, &mesh_store, &frustum, &mut items, &mut skinned);
+        let counts = collect_instances(world, &mesh_store, &frustum, &mut items, &mut skinned);
         items.sort_unstable_by_key(|item| item.key);
         let total = items.len();
-        if culled > 0 {
-            log::trace!("视锥剔除 {culled} / {} 实例", total + culled as usize);
+        self.stats.culled_instances = counts.culled;
+        if counts.culled > 0 {
+            log::trace!(
+                "视锥剔除 {} / {} 实例（普通 + 蒙皮）",
+                counts.culled,
+                counts.visible + counts.culled as usize
+            );
         }
 
         // 2b. 点光阴影 pass 的实例可见性（CPU 粗剔除）：实例包围球到投影灯的
@@ -1264,6 +1340,7 @@ impl Renderer {
             });
         let mut draw_calls = 0u32;
         let mut instances = 0u32;
+        let mut triangles_drawn = 0u32;
         if shadow_enabled && total + skinned.len() > 0 {
             let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1511,6 +1588,13 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.num_indices, 0, first..last);
                 draw_calls += 1;
                 instances += count as u32;
+                // 主 pass 三角形统计：网格索引数 / 3 × 批实例数。索引数取
+                // CPU 目录（网格缺席按 0 处理，不 panic——该路径理论上不可达，
+                // 缺席网格在懒上传阶段已告警跳过）
+                triangles_drawn += mesh_store
+                    .get(MeshHandle((key >> 32) as u32))
+                    .map_or(0, |data| data.indices.len() as u32 / 3)
+                    * count as u32;
                 index += count;
             }
             // 蒙皮实体：独立管线（组 2 = 关节矩阵 storage），实例区间紧随普通实例
@@ -1538,6 +1622,10 @@ impl Renderer {
                     pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
                     draw_calls += 1;
                     instances += 1;
+                    // 蒙皮逐项累加：索引数 / 3（网格缺席按 0，同普通批注释）
+                    triangles_drawn += mesh_store
+                        .get(MeshHandle(item.mesh))
+                        .map_or(0, |data| data.indices.len() as u32 / 3);
                 }
             }
         }
@@ -1695,6 +1783,7 @@ impl Renderer {
         self.gpu.queue.submit([encoder.finish()]);
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
+        self.stats.triangles_drawn = triangles_drawn;
         self.scratch = items;
         self.skinned_scratch = skinned;
     }
@@ -1970,15 +2059,88 @@ mod tests {
         let frustum = Frustum::from_view_proj(&glam::Mat4::IDENTITY);
         let mut items = Vec::new();
         let mut skinned = Vec::new();
-        let culled = collect_instances(&world, &mesh_store, &frustum, &mut items, &mut skinned);
+        let counts = collect_instances(&world, &mesh_store, &frustum, &mut items, &mut skinned);
 
-        assert_eq!(culled, 0);
+        assert_eq!(counts.culled, 0);
+        assert_eq!(counts.visible, items.len() + skinned.len());
         let keys: std::collections::HashSet<u64> = items.iter().map(|i| i.key).collect();
         assert!(keys.contains(&(1u64)), "缺席 Visibility 的实体应可见");
         assert!(keys.contains(&(2u64)), "显式 VISIBLE 应可见");
         assert!(!keys.contains(&(3u64)), "HIDDEN 不应被收集");
         assert_eq!(skinned.len(), 1, "隐藏的蒙皮实体不应被收集");
         assert_eq!(skinned[0].material, 5);
+    }
+
+    /// 蒙皮保守剔除跟随关节变换（反误杀核心，CPU 级）：绑定姿势 AABB 在
+    /// 原点附近，但关节矩阵把几何刚性移到 (10, 0, 0)——只看向 (10, 0, 0)
+    /// 的相机必须看到该实例（误用绑定姿势包围盒剔除会在这里误杀），
+    /// 背对的相机必须把它计入剔除数。
+    #[test]
+    fn skinned_culling_follows_joint_transformed_bounds() {
+        use crate::mesh::primitives;
+        use iris_core::prelude::Transform;
+        use iris_core::world::World;
+
+        let mut mesh_store = MeshStore::new();
+        let mesh = mesh_store.add(primitives::cube()); // 绑定 AABB [-0.5, 0.5]³
+        let mut world = World::new();
+
+        // 关节全局平移 (10, 0, 0)、ibm = 恒等、蒙皮实体在原点：
+        // J = T(10,0,0)，蒙皮后几何出现在 (10, 0, 0) 附近
+        let joint = world.spawn((Transform::from_xyz(10.0, 0.0, 0.0),));
+        let skin = Skin::new(vec![joint], vec![glam::Mat4::IDENTITY]);
+        world.spawn((
+            iris_core::prelude::GlobalTransform::from_matrix(glam::Mat4::IDENTITY),
+            mesh,
+            MaterialHandle(1),
+            skin,
+        ));
+        iris_core::hierarchy::propagate_transforms(&mut world);
+
+        // 相机在 (10, 0, 20) 看向 (10, 0, 0)：绑定 AABB（原点）在视锥外
+        // （横向偏移 10 > 视锥半宽 ~8.3），蒙皮几何在视锥内
+        let toward = Frustum::from_view_proj(&{
+            let view = glam::camera::rh::view::look_at_mat4(
+                Vec3::new(10.0, 0.0, 20.0),
+                Vec3::new(10.0, 0.0, 0.0),
+                Vec3::Y,
+            );
+            let proj = glam::camera::rh::proj::directx::perspective(
+                std::f32::consts::FRAC_PI_4,
+                1.0,
+                0.1,
+                1000.0,
+            );
+            proj * view
+        });
+        let mut items = Vec::new();
+        let mut skinned = Vec::new();
+        let counts = collect_instances(&world, &mesh_store, &toward, &mut items, &mut skinned);
+        assert_eq!(counts.visible, 1, "蒙皮几何被关节移入视锥，必须可见");
+        assert_eq!(counts.culled, 0);
+        assert_eq!(skinned.len(), 1);
+
+        // 同一相机看向 +Z（背对蒙皮几何与绑定 AABB）：剔除数计 1
+        let away = Frustum::from_view_proj(&{
+            let view = glam::camera::rh::view::look_at_mat4(
+                Vec3::new(10.0, 0.0, 20.0),
+                Vec3::new(10.0, 0.0, 40.0),
+                Vec3::Y,
+            );
+            let proj = glam::camera::rh::proj::directx::perspective(
+                std::f32::consts::FRAC_PI_4,
+                1.0,
+                0.1,
+                1000.0,
+            );
+            proj * view
+        });
+        items.clear();
+        skinned.clear();
+        let counts = collect_instances(&world, &mesh_store, &away, &mut items, &mut skinned);
+        assert_eq!(counts.visible, 0, "背对时蒙皮实例应被剔除");
+        assert_eq!(counts.culled, 1);
+        assert!(skinned.is_empty());
     }
 
     fn slice(xs: &[f32]) -> Vec<InstanceRaw> {

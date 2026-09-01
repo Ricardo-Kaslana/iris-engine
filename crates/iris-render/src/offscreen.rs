@@ -84,8 +84,11 @@ impl OffscreenRenderer {
         })
     }
 
-    /// 渲染一帧到离屏纹理，并把结果拷贝到读回缓冲。
-    pub fn render(&mut self, world: &iris_core::world::World) {
+    /// 仅渲染一帧（不做纹理→读回缓冲拷贝）。
+    ///
+    /// 性能基准路径：`render` 额外编码一次拷贝并 submit，本方法把
+    /// `Renderer::draw` 的 CPU 耗时与读回路径解耦（基准只测 draw）。
+    pub fn draw_frame(&mut self, world: &iris_core::world::World) {
         self.renderer.draw(
             world,
             &self.color_view,
@@ -93,6 +96,11 @@ impl OffscreenRenderer {
             self.width,
             self.height,
         );
+    }
+
+    /// 渲染一帧到离屏纹理，并把结果拷贝到读回缓冲。
+    pub fn render(&mut self, world: &iris_core::world::World) {
+        self.draw_frame(world);
         // 颜色纹理 -> 读回缓冲（同一队列，顺序保证在绘制之后）
         let mut encoder = self
             .gpu

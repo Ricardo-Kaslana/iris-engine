@@ -5,6 +5,44 @@
 
 ## [Unreleased]
 
+### Added（R22：蒙皮保守视锥剔除 + FrameStats 统计扩展 + culling_bench 基准）
+
+- **蒙皮实例保守视锥剔除**（`iris-render/renderer.rs` `collect_instances`）：
+  蒙皮实体不再「保守全收」——绑定姿势 AABB 的 8 角点经**每个**关节矩阵
+  变换到当前网格局部、再经实例 model 矩阵到世界，全部（关节数 × 8）点的
+  并集 AABB 与视锥做 `intersects_aabb`。数学保证只多画不漏画：LBS 顶点
+  = Σ wᵢ·(Jᵢ·v)、权重非负和为 1，蒙皮后顶点落在各刚体变换结果的
+  **凸组合**内，凸包必含于逐关节变换后角点并集的 AABB。代价为每实例
+  关节数 × 8 次点变换（Arena 15 蠕虫 × ~5 关节量级可忽略）；网格无 CPU
+  数据 / 空包围盒时退化为不剔除。实现细节：被剔除的蒙皮实体同样进入
+  跳过集合——否则普通查询路径会把它再处理一次（双计 / 误画），CPU 单测
+  抓出后修正。
+- **FrameStats 扩展**：新增 `culled_instances`（本帧被视锥剔除的实例数，
+  普通 + 蒙皮合计，`Visibility::HIDDEN` 过滤不算剔除）与
+  `triangles_drawn`（主 pass 提交三角形总数 = 可见项索引数 / 3 累加：
+  普通批 × 批实例数、蒙皮逐项；网格目录缺席按 0 处理不 panic）。口径
+  文档化：主 pass 口径，不含 UI 与阴影 pass（阴影复用主 pass 实例区间）。
+  `collect_instances` 返回值由 `u32` 改为小结构 `CollectCounts`
+  （visible / culled），trace 日志同步。
+- **测试**（GPU 集成 `culling_render.rs` + CPU 单测）：统计一致性——
+  10 立方体两排、相机 180° 对调：`visible + culled == N`、
+  `triangles_drawn == visible × 12`（精确断言）、`draw_calls` 与批数
+  一致、红像素侧证且对调后（6 可见 > 4 可见）像素增多；蒙皮反误杀回归
+  ——关节全局平移 +X 10 m、ibm 恒等 → J = T(10,0,0)，绑定 AABB 在原点
+  视锥外而蒙皮几何在 (10,0,0) 视锥内：看向时实例必须可见且画面出现
+  红像素、背对时计入 `culled_instances` 且画面全无——误用绑定包围盒
+  剔除时这两组断言必挂。
+- **culling_bench 示例**（量化验收）：5000 立方体（100×50 网格、同网格
+  同材质单批）双朝向各 300 帧（前 50 预热丢弃），输出 FrameStats 全字段
+  + `Renderer::draw` 平均 / 最坏 CPU 耗时——`Instant` 只包 draw 调用，
+  离屏读回不计（`OffscreenRenderer` 新增不拷贝读回缓冲的 `draw_frame`）。
+  开发机实测：面向全场 4730 可见 / 270 剔除 / 1 draw call / 56 760 三角
+  形、draw 平均 ~0.52 ms 最坏 ~0.99 ms；背对望空 0 可见 / 5000 全剔除 /
+  0 draw call、draw 平均 ~0.36 ms。
+- **文档**：ARCHITECTURE §4.4 补蒙皮保守剔除（凸组合论证）与 §4.4.1
+  FrameStats 字段口径表 + 基准实测记录（标注开发机、仅供量级参考），
+  §4.6.2 绘制路径与限制条目同步；README 渲染特性行补蒙皮剔除与帧统计。
+
 ### Added（R21：物理查询 + 均匀网格 broadphase + Arena 扫掠命中 + CI）
 
 - **物理查询 API（iris-core/physics）**：射线 / 线段查询一族纯函数——
