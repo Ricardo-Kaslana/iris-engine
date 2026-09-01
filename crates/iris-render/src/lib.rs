@@ -7,6 +7,8 @@
 //! - 自动实例化批处理：共享网格与材质的实体合并为一个 draw call；
 //! - 4x MSAA、深度测试、Cook-Torrance PBR（方向光 + 点光 + 环境光 + 自发光）；
 //! - 透明渲染（alpha 混合材质 + 按视深排序的透明 pass，不写深度、不投影）；
+//! - 粒子系统 v1（Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染，
+//!   additive / alpha 双混合）；
 //! - 方向光阴影贴图（2048² 深度图 + PCF）与点光 cubemap 阴影
 //!   （首灯 6 面 × 512²，R32Float 存归一化线性距离）；
 //! - HDR 中间缓冲 + ACES 色调映射 + 泛光（Bloom）后处理；
@@ -28,6 +30,7 @@ pub mod light;
 pub mod material;
 pub mod mesh;
 pub mod offscreen;
+pub mod particles;
 pub mod pipeline;
 pub mod post;
 pub mod renderer;
@@ -55,6 +58,9 @@ pub mod prelude {
     pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex, primitives};
     pub use crate::offscreen::OffscreenRenderer;
+    pub use crate::particles::{
+        AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
+    };
     pub use crate::post::BloomSettings;
     pub use crate::renderer::{FrameStats, Renderer};
     pub use crate::skin::{Skin, skin_vertex};

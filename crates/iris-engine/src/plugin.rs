@@ -145,7 +145,34 @@ impl Plugin for PhysicsPlugin {
     }
 }
 
-/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级。
+/// 粒子插件：在 **PostUpdate** 阶段（层级传播之后）推进所有
+/// [`iris_render::particles::ParticleEmitter`]。
+///
+/// 编排语义：发射原点 = `GlobalTransform` 平移——必须在
+/// [`HierarchyPlugin`] 的传播之后执行才能取到当帧全局位置（用户在
+/// Update 移动发射器，当帧新粒子即从新位置出生）；渲染发生在
+/// PostUpdate 全部结束之后，本帧模拟出的活粒子当帧即成像（调用契约
+/// 见 `iris_render::particles` 模块文档）。注册为**并行系统**：
+/// 访问集写 ParticleEmitter、读 GlobalTransform / Time。
+#[derive(Default)]
+pub struct ParticlePlugin;
+
+impl Plugin for ParticlePlugin {
+    fn build(&self, app: &mut App) {
+        use iris_core::prelude::{Access, GlobalTransform, Stage, Time};
+        use iris_render::prelude::{ParticleEmitter, update_particles};
+        app.schedule.add_parallel_system(
+            Stage::PostUpdate,
+            Access::new()
+                .write::<ParticleEmitter>()
+                .read::<GlobalTransform>()
+                .read::<Time>(),
+            update_particles,
+        );
+    }
+}
+
+/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 + 粒子。
 ///
 /// ```ignore
 /// App::new().add_plugins(DefaultPlugins::new("我的游戏")).run();
@@ -187,5 +214,7 @@ impl Plugin for DefaultPlugins {
         AnimationPlugin.build(app);
         PhysicsPlugin.build(app);
         HierarchyPlugin.build(app);
+        // 粒子在层级传播之后推进（发射原点取当帧全局位置）
+        ParticlePlugin.build(app);
     }
 }

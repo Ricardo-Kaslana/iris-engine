@@ -5,6 +5,58 @@
 
 ## [Unreleased]
 
+### Added（R24：粒子系统 v1——Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染）
+
+- **组件与模拟**（`iris-render/particles.rs`）：`ParticleEmitter` 组件
+  （混合模式 / `spawn_rate` 持续发射 / `burst_count` 一次性爆发 /
+  `emitter_lifetime` 发射器寿命 / 粒子寿命 / 初速与方向抖动 / 重力缩放 /
+  尺寸与颜色起止线性插值 / `max_particles` 池上限）+ 私有活粒子池。
+  发射原点 = 实体 `GlobalTransform` 平移，粒子出生即存世界坐标（发射器
+  移动天然留拖尾）。模拟核心 `advance` 为纯函数（不触世界，可脱离世界
+  单测）：半隐式欧拉积分 → 寿命剔除 → burst → 持续发射。**确定性**：
+  出生方向由 splitmix64 哈希流派生（发射器内全局递增计数器 ⊕ 实体
+  `Entity::to_bits`，无 rand 依赖、无全局状态），同一输入两次模拟逐位
+  一致（单测按位型比对守护）；持续发射用累计分数法（rate·dt 取整、
+  余量滚存），任意 dt 序列出生总数收敛于 rate·总时长。**池满语义**：
+  丢弃新粒子（保老弃新，不挤掉旧粒子）；发射器寿命耗尽停发（已出生
+  粒子存活到终点）；burst 首次 update 一次性触发（不受寿命门控、dt=0
+  亦触发）。预设构造 `ParticleEmitter::fountain()` / `explosion()`。
+- **系统与编排**：`update_particles(world)` 单遍系统（模拟只写发射器
+  自身内部粒子池、无跨组件借用，无需 `update_animations` 式两阶段）；
+  `Time` 缺席 dt = 0。`ParticlePlugin` 注册于 **PostUpdate、
+  `HierarchyPlugin` 之后**（发射原点取当帧传播后的全局位置），已入
+  `DefaultPlugins`；prelude 导出 `ParticleEmitter` / `ParticleBlend` /
+  `Particle` / `ParticleInstance` / `AdvanceStats` / `update_particles`。
+  场景序列化 v1 留白（JSON 场景无粒子段）。
+- **渲染**（`renderer.rs` 粒子 pass + `shaders/particle.wgsl`）：实例 =
+  (世界中心, 尺寸) + 线性 RGBA（32 字节/粒）；顶点阶段 `vertex_index`
+  展开 4 顶点 triangle-strip（无顶点缓冲），billboard = center +
+  (right·x + up·y)·size——相机 right / up 从视图矩阵行提取进 32 字节
+  小 uniform（每帧 write_buffer）；片元径向软衰减 `(1 − r²)²`（无硬
+  方块）。**双混合管线**：additive（`SrcAlpha + One`，加法交换律不
+  排序）与 alpha（`ALPHA_BLENDING`，粒子按视深降序、`total_cmp` +
+  收集序号并列断言）；都深度测试开 / 写入关（照透明管线参数）。**pass
+  顺序**：透明 pass 之后、泛光之前——粒子叠加在玻璃等透明结果上，高亮
+  additive 粒子参与泛光；无活粒子零开销。实例缓冲独立、容量不足 2 倍
+  扩容重建，**每帧全量上传**（粒子逐帧全变，增量比对无价值）。
+- **剔除与统计**：剔除按发射器包围球（活粒子 AABB 包围球 + 最大尺寸
+  边距，R22 同款保守界），被剔发射器整批不画且不计入 `culled_instances`
+  （口径为几何实例）；可见粒子计入 `instances` / `draw_calls` /
+  `triangles_drawn`（每粒 2 三角形），`FrameStats` 新增
+  `particles_drawn`（= 各可见发射器活粒子数之和，可与池状态对账）。
+  粒子不进阴影 pass（与透明同理由）。
+- **测试**：CPU 单测 7 项（240 步逐位确定性、发射计数精确 / 余量滚存 /
+  大步长、半隐式欧拉解析对照、寿命剔除 / 发射器耗尽 / 池满、burst
+  一次性、哈希流方向健全性、渲染插值）；GPU 集成 `particles_render.rs`
+  3 项（喷泉可见性 + `particles_drawn` 与池状态对账、40 颗重叠粒子
+  additive 亮度显著高于 alpha 混合的可区分断言、爆炸 one-shot 全灭后
+  不补发）。无 GPU 环境优雅跳过。验收图 `docs/particles_fountain.png`
+  / `docs/particles_explosion.png`（`particle_snapshot` 示例：喷泉持续
+  60 步成像 / 爆炸 burst + 0.3 s 扩散成像）。
+- **文档**：ARCHITECTURE §4.17 粒子系统小节（确定性 / 双混合 / billboard /
+  pass 顺序 / 池满语义），§4.1 帧流程、§4.4.1 FrameStats 口径表、§8 已知
+  限制同步；README 特性行 / 示例列表 / 路线图。
+
 ### Added（R23：透明渲染——alpha 混合材质 + 视深排序透明 pass）
 
 - **材质透明模式**（`iris-render/material.rs`）：`AlphaMode { Opaque, Blend }`

@@ -22,6 +22,7 @@ use crate::instance::InstanceRaw;
 use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
 use crate::mesh::{MeshHandle, MeshStore, upload_mesh};
+use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
 use crate::pipeline::create_pipeline;
 use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
@@ -215,6 +216,15 @@ pub struct Renderer {
     ui_vertex_buf: Option<wgpu::Buffer>,
     /// UI 顶点缓冲可容纳的顶点数。
     ui_capacity: usize,
+    /// 粒子实例缓冲（独立于几何实例缓冲；每帧全量上传，无跨帧镜像——
+    /// 粒子逐帧全变，帧级比对无增量价值）。
+    particle_buf: Option<wgpu::Buffer>,
+    /// 粒子实例缓冲可容纳的实例数。
+    particle_capacity: usize,
+    /// 粒子相机 uniform（billboard 基向量，每帧有粒子时 write_buffer）。
+    particle_camera_buf: wgpu::Buffer,
+    /// 粒子相机绑定组（粒子管线的组 1）。
+    particle_camera_bg: wgpu::BindGroup,
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
     skinned_scratch: Vec<SkinnedItem>,
@@ -223,6 +233,10 @@ pub struct Renderer {
     transparent_skinned_scratch: Vec<TransparentSkinnedItem>,
     /// UI 顶点组装暂存（跨帧复用，避免每帧堆分配）。
     ui_scratch: Vec<crate::ui::UiVertex>,
+    /// 粒子收集暂存：additive 段（后接排好序的 alpha 段，一次全量上传）。
+    particle_scratch: Vec<ParticleInstance>,
+    /// alpha 粒子收集暂存：(视深, 收集序号, 实例)——排序键与数据一体。
+    particle_alpha_scratch: Vec<(f32, u32, ParticleInstance)>,
     clear_color: wgpu::Color,
     pub(crate) stats: FrameStats,
 }
@@ -282,26 +296,52 @@ const _: () = assert!(
     "UiGlobals 必须与 WGSL 布局一致"
 );
 
-/// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass + 透明 pass，
-/// 见 ARCHITECTURE §4.16）：UI pass 只计入 `draw_calls` 的单批，阴影 pass
-/// （复用不透明实例区间，透明项不进阴影）与天空 / 后处理 pass 全部不计。
+/// 与 WGSL `ParticleCamera` 对齐（32 字节，POD）：粒子 billboard 基向量。
+/// right / up 从视图矩阵第 0 / 1 行提取（刚体视图下即相机右 / 上方向），
+/// 每帧 `write_buffer`（有粒子时）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ParticleCameraRaw {
+    right: [f32; 4],
+    up: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<ParticleCameraRaw>() == 32,
+    "ParticleCamera 必须与 WGSL 布局一致"
+);
+
+/// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、透明 pass
+/// 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17）：UI pass 只计入
+/// `draw_calls` 的单批，阴影 pass（复用不透明实例区间，透明项与粒子
+/// 不进阴影）与天空 / 后处理 pass 全部不计。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
     /// 主几何 draw call 数：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 +
-    /// 透明蒙皮每实体 1 + UI 顶点非空时 1。
+    /// 透明蒙皮每实体 1 + 粒子（additive / alpha 段各至多 1）+ UI 顶点非空
+    /// 时 1。
     pub draw_calls: u32,
-    /// 主几何提交的实例数（可见实例，普通 + 蒙皮 + 透明普通 + 透明蒙皮合计）。
+    /// 主几何提交的实例数（可见实例，普通 + 蒙皮 + 透明普通 + 透明蒙皮 +
+    /// 粒子合计）。
     pub instances: u32,
     /// 本帧实例缓冲实际 `write_buffer` 的字节数。0 = 与上一帧逐实例比对
-    /// 完全一致、整帧跳过实例上传（静态场景零上传）。
+    /// 完全一致、整帧跳过实例上传（静态场景零上传）。粒子实例走独立
+    /// 缓冲、每帧全量上传，**不计入**本字段（见 `particles_drawn`）。
     pub instance_upload_bytes: u64,
     /// 本帧被视锥剔除的实例数（普通 + 蒙皮 + 透明合计）。`Visibility::HIDDEN`
-    /// 的过滤不算剔除（不进入 `instances` 也不进入本字段）。
+    /// 的过滤不算剔除（不进入 `instances` 也不进入本字段）。**粒子不进本
+    /// 口径**：剔除按发射器包围球整批裁决，被剔的发射器既不进 `instances`
+    /// 也不进本字段（口径为几何实例，避免混淆，见 ARCHITECTURE §4.17）。
     pub culled_instances: u32,
     /// 主几何实际提交的三角形总数：可见项的网格索引数 / 3 累加（普通批
-    /// × 批实例数，蒙皮逐项；透明同口径计入）。**主几何口径**——不含 UI
-    /// pass 与阴影 pass（阴影 pass 只复用不透明实例区间，透明项不投影）。
+    /// × 批实例数，蒙皮逐项；透明同口径计入；粒子每粒 2 三角形）。
+    /// **主几何口径**——不含 UI pass 与阴影 pass（阴影 pass 只复用不透明
+    /// 实例区间，透明项与粒子不投影）。
     pub triangles_drawn: u32,
+    /// 本帧粒子 pass 提交的粒子实例数（发射器包围球剔除后；已并入
+    /// `instances` / `triangles_drawn`，其 draw call 已并入 `draw_calls`）。
+    /// 与发射器池状态对账：= 各可见发射器 `live_count()` 之和。
+    pub particles_drawn: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -620,6 +660,68 @@ fn collect_instances(
     }
 }
 
+/// 收集全部 [`ParticleEmitter`] 的活粒子为 GPU 实例（`draw` 的粒子 pass
+/// 数据准备；必须在 `update_particles` 之后调用——收集的是本帧模拟后的
+/// 活粒子，调用契约见 `particles.rs`）。
+///
+/// - **剔除按发射器包围球**（R22 同款保守界）：活粒子 AABB 的包围球 +
+///   最大出生/终点尺寸边距（粒子为中心对称 quad，中心到 quad 最远点 =
+///   尺寸，取 `size_start`/`size_end` 较大者保证不漏）。被剔发射器整批
+///   不画、不计入任何统计（`culled_instances` 口径为几何实例，粒子剔除
+///   口径独立，见 ARCHITECTURE §4.17）。
+/// - **分区**：additive 段直接追加（加法交换律，不排序）；alpha 段收集
+///   (视深, 收集序号, 实例) 三元组，由调用方按视深降序（远 → 近，与
+///   R23 透明同款 `total_cmp` + 序号并列断言的比较器——全序、结果与
+///   收集顺序无关）排序后追加。
+///
+/// 返回收集的粒子总数。
+fn collect_particles(
+    world: &iris_core::world::World,
+    view: &Mat4,
+    frustum: &Frustum,
+    additive: &mut Vec<ParticleInstance>,
+    alpha: &mut Vec<(f32, u32, ParticleInstance)>,
+) -> u32 {
+    additive.clear();
+    alpha.clear();
+    let mut total = 0u32;
+    let mut seq = 0u32;
+    // 单发射器的实例组装暂存（跨发射器 clear 复用，池规模 ≤ 单发射器上限）
+    let mut tmp: Vec<ParticleInstance> = Vec::new();
+    world.query::<(&GlobalTransform, &ParticleEmitter)>(|(_, emitter)| {
+        let alive = emitter.particles();
+        if alive.is_empty() {
+            return;
+        }
+        let mut min = alive[0].pos;
+        let mut max = alive[0].pos;
+        for p in alive {
+            min = min.min(p.pos);
+            max = max.max(p.pos);
+        }
+        let center = (min + max) * 0.5;
+        let radius = (max - min).length() * 0.5 + emitter.size_start.max(emitter.size_end);
+        if !frustum.intersects_sphere(center, radius) {
+            return;
+        }
+        tmp.clear();
+        emitter.collect_render(&mut tmp);
+        match emitter.blend {
+            ParticleBlend::Additive => additive.extend(tmp.iter().copied()),
+            ParticleBlend::Alpha => {
+                for inst in &tmp {
+                    // 视深与 R23 透明同口径：中心经视图矩阵后的 -z
+                    let depth = -view.transform_point3(inst.center()).z;
+                    alpha.push((depth, seq, *inst));
+                    seq += 1;
+                }
+            }
+        }
+        total += tmp.len() as u32;
+    });
+    total
+}
+
 impl Renderer {
     pub fn new(gpu: Arc<Gpu>, color_format: wgpu::TextureFormat) -> Self {
         let bundle = create_pipeline(&gpu, color_format, SAMPLE_COUNT);
@@ -869,6 +971,21 @@ impl Renderer {
             &point_shadow_cube_view,
             &env,
         );
+        // 粒子相机 uniform + 绑定组（粒子管线的组 1；内容每帧有粒子时覆写）
+        let particle_camera_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.particle.camera"),
+            size: std::mem::size_of::<ParticleCameraRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let particle_camera_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.particle.camera.bg"),
+            layout: &bundle.particle_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: particle_camera_buf.as_entire_binding(),
+            }],
+        });
         Self {
             gpu,
             bundle,
@@ -902,12 +1019,18 @@ impl Renderer {
             ui_screen_buf,
             ui_vertex_buf: None,
             ui_capacity: 0,
+            particle_buf: None,
+            particle_capacity: 0,
+            particle_camera_buf,
+            particle_camera_bg,
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
             skinned_scratch: Vec::new(),
             transparent_scratch: Vec::new(),
             transparent_skinned_scratch: Vec::new(),
             ui_scratch: Vec::new(),
+            particle_scratch: Vec::new(),
+            particle_alpha_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
                 g: 0.07,
@@ -1111,11 +1234,15 @@ impl Renderer {
         self.stats
     }
 
-    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），随后 ACES
-    /// 色调映射 blit 到 `color_view`（通常为 sRGB 目标）；最后如有 UI
-    /// 组件（`UiRect` / `UiText` / `UiColor`），在同一 `color_view` 上
+    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），透明 pass 与
+    /// 粒子 pass 依次叠加（粒子位于透明之后、泛光之前——粒子叠加在玻璃
+    /// 等透明结果之上，且高亮 additive 粒子参与泛光），随后 ACES 色调映射
+    /// blit 到 `color_view`（通常为 sRGB 目标）；最后如有 UI 组件
+    /// （`UiRect` / `UiText` / `UiColor`），在同一 `color_view` 上
     /// 以 `LoadOp::Load` 叠加 HUD pass——**位于 blit 之后**，因此 HUD
     /// 不参与 HDR / 泛光 / 色调映射，是干净的 sRGB 界面叠加。
+    /// 粒子收集发生在 `update_particles` 之后才有意义（调用契约见
+    /// `particles.rs`：与 `propagate_transforms` 同层的每帧前置系统）。
     pub fn draw(
         &mut self,
         world: &iris_core::world::World,
@@ -1306,6 +1433,23 @@ impl Renderer {
                 .total_cmp(&a.depth)
                 .then_with(|| a.skinned.skin_entity.cmp(&b.skinned.skin_entity))
         });
+        // 2c. 粒子收集（须在 update_particles 之后，调用契约见 particles.rs）：
+        // 发射器包围球剔除 → additive 段不排序、alpha 段按视深降序
+        //（远 → 近；total_cmp + 收集序号并列断言，比较器全序、与收集顺序
+        // 无关——确定性）。alpha 实例按排序后的次序追加在 additive 段之后，
+        // 两个混合段共享同一实例缓冲，各一次 draw。
+        let mut particle_instances = std::mem::take(&mut self.particle_scratch);
+        let mut particle_alpha = std::mem::take(&mut self.particle_alpha_scratch);
+        let particle_total = collect_particles(
+            world,
+            &view,
+            &frustum,
+            &mut particle_instances,
+            &mut particle_alpha,
+        );
+        particle_alpha.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let particle_additive_len = particle_instances.len();
+        particle_instances.extend(particle_alpha.iter().map(|(_, _, inst)| *inst));
         let total = items.len();
         let skinned_total = skinned.len();
         let transparent_total = transparent.len();
@@ -1480,6 +1624,7 @@ impl Renderer {
         let mut draw_calls = 0u32;
         let mut instances = 0u32;
         let mut triangles_drawn = 0u32;
+        let mut particles_drawn = 0u32;
         // 阴影 pass 的几何量 = 不透明普通 + 不透明蒙皮（收集期分区排除
         // 了透明项，透明蒙皮同样不投影）
         let opaque_total = total + skinned_total;
@@ -1671,6 +1816,24 @@ impl Renderer {
                     }
                 }
             }
+        }
+        // 4c. 粒子实例上传（独立缓冲，每帧全量——粒子逐帧全变，帧级比对
+        // 无增量价值）与相机基向量写入。放在 HDR 目标借用（hdr）建立之前：
+        // 容量不足时的缓冲重建需要 &mut self，会与贯穿后续全部 pass 的
+        // hdr 借用冲突。
+        if particle_total > 0 {
+            let cam = ParticleCameraRaw {
+                right: [view.x_axis.x, view.y_axis.x, view.z_axis.x, 0.0],
+                up: [view.x_axis.y, view.y_axis.y, view.z_axis.y, 0.0],
+            };
+            self.gpu
+                .queue
+                .write_buffer(&self.particle_camera_buf, 0, bytemuck::bytes_of(&cam));
+            self.ensure_particle_capacity(particle_instances.len());
+            let particle_buf = self.particle_buf.as_ref().expect("粒子实例缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(particle_buf, 0, bytemuck::cast_slice(&particle_instances));
         }
         // 主 pass：场景渲染到 HDR MSAA 中间缓冲，解析到单采样 HDR
         let hdr = self.hdr.as_ref().expect("HDR 中间缓冲已就绪");
@@ -1871,6 +2034,62 @@ impl Renderer {
                 }
             }
         }
+        // 粒子 pass：透明 pass 之后、泛光之前——
+        // 1) 顺序理由：粒子叠加在玻璃等透明几何的**混合结果**之上（火焰 /
+        //    火花应浮在玻璃前面时的合成结果上），与 R23 透明同处 HDR 链路
+        //    按「后画者在上」由 pass 顺序统一裁决；同时在泛光之前，高亮
+        //    additive 粒子（HDR 亮度 > 1）参与亮度提取，与自发光几何同权。
+        // 2) 写同一 HDR MSAA 目标（LoadOp::Load 继续混合）；深度附件同样
+        //    Load——被不透明几何挡住的粒子照常被遮挡（管线侧深度只测不写）。
+        // 3) additive 先画（顺序无关、不排序——加法交换律），alpha 后画
+        //    （视深降序整段一次 draw）。无粒子时整个 pass 跳过（零开销）。
+        //    实例已在 4c 全量上传，这里只绑定与绘制。
+        if particle_total > 0 {
+            let particle_buf = self.particle_buf.as_ref().expect("粒子实例缓冲已就绪");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.particle"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &hdr.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&hdr.resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(1, &self.particle_camera_bg, &[]);
+            pass.set_vertex_buffer(0, particle_buf.slice(..));
+            if particle_additive_len > 0 {
+                pass.set_pipeline(&self.bundle.particle_additive_pipeline);
+                pass.draw(0..4, 0..particle_additive_len as u32);
+                draw_calls += 1;
+            }
+            if particle_instances.len() > particle_additive_len {
+                pass.set_pipeline(&self.bundle.particle_alpha_pipeline);
+                pass.draw(
+                    0..4,
+                    particle_additive_len as u32..particle_instances.len() as u32,
+                );
+                draw_calls += 1;
+            }
+            instances += particle_total;
+            // 每粒一个 quad = 2 三角形
+            triangles_drawn += 2 * particle_total;
+            particles_drawn = particle_total;
+        }
         // 泛光：提取 -> 水平模糊 -> 垂直模糊（半分辨率三个全屏 pass）。
         // 强度经 uniform 进 blit：关闭时写 0，blit 绑定组无需重建。
         let bloom = world
@@ -2026,10 +2245,13 @@ impl Renderer {
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
         self.stats.triangles_drawn = triangles_drawn;
+        self.stats.particles_drawn = particles_drawn;
         self.scratch = items;
         self.skinned_scratch = skinned;
         self.transparent_scratch = transparent;
         self.transparent_skinned_scratch = transparent_skinned;
+        self.particle_scratch = particle_instances;
+        self.particle_alpha_scratch = particle_alpha;
     }
 
     /// 实例缓冲容量复用：足够则零开销返回 `false`；不足时按 2 倍扩容
@@ -2065,6 +2287,23 @@ impl Renderer {
         }));
         self.ui_capacity = capacity;
         log::debug!("UI 顶点缓冲扩容至 {capacity} 顶点");
+    }
+
+    /// 粒子实例缓冲容量复用（同款模式）：容量足够则零开销，不足时按
+    /// 2 倍扩容整体重建。粒子每帧全量上传，重建后无须特殊处理。
+    fn ensure_particle_capacity(&mut self, needed: usize) {
+        if self.particle_capacity >= needed {
+            return;
+        }
+        let capacity = (needed * 2).max(1024);
+        self.particle_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.particles"),
+            size: (capacity * std::mem::size_of::<ParticleInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.particle_capacity = capacity;
+        log::debug!("粒子实例缓冲扩容至 {capacity} 实例");
     }
 
     fn ensure_mesh(&mut self, store: &MeshStore, handle: MeshHandle) {

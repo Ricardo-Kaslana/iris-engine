@@ -38,7 +38,7 @@ fn gameplay(world: &mut World) {
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → **均匀网格 broadphase 候选筛选**（BTreeMap 字典序 = 确定性；候选升序 + `j > i` 过滤使配对遍历序与 O(n²) 完全一致，bit 级确定性测试无需改动即守护等价性）→ 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」；**射线 / 线段查询**（`raycast` / `raycast_filtered` / `segment_hits_shape`——最近命中优先、`t` 并列取存储序先遍历者，线段扫掠判定防高速穿模）；**球扫掠 shapecast**（`sphere_sweep` / `sphere_sweep_statics`——保守推进二分求首次碰撞分数与阻挡法线，角色控制器地基） |
 | **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -84,6 +84,12 @@ cargo run --example bloom_snapshot --release
 # 透明渲染验收场景（离屏渲染），输出 iris_transparent.bmp（→ docs/transparent.png）：
 # 玻璃罩住自发光内核 + 红绿蓝三块透明板纵深 back-to-front 混合（透明物不投影）
 cargo run -p iris-engine --example transparent_snapshot --release
+
+# 粒子系统验收场景（离屏渲染），输出 iris_particles_fountain.bmp /
+# iris_particles_explosion.bmp（→ docs/particles_fountain.png /
+# docs/particles_explosion.png）：喷泉（持续发射 + 重力回落，alpha 混合）
+# 与爆炸（burst 一次性全向爆发 + 泛光辉光，additive 混合）
+cargo run -p iris-engine --example particle_snapshot --release
 
 # 2D UI 叠加层（HUD）验收场景（离屏渲染），输出 iris_ui.bmp：
 # 点光阴影 3D 场景 + 顶部位图标题 / 血条 / 右下文本（矩形 + 位图字体单批渲染）
@@ -187,7 +193,7 @@ iris-engine/
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
 │   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 示例
-│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / scene_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / scene_snapshot / particle_snapshot / web（wasm 专用入口，见「Web 构建」）
 │   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
 │   └── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
 └── ARCHITECTURE.md      # 架构设计文档
@@ -405,11 +411,13 @@ cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏�
 ## 测试
 
 ```sh
-cargo test --workspace   # 316 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 337 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
 着色器编译、深度测试、MSAA、实例化合批、视锥剔除、多光源照明、
+**粒子系统（喷泉可见性 + particles_drawn 与池状态对账 + additive 亮度
+显著高于 alpha 混合 + 爆炸 one-shot 全灭不补发 + 模拟逐位确定性）**、
 **方向光阴影（开/关整帧差分：成片变暗、无变亮、大部分不变）**、
 **点光 cubemap 阴影（面矩阵全方向覆盖 + 偏置遮挡物阴影落在解析预测位置 +
 开/关整帧差分 + 空跑不污染）**、
@@ -517,6 +525,8 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] 物理与碰撞 v1（Sphere/AABB 刚体：积分 / 检测 / 响应 / 迭代松弛，纯函数确定性求解器）
 - [x] 场景序列化（JSON 双向：环境段 + 实体段 ↔ 世界实体，登记表驱动的资源来源往返）
 - [x] 物理查询 API（射线 / 线段 raycast + 球扫掠 shapecast）与均匀网格 broadphase（候选升序 + `j > i` ⇒ 配对遍历序与 O(n²) 完全一致，bit 级确定性不破坏）
+- [x] 透明渲染（R23：alpha 混合材质 + 视深排序透明 pass）
+- [x] 粒子系统 v1（R24：Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染，additive / alpha 双混合）
 
 ### Web 端到端实测
 

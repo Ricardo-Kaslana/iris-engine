@@ -257,6 +257,8 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
     深度附件 Store（供透明 pass 遮挡测试）
   → 透明 pass（可选，无透明实例零开销）：同一 HDR MSAA 目标 LoadOp::Load
     继续 alpha 混合，深度只测不写（见 §4.16）
+  → 粒子 pass（可选，无活粒子零开销）：billboard 实例化绘制（additive /
+    alpha 双管线），叠加在透明结果上、位于泛光之前（见 §4.17）
   → 泛光（可选）：亮度提取 → 高斯模糊（半分辨率三轮分离迭代）
   → blit pass：叠加泛光 + ACES 色调映射 → sRGB 目标
   → UI 叠加层（可选）：UiRect / UiText 顶点合批单 draw，LoadOp::Load
@@ -341,11 +343,12 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 
 | 字段 | 口径 |
 |---|---|
-| `draw_calls` | 主几何（不透明主 pass + 透明 pass，§4.16）：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 + 透明蒙皮每实体 1 + UI 顶点非空时 1；阴影 / 天空 / 后处理 pass 不计 |
-| `instances` | 主几何提交的**可见**实例数（普通 + 蒙皮 + 透明普通 + 透明蒙皮合计） |
-| `culled_instances` | 被视锥剔除的实例数（普通 + 蒙皮 + 透明合计；`Visibility::HIDDEN` 过滤不算剔除） |
-| `triangles_drawn` | 主几何提交三角形总数：可见项索引数 / 3 累加（普通批 × 批实例数、蒙皮逐项、透明 run × 其实例数；网格目录缺席按 0 不 panic）。不含 UI 与阴影 pass——阴影 pass 只复用不透明实例区间，透明项不投影 |
-| `instance_upload_bytes` | 实例缓冲实际 `write_buffer` 字节数（0 = 整帧跳过上传，见 §4.2） |
+| `draw_calls` | 主几何（不透明主 pass + 透明 pass，§4.16 + 粒子 pass，§4.17）：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 + 透明蒙皮每实体 1 + 粒子（additive / alpha 段各至多 1）+ UI 顶点非空时 1；阴影 / 天空 / 后处理 pass 不计 |
+| `instances` | 主几何提交的**可见**实例数（普通 + 蒙皮 + 透明普通 + 透明蒙皮 + 粒子合计） |
+| `culled_instances` | 被视锥剔除的实例数（普通 + 蒙皮 + 透明合计；`Visibility::HIDDEN` 过滤不算剔除）。**粒子不进本口径**——剔除按发射器包围球整批裁决，被剔的发射器既不进 `instances` 也不进本字段（§4.17） |
+| `triangles_drawn` | 主几何提交三角形总数：可见项索引数 / 3 累加（普通批 × 批实例数、蒙皮逐项、透明 run × 其实例数、粒子每粒 2 三角形；网格目录缺席按 0 不 panic）。不含 UI 与阴影 pass——阴影 pass 只复用不透明实例区间，透明项与粒子不投影 |
+| `instance_upload_bytes` | 几何实例缓冲实际 `write_buffer` 字节数（0 = 整帧跳过上传，见 §4.2）。粒子实例走独立缓冲、每帧全量上传，不计入本字段（§4.17） |
+| `particles_drawn` | 粒子 pass 提交的粒子实例数（发射器包围球剔除后；已并入 `instances` / `triangles_drawn`，其 draw call 已并入 `draw_calls`）。与发射器池状态对账：= 各可见发射器活粒子数之和（§4.17） |
 
 **剔除基准（`culling_bench` 示例，实测记录）**：5000 立方体（100×50 网格，
 同网格同材质单批），双朝向各 300 帧（前 50 帧预热丢弃），1280×720 离屏。
@@ -824,13 +827,88 @@ glTF / HDR 错误经 `From` 映射保上下文）。
   `alpha_mode` 字段，缺席反序列化为 `Opaque`（R23 之前的旧场景文件
   直接兼容），不透明时序列化省略（旧文件重存字节级不变）。
 - **验收**：`transparent_render.rs` 五组用例——混合正确性（参考渲染法，
-  自发光主导使 HDR 合成值可解析断言）、排序正确性（三层 α=0.5 通道
+  自发光材质使 HDR 合成值可解析断言）、排序正确性（三层 α=0.5 通道
   比对 `(αE, α²E, α³E)`，顺序颠倒通道互换必挂）、深度只测不写
   （共面透明对两块都必须出现——写深度则后画板被裁）、透明不投影
   （开/关阴影差分 ≈ 0 + 不透明对照版排除假阴性）、同键 run 合批
   （FrameStats 断言）。CPU 单测覆盖分区与视深排序（renderer.rs）与
   旧场景兼容（scene.rs）。验收图 `docs/transparent.png`
   （`transparent_snapshot` 示例：玻璃罩 + 自发光内核 + 三色板纵深排列）。
+
+### 4.17 粒子系统（R24）
+
+**组件与模拟**（`iris-render/particles.rs`）：`ParticleEmitter` 组件 =
+参数（混合模式 / 发射速率 / burst / 寿命 / 初速与方向抖动 / 重力缩放 /
+尺寸与颜色起止插值 / 池上限）+ 私有活粒子池。发射原点 = 实体
+`GlobalTransform` 平移，粒子出生即存**世界坐标**——发射器移动天然留拖尾。
+模拟为**纯 CPU**（`advance` 不触世界，可脱离世界单测），每帧由
+`update_particles` 系统推进（半隐式欧拉：先更新速度再积分位置 → 寿命
+剔除 → burst 一次性爆发 → 持续发射）。
+
+- **确定性**：出生方向由 splitmix64 哈希流派生（发射器内全局递增计数器
+  ⊕ 实体 `Entity::to_bits` 种子；**无 rand 依赖、无全局状态**）——同一
+  输入序列两次模拟**逐位一致**（单测按位型比对守护，与物理子系统同级
+  语义，可回放）。方向 = normalize(+Y + jitter·u)（u 球面均匀，(z, θ)
+  参数化）：jitter = 0 竖直上抛（喷泉主轴），≈1 张角覆盖上半球，≫1
+  趋近全向球面（爆炸预设取 2.6）。持续发射用**累计分数法**
+  （rate·dt 取整、小数余量滚存）——任意 dt 序列下出生总数收敛于
+  rate·总时长，计数确定。
+- **池满语义**：池达 `max_particles` 时**丢弃新粒子**（保老弃新——持续
+  发射与 burst 同语义，不挤掉旧粒子；池规模即视觉效果上限，行为可预期）。
+  被丢弃的发射尝试同样推进哈希流计数器（确定性与池满与否解耦）。
+- **发射器寿命**：`emitter_lifetime <= 0` 永久；> 0 时耗尽后停止持续
+  发射（已出生粒子存活到各自终点）。burst 在首次 update 一次性触发，
+  不受寿命门控、dt = 0 亦触发（粒子定格供渲染）。
+- **单遍系统**：`update_particles` 在一次查询内以 `&mut ParticleEmitter`
+  直接推进——模拟只写发射器**自身内部**的粒子池，无跨组件借用（对照
+  `update_animations` 的两阶段：它需要写**其他实体**的 Transform）。
+- **构造辅助**：`ParticleEmitter::fountain()`（持续水柱、alpha 混合）与
+  `ParticleEmitter::explosion()`（一次性全向爆发、additive + HDR 暖色）。
+- **集成**：`ParticlePlugin` 注册 `update_particles` 于 **PostUpdate、
+  `HierarchyPlugin` 之后**（发射原点取当帧传播后的全局位置），渲染在其
+  之后进行——「当帧模拟当帧成像」。场景序列化 v1 留白（JSON 场景无
+  粒子段，代码生成）。
+
+**渲染**（`renderer.rs` 粒子 pass + `shaders/particle.wgsl`）：
+
+- **Billboard 实例化**：实例 = (世界中心 xyz, 尺寸 w) + 线性 RGBA
+  （32 字节/粒，`ParticleInstance`）。顶点阶段由 `vertex_index` 把 4 顶点
+  展开为 triangle-strip（**无顶点缓冲**），位置 = center +
+  (right·x + up·y)·size——相机 right / up 从视图矩阵第 0 / 1 行提取，
+  经 32 字节小 uniform（`ParticleCamera`，每帧 write_buffer）进组 1，
+  quad 恒面向相机。片元做**径向软衰减** `falloff = (1 − r²)²`（quad 内
+  UV 距中心，中心 1 → 单位圆边缘 0 → 角落钳 0；曲线写死免贴图），衰减
+  只乘 alpha——加法混合下即调制叠加亮度成光点，alpha 混合下即软边
+  精灵，无「硬方块」感。
+- **双混合管线**：additive（`src·SrcAlpha + dst·One`——加法交换律，
+  实例顺序无关、不排序）与 alpha（标准 `ALPHA_BLENDING`，实例按**视深
+  降序**（远 → 近）排序，比较器与 R23 透明同款 `total_cmp` + 收集序号
+  并列断言——全序、结果与收集顺序无关）。都深度**测试开（Less）/
+  写入关**（与透明管线同参：不遮挡后续几何、互相重叠不被裁）。
+- **pass 顺序**：透明 pass 之后、泛光之前——粒子叠加在玻璃等透明几何的
+  **混合结果**之上（「后画者在上」由 pass 顺序统一裁决），同时高亮
+  additive 粒子（HDR 亮度 > 1）参与泛光亮度提取，与自发光几何同权。
+  写同一 HDR MSAA 目标（Load 混合）；深度附件 Load（被不透明几何挡住
+  的粒子照常被遮挡）。additive 段先画、alpha 段后画，各一次 draw；
+  无活粒子时整个 pass 跳过（零开销）。
+- **缓冲与上传**：粒子实例走**独立缓冲**，容量不足按 2 倍扩容重建
+  （照实例缓冲模式）；**每帧全量上传**——粒子位置 / 尺寸 / 颜色逐帧
+  全变，帧级比对无增量价值（对照 §4.2 几何实例的 diff 增量上传；
+  增量上传留待后续亦无收益）。
+- **剔除与统计**：剔除按**发射器包围球**（活粒子 AABB 包围球 + 最大
+  尺寸边距，R22 同款保守界——只多画不漏画），被剔发射器整批不画且
+  不计入 `culled_instances`（该字段口径为几何实例，粒子剔除口径独立，
+  见 §4.4.1）。可见粒子计入 `instances` / `draw_calls` / 
+  `triangles_drawn`（每粒 2 三角形），并单列 `particles_drawn`
+  （= 各可见发射器活粒子数之和，可与池状态对账）。**粒子不进阴影
+  pass**（与透明同理由）。
+- **验收**：CPU 单测 7 项（逐位确定性、发射计数精确性 / 余量滚存、
+  半隐式欧拉解析对照、寿命剔除 / 寿命耗尽 / 池满、burst 一次性、哈希流
+  健全性、渲染插值）；GPU 集成 `particles_render.rs` 3 项（喷泉可见性 +
+  `particles_drawn` 与池状态对账、additive 亮度显著高于 alpha 混合的
+  可区分断言、爆炸 one-shot 全灭后不补发）。验收图
+  `docs/particles_fountain.png` / `docs/particles_explosion.png`
+  （`particle_snapshot` 示例）。
 
 ## 5. 内存安全策略总表
 
@@ -1111,6 +1189,13 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       → **陷阱原文保留**（资产管线守则）；「GLB 文件 → 关节矩阵」全链路
       的自动化守护已由 GPU 回归测试补上（`skinned_instance_follows_root_
       translation` 的像素级断言，见上上条）。
+13. **粒子系统为 v1**（§4.17）：场景序列化留白（JSON 场景无粒子段，
+    发射器只能代码生成）；渲染实例每帧全量上传（粒子逐帧全变，无增量
+    价值）；无碰撞 / 光照交互 / 软粒子深度淡出（贴地粒子可能穿插硬边）；
+    剔除按发射器包围球保守整批裁决（单个巨池发射器跨视锥边界时会整批
+    保留）；alpha 粒子排序粒度为逐粒子中心视深（与透明几何之间的先后
+    由 pass 顺序裁决，粒子恒在透明几何结果之上）；burst 一次性、无重置
+    API（重复爆炸需重建组件）。
 
 ## 9. 关键设计取舍记录
 

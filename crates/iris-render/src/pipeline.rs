@@ -32,6 +32,12 @@ pub(crate) struct PipelineBundle {
     pub bloom_blur_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
+    /// 粒子 additive 管线（billboard 实例化，`SrcAlpha + One` 加法混合，
+    /// 深度只测不写——火焰 / 火花类高亮粒子，叠加顺序无关）。
+    pub particle_additive_pipeline: wgpu::RenderPipeline,
+    /// 粒子 alpha 管线（标准 alpha 混合 + 深度只测不写，与透明管线参数
+    /// 一致；实例按视深降序绘制）。
+    pub particle_alpha_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
     /// 阴影 pass 专用的精简全局布局（只含 uniform，
     /// 不绑定阴影贴图本身——避免同 pass 内读写冲突）。
@@ -47,6 +53,9 @@ pub(crate) struct PipelineBundle {
     /// UI 绑定组布局：binding 0 = 字形图集纹理、1 = 采样器、
     /// 2 = 屏幕尺寸 uniform（顶点阶段）。
     pub ui_layout: wgpu::BindGroupLayout,
+    /// 粒子相机布局：binding 0 = billboard 基向量小 uniform
+    ///（相机 right / up，视图矩阵第 0 / 1 行，每帧 write_buffer）。
+    pub particle_layout: wgpu::BindGroupLayout,
 }
 
 pub(crate) fn create_pipeline(
@@ -829,6 +838,102 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
+    // 粒子 billboard：4 顶点 triangle-strip 由 vertex_index 展开（无顶点
+    // 缓冲），实例缓冲 = (中心 xyz, 尺寸 w) + 线性 RGBA（32 字节/粒）。
+    // 两条管线仅混合不同——
+    // - additive：color = src·SrcAlpha + dst·One（加法交换律 → 实例
+    //   顺序无关、不排序），alpha 通道同取叠加（结果 alpha 无人消费）；
+    // - alpha：标准 ALPHA_BLENDING（src α, 1 − src α），实例按视深降序。
+    // 都深度**测试开（Less）/ 写入关**——粒子不遮挡任何后续几何，也
+    // 不得因互相重叠而被裁（与透明管线参数一致）；cull None（billboard
+    // 恒面向相机，strip 绕向随四角展开，剔除无意义）；组 1 绑定相机
+    // right / up 小 uniform（每帧 write_buffer）。
+    let particle_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.particle"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/particle.wgsl").into()),
+    });
+    let particle_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.particle"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let particle_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.particle.pipeline.layout"),
+        bind_group_layouts: &[Some(&globals_layout), Some(&particle_layout)],
+        immediate_size: 0,
+    });
+    let make_particle_pipeline =
+        |label: &'static str, blend: wgpu::BlendState| -> wgpu::RenderPipeline {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&particle_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &particle_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(crate::particles::ParticleInstance::LAYOUT)],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &particle_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    // 写线性 HDR 中间缓冲（与主 / 透明 pass 同目标，泛光与
+                    // 色调映射照常作用于粒子）
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+    let particle_additive_pipeline = make_particle_pipeline(
+        "iris.pipeline.particle_additive",
+        wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        },
+    );
+    let particle_alpha_pipeline = make_particle_pipeline(
+        "iris.pipeline.particle_alpha",
+        wgpu::BlendState::ALPHA_BLENDING,
+    );
+
     PipelineBundle {
         pipeline,
         skinned_pipeline,
@@ -843,6 +948,8 @@ pub(crate) fn create_pipeline(
         bloom_threshold_pipeline,
         bloom_blur_pipeline,
         ui_pipeline,
+        particle_additive_pipeline,
+        particle_alpha_pipeline,
         globals_layout,
         shadow_globals_layout,
         point_shadow_layout,
@@ -851,5 +958,6 @@ pub(crate) fn create_pipeline(
         blit_layout,
         bloom_layout,
         ui_layout,
+        particle_layout,
     }
 }
