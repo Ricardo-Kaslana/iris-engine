@@ -9,6 +9,8 @@ authors.workspace = true
 
 [dependencies]
 iris-core = { workspace = true }
+# 空间音频系统（spatial.rs）的三维数学；与 iris-render / iris-arena 同款直依赖
+glam = { workspace = true }
 iris-render = { workspace = true }
 iris-platform = { workspace = true }
 iris-audio = { workspace = true }

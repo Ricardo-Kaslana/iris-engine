@@ -10,7 +10,9 @@
 //!   自动循环，启动即全部 `Visibility::HIDDEN` 待命）+ **弹道池**
 //!   （40 个自发光小球实体，同样隐藏待命）；
 //! - **Update**：`run_arena`（读 `Input` + `Time` + [`ArenaStatics`] →
-//!   `ArenaState::step` → 差分事件计数触发音效）→ `update_arena_visuals`
+//!   `ArenaState::step` → 差分事件计数触发音效：开火 / 命中音**空间化**
+//!   播放——听者每帧跟随场景相机（俯视机位、悬于场地上方，pan 由 XZ
+//!   方位决定），开火定位枪口、命中定位受击敌人）→ `update_arena_visuals`
 //!   （写玩家三层 Transform + 敌人池槽位的可见性 / 变换 / 受击缩放脉冲 +
 //!   弹道池槽位变换；池槽位以逻辑侧**稳定 id** 映射，取用 / 归还全程零
 //!   spawn / despawn）→ `update_arena_hud`（标题 / HP 条 / WAVE / SCORE /
@@ -70,6 +72,10 @@ pub const POOL_PROJECTILES: usize = MAX_PROJECTILES;
 const MODEL_YAW_OFFSET: f32 = std::f32::consts::FRAC_PI_2;
 /// 弹道飞行高度（米）与敌人根高度（蠕虫贴地：模型 y 从 0 起）。
 const PROJECTILE_Y: f32 = 0.5;
+/// 空间音频距离参考（米）：俯视相机的听者悬在约 23 m 高空（相机高度），
+/// 若用混音器默认 4 m 参考，全场音效会衰减到 0.15 以下不可闻——按竞技场
+/// 尺度放大到 25 m：近场 ≈ 0.52、远角 ≈ 0.37，保留距离线索且不掉音量。
+pub const ARENA_REFERENCE_DISTANCE: f32 = 25.0;
 /// 玩家模型子实体的局部几何（模型本体 + 炮管，见 `build_scene`）。
 const PLAYER_MODEL_LOCAL_Y: f32 = 0.55;
 const PLAYER_INVULN_BLINK_HZ: f32 = 12.0;
@@ -307,6 +313,7 @@ impl ArenaPlugin {
                     .read::<Input>()
                     .read::<Time>()
                     .read::<Audio>()
+                    .read::<ArenaEntities>()
                     .read::<ArenaAssets>()
                     .read::<ArenaStatics>()
                     .write::<ArenaState>(),
@@ -370,6 +377,12 @@ fn setup_resources(world: &mut World) {
         world.insert_resource(Audio::new());
     }
     world.insert_resource(ArenaState::new(ARENA_HALF));
+    // 空间音频场域尺度（见 ARENA_REFERENCE_DISTANCE 文档）：窗口程序里
+    // DefaultPlugins 已插入 Audio、headless 测试预插入 Audio::headless——
+    // 两者都只调参数、不覆盖资源（设备句柄独占）
+    if let Some(audio) = world.try_resource::<Audio>() {
+        audio.set_reference_distance(ARENA_REFERENCE_DISTANCE);
+    }
     world.insert_resource(ArenaAssets {
         shoot: sine(1200.0, 0.06, 48_000),
         hit: sine(300.0, 0.08, 48_000),
@@ -645,6 +658,9 @@ fn double_beep(sample_rate: u32) -> AudioClip {
 ///
 /// 事件（开火 / 命中 / 受伤 / 换波）由逻辑侧单调计数器的前后差分检出——
 /// 逻辑层保持纯数据，表现层（音效）完全由差分驱动，无需事件队列。
+/// 开火 / 命中音经 `Audio::play_spatial` **空间化播放**（开火定位枪口、
+/// 命中定位受击敌人，见 `hit_sound_position`），听者每帧跟随场景相机
+/// （俯视机位、悬于场地上方，pan 由 XZ 方位决定，见系统内注释）。
 fn run_arena(world: &World) {
     let dt = world
         .try_resource::<Time>()
@@ -696,7 +712,37 @@ fn run_arena(world: &World) {
         state.total_damage.saturating_sub(damage_before),
         state.wave != wave_before,
     );
+    // ---- 空间声源定位（drop(state) 前取逻辑位置）----
+    // - 开火音 = 玩家 / 枪口位置（弹道出生点：贴地玩家位置 + 弹道高度）；
+    // - 命中音 = 受击闪烁最强的在场敌人（见 `hit_sound_position`）。
+    let player_ground = Vec3::new(state.player.pos.x, 0.0, state.player.pos.y);
+    let muzzle = Vec3::new(state.player.pos.x, PROJECTILE_Y, state.player.pos.y);
+    let hit_pos = hit_sound_position(&state.enemies, player_ground);
     drop(state);
+
+    // ---- 空间听者：每帧取场景相机的全局位姿（俯视 3/4 机位）----
+    // 听者悬于场地上方（y = 相机高度），前方取相机 -Z 轴并经世界 +Y 重
+    // 正交化（from_view）→ 右轴恒为水平，pan 只随声源在 XZ 平面的方位
+    // 摆动——俯视游戏空间音的合理姿态（距离仍按三维距离衰减）。
+    // GlobalTransform 来自上一帧的层级传播（滞后一帧，对音频无感）；首帧
+    // 传播未跑时优雅跳过（保持默认听者，第二帧起正确）。此处直接
+    // set_listener 而非给相机挂 SpatialListener 组件：headless / 离屏快照
+    // 路径（未注册 SpatialPlugin）同样得到正确听者。
+    if let (Some(ents), Some(audio)) = (
+        world.try_resource::<ArenaEntities>(),
+        world.try_resource::<Audio>(),
+    ) {
+        if let Some(global) = world.get::<GlobalTransform>(ents.camera) {
+            let matrix = global.matrix();
+            let forward = -Vec3::new(matrix.z_axis.x, matrix.z_axis.y, matrix.z_axis.z);
+            audio.set_listener(ListenerParams::from_view(
+                global.position(),
+                forward,
+                Vec3::Y,
+            ));
+        }
+    }
+
     if events == (0, 0, 0, 0, false) {
         return;
     }
@@ -705,12 +751,17 @@ fn run_arena(world: &World) {
         world.try_resource::<Audio>(),
     ) {
         if events.0 > 0 {
-            audio.play(assets.shoot.clone(), 0.22, false);
+            // 开火音空间化：定位在枪口（敌人左 / 右侧时开火自己也是声像线索）
+            audio.play_spatial(assets.shoot.clone(), muzzle, 0.22, false);
         }
         if events.1 > 0 {
-            audio.play(assets.hit.clone(), 0.35, false);
+            // 命中音空间化：定位在受击敌人的世界坐标（敌人在左右两侧时
+            // 命中音有左右声像差、远近有衰减差）
+            audio.play_spatial(assets.hit.clone(), hit_pos, 0.35, false);
         }
         if events.3 > 0 {
+            // 受伤 / 开波保持居中非空间播放：受伤是「自身反馈」（源即
+            // 听者脚下），开波是全局播报——定位无信息量
             audio.play(assets.hurt.clone(), 0.6, false);
         }
         if events.4 {
@@ -720,6 +771,22 @@ fn run_arena(world: &World) {
         }
         // 击杀（events.2）不单独配音：命中音 + 连击涨分已足够反馈
     }
+}
+
+/// 命中音的声源位置：取受击闪烁最强的在场敌人。
+///
+/// 本帧命中者的 `hit_flash` 恰被赋满值 [`ENEMY_HIT_FLASH`]（上一帧命中者
+/// 已逐帧衰减）→ `max` 自然优先本帧命中；并列时取列表序最后一个（确定性）。
+/// 被击杀的敌人当帧即被 `retain` 移除、位置不可恢复——本帧全是击杀时
+/// 退化为最近一次受击者的位置；全无受击痕迹则回退玩家位置（音效照发、
+/// 仅定位退化，行为可预期）。
+fn hit_sound_position(enemies: &[EnemyState], fallback: Vec3) -> Vec3 {
+    enemies
+        .iter()
+        .filter(|enemy| enemy.hit_flash > 0.0)
+        .max_by(|a, b| a.hit_flash.total_cmp(&b.hit_flash))
+        .map(|enemy| Vec3::new(enemy.pos.x, 0.0, enemy.pos.y))
+        .unwrap_or(fallback)
 }
 
 /// Update 2：逻辑状态 → 表现。玩家三层结构、敌人池槽位（可见性 / 变换 /

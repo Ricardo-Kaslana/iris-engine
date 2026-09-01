@@ -9,6 +9,8 @@ authors.workspace = true
 
 [dependencies]
 log = { workspace = true }
+# 空间音频 v1 的三维数学（听者 / 声源位置、声像投影）；纯数学库，wasm32 可用
+glam = { workspace = true }
 
 # 平台原因（wasm32）：cpal 在 wasm32-unknown-unknown 上不可用（其 Web 后端
 # 依赖 Web Audio 回调模型与 wasm-bindgen 链路，当前无法编译），因此设备层

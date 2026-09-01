@@ -5,6 +5,62 @@
 
 ## [Unreleased]
 
+### Added（R25：3D 空间音频 v1——距离衰减 + 恒功率立体声声像 + ECS 组件同步系统）
+
+- **混音核心空间化**（`iris-audio/mixer.rs`，新增 `glam` 依赖）：`play_spatial`
+  在声音槽位上记 `spatial` 标记 + 声源世界坐标；`set_listener(ListenerParams)`
+  写听者位姿（`position / forward / right`，`from_view(position, forward, up)`
+  辅助自动正交化——俯仰俯视的相机得到水平右轴，声像只随水平方位摆动；
+  默认原点 / -Z 前 / +X 右，与引擎右手系一致）；`set_sound_position` 播放中
+  移动声源（世代校验防悬垂）。增益模型为**纯函数 `spatial_gain`**（单独导出
+  可单测）：距离衰减 `att = ref / (ref + d)` 软倒数（d=0 → 1、远处平滑趋零、
+  无硬截断；参考距离默认 4 m，混音器级可配、按声音可覆写）；声像
+  `pan = clamp(dot(单位源方向, 听者右轴), −1, 1)` → 恒功率映射
+  `θ = (pan+1)·π/4`、左 = `att·cos θ`、右 = `att·sin θ`（−1 全左 / 0 居中
+  0.707 / +1 全右，总功率守恒）；重叠 / 正上取 pan = 0 居中。`mix` 每帧按
+  **当帧听者位姿**对空间槽位重算增益（单声道源立体声输出按恒功率拆左右；
+  **立体声剪辑 v1 只乘总增益**、不做逐声道声像；非空间 `play` 恒居中无衰减、
+  行为逐位不变）。**已知限制（文档写明）**：无 HRTF / 耳间延迟差，源在正
+  后方与正前方对称——身后不消音、前后不可区分。
+- **Audio 门面转发**（iris-engine）：`play_spatial` / `set_listener` /
+  `set_sound_position` / `set_reference_distance` /
+  `set_sound_reference_distance` 与混音器直操同语义，headless 与设备模式
+  一致（回调 try_lock 机制不变）。
+- **ECS 组件与系统**（iris-engine 新模块 `spatial.rs`）：`SpatialListener`
+  标记组件（每世界取查询序第一个，位姿来自实体 `GlobalTransform`，前方 =
+  实体 -Z 轴经世界 +Y 重正交化）；`SpatialSource` 持续声源组件（剪辑 /
+  音量 / 循环 / 距离参考 + 内部 `SoundId` 状态，v1 定位为循环环境声）。
+  `update_spatial_audio` 系统三步：起播 → 逐帧同步位置 → **组件移除 =
+  帧间差分**（上一帧活跃的「实体 bits → SoundId」快照挂在 `Audio` 资源上，
+  本帧查询检不到即 `stop`；实体 bits 作键防悬垂安全——despawn 后复用下标
+  的新实体代数必变，绝不误停）。`SpatialPlugin` 注册于 **PostUpdate、层级
+  传播之后**（与 `ParticlePlugin` 同层同理由：听者 / 声源读当帧全局位姿；
+  访问集与粒子不相交可同批并行），已入 `DefaultPlugins`。**一次性空间
+  音效不走组件**：游戏代码直接 `audio.play_spatial(clip, pos, vol, false)`。
+- **Iris Arena dogfooding**（iris-arena）：开火音定位**枪口**（弹道出生点）
+  、命中音定位**受击敌人**（受击闪烁最强的在场敌人——本帧命中者闪烁恰为
+  满值、上一帧已衰减，max 自然优先本帧；击杀的敌人当帧即被移除，全无
+  痕迹时回退玩家位置，音效照发仅定位退化）；听者每帧跟随**俯视场景相机**
+  （位姿取相机 `GlobalTransform`、悬于场地上方，pan 由 XZ 平面方位决定；
+  直接 `set_listener` 而非挂组件——headless / 离屏路径未注册
+  `SpatialPlugin` 同样得到正确听者）；竞技场尺度把距离参考放大到 25 m
+  （`ARENA_REFERENCE_DISTANCE`——俯视相机听者悬空 ~23 m，默认 4 m 会让
+  全场音效衰减到不可闻）。受伤 / 开波音保持居中（自身反馈 / 全局播报，
+  定位无信息量）。headless 集成测试断言听者位姿跟随相机 + 空间声入表
+  （槽位状态而非实听）。
+- **测试**：iris-audio 混音器单测 10 项新增（衰减解析 ref=4、d=0/4/12 →
+  1/0.5/0.25 精确断言；恒功率声像正右 / 正左 / 正前 / 重叠 / 正上；
+  `from_view` 正交化与退化输入；混音增益合成 volume × att × 恒功率逐项
+  对照；同配置混音 bit 级确定；`set_sound_position` 世代失效返回 false；
+  左右声道能量比与源方位一致；立体声剪辑仅总增益语义锁定；非空间播放
+  不受听者影响；距离参考默认 / 覆写 / 病态兜底）；iris-engine 5 项
+  （源添加起播且不重复、位置逐帧同步镜像能量、despawn / 摘组件下一帧
+  停止 + 快照归零、听者取查询序第一并逐帧跟随 + 无 Audio 安全、
+  GlobalTransform 缺席跳过 + clone/detach 句柄语义）+ Audio 门面 headless
+  空间转发 1 项；iris-arena headless 1 项（听者跟随相机 + 交火声入表）。
+- **文档**：ARCHITECTURE §4.14「空间化 v1」小节（公式 / 已知限制 / 组件
+  差分语义）、§8 已知限制第 11 条同步；README 音频特性行与路线图。
+
 ### Added（R24：粒子系统 v1——Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染）
 
 - **组件与模拟**（`iris-render/particles.rs`）：`ParticleEmitter` 组件

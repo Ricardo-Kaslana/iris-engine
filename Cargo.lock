@@ -900,6 +900,7 @@ name = "iris-audio"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "glam",
  "log",
 ]
 
@@ -918,6 +919,7 @@ name = "iris-engine"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "glam",
  "image",
  "iris-arena",
  "iris-audio",

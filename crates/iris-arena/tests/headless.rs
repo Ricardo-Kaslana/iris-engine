@@ -634,6 +634,45 @@ fn game_over_and_restart_recycle_everything() {
     );
 }
 
+/// 空间音频 dogfooding：听者每帧跟随场景相机（俯视机位 → 听者悬于玩家
+/// 上空 20 m、后方 12 m），开火 / 命中音经 `play_spatial` 入混音器表。
+/// headless 断言的是槽位状态（听者位姿 + 活跃声音数）而非实听；headless
+/// 不驱动混音 → 非循环声不会自然播完，留在表内可查。
+#[test]
+fn spatial_listener_follows_camera_and_sounds_enter_mixer() {
+    let mut harness = Harness::new();
+    harness.start();
+    // 拉一只敌人到玩家 2 m 处：当帧即进入射程 → 自动开火（并可能命中）
+    {
+        let mut game = harness.game_mut();
+        game.enemies[0].pos = game.player.pos + glam::Vec2::new(2.0, 0.0);
+    }
+    // 第 1 帧：开火（此时尚无相机 GlobalTransform，听者保持默认）+
+    // PostUpdate 层级传播出相机全局位姿；第 2 帧：run_arena 取到位姿 →
+    // set_listener 跟随（位姿取传播时刻的玩家位置——滞后一帧，正好以此
+    // 验证「读上一帧全局位姿」的编排）
+    harness.frame(&[], &[]);
+    let player_propagated = harness.game().player.pos;
+    harness.frame(&[], &[]);
+    let audio = harness.app.world.resource::<Audio>();
+    let listener = audio.mixer().listener();
+    assert!(
+        (listener.position.y - 20.0).abs() < EPS,
+        "听者应悬在相机高度（20 m）：{:?}",
+        listener.position
+    );
+    assert!(
+        (listener.position.x - player_propagated.x).abs() < 1e-2
+            && (listener.position.z - (player_propagated.y + 12.0)).abs() < 1e-2,
+        "听者应在玩家上空、后方 12 m（相机子实体偏移）：{:?} vs 玩家 {player_propagated:?}",
+        listener.position
+    );
+    assert!(
+        audio.mixer().active_count() >= 1,
+        "交火中的开火 / 命中音应已入混音器表（空间化播放）"
+    );
+}
+
 /// 混战负载下的 draw calls（记录性断言）：13 敌 + 20 弹在场的离屏一帧
 /// 保持在 300 以内。无 GPU 环境自动跳过（与其余 GPU 集成测试同约定）。
 #[test]

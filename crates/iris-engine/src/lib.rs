@@ -19,6 +19,7 @@ pub mod assets;
 pub mod audio;
 pub mod plugin;
 pub mod scene;
+pub mod spatial;
 
 // 纯音频库随门面一并可用：`iris_engine::iris_audio::...` 全路径直达
 pub use iris_audio;
@@ -33,15 +34,17 @@ pub mod prelude {
     pub use crate::assets::asset_path;
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, ParticlePlugin,
-        PhysicsPlugin, Plugin, RenderPlugin, TimePlugin, WindowPlugin,
+        PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin, WindowPlugin,
     };
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记
     pub use crate::scene::{
         GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError, load_scene, save_scene,
     };
+    // 空间音频 v1（听者 / 声源组件与每帧同步系统）
+    pub use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
     // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）
     pub use iris_audio::{
-        AudioClip, AudioError, AudioMixer, AudioOutput, SoundId, load_wav, noise, parse_wav, sine,
-        square,
+        AudioClip, AudioError, AudioMixer, AudioOutput, ListenerParams, SoundId, load_wav, noise,
+        parse_wav, sine, square,
     };
 }

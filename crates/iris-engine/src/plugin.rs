@@ -172,7 +172,38 @@ impl Plugin for ParticlePlugin {
     }
 }
 
-/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 + 粒子。
+/// 空间音频插件：在 **PostUpdate** 阶段（层级传播之后）同步听者位姿与
+/// 空间声源（见 `crate::spatial`）。
+///
+/// 编排语义与 [`ParticlePlugin`] 同层、同理由：听者与声源都读
+/// `GlobalTransform`——必须在 [`HierarchyPlugin`] 的传播之后执行，用户在
+/// Update 挪动相机 / 声源，**当帧**的混音增益即跟随新位置（混音增益每帧
+/// 重算，无渲染式的当帧成像截止点，晚于粒子的注册序只是确定性的表现
+/// 收尾顺序，两者访问集不相交、可同批并行）。注册为**并行系统**：访问集
+/// 写 SpatialSource、读 SpatialListener / GlobalTransform / Audio（播放
+/// 编排经混音器的 `Arc<Mutex>` 完成，`&Audio` 即可——与 `run_arena` 等
+/// 既有系统同款声明）。
+#[derive(Default)]
+pub struct SpatialPlugin;
+
+impl Plugin for SpatialPlugin {
+    fn build(&self, app: &mut App) {
+        use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
+        use iris_core::prelude::{Access, GlobalTransform, Stage};
+        app.schedule.add_parallel_system(
+            Stage::PostUpdate,
+            Access::new()
+                .write::<SpatialSource>()
+                .read::<SpatialListener>()
+                .read::<GlobalTransform>()
+                .read::<Audio>(),
+            update_spatial_audio,
+        );
+    }
+}
+
+/// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 +
+/// 粒子 + 空间音频。
 ///
 /// ```ignore
 /// App::new().add_plugins(DefaultPlugins::new("我的游戏")).run();
@@ -216,5 +247,8 @@ impl Plugin for DefaultPlugins {
         HierarchyPlugin.build(app);
         // 粒子在层级传播之后推进（发射原点取当帧全局位置）
         ParticlePlugin.build(app);
+        // 空间音频与粒子同层（层级传播之后）：听者 / 声源读当帧全局位姿，
+        // 当帧混音增益即跟随（访问集与粒子不相交，可同批并行）
+        SpatialPlugin.build(app);
     }
 }

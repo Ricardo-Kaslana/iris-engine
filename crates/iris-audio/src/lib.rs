@@ -5,7 +5,8 @@
 //! 分层设计（可测性优先）：
 //! - **混音核心**（[`AudioMixer`]）全部纯函数、不接触任何设备——采样推进
 //!   由调用方每帧调用 [`AudioMixer::mix`] 填充输出缓冲驱动，采样级数学
-//!   可在单测中确定性断言（音量、叠加、循环回绕、重采样、限幅）；
+//!   可在单测中确定性断言（音量、叠加、循环回绕、重采样、限幅、空间化
+//!   衰减 / 声像，后者见 [`spatial_gain`]）；
 //! - **设备层**（[`AudioOutput`]）只是把 [`AudioMixer`] 接到 cpal 输出流的
 //!   薄壳：实时回调内 `try_lock` 混音器，拿不到锁立即填静音（实时线程
 //!   绝不阻塞）；无设备 / wasm32 下优雅降级（[`AudioOutput::device`]
@@ -18,6 +19,10 @@
 //! let mut buf = vec![0.0; 480];          // 10ms 立体声 @ 48kHz
 //! mixer.mix(&mut buf, 2, 48_000);        // 推进混音（或由设备回调驱动）
 //! ```
+//!
+//! 空间化 v1：[`AudioMixer::set_listener`] + [`AudioMixer::play_spatial`] +
+//! [`AudioMixer::set_sound_position`]——距离软倒数衰减 + 恒功率立体声声像
+//! （模型与已知限制见 `mixer` 模块文档）。
 
 use std::fmt;
 
@@ -29,7 +34,7 @@ pub mod wav;
 
 pub use clip::AudioClip;
 pub use device::AudioOutput;
-pub use mixer::{AudioMixer, SoundId};
+pub use mixer::{AudioMixer, DEFAULT_REFERENCE_DISTANCE, ListenerParams, SoundId, spatial_gain};
 pub use procedural::{noise, sine, square};
 pub use wav::{load_wav, parse_wav};
 
