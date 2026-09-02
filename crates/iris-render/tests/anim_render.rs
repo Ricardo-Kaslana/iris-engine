@@ -7,7 +7,7 @@
 
 use glam::Vec3;
 use iris_core::hierarchy::propagate_transforms;
-use iris_core::prelude::World;
+use iris_core::prelude::{Time, World};
 use iris_render::prelude::*;
 
 /// 红色方块（XY 平面，法线 +Z）+ yaw 0°→80° / 1s 旋转动画的 GLB。
@@ -88,6 +88,23 @@ fn red_dominant_pixels(px: &[u8], w: u32, h: u32) -> u32 {
     count
 }
 
+/// 全画面红色像素计数（step=2 粗采样）。方块 yaw 越大屏占越窄，
+/// 计数单调下降——中心区计数在 40° 时仍被方块填满（见 crossfade 用例），
+/// 全画面计数才能区分 0° / 40° / 80°。
+fn red_pixel_count_full(px: &[u8], w: u32, h: u32) -> u32 {
+    let mut count = 0u32;
+    for y in (0..h).step_by(2) {
+        for x in (0..w).step_by(2) {
+            let i = ((y * w + x) * 4) as usize;
+            let (r, g, b) = (px[i] as i32, px[i + 1] as i32, px[i + 2] as i32);
+            if r > 110 && r > g + 40 && r > b + 40 {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 #[test]
 fn animated_quad_rotates_on_screen() {
     let dir = std::env::temp_dir().join("iris-anim-test");
@@ -137,5 +154,104 @@ fn animated_quad_rotates_on_screen() {
     assert!(
         at_end * 3 < at_start,
         "旋转到 80° 后红色像素应锐减（{at_start} -> {at_end}）"
+    );
+}
+
+/// crossfade 混合的 GPU 端到端：两个**程序化构造**的剪辑（直接 API，
+/// 不经 GLB 动画段——恒 yaw 0° 与恒 yaw 80°）之间 transition，
+/// 中点帧（yaw ≈ 40°）的红色像素应严格介于两个极值帧之间。
+#[test]
+fn crossfade_quad_midframe_between_extremes() {
+    let dir = std::env::temp_dir().join("iris-anim-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("quad.glb");
+    std::fs::write(&path, animated_quad_glb()).unwrap();
+
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+
+    let mut world = World::new();
+    world.insert_resource(MeshStore::new());
+    world.insert_resource(MaterialStore::new());
+    world.insert_resource(TextureStore::new());
+    world.insert_resource(Camera {
+        eye: Vec3::new(0.0, 0.0, 3.0),
+        ..Camera::default()
+    });
+    world.insert_resource(DirectionalLight::default());
+
+    let instance = spawn_gltf_instance(&mut world, &path).expect("GLB 应加载成功");
+    let root = instance.roots[0];
+
+    // 两个恒值旋转剪辑：clip 0 = yaw 0°（正对），clip 1 = yaw 80°（近侧对）
+    let (s, c) = (40f32).to_radians().sin_cos();
+    let constant_yaw = |quat: [f32; 4]| AnimationChannel {
+        node: 0,
+        path: AnimationPath::Rotation,
+        interpolation: AnimationInterpolation::Linear,
+        times: vec![0.0, 1.0],
+        values: [quat, quat].concat(),
+    };
+    let clip_face = AnimationClip {
+        name: "face".into(),
+        channels: vec![constant_yaw([0.0, 0.0, 0.0, 1.0])],
+        duration: 1.0,
+        events: Vec::new(),
+    };
+    let clip_side = AnimationClip {
+        name: "side".into(),
+        channels: vec![constant_yaw([0.0, s, 0.0, c])],
+        duration: 1.0,
+        events: Vec::new(),
+    };
+    world.insert(
+        root,
+        AnimationPlayer::new(vec![clip_face, clip_side], instance.node_entities.clone()),
+    );
+    world.insert_resource(Time::default());
+
+    // 极值一：纯 clip 0（yaw 0°，无过渡、dt=0）
+    update_animations(&world);
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let (w, h) = renderer.size();
+    let at_start = red_pixel_count_full(&renderer.read_pixels(), w, h);
+
+    // 中点帧：向 clip 1 过渡 0.5s，推进 0.25s →
+    // w = smoothstep(0.25 / 0.5) = 0.5 → slerp 中点 ≈ yaw 40°
+    world
+        .get_mut::<AnimationPlayer>(root)
+        .unwrap()
+        .transition(1, 0.5);
+    world
+        .resource_mut::<Time>()
+        .advance(std::time::Duration::from_secs_f64(0.25));
+    update_animations(&world);
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let at_mid = red_pixel_count_full(&renderer.read_pixels(), w, h);
+
+    // 极值二：过渡完成（elapsed ≥ duration → blend 清除，纯目标 yaw 80°）
+    world
+        .resource_mut::<Time>()
+        .advance(std::time::Duration::from_secs_f64(0.25));
+    update_animations(&world);
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let at_end = red_pixel_count_full(&renderer.read_pixels(), w, h);
+
+    // 粗粒度断言（容差理由：光照 / MSAA / 像素判定的离散抖动使其余
+    // 数值型断言脆弱；「严格介于两极值之间」已足以暴露混合权重
+    // 未生效（贴任一极值）或旋转方向错误等回归）
+    assert!(at_start > 300, "yaw 0° 方块应充满视野，红色像素 {at_start}");
+    assert!(
+        at_end < at_mid && at_mid < at_start,
+        "混合中点应介于两极值之间（{at_start} -> {at_mid} -> {at_end}）"
+    );
+    assert!(
+        world.get::<AnimationPlayer>(root).unwrap().blend.is_none(),
+        "过渡完成后 blend 应清除"
     );
 }

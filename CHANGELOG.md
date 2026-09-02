@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### Added（R28：动画 v2——crossfade 混合 + 轻量状态机 + 动画事件轨道）
+
+- **crossfade 姿势混合**（iris-render `animation`）：`AnimationPlayer`
+  新增 `blend: Option<AnimationBlend>`（默认 None）与
+  `transition(clip, duration)`——目标剪辑正常推进、源姿势在过渡开始时
+  **冻结快照**（可预测、可测试：混合结果只由 elapsed 决定，且避免源
+  循环回绕的姿势跳变）；权重 `smoothstep(elapsed/duration)`（首尾速度
+  连续，中点与线性同为 0.5）；对「目标实体 + 路径」并集逐项混合：
+  平移/缩放 lerp、旋转 **slerp**（nlerp 大角度中段角速度不均，取舍
+  写入注释），仅一方有的通道取该方值（**缺方通道不拖拽**）。
+  `duration ≤ 0` = 硬切换、同剪辑请求忽略、目标越界忽略 + debug_assert；
+  elapsed ≥ duration 自动清除回纯目标。混合与 time 同步在系统阶段一
+  推进——姿势与分帧方式无关（GPU 测试守护「中点帧严格介于两极值之间」，
+  程序化构造 yaw 0° / 80° 双剪辑直接 API）。
+- **轻量状态机**：`states`（clip + looping + speed）/ `edges`
+  （from → to + 过渡时长）/ `current_state`，全部默认空 = 不启用，
+  直接操作 `active/looping/speed` 的旧路径完全保留。
+  `request_state(state)`：有 `current → state` 边按 `edge.duration` 启动
+  crossfade、无边硬切换，`looping/speed` 同步为目标态（states 非空时
+  `advanced` 以当前状态参数为准）；**条件判定留给游戏侧**（无参数黑板，
+  v1 边界写入文档）。
+- **动画事件轨道**：`AnimationClip.events`
+  （`AnimationEvent { time, name }`；事件不在 glTF 标准内，GLB 解析
+  不产事件，API 侧 `clip.events.push` 构造）+ `player.pending_events`
+  + `take_events()`（**消费方每帧 drain** 的帧内消息契约）。跨界检测
+  纯函数 `collect_events` 单独导出可单测：非循环 `(prev, new]`——停在
+  末端后区间为空、**末端事件不重复触发**；循环传**取模前原始时间**，
+  事件每被跨越一次触发一次、一帧跨 k 圈 **multi-fire k 次**（确定性：
+  `⌊(new−t_e)/dur⌋ − ⌊(prev−t_e)/dur⌋`），输出恒按触发时刻升序。
+  CPU 单测：slerp 中点 45°（1e-5）、smoothstep 精确式、回绕 / multi-fire /
+  时序、同配置双 player 逐位一致。iris-render 不依赖 audio——「脚步声」
+  联动以模块文档 ignore 示例交付，运行时联动留待游戏轮。
+- **兼容性**：全部既有动画测试（anim_render / skin_render / gltf_render
+  及 lib 内动画单测）零逻辑改动通过；`AnimationPlayer` 新字段全部经
+  `Default` 给中性默认，`AnimationClip` 仅 glTF 解析与既有单测的构造
+  字面量机械补 `events: Vec::new()`，断言未动。
+
 ### Added（R27：后处理链 v1——曝光控制 + pass 串联框架 + 暗角示范 pass）
 
 - **曝光控制**：iris-render 新资源 `ExposureSettings { exposure }`

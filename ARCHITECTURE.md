@@ -467,6 +467,45 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   `Time` 资源缺席时 dt=0，可手动设置 `player.time` 定位到任意时刻（离屏快照用）。
 - **单帧 delta 钳制**：`Time.max_delta`（默认 0.25s）会钳制大步长——
   测试或回放需要确定性大步长时分多帧推进。
+- **crossfade 姿势混合（v2）**：`AnimationPlayer::transition(clip, duration)`
+  启动向目标剪辑的平滑过渡（`AnimationBlend`）。目标剪辑正常推进、
+  源姿势在过渡开始时**冻结快照**（`from_clip`/`from_time`，源不再推进）——
+  混合结果只由 elapsed 决定：可预测、可测试，且避免源剪辑循环回绕 /
+  播完造成的姿势跳变。权重 `w = smoothstep(elapsed/duration)`（首尾速度
+  连续、视觉顺滑；中点与线性同为 0.5）；混合按「目标实体 + 路径」并集
+  逐项进行——双方都有：平移/缩放分量 lerp、旋转 **slerp**（恒定角速度；
+  nlerp 大角度下中段角速度不均，逐实体每帧个位数旋转通道不值得省）；
+  仅一方有：直接取该方值（**缺方通道不拖拽**）。边界语义：`duration ≤ 0`
+  = 硬切换；同剪辑请求忽略；目标越界忽略 + debug_assert（release 静默）；
+  `elapsed ≥ duration` 后混合自动清除回纯目标姿势。混合采样用的 elapsed
+  与 time 同步在阶段一推进（`elapsed + dt`，阶段二才落账）——姿势只由
+  过渡总时长决定，与分帧方式无关。
+- **轻量状态机（v2）**：`states`（`AnimationState { clip, looping, speed }`）+
+  `edges`（`AnimationEdge { from, to, duration }`）+ `current_state`，
+  全部默认空 = 不启用，直接操作 `active/looping/speed` 的旧路径完全保留。
+  `request_state(state)`：查 `current → state` 边——有边按 `edge.duration`
+  启动 crossfade、无边硬切换；两种情况 `looping/speed` 都同步为目标态，
+  states 非空时 `advanced` 的循环/速度以当前状态为准。**条件判定留给
+  游戏侧**：边只带过渡时长，无参数黑板 / 条件求值——何时 request 由
+  调用方按玩法逻辑决定（v1 边界：引擎只做「边 + 过渡时长」，不做状态
+  内行为逻辑）。
+- **动画事件轨道（v2）**：`AnimationClip.events`
+  （`AnimationEvent { time, name }`）——事件不在 glTF 标准内，**GLB 解析
+  不产事件**，由 API 侧构造（`clip.events.push`）。`update_animations`
+  每帧做跨界检测（纯函数 `collect_events`，可脱离 ECS 单测）：
+  - 非循环命中 `(prev, new]`（prev 必须取推进前的 `player.time`——两阶段
+    数据流先取再推进）；播放器停在末端后每帧 `prev == new`、区间为空，
+    **末端事件不重复触发**；
+  - 循环传入**取模前原始时间**：事件每被跨越一次触发一次，一帧跨 k 圈
+    重复命中 k 次（**multi-fire**，确定性；跨越次数 =
+    `⌊(new−t_e)/dur⌋ − ⌊(prev−t_e)/dur⌋`）；回绕 `(prev, dur] ∪ [0, new]`
+    是跨圈不足一圈的特例；
+  - 输出恒按触发时刻升序（事件表本身可乱序）。
+  命中的事件名进入 `player.pending_events`，**消费方每帧
+  `take_events()` drain**（帧内消息语义，同 iris-core `Events` 的 drain；
+  不消费会跨帧累积）。crossfade 期间只有目标剪辑（active）产事件——
+  源已冻结不再推进。典型联动（音频脚步声，玩法侧每帧）：
+  `for name in player.take_events() { if name == "footstep" { audio.play(...) } }`。
 
 ### 4.6.2 骨骼蒙皮（GPU LBS）
 

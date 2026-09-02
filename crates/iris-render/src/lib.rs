@@ -43,8 +43,9 @@ pub mod visibility;
 
 pub mod prelude {
     pub use crate::animation::{
-        AnimatedField, AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath,
-        AnimationPlayer, update_animations,
+        AnimatedField, AnimationBlend, AnimationChannel, AnimationClip, AnimationEdge,
+        AnimationEvent, AnimationInterpolation, AnimationPath, AnimationPlayer, AnimationState,
+        collect_events, update_animations,
     };
     pub use crate::asset::{
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,

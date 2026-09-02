@@ -959,6 +959,8 @@ impl GltfLoader {
             name: anim.name.clone().unwrap_or_default(),
             channels,
             duration,
+            // 事件不在 glTF 标准内：GLB 解析不产事件，由 API 侧构造
+            events: Vec::new(),
         })
     }
 }

@@ -1,14 +1,33 @@
-//! glTF 动画运行时：剪辑采样、[`AnimationPlayer`] 组件与每帧推进系统。
+//! glTF 动画运行时：剪辑采样、crossfade 混合、轻量状态机、事件轨道
+//! 与每帧推进系统。
 //!
 //! glTF 动画模型：每条通道绑定「某节点 + 某属性（平移/旋转/缩放）」，
 //! 按关键帧时间轴驱动。采样时被动画的属性**覆写**目标实体 `Transform` 的
 //! 对应字段，未动画的字段保持当前值（即加载时的静止姿势）。
 //!
+//! v2 扩展（新字段全部带默认值，不启用时行为与 v1 完全一致）：
+//! - **crossfade**：[`AnimationPlayer::transition`] 向目标剪辑平滑过渡，
+//!   源姿势在过渡开始时冻结快照（[`AnimationBlend`]）；
+//! - **状态机**：[`AnimationPlayer::states`] + [`AnimationPlayer::edges`]，
+//!   [`AnimationPlayer::request_state`] 按「当前态 → 目标态」的边启动
+//!   crossfade；**条件判定留给游戏侧**（无参数黑板，调用方自行决定何时
+//!   request）；
+//! - **事件轨道**：[`AnimationClip::events`] 命中后进入
+//!   [`AnimationPlayer::pending_events`]，消费方每帧
+//!   [`AnimationPlayer::take_events`] drain；跨界检测在纯函数
+//!   [`collect_events`] 中（可脱离 ECS 单测）。
+//!
+//! 事件联动示范（音频脚步声；iris-render 不依赖 audio，运行时联动由
+//! 玩法侧完成）：
+//!
 //! ```ignore
-//! let instance = spawn_gltf_instance(&mut world, "assets/model.glb")?;
-//! let root = instance.roots[0];
-//! world.insert(root, instance.player()); // 挂载后默认循环播放第一个剪辑
-//! // DefaultPlugins 已注册 update_animations（在层级传播之前执行）
+//! // 每帧在 update_animations 之后：
+//! let mut player = world.get_mut::<AnimationPlayer>(root).unwrap();
+//! for name in player.take_events() {
+//!     if name == "footstep" {
+//!         audio.play("step.wav"); // 对接 R25 音频闭环
+//!     }
+//! }
 //! ```
 
 use glam::Quat;
@@ -127,12 +146,69 @@ pub enum AnimatedField {
     Scale([f32; 3]),
 }
 
+/// 动画事件：剪辑时间轴上的命名标记（如「footstep」「hit_frame」）。
+///
+/// 事件不在 glTF 标准内，**GLB 解析不产事件**——由 API 侧构造
+/// （`clip.events.push(AnimationEvent { time, name })`），`time` 建议落在
+/// `[0, duration]` 内。命中判定见 [`collect_events`]。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimationEvent {
+    /// 触发时刻（秒，相对剪辑起点）。
+    pub time: f32,
+    /// 事件名（消费方按名分发）。
+    pub name: String,
+}
+
 /// 一段动画剪辑：若干通道的集合，时长取各通道最后关键帧时间的最大值。
 #[derive(Clone, Debug, Default)]
 pub struct AnimationClip {
     pub name: String,
     pub channels: Vec<AnimationChannel>,
     /// 剪辑时长（秒）；无通道时为 0。
+    pub duration: f32,
+    /// 事件轨道（时间任意序均可，输出恒按触发时刻排序）；GLB 解析恒为空。
+    pub events: Vec<AnimationEvent>,
+}
+
+/// 一次 crossfade 过渡的状态：目标剪辑为 `player.active`（正常推进），
+/// 源姿势在过渡开始时**冻结快照**为 `(from_clip, from_time)`。
+///
+/// 源不再推进的选择理由：混合结果只由 `elapsed` 决定——可预测、可测试
+/// （同样输入恒得同样姿势），且避免源剪辑循环回绕或播完造成的姿势跳变；
+/// 代价是长过渡里源姿态定格，对 0.1~0.5s 量级的过渡不可感知。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimationBlend {
+    /// 过渡开始时的源剪辑索引。
+    pub from_clip: usize,
+    /// 过渡开始时冻结的源姿势快照（源时间不再推进）。
+    pub from_time: f32,
+    /// 过渡总时长（秒）。
+    pub duration: f32,
+    /// 已流逝的过渡时长（秒）。
+    pub elapsed: f32,
+}
+
+/// 状态机的一个状态：绑定剪辑与播放参数。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimationState {
+    /// 该状态播放的剪辑索引。
+    pub clip: usize,
+    /// 该状态是否循环（进入状态时同步到播放器）。
+    pub looping: bool,
+    /// 该状态的播放速度倍率（进入状态时同步到播放器）。
+    pub speed: f32,
+}
+
+/// 状态机的一条边：`from → to` 的过渡时长。
+///
+/// v1 边界：边只带「过渡时长」，不带条件表达式——**何时切换由游戏侧
+/// 判定**（调用方按玩法逻辑调用 [`AnimationPlayer::request_state`]，
+/// 引擎不设参数黑板 / 条件求值）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimationEdge {
+    pub from: usize,
+    pub to: usize,
+    /// 过渡时长（秒）；0 = 硬切换。
     pub duration: f32,
 }
 
@@ -147,11 +223,44 @@ pub struct AnimationPlayer {
     pub active: usize,
     /// 当前播放时间（秒）。
     pub time: f32,
-    /// 播放速度倍率（1 = 原速）。
+    /// 播放速度倍率（1 = 原速）；states 非空时以当前状态的 speed 为准。
     pub speed: f32,
     pub playing: bool,
-    /// 到达剪辑末尾后是否循环。
+    /// 到达剪辑末尾后是否循环；states 非空时以当前状态的 looping 为准。
     pub looping: bool,
+    /// 进行中的 crossfade（None = 无过渡，纯 active 剪辑姿势）。
+    pub blend: Option<AnimationBlend>,
+    /// 状态机状态表；**空 = 不用状态机**——直接操作 active/looping/speed
+    /// 的旧路径完全保留。
+    pub states: Vec<AnimationState>,
+    /// 状态机边表（`from → to` + 过渡时长）。
+    pub edges: Vec<AnimationEdge>,
+    /// 当前状态下标（states 非空时有效）。
+    pub current_state: usize,
+    /// 本帧命中待消费的事件名（按触发时刻升序）；**消费方每帧
+    /// [`AnimationPlayer::take_events`] drain**——不消费会跨帧累积。
+    pub pending_events: Vec<String>,
+}
+
+impl Default for AnimationPlayer {
+    /// 全字段的默认值（兼容性承诺：新增字段一律给中性默认——
+    /// blend/states/edges/pending_events 默认空/None，行为与 v1 一致）。
+    fn default() -> Self {
+        Self {
+            clips: Vec::new(),
+            node_entities: Vec::new(),
+            active: 0,
+            time: 0.0,
+            speed: 1.0,
+            playing: true,
+            looping: true,
+            blend: None,
+            states: Vec::new(),
+            edges: Vec::new(),
+            current_state: 0,
+            pending_events: Vec::new(),
+        }
+    }
 }
 
 impl AnimationPlayer {
@@ -160,12 +269,105 @@ impl AnimationPlayer {
         Self {
             clips,
             node_entities,
-            active: 0,
-            time: 0.0,
-            speed: 1.0,
-            playing: true,
-            looping: true,
+            ..Default::default()
         }
+    }
+
+    /// 生效的循环标记：挂了状态机（states 非空且下标合法）时以当前状态
+    /// 为准，否则回落到组件字段（旧路径）。
+    fn effective_looping(&self) -> bool {
+        match self.states.get(self.current_state) {
+            Some(state) => state.looping,
+            None => self.looping,
+        }
+    }
+
+    /// 生效的播放速度：规则同 [`AnimationPlayer::effective_looping`]。
+    fn effective_speed(&self) -> f32 {
+        match self.states.get(self.current_state) {
+            Some(state) => state.speed,
+            None => self.speed,
+        }
+    }
+
+    /// 启动向目标剪辑 `clip` 的 crossfade。
+    ///
+    /// 语义：
+    /// - `duration <= 0` = **硬切换**（立即改播目标剪辑，时间归零）；
+    /// - 与当前活动剪辑相同 = 忽略（无过渡意义）；
+    /// - 目标越界 = 忽略并 `debug_assert!`（release 下静默忽略——调用方
+    ///   传错索引不应让播放器报废）；
+    /// - 过渡中再次 transition：以当前活动剪辑为新源重新开始。
+    ///
+    /// 过渡开始时把源姿势冻结为快照（见 [`AnimationBlend`]），目标剪辑
+    /// 从 0 开始正常推进并置 `playing = true`。
+    pub fn transition(&mut self, clip: usize, duration: f32) {
+        if clip >= self.clips.len() {
+            debug_assert!(
+                false,
+                "transition 目标剪辑越界：{clip} / {}",
+                self.clips.len()
+            );
+            return;
+        }
+        if clip == self.active {
+            return;
+        }
+        if duration <= 0.0 {
+            self.active = clip;
+            self.time = 0.0;
+            self.blend = None;
+            return;
+        }
+        self.blend = Some(AnimationBlend {
+            from_clip: self.active,
+            from_time: self.time,
+            duration,
+            elapsed: 0.0,
+        });
+        self.active = clip;
+        self.time = 0.0;
+        self.playing = true;
+    }
+
+    /// 请求切换到状态机状态 `state`。
+    ///
+    /// 存在 `current → state` 边时按 `edge.duration` 启动 crossfade，
+    /// 否则硬切换；两种情况下 `looping` / `speed` 都同步为目标状态值，
+    /// `current_state` 立即更新。与 [`AnimationPlayer::transition`] 同款
+    /// 边界语义：同状态请求忽略、越界忽略 + `debug_assert!`。
+    /// **何时调用由游戏侧判定**（无参数黑板，见 [`AnimationEdge`]）。
+    pub fn request_state(&mut self, state: usize) {
+        if state >= self.states.len() {
+            debug_assert!(
+                false,
+                "request_state 目标状态越界：{state} / {}",
+                self.states.len()
+            );
+            return;
+        }
+        if state == self.current_state {
+            return;
+        }
+        let target = self.states[state].clone();
+        let edge = self
+            .edges
+            .iter()
+            .find(|e| e.from == self.current_state && e.to == state)
+            .map(|e| e.duration);
+        self.current_state = state;
+        self.looping = target.looping;
+        self.speed = target.speed;
+        match edge {
+            Some(duration) => self.transition(target.clip, duration),
+            None => self.transition(target.clip, 0.0),
+        }
+    }
+
+    /// 取走全部待消费事件名（drain 语义）。**每帧调用一次**——
+    /// 事件是帧内消息，不调用会跨帧累积。
+    pub fn take_events(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_events)
     }
 
     /// 推进后的时间与播放状态（不修改自身，供系统两阶段处理）。
@@ -179,8 +381,8 @@ impl AnimationPlayer {
         if clip.duration <= 0.0 {
             return (self.time, false);
         }
-        let t = self.time + dt * self.speed;
-        if self.looping {
+        let t = self.time + dt * self.effective_speed();
+        if self.effective_looping() {
             (t % clip.duration, true)
         } else if t >= clip.duration {
             (clip.duration, false)
@@ -190,9 +392,118 @@ impl AnimationPlayer {
     }
 }
 
+/// 事件跨界检测（纯函数）：播放时间从 `prev_time` 推进到 `new_time`，
+/// 返回本帧命中的事件下标（按触发时刻升序；一事件多次触发则下标重复
+/// 出现多次）。
+///
+/// 时间语义（调用方务必区分）：
+/// - **非循环**：`new_time` 为钳制后的播放时间，命中区间 `(prev_time, new_time]`。
+///   播放器停在末端后每帧 `prev == new`，区间为空 → **末端事件不重复触发**；
+/// - **循环**：`new_time` 为**取模前的原始推进时间**（`prev + dt·speed`，
+///   一帧可跨多圈）。事件每被跨越一次触发一次——一帧跨 k 圈即重复命中
+///   k 次（**multi-fire**，确定性：命中次数 = 跨越该事件时刻的完整次数）；
+///   单圈内的回绕 `(prev, dur] ∪ [0, new]` 是跨圈不足一圈时的特例。
+///   `duration <= 0` 恒返回空。
+///
+/// 两阶段数据流注意：`prev_time` 必须取推进前的 `player.time`
+/// （阶段一先取再推进）。
+pub fn collect_events(
+    events: &[AnimationEvent],
+    prev_time: f32,
+    new_time: f32,
+    duration: f32,
+    looping: bool,
+) -> Vec<usize> {
+    if duration <= 0.0 || events.is_empty() {
+        return Vec::new();
+    }
+    // (触发时刻, 事件下标)：触发时刻用于输出排序（事件表本身可乱序）
+    let mut hits: Vec<(f32, usize)> = Vec::new();
+    if looping {
+        for (i, event) in events.iter().enumerate() {
+            // 跨越次数 = 满足 prev < e.time + m·dur <= new 的整数 m 的个数
+            //            = floor((new - e.time)/dur) - floor((prev - e.time)/dur)
+            // 下界取严格大于：恰在 prev 处的跨越上一帧已触发，不重复
+            let lower = ((prev_time - event.time) / duration).floor() as i64;
+            let upper = ((new_time - event.time) / duration).floor() as i64;
+            for m in lower + 1..=upper {
+                hits.push((event.time + m as f32 * duration, i));
+            }
+        }
+    } else {
+        let new_time = new_time.min(duration);
+        for (i, event) in events.iter().enumerate() {
+            if event.time > prev_time && event.time <= new_time {
+                hits.push((event.time, i));
+            }
+        }
+    }
+    // 按触发时刻升序；同刻按事件下标（确定性）
+    hits.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
+/// crossfade 权重（目标剪辑占比）：`smoothstep(elapsed / duration)`。
+///
+/// 选 smoothstep 而非线性：线性在过渡首尾速度突变（起停生硬），
+/// smoothstep 两端导数为 0、视觉更顺滑；中点处两者同为 0.5，可预测性
+/// 不打折。`duration <= 0` 恒为 1.0（纯目标）。
+fn blend_weight(elapsed: f32, duration: f32) -> f32 {
+    if duration <= 0.0 {
+        return 1.0;
+    }
+    let t = (elapsed / duration).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 同路径的两份采样值按目标权重 `w` 混合。
+///
+/// 平移/缩放分量线性 lerp；旋转用 **slerp 而非 nlerp**——nlerp 在角度
+/// 较大时角速度先快后慢（非线性），crossfade 中段旋转会肉眼发冲，
+/// slerp 恒定角速度，代价只是少量三角函数（每实体每帧个位数旋转通道，
+/// 不值得省）。点积为负先翻转短路径（与通道采样同款）。
+fn blend_fields(src: &AnimatedField, dst: &AnimatedField, w: f32) -> AnimatedField {
+    match (src, dst) {
+        (AnimatedField::Translation(a), AnimatedField::Translation(b)) => {
+            AnimatedField::Translation(lerp3(a, b, w))
+        }
+        (AnimatedField::Scale(a), AnimatedField::Scale(b)) => AnimatedField::Scale(lerp3(a, b, w)),
+        (AnimatedField::Rotation(a), AnimatedField::Rotation(b)) => {
+            let mut b = *b;
+            if a.dot(b) < 0.0 {
+                b = -b;
+            }
+            AnimatedField::Rotation(a.slerp(b, w))
+        }
+        // 两侧路径必然一致（按「实体 + 路径」配对后才会调用），兜底取目标
+        _ => *dst,
+    }
+}
+
+fn lerp3(a: &[f32; 3], b: &[f32; 3], w: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] - a[0]) * w,
+        a[1] + (b[1] - a[1]) * w,
+        a[2] + (b[2] - a[2]) * w,
+    ]
+}
+
+fn animated_path(field: &AnimatedField) -> AnimationPath {
+    match field {
+        AnimatedField::Translation(_) => AnimationPath::Translation,
+        AnimatedField::Rotation(_) => AnimationPath::Rotation,
+        AnimatedField::Scale(_) => AnimationPath::Scale,
+    }
+}
+
 /// 单个动画根实体的采样任务包（`update_animations` 阶段一产出、阶段二
-/// 消费）：根实体 + 推进后的时间 + 循环标记 + 「目标实体 → 覆写字段」列表。
-type AnimationJob = (Entity, f32, bool, Vec<(Entity, AnimatedField)>);
+/// 消费）：根实体 + 推进后的时间 + 循环标记 + 「目标实体 → 覆写字段」
+/// 列表（crossfade 时已混合完毕）+ 本帧命中的事件名。
+type AnimationJob = (Entity, f32, bool, Vec<(Entity, AnimatedField)>, Vec<String>);
 
 /// 每帧动画系统：推进所有 [`AnimationPlayer`]，把采样结果覆写到目标实体的
 /// `Transform`。必须在 `propagate_transforms` 之前执行（DefaultPlugins 已保证）；
@@ -206,11 +517,35 @@ pub fn update_animations(world: &iris_core::world::World) {
         .map(|t| t.delta_secs())
         .unwrap_or(0.0);
 
-    // 阶段一（只读采样）：推进时间并把每条通道的采样值收集为覆写任务
+    // 阶段一（只读采样）：推进时间、做事件跨界检测、按需混合，
+    // 收集为覆写任务
     let mut jobs: Vec<AnimationJob> = Vec::new();
     world.query::<(Entity, &AnimationPlayer)>(|(entity, player)| {
+        // 事件检测要用推进前的时间（先取再推进）
+        let prev_time = player.time;
+        // 混合推进与目标剪辑播放同步：暂停时整段冻结（含 crossfade）
+        let blend_dt = if player.playing { dt } else { 0.0 };
         let (time, playing) = player.advanced(dt);
+        let looping = player.effective_looping();
+        // 循环时 collect_events 需要取模前的原始时间（multi-fire 检测）；
+        // 非循环 advanced 已钳制，直接用
+        let raw_time = if playing && looping {
+            prev_time + dt * player.effective_speed()
+        } else {
+            time
+        };
+        let fired = player
+            .clips
+            .get(player.active)
+            .map(|clip| {
+                collect_events(&clip.events, prev_time, raw_time, clip.duration, looping)
+                    .into_iter()
+                    .map(|i| clip.events[i].name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let Some(clip) = player.clips.get(player.active) else {
+            jobs.push((entity, time, playing, Vec::new(), fired));
             return;
         };
         let mut fields = Vec::with_capacity(clip.channels.len());
@@ -221,14 +556,57 @@ pub fn update_animations(world: &iris_core::world::World) {
             };
             fields.push((target, channel.sample(time)));
         }
-        jobs.push((entity, time, playing, fields));
+        // crossfade 混合：对「目标实体 + 路径」并集逐项混入冻结的源快照。
+        // 混合用的 elapsed 加上 dt（与 time 的推进对称，两阶段只读），
+        // 保证姿势只由过渡总时长决定、与分帧方式无关
+        if let Some(blend) = player.blend {
+            if let Some(src_clip) = player.clips.get(blend.from_clip) {
+                let w = blend_weight(blend.elapsed + blend_dt, blend.duration);
+                // 源快照采样（源时间冻结在 transition 时刻）
+                let mut src: Vec<(Entity, AnimationPath, AnimatedField)> = src_clip
+                    .channels
+                    .iter()
+                    .filter_map(|c| {
+                        let target = player.node_entities.get(c.node).copied().flatten()?;
+                        Some((target, c.path, c.sample(blend.from_time)))
+                    })
+                    .collect();
+                // 双方都有：混合
+                for (target, field) in fields.iter_mut() {
+                    let path = animated_path(field);
+                    if let Some(pos) = src.iter().position(|(e, p, _)| *e == *target && *p == path)
+                    {
+                        let src_field = src.remove(pos).2;
+                        *field = blend_fields(&src_field, field, w);
+                    }
+                }
+                // 仅源有：直接取源值（缺方通道不拖拽——目标剪辑没有的
+                // 通道保持在源姿势，而不是被目标姿势瞬间带走）
+                for (target, _, field) in src {
+                    fields.push((target, field));
+                }
+            }
+        }
+        jobs.push((entity, time, playing, fields, fired));
     });
 
     // 阶段二（写入）：更新播放状态，覆写目标实体的局部变换
-    for (player_entity, time, playing, fields) in jobs {
+    for (player_entity, time, playing, fields, events) in jobs {
         if let Some(mut player) = world.get_mut::<AnimationPlayer>(player_entity) {
+            // 读到的是推进前的 playing：暂停时混合计时同步冻结
+            let was_playing = player.playing;
             player.time = time;
             player.playing = playing;
+            player.pending_events.extend(events);
+            // 推进 crossfade 计时；完成后清除，回到纯目标姿势
+            if was_playing {
+                if let Some(blend) = player.blend.as_mut() {
+                    blend.elapsed += dt;
+                    if blend.elapsed >= blend.duration {
+                        player.blend = None;
+                    }
+                }
+            }
         }
         for (target, field) in fields {
             let Some(mut transform) = world.get_mut::<Transform>(target) else {
@@ -246,6 +624,8 @@ pub fn update_animations(world: &iris_core::world::World) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iris_core::world::World;
+    use std::time::Duration;
 
     fn translation_channel(interpolation: AnimationInterpolation) -> AnimationChannel {
         AnimationChannel {
@@ -255,6 +635,54 @@ mod tests {
             times: vec![0.0, 1.0, 2.0],
             values: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0],
         }
+    }
+
+    /// 恒值平移通道（单关键帧）。
+    fn constant_translation(node: usize, v: [f32; 3]) -> AnimationChannel {
+        AnimationChannel {
+            node,
+            path: AnimationPath::Translation,
+            interpolation: AnimationInterpolation::Linear,
+            times: vec![0.0],
+            values: v.to_vec(),
+        }
+    }
+
+    /// 恒值旋转通道（单关键帧）。
+    fn constant_rotation(node: usize, q: Quat) -> AnimationChannel {
+        AnimationChannel {
+            node,
+            path: AnimationPath::Rotation,
+            interpolation: AnimationInterpolation::Linear,
+            times: vec![0.0],
+            values: vec![q.x, q.y, q.z, q.w],
+        }
+    }
+
+    fn clip(name: &str, channels: Vec<AnimationChannel>, duration: f32) -> AnimationClip {
+        AnimationClip {
+            name: name.into(),
+            channels,
+            duration,
+            events: Vec::new(),
+        }
+    }
+
+    /// 建「双剪辑 + 播放器」世界：root 实体挂播放器，node 0 指向 root。
+    fn blend_world(clip_a: AnimationClip, clip_b: AnimationClip) -> (World, Entity) {
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let player = AnimationPlayer::new(vec![clip_a, clip_b], vec![Some(root)]);
+        world.insert(root, player);
+        (world, root)
+    }
+
+    /// 确定性推进 Time 并跑一帧动画系统。
+    fn step(world: &World, dt: f64) {
+        world
+            .resource_mut::<Time>()
+            .advance(Duration::from_secs_f64(dt));
+        update_animations(world);
     }
 
     fn sample_translation(channel: &AnimationChannel, t: f32) -> [f32; 3] {
@@ -336,6 +764,7 @@ mod tests {
             name: "c".into(),
             channels: vec![],
             duration: 1.0,
+            events: Vec::new(),
         };
         let mut player = AnimationPlayer::new(vec![clip], vec![]);
         assert_eq!(player.advanced(0.3), (0.3, true));
@@ -352,5 +781,432 @@ mod tests {
         player.time = t;
         player.playing = playing;
         assert_eq!(player.advanced(0.3), (1.0, false), "暂停不应推进");
+    }
+
+    #[test]
+    fn blend_weight_is_smoothstep() {
+        assert_eq!(blend_weight(0.0, 1.0), 0.0);
+        assert_eq!(blend_weight(1.0, 1.0), 1.0);
+        // smoothstep(0.5) = 0.25 · (3 − 1) = 0.5：中点与线性一致
+        assert_eq!(blend_weight(0.5, 1.0), 0.5);
+        // smoothstep(0.25) = 0.0625 · 2.5
+        assert!((blend_weight(0.25, 1.0) - 0.15625).abs() < 1e-6);
+        // 越界钳制
+        assert_eq!(blend_weight(2.0, 1.0), 1.0);
+        assert_eq!(blend_weight(-1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn crossfade_translation_midpoint() {
+        let a = clip("a", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let b = clip("b", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        assert!(world.get::<AnimationPlayer>(root).unwrap().blend.is_some());
+
+        // max_delta = 0.25s 钳制，分两帧共推进 0.5s；混合权重应与
+        // 分帧方式无关：w = smoothstep(0.5) = 0.5
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let transform = world.get::<Transform>(root).unwrap();
+        // 精确式：x = 0 + (2 − 0)·smoothstep(0.5) = 2·blend_weight(0.5, 1)
+        let expected_x = 2.0 * blend_weight(0.5, 1.0);
+        assert!(
+            (transform.position.x - expected_x).abs() < 1e-6,
+            "中点 x 应为 {expected_x}，实际 {}",
+            transform.position.x
+        );
+        let player = world.get::<AnimationPlayer>(root).unwrap();
+        assert!(
+            (player.time - 0.5).abs() < 1e-6,
+            "目标剪辑时间应推进到 0.5，实际 {}",
+            player.time
+        );
+    }
+
+    #[test]
+    fn crossfade_rotation_slerp_midpoint() {
+        let a = clip("face", vec![constant_rotation(0, Quat::IDENTITY)], 1.0);
+        let b = clip(
+            "side",
+            vec![constant_rotation(
+                0,
+                Quat::from_rotation_y(90f32.to_radians()),
+            )],
+            1.0,
+        );
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let transform = world.get::<Transform>(root).unwrap();
+        let expected = Quat::from_rotation_y(45f32.to_radians());
+        // slerp 中点 = 45°（角距容差 1e-5 rad）
+        let angle = 2.0
+            * transform
+                .rotation
+                .dot(expected)
+                .abs()
+                .clamp(0.0, 1.0)
+                .acos();
+        assert!(
+            angle < 1e-5,
+            "中点应为 yaw 45°，角距 {angle} rad，实际 {:?}",
+            transform.rotation
+        );
+    }
+
+    #[test]
+    fn crossfade_missing_channels_do_not_drag() {
+        // A 只有平移、B 只有旋转：混合期平移取 A、旋转取 B
+        let a = clip(
+            "trans_only",
+            vec![constant_translation(0, [2.0, 0.0, 0.0])],
+            1.0,
+        );
+        let b = clip(
+            "rot_only",
+            vec![constant_rotation(
+                0,
+                Quat::from_rotation_y(90f32.to_radians()),
+            )],
+            1.0,
+        );
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let transform = world.get::<Transform>(root).unwrap();
+        assert_eq!(
+            [
+                transform.position.x,
+                transform.position.y,
+                transform.position.z
+            ],
+            [2.0, 0.0, 0.0],
+            "平移只有 A 有：应取 A 的值"
+        );
+        let expected = Quat::from_rotation_y(90f32.to_radians());
+        let dot = transform.rotation.dot(expected).abs();
+        assert!(
+            (dot - 1.0).abs() < 1e-5,
+            "旋转只有 B 有：应取 B 的值，实际 {:?}",
+            transform.rotation
+        );
+    }
+
+    #[test]
+    fn crossfade_completes_to_pure_target() {
+        let a = clip("a", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let b = clip("b", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        // 共推进 1.0s ≥ duration：blend 清除，姿势为纯目标
+        for _ in 0..4 {
+            step(&world, 0.25);
+        }
+        assert!(
+            world.get::<AnimationPlayer>(root).unwrap().blend.is_none(),
+            "过渡完成后 blend 应清除"
+        );
+        let x = world.get::<Transform>(root).unwrap().position.x;
+        assert_eq!(x, 2.0, "应为纯目标姿势");
+        // 继续推进保持纯目标
+        step(&world, 0.25);
+        assert!(world.get::<AnimationPlayer>(root).unwrap().blend.is_none());
+        assert_eq!(world.get::<Transform>(root).unwrap().position.x, 2.0);
+    }
+
+    #[test]
+    fn pause_freezes_blend() {
+        let a = clip("a", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let b = clip("b", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        step(&world, 0.25); // w = smoothstep(0.25)
+        let x0 = world.get::<Transform>(root).unwrap().position.x;
+        // 暂停：混合计时应与播放时间一起冻结，姿势不再变化
+        world.get_mut::<AnimationPlayer>(root).unwrap().playing = false;
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let elapsed = world
+            .get::<AnimationPlayer>(root)
+            .unwrap()
+            .blend
+            .unwrap()
+            .elapsed;
+        assert_eq!(elapsed, 0.25, "暂停时 blend 计时应冻结");
+        let x1 = world.get::<Transform>(root).unwrap().position.x;
+        assert_eq!(x0.to_bits(), x1.to_bits(), "暂停时姿势应逐位不动");
+    }
+
+    #[test]
+    fn transition_hard_switch_semantics() {
+        let a = clip("a", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let b = clip("b", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        // duration = 0：硬切换
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 0.0);
+        {
+            let player = world.get::<AnimationPlayer>(root).unwrap();
+            assert!(player.blend.is_none(), "硬切换不应有 blend");
+            assert_eq!(player.active, 1);
+            assert_eq!(player.time, 0.0, "硬切换后时间归零");
+        }
+        // 同剪辑请求忽略
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        assert!(world.get::<AnimationPlayer>(root).unwrap().blend.is_none());
+    }
+
+    #[test]
+    fn state_machine_edge_starts_crossfade() {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let walk = clip("walk", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let mut player = AnimationPlayer::new(vec![idle, walk], vec![]);
+        player.states = vec![
+            AnimationState {
+                clip: 0,
+                looping: true,
+                speed: 1.0,
+            },
+            AnimationState {
+                clip: 1,
+                looping: false,
+                speed: 2.0,
+            },
+        ];
+        player.edges = vec![AnimationEdge {
+            from: 0,
+            to: 1,
+            duration: 0.3,
+        }];
+        player.request_state(1);
+        assert!(player.blend.is_some(), "有边应启动 crossfade");
+        assert_eq!(player.blend.unwrap().duration, 0.3, "过渡时长取边值");
+        assert_eq!(player.current_state, 1);
+        assert_eq!(player.active, 1, "应切到目标态的剪辑");
+        assert!(!player.looping, "looping 应切到目标态");
+        assert!((player.speed - 2.0).abs() < 1e-6, "speed 应切到目标态");
+        // states 非空：advanced 以当前状态的 looping/speed 为准
+        // （walk 态 speed=2.0、非循环：0 + 0.4·2 = 0.8）
+        assert_eq!(player.advanced(0.4), (0.8, true));
+        // 无边：硬切换（清掉边表后切回 idle）
+        player.edges.clear();
+        player.request_state(0);
+        assert!(player.blend.is_none(), "无边应硬切换");
+        assert_eq!(player.active, 0);
+        assert_eq!(player.time, 0.0);
+        assert!(player.looping, "应切回 idle 的循环参数");
+        assert!((player.speed - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "目标状态越界")]
+    fn request_state_out_of_range_panics_in_debug() {
+        let mut player = AnimationPlayer::new(vec![], vec![]);
+        player.states = vec![AnimationState {
+            clip: 0,
+            looping: true,
+            speed: 1.0,
+        }];
+        player.request_state(5);
+    }
+
+    #[test]
+    fn events_fire_once_within_interval() {
+        let events = vec![
+            AnimationEvent {
+                time: 0.5,
+                name: "a".into(),
+            },
+            AnimationEvent {
+                time: 0.95,
+                name: "b".into(),
+            },
+        ];
+        // 精确命中：0.4 → 0.6 命中 t=0.5
+        assert_eq!(collect_events(&events, 0.4, 0.6, 1.0, false), vec![0]);
+        // 未达不触发
+        assert!(collect_events(&events, 0.0, 0.49, 1.0, false).is_empty());
+        // 越过后不重复
+        assert!(collect_events(&events, 0.6, 0.9, 1.0, false).is_empty());
+        // 边界：命中区间 (prev, new] 恰好含 new
+        assert_eq!(collect_events(&events, 0.4, 0.5, 1.0, false), vec![0]);
+        // 非循环停在末端：prev == new == duration，区间为空，不重复触发
+        assert!(collect_events(&events, 1.0, 1.0, 1.0, false).is_empty());
+        // 末端事件：推进到末端那一帧触发一次
+        let end = vec![AnimationEvent {
+            time: 1.0,
+            name: "end".into(),
+        }];
+        assert_eq!(collect_events(&end, 0.9, 1.0, 1.0, false), vec![0]);
+        assert!(collect_events(&end, 1.0, 1.0, 1.0, false).is_empty());
+    }
+
+    #[test]
+    fn looping_events_wrap_and_multifire() {
+        // 事件表故意乱序：输出必须按触发时刻排序
+        let events = vec![
+            AnimationEvent {
+                time: 0.95,
+                name: "late".into(),
+            },
+            AnimationEvent {
+                time: 0.05,
+                name: "early".into(),
+            },
+        ];
+        // 回绕：prev=0.9 → 原始时间 1.1（显示 0.1），
+        // 命中 (0.9, 1] 的 0.95 与 [0, 0.1] 的 0.05，按触发时刻排序
+        assert_eq!(collect_events(&events, 0.9, 1.1, 1.0, true), vec![0, 1]);
+        // 一帧两圈 multi-fire：prev=0.1 → 原始时间 2.15，t=0.5 被跨越两次
+        let mid = vec![AnimationEvent {
+            time: 0.5,
+            name: "m".into(),
+        }];
+        assert_eq!(
+            collect_events(&mid, 0.1, 2.15, 1.0, true),
+            vec![0, 0],
+            "一帧跨两圈应重复命中两次"
+        );
+        // 恰在 prev 处的事件不重复触发（上一帧已触发）
+        assert!(collect_events(&mid, 0.5, 0.9, 1.0, true).is_empty());
+    }
+
+    #[test]
+    fn events_flow_through_update_and_drain() {
+        let mut clip_a = clip("walk", vec![], 1.0);
+        clip_a.events = vec![
+            AnimationEvent {
+                time: 0.25,
+                name: "footstep".into(),
+            },
+            AnimationEvent {
+                time: 0.75,
+                name: "footstep2".into(),
+            },
+        ];
+        let (mut world, root) = blend_world(clip_a, clip("idle", vec![], 1.0));
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        assert_eq!(
+            world.get::<AnimationPlayer>(root).unwrap().pending_events,
+            vec!["footstep"],
+            "0.25s 事件应在第一帧命中"
+        );
+        // drain 消费
+        let taken = world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .take_events();
+        assert_eq!(taken, vec!["footstep"]);
+        assert!(
+            world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .pending_events
+                .is_empty()
+        );
+        // 第二帧（0.25 → 0.30）：无跨越，不重复触发
+        step(&world, 0.05);
+        assert!(
+            world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .pending_events
+                .is_empty()
+        );
+        // 循环回绕经系统：0.9 → 原始 1.1（显示 0.1）。
+        // 命中区间 (0.9, 1] ∪ [0, 0.1] 不含 0.25 / 0.75 → 无误报
+        world.get_mut::<AnimationPlayer>(root).unwrap().time = 0.9;
+        step(&world, 0.2);
+        assert!(
+            world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .pending_events
+                .is_empty(),
+            "回绕帧不应误报"
+        );
+        // 跨圈命中：0.75 → 原始 1.25（显示 0.25），0.25 事件在新一圈再触发
+        world.get_mut::<AnimationPlayer>(root).unwrap().time = 0.75;
+        step(&world, 0.25); // 原始 1.0：区间 (0.75, 1]，无命中
+        assert!(
+            world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .pending_events
+                .is_empty()
+        );
+        step(&world, 0.25); // 原始 1.25：跨过 1.25 处的 0.25 → 命中
+        assert_eq!(
+            world.get::<AnimationPlayer>(root).unwrap().pending_events,
+            vec!["footstep"],
+            "回绕后事件应在新的圈里再次触发"
+        );
+    }
+
+    #[test]
+    fn blend_is_bitwise_deterministic() {
+        let build = || {
+            let (a, d) = (constant_translation(0, [0.0, 1.0, 0.0]), 1.0);
+            let b = constant_translation(0, [2.0, 3.0, 0.0]);
+            let (mut world, root) = blend_world(clip("a", vec![a], d), clip("b", vec![b], 1.0));
+            world.insert_resource(Time::default());
+            world
+                .get_mut::<AnimationPlayer>(root)
+                .unwrap()
+                .transition(1, 1.0);
+            (world, root)
+        };
+        let (world_a, root_a) = build();
+        let (world_b, root_b) = build();
+        for _ in 0..3 {
+            step(&world_a, 0.25);
+            step(&world_b, 0.25);
+            let ta = world_a.get::<Transform>(root_a).unwrap();
+            let tb = world_b.get::<Transform>(root_b).unwrap();
+            assert_eq!(
+                [
+                    ta.position.x.to_bits(),
+                    ta.position.y.to_bits(),
+                    ta.position.z.to_bits()
+                ],
+                [
+                    tb.position.x.to_bits(),
+                    tb.position.y.to_bits(),
+                    tb.position.z.to_bits()
+                ],
+                "同配置两个播放器应逐位一致"
+            );
+        }
     }
 }
