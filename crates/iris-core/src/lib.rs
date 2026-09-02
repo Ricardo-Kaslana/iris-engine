@@ -22,6 +22,7 @@ pub mod event;
 pub mod hierarchy;
 pub mod instant;
 pub mod name;
+pub mod nav;
 pub mod physics;
 pub mod query;
 pub mod resource;
@@ -48,6 +49,7 @@ pub mod prelude {
     // 跨平台时间点封装（wasm 上 std::time::Instant 会运行时 panic，见 instant.rs）
     pub use crate::instant::Instant;
     pub use crate::name::Name;
+    pub use crate::nav::{NavGrid, NavGridParams};
     pub use crate::physics::{
         Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker, PHYSICS_GRAVITY,
         RigidBody, step_physics,
