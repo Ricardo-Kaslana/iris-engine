@@ -19,6 +19,9 @@
 //! - IBL 环境光照（程序化天空 + 分割求和，初始化时一次性烘焙）；
 //! - 外部 HDR 环境贴图（Radiance .hdr equirectangular → IBL 与天空盒，generation 失效重烘）；
 //! - 视锥剔除与实体挂载相机；
+//! - 网格距离 LOD（`LodMesh` 组件：近 high / 远 low，收集期按距离选网格）；
+//! - 纹理 BC1 GPU 压缩（确定性编码器 + 特性/对齐/不透明决策树，无特性
+//!   或 web 自动回退 RGBA8）与 CPU / GPU 内存占用统计；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
 pub mod animation;
@@ -39,6 +42,7 @@ pub mod renderer;
 pub mod skin;
 pub mod surface;
 pub mod texture;
+pub mod texture_bcn;
 pub mod ui;
 pub mod visibility;
 
@@ -64,7 +68,9 @@ pub mod prelude {
         cascade_splits, snap_aabb_to_texels,
     };
     pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
-    pub use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex, primitives};
+    pub use crate::mesh::{
+        LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, Vertex, primitives,
+    };
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::particles::{
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
@@ -74,6 +80,9 @@ pub mod prelude {
     pub use crate::skin::{Skin, skin_vertex};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
+    pub use crate::texture_bcn::{
+        BC1_BLOCK_BYTES, bc1_eligible, encode_bc1, encoded_len, padded_extent,
+    };
     pub use crate::ui::{UiColor, UiRect, UiText, glyph_bits, text_width};
     pub use crate::visibility::Visibility;
 }

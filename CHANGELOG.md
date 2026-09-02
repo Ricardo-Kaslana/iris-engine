@@ -5,6 +5,47 @@
 
 ## [Unreleased]
 
+### Added（R30：内存与规模——BC1 纹理压缩 + 距离 LOD + 内存占用统计）
+
+- **纹理 BC1 GPU 压缩**（iris-render `texture_bcn`）：上传决策树「设备
+  启用 `TEXTURE_COMPRESSION_BC` + 尺寸 4 对齐 + 全不透明（alpha 恒 255）
+  → `Bc1RgbaUnormSrgb`（0.5 B/px，对 RGBA8 的 8 倍节省）；任一不满足
+  回退 RGBA8」。wasm 的 WebGPU 实现普遍无 BC 特性——**无分支回退**：
+  不写 cfg，运行时特性检测天然覆盖 web 与 native 老 GPU；wgpu 压缩格式
+  要求特性显式请求，`Gpu` 初始化按适配器能力请求 BCn 子集并新增
+  `features()` / `supports_bc()` 检测入口。编码器 `encode_bc1` 纯函数、
+  全整数运算、零 unsafe：逐 4×4 块取 RGB 距离最远端点（O(16²) 确定性
+  暴力，与 PCA 法的取舍写入文档）、亮度排序 c0 > c1、RGB565 四舍五入
+  量化、四色调色板最近项索引（并列取先）；**确定性契约**——同输入两次
+  编码逐位一致（单测）；非 4 倍数尺寸统一预 pad（边缘像素复制）写死。
+  质量护栏：纯色 565 精确色往返零误差、温和渐变平均误差 < 4/255、位
+  打包逐字节断言；GPU 测试 `bc1_render.rs` 以「alpha=255 副本 → BC1 /
+  alpha=100 副本 → RGBA 回退」的同画面 A/B 断言两路径全帧平均误差近零。
+  mipmap v1 不做（引擎无 mip 机制，文档写明）。
+- **网格距离 LOD**：`LodMesh { high, low, switch_distance }` 组件（挂载
+  实体**替换** `MeshHandle` 参与收集）；收集查询改 `Option<&MeshHandle>`
+  + `Option<&LodMesh>` 协同——有 LodMesh 按「实体原点到相机 eye 欧氏
+  距离」选网格（`dist <= switch` 用 high、边界归近侧；纯函数 `select`
+  可单测），选中的句柄参与合批 / 剔除 / 透明排序 / 三角形统计，无
+  LodMesh 走旧语义、两者皆无跳过；蒙皮路径同口径。`FrameStats::
+  triangles_drawn` 天然成为验收指标。v1 限制写入文档：距离用实体原点
+  （非包围球中心）、**无滞回**（边界抖动可能逐帧切换）、仅两级。
+- **内存占用统计**：「低占用」卖点观测口径——`TextureStore::
+  memory_bytes()`（Σ 源 RGBA 字节）/ `MeshStore::memory_bytes()`（顶点 +
+  索引 + 蒙皮属性字节）；`TextureStore::gpu_bytes_estimate(feature_bc)`
+  按上传决策树逐纹理估算显存（BC1 0.5 / RGBA 4 B/px，与渲染器共用
+  同一决策纯函数），`Renderer::texture_is_bc1(handle)` 观测实际上传
+  格式。
+- **验收基准**：新示例 `memory_bench`（iris-engine）——4 × 2048² 程序化
+  纹理 + 高/低模 UV 球对 + 8 个 LodMesh 实体，输出真实数字（开发机
+  RTX 4060 Laptop / Vulkan / release）：CPU 源纹理 64.00 MiB、GPU RGBA8
+  回退 64.00 MiB vs **BC1 实际上传 8.00 MiB（压缩比 8.00x，显存
+  -87.5%）**；LOD 近景帧 `triangles_drawn` 49,152（8 × 6144 高模）→
+  远景帧 768（8 × 96 低模，**-98.4%**，instances / draw_calls 不变）。
+  新 GPU 测试 `bc1_render.rs` / `lod_render.rs`；既有纹理相关测试零
+  改动全过；文档：ARCHITECTURE §4.18 / §4.19（含实测数据段）、§4.1 /
+  §4.9 / §7 / §8 同步，README 特性行与示例列表。
+
 ### Added（R29：阴影 v2——方向光级联阴影 CSM，3 级）
 
 - **级联阴影贴图**（iris-render）：方向光阴影贴图从单张 2048² 升级为

@@ -1,11 +1,51 @@
-//! 网格：CPU 数据目录 + 基础图元生成器。
+//! 网格：CPU 数据目录 + 基础图元生成器 + 距离 LOD 组件。
 
+use glam::Vec3;
 use iris_core::Resource;
 use wgpu::util::DeviceExt;
 
 /// 网格句柄。指向 `MeshStore` 中的条目，也作为 ECS 组件挂载到实体上。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, iris_core::Component)]
 pub struct MeshHandle(pub u32);
+
+/// 距离 LOD 组件（R30）：同一实体的高模 / 低模网格对 + 切换距离。
+///
+/// 挂载实体时**替换** `MeshHandle` 参与渲染收集（本组件自带两个句柄，
+/// 不与 `MeshHandle` 并存）；收集期按「实体原点到相机 eye 的欧氏距离」
+/// 选择：`dist <= switch_distance` 用 `high`，否则 `low`——选中的句柄
+/// 参与合批排序键、视锥剔除、透明排序与 `triangles_drawn` 统计，对
+/// 下游完全透明。v1 距离用**实体原点**而非包围球中心（省每帧包围盒
+/// 展开；对称网格原点即中心，偏心网格远处剔除边界略保守，误差可接受）。
+///
+/// v1 已知限制（诚实清单）：
+/// - **无滞回**（hysteresis）：实体距离在 `switch_distance` 边界附近
+///   抖动时，两网格可能逐帧来回切换（几何体量变化 + 显存换入换出）。
+///   需要时游戏侧可给 `switch_distance` 加时间平滑，引擎内双阈值滞回
+///   在路线图；
+/// - 高低模一般共享材质（切换只换几何）；两句柄指向不同材质时切换帧
+///   批次重排是合法行为，但可能触发额外 draw call。
+#[derive(Clone, Copy, Debug, PartialEq, iris_core::Component)]
+pub struct LodMesh {
+    /// 近距网格（`dist <= switch_distance` 时使用）。
+    pub high: MeshHandle,
+    /// 远距网格（`dist > switch_distance` 时使用）。
+    pub low: MeshHandle,
+    /// 切换距离（米，实体原点到相机 eye 的欧氏距离）。
+    pub switch_distance: f32,
+}
+
+impl LodMesh {
+    /// 距离选择纯函数：`eye` 为观察点（相机眼点），`origin` 为实体原点
+    /// （GlobalTransform 平移）。距离恰等于 `switch_distance` 时用 high
+    /// （边界归近侧——近处宁可用高模）。
+    pub fn select(&self, eye: Vec3, origin: Vec3) -> MeshHandle {
+        if eye.distance(origin) <= self.switch_distance {
+            self.high
+        } else {
+            self.low
+        }
+    }
+}
 
 /// 顶点：位置 + 法线 + 纹理坐标（32 字节，POD）。
 #[repr(C)]
@@ -365,6 +405,23 @@ impl MeshStore {
     pub fn is_empty(&self) -> bool {
         self.meshes.is_empty()
     }
+
+    /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 × 32B）
+    /// （不含 Vec 分配器开销）。「低占用」卖点的观测口径之一；GPU 侧
+    /// 顶点 / 索引缓冲与源同尺寸（蒙皮缓冲同），故该值亦即 GPU 网格
+    /// 占用的准确上界估算。
+    pub fn memory_bytes(&self) -> u64 {
+        self.meshes
+            .iter()
+            .map(|data| {
+                data.vertices.len() as u64 * std::mem::size_of::<Vertex>() as u64
+                    + data.indices.len() as u64 * std::mem::size_of::<u32>() as u64
+                    + data.skin.as_ref().map_or(0, |s| {
+                        s.len() as u64 * std::mem::size_of::<SkinVertex>() as u64
+                    })
+            })
+            .sum()
+    }
 }
 
 /// 便捷上传：由渲染器调用，将 `MeshData` 变为 GPU 缓冲。
@@ -408,6 +465,56 @@ pub(crate) fn upload_mesh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LodMesh 距离选择纯函数（R30）：边界归近侧（≤ 用 high）、远离用
+    /// low；与观察方向无关（纯欧氏距离）。
+    #[test]
+    fn lod_select_picks_by_distance_with_near_boundary() {
+        let lod = LodMesh {
+            high: MeshHandle(7),
+            low: MeshHandle(3),
+            switch_distance: 10.0,
+        };
+        let origin = Vec3::new(2.0, 1.0, 2.0); // 到原点距离 = 3
+        assert_eq!(
+            lod.select(Vec3::ZERO, origin),
+            MeshHandle(7),
+            "3 ≤ 10 → high"
+        );
+        assert_eq!(
+            lod.select(Vec3::new(2.0, 1.0, 11.0), origin),
+            MeshHandle(7),
+            "距离 9 ≤ 10 → high"
+        );
+        // 恰在边界（距离 = switch_distance）归近侧
+        let at_edge = Vec3::new(2.0, 1.0, 12.0); // 距离恰 10
+        assert_eq!(lod.select(at_edge, origin), MeshHandle(7), "边界归近侧");
+        // 超界 0.001 m 用 low
+        let past_edge = Vec3::new(2.0, 1.0, 13.0); // 距离 11 > 10
+        assert_eq!(lod.select(past_edge, origin), MeshHandle(3), "超界用 low");
+    }
+
+    /// 内存统计（R30）：顶点 32B + 索引 4B + 蒙皮属性 32B 逐网格累加。
+    #[test]
+    fn mesh_store_memory_bytes_sums_buffers() {
+        let mut store = MeshStore::new();
+        store.add(primitives::cube()); // 24 顶点 / 36 索引
+        assert_eq!(store.memory_bytes(), (24 * 32 + 36 * 4) as u64);
+        let mut skinned = primitives::cube();
+        skinned.skin = Some(vec![
+            SkinVertex {
+                joints: [0; 4],
+                weights: [0.0; 4],
+            };
+            24
+        ]);
+        store.add(skinned);
+        assert_eq!(
+            store.memory_bytes(),
+            2 * (24 * 32 + 36 * 4) as u64 + 24 * 32,
+            "蒙皮属性字节必须计入"
+        );
+    }
 
     #[test]
     fn cube_topology() {

@@ -74,6 +74,44 @@ impl TextureStore {
     pub fn get(&self, handle: TextureHandle) -> Option<&CpuTexture> {
         self.textures.get(handle.0 as usize)
     }
+
+    pub fn len(&self) -> usize {
+        self.textures.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.textures.is_empty()
+    }
+
+    /// CPU 源内存占用（字节）：Σ 宽×高×4（RGBA8 源数据，不含 Vec 的
+    /// 分配器开销）。「低占用」卖点的观测口径之一。
+    pub fn memory_bytes(&self) -> u64 {
+        self.textures
+            .iter()
+            .map(|t| t.width as u64 * t.height as u64 * 4)
+            .sum()
+    }
+
+    /// GPU 侧显存占位**估算**（非精确值：驱动可能对齐 / 复制分配，
+    /// 采样器等附属对象不计）。按渲染器上传决策树逐纹理计算（R30）：
+    /// - BC1 路径（`feature_bc` 为真且尺寸 4 对齐且全不透明，决策见
+    ///   [`crate::texture_bcn::bc1_eligible`]）：4×4 块 8 字节 = 0.5 B/px；
+    /// - 其余（含 web / 无特性 / 非对齐 / 半透明回退）：RGBA8 4 B/px。
+    ///
+    /// mipmap v1 无（单 mip 计）；同一 `feature_bc` 取值下与渲染器实际上传
+    /// 格式一致（决策函数共用），`false` / `true` 两次调用的差即压缩节省。
+    pub fn gpu_bytes_estimate(&self, feature_bc: bool) -> u64 {
+        self.textures
+            .iter()
+            .map(|t| {
+                if crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc) {
+                    (t.width as u64 / 4) * (t.height as u64 / 4) * 8
+                } else {
+                    t.width as u64 * t.height as u64 * 4
+                }
+            })
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -104,5 +142,24 @@ mod tests {
         assert_eq!(handle, TextureHandle(1));
         assert_eq!(store.get(handle).unwrap().rgba, vec![255, 0, 0, 255]);
         assert!(store.get(TextureHandle(99)).is_none());
+    }
+
+    /// 内存统计（R30）：memory_bytes = Σ 源 RGBA 字节；gpu_bytes_estimate
+    /// 按上传决策树计——BC 特性下 4 对齐不透明纹理 0.5 B/px，其余 4 B/px；
+    /// 两次估算之差即压缩节省。
+    #[test]
+    fn memory_stats_track_source_and_gpu_estimate() {
+        let mut store = TextureStore::new();
+        // 0 号兜底：1×1 纯色（非 4 对齐 → 恒走 RGBA 路径）
+        assert_eq!(store.memory_bytes(), 4);
+        assert_eq!(store.gpu_bytes_estimate(true), 4);
+        // 8×8 棋盘（不透明、4 对齐）：特性开启走 BC1 = 2 块×2 块×8 B = 32 B
+        let checker = CpuTexture::checkerboard(2, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
+        assert!(checker.rgba.iter().all(|&b| b == 255 || b == 0));
+        store.add(checker);
+        assert_eq!(store.memory_bytes(), 4 + 8 * 8 * 4);
+        assert_eq!(store.gpu_bytes_estimate(true), 4 + 32);
+        // 同一 store 关闭特性：全 RGBA
+        assert_eq!(store.gpu_bytes_estimate(false), 4 + 8 * 8 * 4);
     }
 }

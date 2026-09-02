@@ -261,7 +261,9 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 ### 4.1 帧流程
 
 ```text
-World 查询 (Transform, MeshHandle, MaterialHandle)
+World 查询 (Transform, MaterialHandle, MeshHandle | LodMesh)
+  → LOD 网格解析：挂 LodMesh 的实体按实体原点到相机 eye 的欧氏距离
+    选 high / low（§4.19），未挂载用 MeshHandle 旧语义
   → 实例数据 InstanceRaw（模型矩阵 + 法线矩阵，112B/实例）
   → 按 alpha_mode 分区：不透明 → (网格, 材质) 稳定排序成批；
     透明 → 视深降序（远 → 近，见 §4.16）
@@ -690,8 +692,14 @@ v1 的单张阴影贴图以注视点为中心、`shadow_range`（24 m）为半�
 - CPU 目录（`MeshStore / MaterialStore / TextureStore`，World 资源）与
   GPU 缓存（`Renderer` 内 HashMap）分离，**句柄即弱引用**。
 - 惰性上传：渲染时首次遇到的句柄才上传 GPU；重复句柄零开销。
+  纹理上传走 BC1 决策树（R30）：设备启用 `TEXTURE_COMPRESSION_BC` +
+  尺寸 4 对齐 + 全不透明 → `Bc1RgbaUnormSrgb`（显存 1/8），否则回退
+  `Rgba8UnormSrgb`（见 §4.18）。
 - 帧统计（`FrameStats`）暴露 draw call / 实例数 / 剔除数 / 三角形数 /
-  上传字节（字段口径见 §4.4.1），供性能面板与测试断言。
+  上传字节（字段口径见 §4.4.1），供性能面板与测试断言；目录侧另有
+  `memory_bytes` / `gpu_bytes_estimate` 内存占用统计（§4.18）。
+- `Gpu::features()` / `Gpu::supports_bc()` 暴露设备特性（wgpu 的压缩
+  纹理格式要求特性显式请求，初始化时已按适配器能力请求 BCn 子集）。
 
 ### 4.10 离屏渲染
 
@@ -1146,6 +1154,86 @@ glTF / HDR 错误经 `From` 映射保上下文）。
   `docs/particles_fountain.png` / `docs/particles_explosion.png`
   （`particle_snapshot` 示例）。
 
+### 4.18 纹理 BC1 压缩与内存占用统计（R30）
+
+**上传决策树**（`texture_bcn::bc1_eligible`，渲染器 `ensure_texture` 与
+`TextureStore::gpu_bytes_estimate` 共用同一纯函数，单一事实来源）：
+
+```text
+设备启用 Features::TEXTURE_COMPRESSION_BC（Gpu::supports_bc，初始化时
+    按适配器能力显式请求——wgpu 压缩格式要求设备特性）
+  且 尺寸本身 4 对齐（wgpu 压缩纹理块对齐；编码器的 pad 能力不在上传
+    路径启用——pad 区是复制的边缘像素，贴边有渗色风险，v1 保守）
+  且 全不透明（alpha 恒 255——BC1 无 alpha 通道，半透明纹理压缩即丢语义）
+→ 上传 Bc1RgbaUnormSrgb（4×4 块 8 B = 0.5 B/px，对 RGBA8 的 8 倍节省）
+否则 → Rgba8UnormSrgb 照旧（4 B/px）
+```
+
+- **无分支回退**：wasm 的 WebGPU 实现普遍无 BC 特性、native 老 GPU 同样
+  可能没有——不写任何 cfg，运行时特性检测天然覆盖（web 自动 RGBA8），
+  与「wasm 只需编译可用 + 优雅降级」的平台策略一致。
+- **编码器**（`texture_bcn::encode_bc1`，纯函数、全整数运算、零 unsafe）：
+  逐 4×4 块取 RGB 距离最远的两像素为端点（O(16²) 确定性暴力，与
+  PCA / 范围法的取舍见模块文档——质量略差但逐位可复现），按亮度排序
+  c0 > c1，RGB565 量化（四舍五入 + 位复制展开），像素索引取四色调色板
+  （两 565 端点 + 两个 1/3 插值）中最近项、并列取最小索引。**确定性
+  契约**：同输入两次编码逐位一致（单测守护）——回放 / 差分测试的硬
+  要求。纯色块往返零误差（端点同色 → 调色板退化、索引无歧义）；位打包
+  布局有手工构造块的逐字节断言。尺寸非 4 倍数统一**预 pad**（边缘像素
+  复制）写死——「向下取整块数」丢像素、「末块按实际像素」产出非法
+  BC1 流，pad 是唯一能产出完整合法块阵列的方案。
+- **质量护栏**（单测）：纯色 565 精确色黑/白/三原色/三补色往返误差 = 0；
+  温和灰度渐变块平均误差 < 4/255；GPU 集成测试 `bc1_render.rs` 用
+  「不透明副本 → BC1 路径、alpha=100 副本 → RGBA 回退」的同画面 A/B
+  （不透明材质不消费纹理 alpha，两副本画面等价，像素对比即纯格式对比）
+  断言全帧平均误差 < 2/255（块内纯色棋盘格解码精确，实测 0）。
+- **mipmap v1 不做**：引擎无 mipmap 机制（`mip_level_count` 恒 1），
+  BC1 上传为单 mip；引入 mipmap 时编码器补 mip 链生成（接口另议）。
+
+**内存占用统计**（「低占用」卖点的观测口径）：
+
+- `TextureStore::memory_bytes()`：Σ 源 RGBA 字节；`MeshStore::memory_bytes()`：
+  Σ（顶点 32 B + 索引 4 B + 蒙皮属性 32 B）——亦即 GPU 网格缓冲的准确
+  上界估算（顶点/索引/蒙皮缓冲与 CPU 源同尺寸）。
+- `TextureStore::gpu_bytes_estimate(feature_bc)`：GPU 侧显存占位**估算**
+  （驱动可能对齐分配，非精确值；mipmap 无，单 mip 计），逐纹理按上传
+  决策树计（BC1 0.5 B/px 或 RGBA 4 B/px）；`false`/`true` 两次调用之差
+  即压缩节省。`Renderer::texture_is_bc1(handle)` 观测逐纹理实际上传
+  格式（测试与内存对账用）。
+
+**实测数据**（开发机：RTX 4060 Laptop GPU / Vulkan / Windows，release
+构建，`memory_bench` 示例，量级参考非承诺值）：
+
+| 口径 | 字节 | 说明 |
+|------|------|------|
+| CPU 源纹理（4 × 2048² RGBA8 + 1×1 兜底） | 67,108,868 B（64.00 MiB） | `TextureStore::memory_bytes` |
+| GPU 上传估算（无 BC 特性，全 RGBA8） | 67,108,868 B（64.00 MiB） | `gpu_bytes_estimate(false)` |
+| GPU 上传（BC1，本机实际路径） | 8,388,612 B（8.00 MiB） | `gpu_bytes_estimate(true)`，实测 `texture_is_bc1` 全真 |
+| **压缩比** | **8.00x（显存 -87.5%）** | 理论值 8x，程序化棋盘格无 pad 损耗 |
+| 高模 uv_sphere(64, 48) | 6,144 三角形 / 175,648 B | 网格对之一 |
+| 低模 uv_sphere(8, 6) | 96 三角形（1.6%） | 64x 削减 |
+| LOD 近景帧 `triangles_drawn`（8 实体） | 49,152（8 × 6144） | eye 距离 15–50 m ≤ 60 m |
+| LOD 远景帧 `triangles_drawn` | 768（8 × 96），**-98.4%** | eye 距离 205–240 m > 60 m；instances / draw_calls 不变 |
+
+### 4.19 网格距离 LOD（R30）
+
+- **组件**：`LodMesh { high, low, switch_distance }`（iris-render，
+  Component 派生）。挂载实体**替换** `MeshHandle` 参与渲染收集（组件
+  自带两个句柄，不与 `MeshHandle` 并存）；收集查询为
+  `Option<&MeshHandle>` + `Option<&LodMesh>` 双可选——有 `LodMesh` 按距离
+  选一个句柄参与合批排序键 / 视锥剔除 / 透明排序 / 三角形统计，无则
+  `MeshHandle` 旧语义，两者皆无的实体静默跳过（不可渲染）。蒙皮路径
+  同口径（高低模各自带蒙皮属性时 LOD 随切换生效）。
+- **距离**：实体 `GlobalTransform` 平移到相机 eye 的欧氏距离（v1 用实体
+  原点而非包围球中心——省每帧包围盒展开，对称网格原点即中心，偏心
+  网格边界略保守）；`dist <= switch_distance` 用 high（边界归近侧），
+  否则 low。选择为纯函数 `LodMesh::select`（单测覆盖边界与方向无关性）。
+- **验收口径**：`FrameStats::triangles_drawn` 天然成为 LOD 指标——GPU
+  集成测试 `lod_render.rs` 断言同一实体近/远两帧三角形精确等于选中
+  网格的三角形数、两帧均可见且近帧像素更多（低模像素宽松证据）。
+- **无滞回**（v1 限制，见 §8）：实体距离在 `switch_distance` 边界抖动时
+  两网格可能逐帧来回切换；需要时游戏侧可给切换距离做时间平滑。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -1210,9 +1298,9 @@ glTF / HDR 错误经 `From` 映射保上下文）。
 | 数据 | 稀疏集 dense 数组连续遍历；组件按类型分储避免缓存行浪费 |
 | 调度 | 声明式读写集冲突分批，无冲突系统多线程并行（§3.7） |
 | 数学 | glam：SSE/NEON 自动向量化（release 构建生效） |
-| GPU | 自动实例化合批；单实例 112B 紧凑布局；实例缓冲跨帧持久——与上帧镜像比对后仅传变化段，静态场景零上传（变化 >50% 或缓冲重建 / 实例数变化时回退全量，§4.2） |
+| GPU | 自动实例化合批；单实例 112B 紧凑布局；实例缓冲跨帧持久——与上帧镜像比对后仅传变化段，静态场景零上传（变化 >50% 或缓冲重建 / 实例数变化时回退全量，§4.2）；纹理 BC1 GPU 压缩（8 倍显存节省，§4.18）；网格距离 LOD（远景 64x 三角形削减实测，§4.19） |
 | 提交 | wgpu 命令编码 → 队列异步提交，CPU/GPU 并行 |
-| 内存 | 无 GC；实体索引复用；scratch 缓冲跨帧复用（批处理排序数组） |
+| 内存 | 无 GC；实体索引复用；scratch 缓冲跨帧复用（批处理排序数组）；纹理/网格内存占用统计口径（`memory_bytes` / `gpu_bytes_estimate`，§4.18） |
 | 构建 | `lto = "thin"`、`codegen-units = 1`、`strip = "debuginfo"` |
 
 ## 8. 已知限制（诚实清单）
@@ -1469,6 +1557,17 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       → **改写为模式警示**（无引擎行为改动）：`World::insert_resource`
       文档 + §2 iris-bastion 段记录——同型多实例资源必须 distinct
       newtype。
+
+16. **距离 LOD 为 v1**（§4.19）：距离用实体原点（非包围球中心，偏心
+    网格的切换边界略保守）；**无滞回**——实体在 `switch_distance` 边界
+    抖动时两网格可能逐帧来回切换（需要时游戏侧做时间平滑，引擎内双
+    阈值滞回在路线图）；只有两级（无连续 LOD 链）；切换即硬切（无
+    geometry morph / 渐隐过渡）。
+17. **BC1 压缩为 v1**（§4.18）：仅 BC1（无 BC3/BC7——带 alpha 的纹理
+    一律回退 RGBA8，显存优势丢失）；上传路径只在源尺寸 4 对齐时启用
+    （非对齐纹理回退 RGBA8，编码器 pad 能力未接入上传）；无 mipmap
+    （远距离细节闪烁没有 mip 链缓解）；编码器为确定性暴力端点选择
+    （质量敏感资产可用离线工具预压缩，运行时编码走同一管线）。
 
 ## 9. 关键设计取舍记录
 

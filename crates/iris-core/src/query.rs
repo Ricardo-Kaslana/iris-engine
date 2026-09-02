@@ -184,6 +184,7 @@ impl_query_part_for_tuple!(A, B, C);
 impl_query_part_for_tuple!(A, B, C, D);
 impl_query_part_for_tuple!(A, B, C, D, E);
 impl_query_part_for_tuple!(A, B, C, D, E, F);
+impl_query_part_for_tuple!(A, B, C, D, E, F, G);
 
 #[cfg(test)]
 mod tests {

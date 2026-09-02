@@ -3,8 +3,10 @@
 //! 数据流：
 //! ```text
 //! World 资源（MeshStore / MaterialStore / TextureStore，CPU 目录）
-//!     -> Renderer 内 GPU 缓存（HashMap<句柄, GPU 资源>，按需懒上传）
-//!     -> 查询 (Transform, MeshHandle, MaterialHandle) 收集实例
+//!     -> Renderer 内 GPU 缓存（HashMap<句柄, GPU 资源>，按需懒上传；
+//!        纹理按 BC1 决策树压缩上传，见 texture_bcn）
+//!     -> 查询 (Transform, MaterialHandle, MeshHandle|LodMesh) 收集实例
+//!        （LodMesh 按实体-相机距离选 high/low，见 mesh.rs）
 //!     -> 按 (网格, 材质) 排序合并为批次 -> 一个批次一个 draw call
 //! ```
 
@@ -21,7 +23,7 @@ use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
 use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight, cascade_fit, cascade_splits};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
-use crate::mesh::{MeshHandle, MeshStore, upload_mesh};
+use crate::mesh::{LodMesh, MeshHandle, MeshStore, upload_mesh};
 use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
 use crate::pipeline::{SHADOW_CASCADES, create_pipeline};
 use crate::skin::Skin;
@@ -199,6 +201,9 @@ struct TransparentSkinnedItem {
 struct GpuTexture {
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// 上传时是否走了 BC1 压缩（R30：`texture_is_bc1` 的观测口径，
+    /// 供测试断言与内存对账）。
+    bc1: bool,
 }
 
 struct GpuMaterial {
@@ -606,6 +611,23 @@ fn alpha_of(materials: &MaterialStore, handle: MaterialHandle) -> AlphaMode {
         .unwrap_or(AlphaMode::Opaque)
 }
 
+/// LOD 网格解析（R30）：挂 [`LodMesh`] 的实体按距离选 high / low（距离 =
+/// 实体原点到相机 eye 的欧氏距离，v1 不用包围球中心，取舍见组件文档）；
+/// 未挂载回退 `MeshHandle` 旧语义；两者皆无返回 `None`（收集跳过该实体
+/// ——查询带两个 `Option` 后「无任何网格句柄」成为合法查询命中）。
+fn resolve_mesh_handle(
+    lod: Option<&LodMesh>,
+    mesh: Option<&MeshHandle>,
+    eye: Vec3,
+    origin: Vec3,
+) -> Option<MeshHandle> {
+    match (lod, mesh) {
+        (Some(lod), _) => Some(lod.select(eye, origin)),
+        (None, Some(mesh)) => Some(*mesh),
+        (None, None) => None,
+    }
+}
+
 /// 透明排序视深：网格包围球中心（无 bounds 时回退模型平移列）经视图
 /// 矩阵变换后的 -z（相机前方为正，值越大离相机越远）。包围球中心是
 /// 排序启发式——逐像素排序不可行，中心视深对凸体与薄板是精确序。
@@ -675,6 +697,12 @@ fn skin_world_aabb(
 /// 剔除；蒙皮实体做**保守并集 AABB 视锥剔除**（见
 /// `skin_world_aabb`）。视锥剔除与剔除计数对透明同样生效。返回可见 /
 /// 被剔除的实例数（日志与 `FrameStats` 用）；排序由调用方完成。
+///
+/// **距离 LOD（R30）**：网格句柄经 `resolve_mesh_handle` 解析——挂
+/// [`LodMesh`] 的实体按「实体原点到 `eye` 的欧氏距离」选 high / low，
+/// 未挂载用 `MeshHandle` 旧语义；选中的句柄决定合批键 / 剔除包围体 /
+/// 三角形统计（蒙皮路径同口径，LOD 高低模各自带蒙皮属性）。`eye` 由
+/// 调用方从解析后的相机传入（资源相机 / 实体挂载相机同源）。
 // 四个输出列表各自类型不同、语义独立（跨帧复用的 scratch 缓冲逐个传入），
 // 收拢成结构体反而多一层拆装；参数多但全为引用/裸缓冲，与 scene.rs
 // `build_entity_section` 同理豁免。
@@ -684,6 +712,7 @@ fn collect_instances(
     mesh_store: &MeshStore,
     material_store: &MaterialStore,
     view: &Mat4,
+    eye: Vec3,
     frustum: &Frustum,
     items: &mut Vec<DrawItem>,
     skinned: &mut Vec<SkinnedItem>,
@@ -708,20 +737,26 @@ fn collect_instances(
     world.query::<(
         iris_core::prelude::Entity,
         &GlobalTransform,
-        &MeshHandle,
         &MaterialHandle,
+        Option<&MeshHandle>,
+        Option<&LodMesh>,
         &Skin,
         Option<&Visibility>,
-    )>(|(e, gt, m, mat, skin, visibility)| {
+    )>(|(e, gt, mat, mesh, lod, skin, visibility)| {
         // 自身 HIDDEN 跳过 + 祖先链级联（任一祖先隐藏 ⇒ 子树全隐藏）
         if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
         }
+        // LOD 距离选择：挂 LodMesh 按距离选 high / low，否则 MeshHandle；
+        // 两者皆无（纯 Skin 实体，合法但不可渲染）静默跳过
+        let Some(m) = resolve_mesh_handle(lod, mesh, eye, gt.position()) else {
+            return;
+        };
         skinned_entities.insert(e.to_bits());
         let mut joint_matrices = Vec::with_capacity(skin.joints.len());
         skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
         let model = gt.matrix();
-        let world_aabb = skin_world_aabb(mesh_store, *m, &model, &joint_matrices);
+        let world_aabb = skin_world_aabb(mesh_store, m, &model, &joint_matrices);
         if world_aabb.is_some_and(|(min, max)| !frustum.intersects_aabb(min, max)) {
             culled += 1;
             return;
@@ -748,10 +783,11 @@ fn collect_instances(
     world.query::<(
         iris_core::prelude::Entity,
         &GlobalTransform,
-        &MeshHandle,
         &MaterialHandle,
+        Option<&MeshHandle>,
+        Option<&LodMesh>,
         Option<&Visibility>,
-    )>(|(e, gt, m, mat, visibility)| {
+    )>(|(e, gt, mat, mesh, lod, visibility)| {
         // 自身 HIDDEN 跳过 + 祖先链级联（与蒙皮路径同语义）
         if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
@@ -760,10 +796,16 @@ fn collect_instances(
         if skinned_entities.contains(&e.to_bits()) {
             return;
         }
+        // LOD 距离选择（组件缺席 = MeshHandle 旧语义；两者皆无跳过——
+        // 挂了材质却没有任何网格句柄的实体不可渲染）
+        let Some(m) = resolve_mesh_handle(lod, mesh, eye, gt.position()) else {
+            return;
+        };
         let model = gt.matrix();
         // 包围球剔除：局部球心经模型矩阵变换，半径按最大列缩放保守放大
+        //（按 LOD 选中的网格算，高低模包围体差异直接进入剔除边界）
         let culled_now = mesh_store
-            .get(*m)
+            .get(m)
             .and_then(|data| data.bounds())
             .is_some_and(|(min, max)| {
                 let min = Vec3::from(min);
@@ -787,7 +829,7 @@ fn collect_instances(
         if alpha_of(material_store, *mat) == AlphaMode::Blend {
             transparent.push(TransparentItem {
                 key,
-                depth: view_depth(view, mesh_store, *m, model),
+                depth: view_depth(view, mesh_store, m, model),
                 entity: e.to_bits(),
                 instance: InstanceRaw::from_matrix(model),
             });
@@ -1088,6 +1130,8 @@ impl Renderer {
             sampler: gpu
                 .device
                 .create_sampler(&wgpu::SamplerDescriptor::default()),
+            // 1×1 兜底纹理非 4 对齐，恒走 RGBA 路径（决策树与其一致）
+            bc1: false,
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
@@ -1614,6 +1658,7 @@ impl Renderer {
             &mesh_store,
             &material_store,
             &view,
+            eye,
             &frustum,
             &mut items,
             &mut skinned,
@@ -2634,17 +2679,54 @@ impl Renderer {
             log::warn!("纹理句柄 {handle:?} 不存在，使用白色兜底纹理");
             return;
         };
+        let width = cpu.width.max(1);
+        let height = cpu.height.max(1);
+        // R30 BC1 压缩决策树（决策纯函数与 TextureStore::gpu_bytes_estimate
+        // 共用）：特性启用 + 尺寸 4 对齐 + 全不透明 → 8 倍显存节省；
+        // 任一不满足回退 RGBA8（web / 无特性 / 非对齐 / 半透明自动命中，
+        // 无 cfg 分支）。mipmap v1 无——单 mip 上传，`mip_level_count` 恒 1。
+        let use_bc1 =
+            crate::texture_bcn::bc1_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
+        if use_bc1 {
+            log::info!("纹理 {handle:?}（{width}×{height}）走 BC1 压缩上传（显存 1/8）");
+        }
+        // 压缩路径：数据为 4×4 块流，bytes_per_row 按块计（宽/4 块 × 8B）；
+        // 回退路径：RGBA8 逐字节（Cow 借用源数据，零拷贝）。
+        let (format, data, bytes_per_row, bc1) = if use_bc1 {
+            let blocks = crate::texture_bcn::encode_bc1(&cpu.rgba, width, height);
+            debug_assert_eq!(
+                blocks.len() as u64,
+                crate::texture_bcn::encoded_len(width, height)
+            );
+            (
+                wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+                std::borrow::Cow::Owned(blocks),
+                (width / 4) * 8,
+                true,
+            )
+        } else {
+            (
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                std::borrow::Cow::Borrowed(&cpu.rgba[..]),
+                width * 4,
+                false,
+            )
+        };
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("iris.texture"),
+            label: if bc1 {
+                Some("iris.texture.bc1")
+            } else {
+                Some("iris.texture")
+            },
             size: wgpu::Extent3d {
-                width: cpu.width.max(1),
-                height: cpu.height.max(1),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -2655,15 +2737,15 @@ impl Renderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &cpu.rgba,
+            &data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(cpu.width * 4),
+                bytes_per_row: Some(bytes_per_row),
                 rows_per_image: None,
             },
             wgpu::Extent3d {
-                width: cpu.width.max(1),
-                height: cpu.height.max(1),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
         );
@@ -2678,7 +2760,13 @@ impl Renderer {
             ..Default::default()
         });
         self.texture_gpu
-            .insert(handle.0, GpuTexture { view, sampler });
+            .insert(handle.0, GpuTexture { view, sampler, bc1 });
+    }
+
+    /// 该纹理句柄的 GPU 上传是否走了 BC1 压缩（R30）。未上传（懒上传未
+    /// 触发）/ 不存在 / 回退 RGBA8 均返回 `false`。测试与内存对账用。
+    pub fn texture_is_bc1(&self, handle: TextureHandle) -> bool {
+        self.texture_gpu.get(&handle.0).is_some_and(|t| t.bc1)
     }
 
     fn ensure_material(
@@ -2752,8 +2840,8 @@ mod tests {
         r
     }
 
-    /// `collect_instances` 的测试便捷封装：视图恒等、材质目录只有 0 号
-    /// 默认材质（句柄缺席按不透明，与既有测试语义一致），透明列表丢弃。
+    /// `collect_instances` 的测试便捷封装：视图恒等、eye 在原点、材质目录
+    /// 只有 0 号默认材质（句柄缺席按不透明，与既有测试语义一致），透明列表丢弃。
     fn collect_opaque(
         world: &iris_core::world::World,
         mesh_store: &MeshStore,
@@ -2769,6 +2857,7 @@ mod tests {
             mesh_store,
             &materials,
             &glam::Mat4::IDENTITY,
+            Vec3::ZERO,
             frustum,
             items,
             skinned,
@@ -2915,6 +3004,82 @@ mod tests {
         assert!(skinned.is_empty());
     }
 
+    /// 距离 LOD 收集（R30 CPU 级）：挂 `LodMesh` 的实体按「实体原点到
+    /// eye 的欧氏距离」选择参与收集的网格——近处选 high、远处选 low，
+    /// 合批键 / 剔除 / 统计全部按选中的网格算；未挂 `LodMesh` 的实体走
+    /// `MeshHandle` 旧语义不受影响（GPU 端 triangles_drawn 验收见
+    /// `lod_render.rs`）。
+    #[test]
+    fn lod_entities_select_mesh_by_distance_in_collection() {
+        use crate::mesh::primitives;
+        use iris_core::prelude::Transform;
+        use iris_core::world::World;
+
+        let mut mesh_store = MeshStore::new();
+        let high = mesh_store.add(primitives::uv_sphere(1.0, 24, 16)); // MeshHandle(0)
+        let low = mesh_store.add(primitives::cube()); // MeshHandle(1)
+        let plain = mesh_store.add(primitives::cube()); // MeshHandle(2)
+
+        let mut world = World::new();
+        // 近处 LOD 实体（距原点 5 < 10 → high）+ 远处 LOD 实体（距原点
+        // 50 > 10 → low）+ 普通 MeshHandle 实体（旧语义）
+        world.spawn((
+            Transform::from_xyz(0.0, 0.0, -5.0),
+            LodMesh {
+                high,
+                low,
+                switch_distance: 10.0,
+            },
+            MaterialHandle(1),
+        ));
+        world.spawn((
+            Transform::from_xyz(0.0, 0.0, -50.0),
+            LodMesh {
+                high,
+                low,
+                switch_distance: 10.0,
+            },
+            MaterialHandle(2),
+        ));
+        world.spawn((
+            Transform::from_xyz(0.0, 0.0, -5.0),
+            plain,
+            MaterialHandle(3),
+        ));
+        iris_core::hierarchy::propagate_transforms(&mut world);
+
+        // eye 在原点（与 collect_opaque 硬编码一致）；宽视锥（90° / far 1000）
+        // 覆盖 -5 与 -50 两个深度，避免视锥剔除混入本测试的观察
+        let frustum = Frustum::from_view_proj(&{
+            let view = glam::camera::rh::view::look_at_mat4(
+                Vec3::ZERO,
+                Vec3::new(0.0, 0.0, -1.0),
+                Vec3::Y,
+            );
+            let proj = glam::camera::rh::proj::directx::perspective(
+                std::f32::consts::FRAC_PI_2,
+                1.0,
+                0.1,
+                1000.0,
+            );
+            proj * view
+        });
+        let mut items = Vec::new();
+        let mut skinned = Vec::new();
+        let counts = collect_opaque(&world, &mesh_store, &frustum, &mut items, &mut skinned);
+        assert_eq!(counts.visible, 3);
+        assert_eq!(counts.culled, 0);
+        // 排序键高 32 位 = 网格句柄：三个网格必须各有一项
+        let mesh_ids: std::collections::HashSet<u32> =
+            items.iter().map(|i| (i.key >> 32) as u32).collect();
+        assert!(mesh_ids.contains(&high.0), "近距实体应选 high 网格");
+        assert!(mesh_ids.contains(&low.0), "远距实体应选 low 网格");
+        assert!(
+            mesh_ids.contains(&plain.0),
+            "无 LodMesh 实体保持 MeshHandle 旧语义"
+        );
+    }
+
     /// 透明分区与视深排序（CPU 级）：Blend 材质进透明列表、Opaque 进不透明
     /// 列表；视深 = 包围球中心经视图变换后的 -z；排序降序（远 → 近）、
     /// 深度并列按实体 bits 升序。蒙皮 Blend 实体进透明蒙皮列表（不透明
@@ -2971,6 +3136,7 @@ mod tests {
             &mesh_store,
             &material_store,
             &view,
+            Vec3::new(0.0, 0.0, 20.0),
             &frustum,
             &mut items,
             &mut skinned,

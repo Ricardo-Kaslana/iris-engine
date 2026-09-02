@@ -38,9 +38,16 @@ impl Gpu {
             })
             .await
             .ok()?;
+        // 纹理压缩特性必须**显式请求**才会出现在设备特性集（wgpu 语义）：
+        // 只请求 BCn 子集（适配器不支持时与运算为空集，等价默认请求），
+        // 不整体转发 adapter.features()——个别特性请求失败会让设备创建
+        // 整体失败，得不偿失。wasm 的 WebGPU 实现普遍无此特性，与 native
+        // 无 BC 的老 GPU 走同一条运行时回退（无 cfg 分支，见 texture_bcn）。
+        let bcn = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("iris.gpu"),
+                required_features: bcn,
                 ..Default::default()
             })
             .await
@@ -77,6 +84,22 @@ impl Gpu {
         compatible_surface: Option<&wgpu::Surface<'static>>,
     ) -> Option<Self> {
         pollster::block_on(Self::with_instance_async(instance, compatible_surface))
+    }
+
+    /// 设备实际启用的 wgpu 特性集（初始化时请求的 BCn 子集 + 平台默认）。
+    /// 纹理压缩等可选能力的运行时检测入口（调用方按特性走不同路径）。
+    pub fn features(&self) -> wgpu::Features {
+        self.device.features()
+    }
+
+    /// 是否支持 BCn 纹理压缩（`Features::TEXTURE_COMPRESSION_BC`）。
+    /// 纹理上传路径据此决策 BC1 / RGBA8 回退（见 `texture_bcn`）；
+    /// wgpu 的压缩纹理格式要求该特性显式启用后才可用（初始化已请求，
+    /// 本方法即最终裁决）。wasm 的 WebGPU 实现普遍返回 `false`——web
+    /// 自动走 RGBA8 回退，无需 cfg 分支。
+    pub fn supports_bc(&self) -> bool {
+        self.features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
     }
 
     /// 离屏 GPU 上下文（无窗口表面）。
