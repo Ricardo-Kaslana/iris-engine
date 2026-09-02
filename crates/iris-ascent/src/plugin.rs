@@ -12,7 +12,8 @@
 //!   [`move_and_slide_statics`]——物理即角色控制器）→ 写玩家根实体 /
 //!   模型朝向 / **动画状态机**（移动 ↔ 静止 `request_state`，双向
 //!   0.15 s crossfade）→ `take_events` 消费 footstep 事件轨道 → 事件
-//!   触发**空间音频**（听者跟随相机）→ 相机平滑追随（复活瞬移即吸附））
+//!   触发**空间音频**（听者跟随相机）→ 复活帧请求相机吸附；平滑追随
+//!   由引擎 `update_smooth_follow` 系统（随后注册）完成）
 //!   → `trigger_ascent_fx`（事件 → FX 池粒子 burst）→
 //!   `update_ascent_visuals`（宝石自转浮动 / 检查点旗换色 / 信标自转）
 //!   → `update_ascent_hud`（宝石 n/N / 检查点 / 坠落计数 / 横幅）。
@@ -27,9 +28,12 @@
 //! 根实体只承载逻辑位置（rotation 恒恒等——朝向写根实体会让相机子实体
 //! 绕玩家公转）；模型子实体挂双剪辑 [`AnimationPlayer`]（朝向 / 动画
 //! 都写它，二者不冲突——朝向是 yaw、动画剪辑驱动模型内部节点）；相机
-//! 子实体按固定偏移 + 平滑追随（平滑量写在子实体的**局部**位置上：
-//! 局部 = 平滑世界位 − 根位置，层级传播还原出平滑世界位；复活瞬移时
-//! 直接吸附，不做长距离甩镜头）。
+//! 子实体挂引擎 [`SmoothFollow`] 组件（打磨 IV 摩擦④闭合：平滑世界位
+//! 记忆在组件里，局部位置由引擎系统逐帧写 = 平滑世界位经父系逆变换，
+//! 层级传播还原出平滑世界位；复活瞬移调 `snap()` 直接吸附，不做长距离
+//! 甩镜）。模型实体在装配时调用 [`AnimationPlayer::capture_rest`]
+//! （打磨 IV 摩擦①闭合：双剪辑**不再强制路径对齐**——idle 只写 scale、
+//! walk 只写 rotation，crossfade 混合期「仅源有」的通道平滑淡回基姿势）。
 //!
 //! # 角色模型（R28 主载荷）
 //!
@@ -77,7 +81,7 @@ pub const ASCENT_REFERENCE_DISTANCE: f32 = 12.0;
 pub const CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 4.2, 8.5);
 /// 相机俯仰（弧度，绕 X 负角 = 望向玩家脚下）。
 const CAMERA_PITCH: f32 = -25.0_f32.to_radians();
-/// 相机平滑追随刚度（1/秒）：`pos → 目标` 指数趋近系数。
+/// 相机平滑追随的刚度（1/秒）：[`SmoothFollow`] 的指数趋近系数。
 const CAMERA_STIFFNESS: f32 = 6.0;
 /// 坠落横幅持续（秒）。
 const FALL_BANNER_SECS: f32 = 2.0;
@@ -96,15 +100,6 @@ pub const BANNER_TEXT_NAME: &str = "ascent/hud/banner";
 /// 适配：把纯逻辑类型接入引擎资源存储（逻辑核心零引擎依赖，跨模块手动
 /// 实现 `Resource` 即可「选择性接入」）。
 impl iris_core::resource::Resource for AscentState {}
-
-/// 相机平滑追随的**世界位**（ rigs 的记忆态）：目标 = 玩家位置 +
-/// [`CAMERA_OFFSET`]，逐帧指数趋近；相机子实体的局部位置 = 本位 − 根
-/// 位置（层级传播还原出平滑世界位；复活瞬移时整体吸附）。
-#[derive(Clone, Copy, Debug, Resource)]
-pub struct CameraRig {
-    /// 当前平滑世界位。
-    pub pos: Vec3,
-}
 
 /// 坠落横幅剩余显示时间（秒；`run_ascent` 置位、HUD 递减清零）。
 #[derive(Clone, Copy, Debug, Default, Resource)]
@@ -139,7 +134,7 @@ pub struct AscentEntities {
     pub player_root: Entity,
     /// 模型子实体：挂 [`AnimationPlayer`]，朝向（yaw）写它的 rotation。
     pub player_model: Entity,
-    /// 相机子实体（`ActiveCamera`；局部位置承载平滑追随）。
+    /// 相机子实体（`ActiveCamera` + `SmoothFollow`）。
     pub camera: Entity,
     /// 山顶信标（自旋表现）。
     pub beacon: Entity,
@@ -213,7 +208,8 @@ impl AscentPlugin {
                 build_scene(world, &model_path)
             })
             // Update 内的顺序即注册顺序：逻辑 + 输入 + 音频 + 相机 +
-            // 状态机 → FX 粒子触发 → 表现 → HUD
+            // 状态机 → 平滑追随（引擎系统，须在玩家位置写入之后）→
+            // FX 粒子触发 → 表现 → HUD
             .add_parallel_system(
                 Stage::Update,
                 Access::new()
@@ -226,9 +222,17 @@ impl AscentPlugin {
                     .write::<AscentState>()
                     .write::<Transform>()
                     .write::<AnimationPlayer>()
-                    .write::<CameraRig>()
+                    .write::<SmoothFollow>()
                     .write::<BannerTimer>(),
                 run_ascent,
+            )
+            .add_parallel_system(
+                Stage::Update,
+                Access::new()
+                    .read::<Time>()
+                    .write::<SmoothFollow>()
+                    .write::<Transform>(),
+                update_smooth_follow,
             )
             .add_parallel_system(
                 Stage::Update,
@@ -292,9 +296,6 @@ fn setup_resources(world: &mut World) {
         world.insert_resource(Viewport::default());
     }
     world.insert_resource(AscentState::new());
-    world.insert_resource(CameraRig {
-        pos: SPAWN_FOOT + Vec3::new(0.0, HALF_HEIGHT, 0.0) + CAMERA_OFFSET,
-    });
     world.insert_resource(BannerTimer::default());
     if let Some(audio) = world.try_resource::<Audio>() {
         audio.set_reference_distance(ASCENT_REFERENCE_DISTANCE);
@@ -585,8 +586,9 @@ fn build_decor(world: &mut World) {
 }
 
 /// 三层玩家结构：根（逻辑位置）→ 模型（双剪辑动画 + 朝向）→ 相机
-/// （固定偏移 + 平滑追随）。模型优先加载 [`MODEL_PATH`] GLB（双剪辑 +
-/// 状态机 + footstep 事件轨道）；失败降级为程序化几何 + 代码剪辑。
+/// （`SmoothFollow` 平滑追随 + 固定俯仰）。模型优先加载 [`MODEL_PATH`]
+/// GLB（双剪辑 + 状态机 + footstep 事件轨道 + `capture_rest` 基姿势）；
+/// 失败降级为程序化几何 + 代码剪辑（同构）。
 fn build_player(world: &mut World, model_path: &Path) -> (Entity, Entity, Entity) {
     // 根：只承载逻辑位置
     let player_root = world.spawn((
@@ -612,6 +614,10 @@ fn build_player(world: &mut World, model_path: &Path) -> (Entity, Entity, Entity
                     },
                 ];
             }
+            // 基姿势捕获（打磨 IV 摩擦①）：实体已全部生成、动画尚未
+            // 推进——此刻的 Transform 就是「未播放动画时的初始值」，
+            // crossfade「仅源有」的通道以此平滑淡回
+            player.capture_rest(world);
             world.insert(root, player);
             world.insert(root, Name("ascent/player-model".into()));
             world.add_child(player_root, root);
@@ -635,7 +641,8 @@ fn build_player(world: &mut World, model_path: &Path) -> (Entity, Entity, Entity
             model
         }
     };
-    // 相机子实体：固定偏移 + 俯视；平滑追随的局部位置由 run_ascent 逐帧写
+    // 相机子实体：固定偏移 + 俯视；平滑追随由引擎 SmoothFollow 系统逐帧
+    // 写局部位置（打磨 IV 摩擦④：游戏侧 CameraRig 绕行已删除）
     let camera = world.spawn((
         Name("ascent/player-camera".into()),
         Transform {
@@ -647,6 +654,7 @@ fn build_player(world: &mut World, model_path: &Path) -> (Entity, Entity, Entity
             fov_y_radians: 55.0_f32.to_radians(),
             ..ActiveCamera::default()
         },
+        SmoothFollow::new(player_root, CAMERA_OFFSET, CAMERA_STIFFNESS),
     ));
     world.add_child(player_root, camera);
     (player_root, player_model, camera)
@@ -681,8 +689,8 @@ fn configure_state_machine(player: &mut AnimationPlayer) {
 }
 
 /// 降级角色：程序化盒身 + 眼，代码构建的同构双剪辑（idle 呼吸缩放 /
-/// walk 前倾摇摆 + footstep 事件轨道）——状态机 / crossfade / 事件轨
-/// 道行为与 GLB 路径完全一致。
+/// walk 前倾摇摆 + footstep 事件轨道，各只一条通道）——状态机 /
+/// crossfade / 事件轨道 / rest 基姿势行为与 GLB 路径完全一致。
 fn fallback_robot(world: &mut World) -> Entity {
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
     let body_mat = world
@@ -720,57 +728,41 @@ fn fallback_robot(world: &mut World) -> Entity {
     world.add_child(wrapper, body);
     world.add_child(body, eye);
 
-    // 代码剪辑（与 GLB 同构）：idle 呼吸（缩放）+ 恒等旋转；walk 前倾
-    // 10° + 左右摇摆 ±6°（旋转）+ 恒等缩放——两剪辑都带两条路径，crossfade
-    // 混合完整、结束态完全由目标剪辑定义
-    let identity = [0.0f32, 0.0, 0.0, 1.0];
+    // 代码剪辑（与 GLB 同构，各只声明真正驱动的通道——打磨 IV 摩擦①
+    // 闭合后无需恒值通道对齐）：idle 呼吸（缩放，围绕建模尺寸 0.7 ×
+    // 0.8 × 0.5 压缩伸展）；walk 前倾 10° + 左右摇摆 ±6°（旋转）。
+    // rest 捕获的基姿势 = body 初始 TRS（scale (0.7, 0.8, 0.5)、旋转
+    // 恒等）= idle 的首末关键帧，过渡完成后「仅源有」通道恰停在基姿势
     let lean_sway = |sway_deg: f32| {
         let q = Quat::from_rotation_z(sway_deg.to_radians())
             * Quat::from_rotation_x(10.0_f32.to_radians());
         [q.x, q.y, q.z, q.w]
     };
+    let breathe = 0.93f32;
     let mut idle = AnimationClip {
         name: "idle".into(),
         duration: 2.0,
         ..AnimationClip::default()
     };
-    idle.channels = vec![
-        AnimationChannel {
-            node: 0,
-            path: AnimationPath::Scale,
-            interpolation: AnimationInterpolation::Linear,
-            times: vec![0.0, 1.0, 2.0],
-            values: vec![1.0, 1.0, 1.0, 1.0, 0.93, 1.0, 1.0, 1.0, 1.0],
-        },
-        AnimationChannel {
-            node: 0,
-            path: AnimationPath::Rotation,
-            interpolation: AnimationInterpolation::Linear,
-            times: vec![0.0, 1.0, 2.0],
-            values: [identity, identity, identity].concat(),
-        },
-    ];
+    idle.channels = vec![AnimationChannel {
+        node: 0,
+        path: AnimationPath::Scale,
+        interpolation: AnimationInterpolation::Linear,
+        times: vec![0.0, 1.0, 2.0],
+        values: vec![0.7, 0.8, 0.5, 0.7, 0.8 * breathe, 0.5, 0.7, 0.8, 0.5],
+    }];
     let mut walk = AnimationClip {
         name: "walk".into(),
         duration: 0.6,
         ..AnimationClip::default()
     };
-    walk.channels = vec![
-        AnimationChannel {
-            node: 0,
-            path: AnimationPath::Rotation,
-            interpolation: AnimationInterpolation::Linear,
-            times: vec![0.0, 0.3, 0.6],
-            values: [lean_sway(6.0), lean_sway(-6.0), lean_sway(6.0)].concat(),
-        },
-        AnimationChannel {
-            node: 0,
-            path: AnimationPath::Scale,
-            interpolation: AnimationInterpolation::Linear,
-            times: vec![0.0, 0.3, 0.6],
-            values: vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-        },
-    ];
+    walk.channels = vec![AnimationChannel {
+        node: 0,
+        path: AnimationPath::Rotation,
+        interpolation: AnimationInterpolation::Linear,
+        times: vec![0.0, 0.3, 0.6],
+        values: [lean_sway(6.0), lean_sway(-6.0), lean_sway(6.0)].concat(),
+    }];
     walk.events = vec![
         AnimationEvent {
             time: 0.15,
@@ -783,6 +775,8 @@ fn fallback_robot(world: &mut World) -> Entity {
     ];
     let mut player = AnimationPlayer::new(vec![idle, walk], vec![Some(body)]);
     configure_state_machine(&mut player);
+    // 基姿势捕获：body 已 spawn、动画未推进（语义同 GLB 路径）
+    player.capture_rest(world);
     world.insert(wrapper, player);
     wrapper
 }
@@ -950,7 +944,8 @@ fn build_hud(world: &mut World) {
 // ---------------------------------------------------------------------------
 
 /// Update 1：读输入与时间 → 相机相对翻译 → 推进纯逻辑 → 写玩家 /
-/// 朝向 / 状态机 → footstep 事件轨道 → 事件空间音频 → 相机平滑追随。
+/// 朝向 / 状态机 → footstep 事件轨道 → 事件空间音频 → 复活帧请求相机
+/// 吸附（平滑追随本体由引擎 `update_smooth_follow` 完成）。
 fn run_ascent(world: &World) {
     let dt = world
         .try_resource::<Time>()
@@ -1029,7 +1024,7 @@ fn run_ascent(world: &World) {
     let respawned = respawn_at.is_some();
 
     // ---- 三层结构写回：根 = 逻辑位置（rotation 恒恒等），模型 = 朝向，
-    // 相机 = 平滑追随（局部位置承载）----
+    // 相机 = 平滑追随（引擎系统写局部位置）----
     if let Some(ents) = world.try_resource::<AscentEntities>() {
         if let Some(mut transform) = world.get_mut::<Transform>(ents.player_root) {
             transform.position = state.pos;
@@ -1037,17 +1032,12 @@ fn run_ascent(world: &World) {
         if let Some(mut transform) = world.get_mut::<Transform>(ents.player_model) {
             transform.rotation = Quat::from_rotation_y(state.facing);
         }
-        // 相机平滑追随：目标 = 玩家 + 固定偏移；指数趋近，复活瞬移吸附
-        if let Some(mut rig) = world.try_resource_mut::<CameraRig>() {
-            let target = state.pos + CAMERA_OFFSET;
-            rig.pos = if respawned {
-                target
-            } else {
-                let t = (CAMERA_STIFFNESS * dt).min(1.0);
-                rig.pos + (target - rig.pos) * t
-            };
-            if let Some(mut transform) = world.get_mut::<Transform>(ents.camera) {
-                transform.position = rig.pos - state.pos;
+        // 相机平滑追随：平滑与局部位置写入由引擎系统 `update_smooth_follow`
+        // 完成（注册在本系统之后）；本系统只负责瞬移帧的吸附请求（打磨 IV
+        // 摩擦④闭合：游戏侧 CameraRig 绕行删除）
+        if respawned {
+            if let Some(mut follow) = world.get_mut::<SmoothFollow>(ents.camera) {
+                follow.snap();
             }
         }
 

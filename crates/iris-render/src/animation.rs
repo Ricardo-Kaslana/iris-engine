@@ -7,7 +7,11 @@
 //!
 //! v2 扩展（新字段全部带默认值，不启用时行为与 v1 完全一致）：
 //! - **crossfade**：[`AnimationPlayer::transition`] 向目标剪辑平滑过渡，
-//!   源姿势在过渡开始时冻结快照（[`AnimationBlend`]）；
+//!   源姿势在过渡开始时冻结快照（[`AnimationBlend`]）；混合期「目标剪辑
+//!   没有」的通道从冻结源值平滑淡回**基姿势**（rest pose，需先
+//!   [`AnimationPlayer::capture_rest`] 捕获；未捕获时保持 v2 的
+//!   「定格在源值」语义）——过渡完成后该通道恰停在基姿势，与「未被
+//!   动画的字段保持当前值」的覆写语义自洽，不会出现完成瞬间的跳变；
 //! - **状态机**：[`AnimationPlayer::states`] + [`AnimationPlayer::edges`]，
 //!   [`AnimationPlayer::request_state`] 按「当前态 → 目标态」的边启动
 //!   crossfade；**条件判定留给游戏侧**（无参数黑板，调用方自行决定何时
@@ -176,6 +180,13 @@ pub struct AnimationClip {
 /// 源不再推进的选择理由：混合结果只由 `elapsed` 决定——可预测、可测试
 /// （同样输入恒得同样姿势），且避免源剪辑循环回绕或播完造成的姿势跳变；
 /// 代价是长过渡里源姿态定格，对 0.1~0.5s 量级的过渡不可感知。
+///
+/// 「目标剪辑没有的通道」（仅源有）在混合期不是恒取源值：已捕获基姿势
+/// （[`AnimationPlayer::rest`] 非空）时按混合权重 `w` 从源值平滑淡回
+/// 基姿势——过渡完成时（`w` = 1）恰为 rest 值，`blend` 清除后该通道
+/// 不再被任何剪辑覆写、Transform 停在 rest，与「未被动画的字段保持
+/// 当前值」的覆写语义自洽；rest 未捕获时保持 v2 语义（恒取源值，过渡
+/// 结束后定格在最后的源值——纯构造播放器的既有行为不变）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnimationBlend {
     /// 过渡开始时的源剪辑索引。
@@ -240,6 +251,12 @@ pub struct AnimationPlayer {
     /// 本帧命中待消费的事件名（按触发时刻升序）；**消费方每帧
     /// [`AnimationPlayer::take_events`] drain**——不消费会跨帧累积。
     pub pending_events: Vec<String>,
+    /// 基姿势（rest pose）快照：「目标实体 → 平移 / 旋转 / 缩放三通道的
+    /// 静止值」——[`AnimationPlayer::capture_rest`] 捕获（实体生成之后、
+    /// 首次动画推进之前调用一次）。**空表 = 未捕获**：crossfade 的
+    /// 「仅源有」通道保持 v2 定格语义；捕获后混合期平滑淡回基姿势
+    /// （语义见 [`AnimationBlend`]）。默认空，兼容性承诺与 v1/v2 一致。
+    pub rest: Vec<(Entity, AnimatedField)>,
 }
 
 impl Default for AnimationPlayer {
@@ -259,6 +276,7 @@ impl Default for AnimationPlayer {
             edges: Vec::new(),
             current_state: 0,
             pending_events: Vec::new(),
+            rest: Vec::new(),
         }
     }
 }
@@ -288,6 +306,48 @@ impl AnimationPlayer {
             Some(state) => state.speed,
             None => self.speed,
         }
+    }
+
+    /// 捕获基姿势（rest pose）：把全部 [`AnimationPlayer::node_entities`]
+    /// 目标实体当前的 `Transform`（平移 / 旋转 / 缩放三条通道）记入
+    /// [`AnimationPlayer::rest`]。
+    ///
+    /// 调用时机：**实体生成之后、任何动画推进之前**——`spawn_gltf_instance`
+    /// 的调用序（先 spawn 全部节点实体、后构造播放器）满足该前提，此时
+    /// 捕获到的就是「未播放动画时的初始值」。重复调用以调用时刻的姿势
+    /// 覆盖旧快照（换装 / 重新锚定基姿势时可用）。没有 `Transform` 的
+    /// 目标实体跳过。
+    ///
+    /// 捕获后 crossfade 的「仅源有」通道在混合期从冻结源值平滑淡回基
+    /// 姿势（语义见 [`AnimationBlend`]）。两个诚实的边界：
+    /// - **rest 是捕获时刻的快照**：捕获后若 Transform 被其它剪辑改过，
+    ///   混合仍淡回捕获时记录的值（不是「当前未动画姿势」）；
+    /// - 退化的零四元数（glTF 节点缺省 rotation 的加载产物）按恒等
+    ///   处理——零四元数不可作为 slerp 端点。
+    pub fn capture_rest(&mut self, world: &iris_core::world::World) {
+        self.rest = self
+            .node_entities
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter_map(|&entity| {
+                let transform = world.get::<Transform>(entity)?;
+                // 零四元数（长度² ≈ 0）不是合法旋转：按恒等捕获
+                let rotation = if transform.rotation.length_squared() < 1e-10 {
+                    Quat::IDENTITY
+                } else {
+                    transform.rotation
+                };
+                Some((
+                    entity,
+                    [
+                        AnimatedField::Translation(transform.position.to_array()),
+                        AnimatedField::Rotation(rotation),
+                        AnimatedField::Scale(transform.scale.to_array()),
+                    ],
+                ))
+            })
+            .flat_map(|(entity, fields)| fields.map(move |field| (entity, field)))
+            .collect();
     }
 
     /// 启动向目标剪辑 `clip` 的 crossfade。
@@ -333,9 +393,12 @@ impl AnimationPlayer {
     /// 请求切换到状态机状态 `state`。
     ///
     /// 存在 `current → state` 边时按 `edge.duration` 启动 crossfade，
-    /// 否则硬切换；两种情况下 `looping` / `speed` 都同步为目标状态值，
-    /// `current_state` 立即更新。与 [`AnimationPlayer::transition`] 同款
-    /// 边界语义：同状态请求忽略、越界忽略 + `debug_assert!`。
+    /// 否则硬切换（**无边不是错误**——显式硬切换是合法用法，但会打一条
+    /// `log::debug!` 留线索：含 from / to 状态与边表长度。调试期清空
+    /// edges 会让全部过渡退化成跳变、画面闪变无线索，由此可定位，
+    /// 打磨 IV 摩擦③）；两种情况下 `looping` / `speed` 都同步为目标
+    /// 状态值，`current_state` 立即更新。与 [`AnimationPlayer::transition`]
+    /// 同款边界语义：同状态请求忽略、越界忽略 + `debug_assert!`。
     /// **何时调用由游戏侧判定**（无参数黑板，见 [`AnimationEdge`]）。
     pub fn request_state(&mut self, state: usize) {
         if state >= self.states.len() {
@@ -349,18 +412,26 @@ impl AnimationPlayer {
         if state == self.current_state {
             return;
         }
+        let from = self.current_state;
         let target = self.states[state].clone();
         let edge = self
             .edges
             .iter()
-            .find(|e| e.from == self.current_state && e.to == state)
+            .find(|e| e.from == from && e.to == state)
             .map(|e| e.duration);
         self.current_state = state;
         self.looping = target.looping;
         self.speed = target.speed;
         match edge {
             Some(duration) => self.transition(target.clip, duration),
-            None => self.transition(target.clip, 0.0),
+            None => {
+                log::debug!(
+                    "request_state：状态 {from} → {state} 无边（边表 {} 条）——硬切换到剪辑 {}",
+                    self.edges.len(),
+                    target.clip
+                );
+                self.transition(target.clip, 0.0);
+            }
         }
     }
 
@@ -580,10 +651,19 @@ pub fn update_animations(world: &iris_core::world::World) {
                         *field = blend_fields(&src_field, field, w);
                     }
                 }
-                // 仅源有：直接取源值（缺方通道不拖拽——目标剪辑没有的
-                // 通道保持在源姿势，而不是被目标姿势瞬间带走）
-                for (target, _, field) in src {
-                    fields.push((target, field));
+                // 仅源有：目标剪辑没有的通道不拖拽——rest 已捕获时从源值
+                // 平滑淡回基姿势（w = 1 时恰为 rest；过渡完成 blend 清除后
+                // 该通道不再覆写、Transform 停在 rest，与「未被动画的字段
+                // 保持当前值」自洽，完成瞬间无跳变）；rest 未捕获保持 v2
+                // 语义（保持源姿势，过渡后定格在最后的源值）
+                for (target, path, field) in src {
+                    let value = match player.rest.iter().find(|(entity, rest_field)| {
+                        *entity == target && animated_path(rest_field) == path
+                    }) {
+                        Some((_, rest_field)) => blend_fields(&field, rest_field, w),
+                        None => field,
+                    };
+                    fields.push((target, value));
                 }
             }
         }
@@ -624,6 +704,7 @@ pub fn update_animations(world: &iris_core::world::World) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3;
     use iris_core::world::World;
     use std::time::Duration;
 
@@ -904,6 +985,216 @@ mod tests {
             (dot - 1.0).abs() < 1e-5,
             "旋转只有 B 有：应取 B 的值，实际 {:?}",
             transform.rotation
+        );
+    }
+
+    /// 摩擦①闭合（rest 已捕获）：「仅源有」的通道在混合期从源值平滑淡回
+    /// 基姿势，过渡完成帧恰为 rest 值——blend 清除后该通道不再被任何
+    /// 剪辑覆写，Transform 停在 rest（与「未被动画的字段保持当前值」
+    /// 自洽），不再定格在源姿势。
+    #[test]
+    fn crossfade_source_only_channel_settles_to_rest() {
+        // A 只有平移 [2,0,0]（源）、B 只有旋转（目标）；rest 平移 = 原点
+        let a = clip(
+            "trans_only",
+            vec![constant_translation(0, [2.0, 0.0, 0.0])],
+            1.0,
+        );
+        let b = clip(
+            "rot_only",
+            vec![constant_rotation(
+                0,
+                Quat::from_rotation_y(90f32.to_radians()),
+            )],
+            1.0,
+        );
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![a, b], vec![Some(root)]);
+        player.capture_rest(&world);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        // 混合中点：平移 = lerp(源 2, rest 0, smoothstep(0.5)=0.5) = 1
+        // ——不再恒为源值（旧语义的断言值 2 会在混合期被带走向 rest）
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let x_mid = world.get::<Transform>(root).unwrap().position.x;
+        assert!(
+            (x_mid - 1.0).abs() < 1e-6,
+            "中点应 = lerp(2, rest 0, 0.5) = 1，实际 {x_mid}"
+        );
+        // 过渡完成：平移 = rest（原点），旋转 = 目标剪辑的值
+        for _ in 0..2 {
+            step(&world, 0.25);
+        }
+        {
+            let player = world.get::<AnimationPlayer>(root).unwrap();
+            assert!(player.blend.is_none(), "过渡完成后 blend 应清除");
+            let transform = world.get::<Transform>(root).unwrap();
+            assert_eq!(
+                transform.position.x, 0.0,
+                "完成帧「仅源有」通道应恰为 rest 平移"
+            );
+            let expected = Quat::from_rotation_y(90f32.to_radians());
+            let dot = transform.rotation.dot(expected).abs();
+            assert!((dot - 1.0).abs() < 1e-5, "目标侧通道应为目标剪辑的值");
+        }
+        // blend 清除后：该通道不再被覆写，Transform 停在 rest
+        step(&world, 0.25);
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().position.x,
+            0.0,
+            "完成后 Transform 应停在 rest"
+        );
+    }
+
+    /// 摩擦①闭合（连续性）：过渡完成瞬间「仅源有」的通道值连续——
+    /// 帧序列按 smoothstep 收敛逼近 rest、完成帧恰为 rest（无跳变）。
+    #[test]
+    fn crossfade_completion_frame_is_rest_without_jump() {
+        let a = clip(
+            "trans_only",
+            vec![constant_translation(0, [2.0, 0.0, 0.0])],
+            1.0,
+        );
+        let b = clip("rot_only", vec![], 1.0);
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![a, b], vec![Some(root)]);
+        player.capture_rest(&world);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        // 0.25 s × 4 = 1.0 s：第 4 帧为完成帧
+        let mut xs = Vec::new();
+        for _ in 0..4 {
+            step(&world, 0.25);
+            xs.push(world.get::<Transform>(root).unwrap().position.x);
+        }
+        // x = 2·(1 − smoothstep(k/4))：单调收敛，完成帧 = rest = 0
+        assert_eq!(xs[3], 0.0, "完成帧应恰为 rest 平移 0");
+        assert!(xs[2] > 0.0, "完成前一帧应仍未到 rest");
+        assert!(
+            (xs[2] - xs[3]) < (xs[1] - xs[2]),
+            "帧间步幅应按 smoothstep 收敛（无跳变）：{xs:?}"
+        );
+    }
+
+    /// 兼容性承诺：rest 未捕获（纯构造播放器）时保持 v2 语义——「仅源
+    /// 有」通道过渡期恒取源值、完成后定格在最后的源值。
+    #[test]
+    fn crossfade_without_rest_keeps_v2_freeze_semantics() {
+        let a = clip(
+            "trans_only",
+            vec![constant_translation(0, [2.0, 0.0, 0.0])],
+            1.0,
+        );
+        let b = clip("rot_only", vec![], 1.0);
+        let (mut world, root) = blend_world(a, b);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        for _ in 0..4 {
+            step(&world, 0.25);
+        }
+        assert!(world.get::<AnimationPlayer>(root).unwrap().blend.is_none());
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().position.x,
+            2.0,
+            "rest 未捕获：完成后应定格在源值（v2 语义不变）"
+        );
+    }
+
+    /// rest 是捕获时刻的快照：捕获后 Transform 被其它剪辑改过，混合仍
+    /// 淡回捕获时记录的值（模块文档写明的诚实边界）。
+    #[test]
+    fn rest_pose_is_capture_time_snapshot() {
+        let a = clip(
+            "trans_only",
+            vec![constant_translation(0, [2.0, 0.0, 0.0])],
+            1.0,
+        );
+        let b = clip("rot_only", vec![], 1.0);
+        let mut world = World::new();
+        let root = world.spawn((Transform::from_xyz(5.0, 0.0, 0.0),));
+        let mut player = AnimationPlayer::new(vec![a, b], vec![Some(root)]);
+        player.capture_rest(&world); // rest 平移 = (5, 0, 0)
+        world.insert(root, player);
+        // 捕获后 Transform 被改（模拟其它系统动过）
+        world.get_mut::<Transform>(root).unwrap().position = Vec3::ZERO;
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        for _ in 0..4 {
+            step(&world, 0.25);
+        }
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().position.x,
+            5.0,
+            "混合应淡回捕获时刻的 rest（5），而非当前值（0）"
+        );
+    }
+
+    /// 零四元数（glTF 节点缺省 rotation 的加载产物）不可作为 slerp
+    /// 端点：capture_rest 按恒等捕获。
+    #[test]
+    fn capture_rest_sanitizes_degenerate_rotation() {
+        // 源只有旋转（会被淡回 rest 旋转）、目标空剪辑
+        let a = clip(
+            "rot_only",
+            vec![constant_rotation(
+                0,
+                Quat::from_rotation_y(90f32.to_radians()),
+            )],
+            1.0,
+        );
+        let b = clip("none", vec![], 1.0);
+        let mut world = World::new();
+        // 模拟 GLB 加载产物：rotation 缺省 → 零四元数
+        let root = world.spawn((Transform {
+            position: Vec3::ONE,
+            rotation: Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+            scale: Vec3::ONE,
+        },));
+        let mut player = AnimationPlayer::new(vec![a, b], vec![Some(root)]);
+        player.capture_rest(&world);
+        let rest_rotation = player
+            .rest
+            .iter()
+            .find_map(|(_, field)| match field {
+                AnimatedField::Rotation(q) => Some(*q),
+                _ => None,
+            })
+            .expect("rest 应含旋转通道");
+        assert!(
+            (rest_rotation.dot(Quat::IDENTITY) - 1.0).abs() < 1e-6,
+            "零四元数应按恒等捕获，实际 {rest_rotation:?}"
+        );
+        // 淡回 rest 的 slerp 端点合法：完整过渡不产生 NaN
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .transition(1, 1.0);
+        for _ in 0..4 {
+            step(&world, 0.25);
+        }
+        let rotation = world.get::<Transform>(root).unwrap().rotation;
+        assert!(
+            rotation.length_squared() > 0.5,
+            "完成后旋转应停在合法的 rest 恒等（无 NaN），实际 {rotation:?}"
         );
     }
 

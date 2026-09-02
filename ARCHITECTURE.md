@@ -466,6 +466,15 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   插入、主循环每次 `Resized` 自动同步，照 `Input` 资源模式；离屏 /
   headless 程序无窗口事件，手动 `insert_resource` 写入实际渲染目标
   尺寸，缺省 1280×720）。
+- **平滑追随（打磨 IV）**：iris-engine `camera_rig` 模块的
+  `SmoothFollow` 组件 + `update_smooth_follow` 系统把「挂载相机 + 第三
+  人称平滑追随」固化为现成范式——平滑世界位以 `1 − exp(−lerp·dt)`
+  帧率无关指数趋近「目标当帧世界位 + offset」，追随者局部平移写为
+  `parent⁻¹ × pos`（父链旋转 / 缩放也精确还原）；`snap()` 吸附（复活 /
+  传送）、首帧吸附。注册契约：Update 阶段、在追随目标的写入系统之后
+  （目标本帧位移当帧即被追随）；目标世界位沿父链以局部 `Transform`
+  现值合成，不读滞后一帧的 `GlobalTransform`（读上帧口径亦可接受，
+  文档写明）。iris-ascent 第三人称相机即消费方。
 
 ### 4.6 glTF 2.0 资产管线（`asset` 模块）
 
@@ -488,7 +497,16 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   的便捷包装。
 - **GLB 容器**：按内容嗅探（magic "glTF"），校验版本（仅 2）、chunk 边界与
   顺序（JSON 首位、BIN 仅一个且在 JSON 后）；BIN chunk 作为无 uri 的
-  buffer 0 数据源。`write_glb` 为对称的容器组装工具（gen_asset 示例使用）。
+  buffer 0 数据源。`write_glb` 为对称的容器组装工具。
+- **编程式构造（打磨 IV）**：iris-engine `gltf_builder` 模块的
+  `GltfBuilder` 把「声明几何 / 层级 / 关键帧」与「bufferView 偏移 /
+  accessor 下标 / sampler 编号 / 对齐填充」分离——`material` / `mesh`
+  （单 primitive，POSITION 包围盒与索引宽度自动处理）/ `node` +
+  `add_child`（顶层自动推断）/ `skin` + `attach_skin` / `animation`
+  （`AnimChannel` 复用运行时枚举，时间轴内容一致自动共享 times
+  accessor）声明完即 `build_glb()` / `build_json_and_bin(uri)`；与
+  加载器互为逆操作（单测「构造 → 加载 → 剪辑 / 节点映射 / 蒙皮」守
+  护），gen_asset 示例的全部资产生成已经迁移。
 - **去重**：同一 glTF 的 mesh / material / texture 按 (索引[, primitive]) 缓存句柄，
   多节点引用同一网格不重复上传 CPU 目录。
 - **容错与降级**：所有错误收敛为 `GltfError`（Io / Json / Image / Unsupported /
@@ -524,7 +542,12 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   连续、视觉顺滑；中点与线性同为 0.5）；混合按「目标实体 + 路径」并集
   逐项进行——双方都有：平移/缩放分量 lerp、旋转 **slerp**（恒定角速度；
   nlerp 大角度下中段角速度不均，逐实体每帧个位数旋转通道不值得省）；
-  仅一方有：直接取该方值（**缺方通道不拖拽**）。边界语义：`duration ≤ 0`
+  仅目标有：取目标值；**仅源有**：`lerp/slerp(源值, rest 值, w)` 平滑淡回
+  **基姿势**（`AnimationPlayer::capture_rest(&World)` 在实体生成后、动画
+  推进前把全部目标实体的初始 TRS 记为 rest 快照；过渡完成时恰为 rest，
+  blend 清除后该通道不再被覆写、Transform 停在 rest——完成瞬间无跳变，
+  不再定格在源值；rest 未捕获时保持 v2「取源值、定格」语义——纯构造
+  播放器的既有行为不变）。边界语义：`duration ≤ 0`
   = 硬切换；同剪辑请求忽略；目标越界忽略 + debug_assert（release 静默）；
   `elapsed ≥ duration` 后混合自动清除回纯目标姿势。混合采样用的 elapsed
   与 time 同步在阶段一推进（`elapsed + dt`，阶段二才落账）——姿势只由
@@ -533,7 +556,9 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   `edges`（`AnimationEdge { from, to, duration }`）+ `current_state`，
   全部默认空 = 不启用，直接操作 `active/looping/speed` 的旧路径完全保留。
   `request_state(state)`：查 `current → state` 边——有边按 `edge.duration`
-  启动 crossfade、无边硬切换；两种情况 `looping/speed` 都同步为目标态，
+  启动 crossfade、无边硬切换（**无边 = 合法的显式硬切换**，但会打
+  `log::debug!` 留线索：含 from / to 状态与边表长度——调试期清空 edges
+  导致全部过渡跳变时可由此定位）；两种情况 `looping/speed` 都同步为目标态，
   states 非空时 `advanced` 的循环/速度以当前状态为准。**条件判定留给
   游戏侧**：边只带过渡时长，无参数黑板 / 条件求值——何时 request 由
   调用方按玩法逻辑决定（v1 边界：引擎只做「边 + 过渡时长」，不做状态
@@ -1617,7 +1642,10 @@ glTF / HDR 错误经 `From` 映射保上下文）。
     （质量敏感资产可用离线工具预压缩，运行时编码走同一管线）。
 18. **dogfooding IV 发现的引擎摩擦（iris-ascent 实践反馈）**——第四轮
     （3D 平台跳跃）把 R28–R31 压榨一遍的「现象 → 绕行 → 建议修法」
-    清单；均未改引擎（绕行在游戏侧，作为下一轮打磨的输入）：
+    清单；均未改引擎（绕行在游戏侧，作为下一轮打磨的输入）。
+    （更新：**六条已全部闭合于「引擎 API 打磨 IV」轮**，iris-ascent 的
+    绕行代码已同步删除并改用新 API 作闭合证明——①②③④ 引擎侧修复，
+    ⑤⑥ 按原建议以文档闭合。）
     ① **crossfade 的缺通道混合语义**：混合只作用于「双方都有」的
     「目标实体 + 路径」对，「仅源有」的通道在过渡期保持源姿势、过渡
     结束后**定格在最后的源值**（不再被任何剪辑驱动）——idle 只有
@@ -1625,29 +1653,56 @@ glTF / HDR 错误经 `From` 映射保上下文）。
     **绕行**：状态机用的剪辑强制路径对齐（两剪辑都写 scale + rotation
     两通道，恒值通道也要写）。**建议**：blend 结束时把「仅源有」路径
     淡回目标实体的静止姿势，或文档显式警告「crossfade 剪辑必须路径
-    对齐」；② **程序化 GLB 生成是手写 JSON 字符串**：bufferView 偏移 /
-    accessor 下标 / sampler 编号全靠手工记账（gen_asset 四个生成函数
+    对齐」→ **已修复**：`AnimationPlayer::rest` 基姿势快照 +
+    `capture_rest(&World)`（实体生成后、动画推进前捕获一次），混合期
+    「目标无此通道」的通道值 = `lerp/slerp(源值, rest 值, w)`——过渡
+    完成时恰为 rest、blend 清除后该通道停在 rest（与「未被动画的字段
+    保持当前值」自洽，完成瞬间无跳变）；rest 未捕获保持 v2 语义（既有
+    测试零改动全过）。游戏侧：双剪辑恒值对齐通道删除，模型装配处
+    `capture_rest`，回归测试断言 idle↔walk 过渡后 scale / rotation 回
+    基姿势；GPU 端到端断言完成帧与播放动画前逐像素一致（§4.6.1）；② **程序化 GLB 生成是手写 JSON 字符串**：bufferView 偏移 /
+    accessor 下标 / sampler 编号全靠手工记账（gen_asset 生成函数
     均如此），错一位即加载失败或姿势错乱且无定位信息。**绕行**：复制
     既有函数为模板改数。**建议**：引擎提供编程式组装 API
-    （`GltfBuilder`：append_mesh / add_animation_channel / write_glb）；
-    ③ **状态机无边时 `request_state` 静默硬切换**：调试期清空 edges
+    （`GltfBuilder`：append_mesh / add_animation_channel / write_glb）→
+    **已修复**：iris-engine 新模块 `gltf_builder`（material / mesh /
+    node+add_child / skin+attach_skin / animation 声明式 API +
+    build_glb / build_json_and_bin）——二进制记账、4 字节对齐、POSITION
+    包围盒、索引宽度选型、顶层推断、times accessor 共享全部收进
+    builder；gen_asset 五个生成函数全部迁移，重新生成的资产与旧文件
+    加载语义等价（节点 TRS / 剪辑关键帧 / 蒙皮 ibm 逐位一致；唯一差异
+    为节点旋转从缺省零四元数变为显式恒等，行为等价），加载侧 GPU 测试
+    零改动全过；③ **状态机无边时 `request_state` 静默硬切换**：调试期清空 edges
     会让全部过渡变成跳变，画面闪变无任何日志线索。**建议**：硬切换
-    路径打 `log::debug`；④ **「子实体相机 + 平滑追随」无现成范式**：
+    路径打 `log::debug` → **已修复**：无边分支打 `log::debug!`（含
+    from / to 状态与边表长度），文档写明「无边 = 合法的显式硬切换」；④ **「子实体相机 + 平滑追随」无现成范式**：
     平滑量必须写在子实体的**局部**位置（局部 = 平滑世界位 − 根位置，
     层级传播还原世界位）；GlobalTransform 滞后一帧；瞬移（复活）需要
     手动吸附，否则相机长距离甩镜。**绕行**：游戏侧约 30 行的
     `CameraRig` 资源（iris-ascent plugin）。**建议**：引擎提供
-    `SmoothFollow` 组件或在下游游戏模板文档中固化该范式；⑤
-    **`move_and_slide` 的衔接参数域无指导**：`step_height 0.3` +
+    `SmoothFollow` 组件或在下游游戏模板文档中固化该范式 →
+    **已修复**：iris-engine 新模块 `camera_rig`——`SmoothFollow` 组件 +
+    `update_smooth_follow` 并行系统（帧率无关 `1 − exp(−lerp·dt)` 指数
+    趋近、局部 = `parent⁻¹ × 平滑世界位`、`snap()` 吸附、首帧吸附）；
+    编排契约（目标写入系统之后注册、目标世界位沿父链局部 Transform
+    现值合成而非读滞后一帧的 GlobalTransform、与层级传播的先后）写入
+    模块文档。游戏侧：`CameraRig` 资源与积分代码删除，相机改挂
+    `SmoothFollow`，复活帧 `snap()`；⑤ **`move_and_slide` 的衔接参数域无指导**：`step_height 0.3` +
     `snap_distance 0.2` 对「落差 ≤ 0.3、缝宽 ≤ 0.5（< 胶囊直径）」的
     台间衔接恰好可靠；缝宽 > 2×snap_distance 且落差 > step_height 的
     衔接会以「贴边落在台缘角点」的方式卡墙，且失败模式不易诊断。
     **绕行**：iris-ascent 以关卡不变量单测固化衔接域（落差 ≤ 0.3、
     缝宽 ≤ 0.5）。**建议**：character 模块文档附「平台跳跃衔接参数
-    表」；⑥ **跳跃输入的电平 vs 边沿**：`key_pressed` 边沿对「落地就
+    表」→ **已闭合（文档）**：`iris-core::character` 模块文档新增
+    「平台跳跃衔接参数表」——低台阶 / 走落 / 水平缝 / 落点窗口 / 平台
+    厚度的可靠域与推导，超域失败模式（台缘角点 45° 法线卡墙、双超域、
+    薄板穿通）的症状 / 复现特征 / 诊断建议；⑥ **跳跃输入的电平 vs 边沿**：`key_pressed` 边沿对「落地就
     跳」（跳跃蓄压）不友好，脚本注入也要 release+press 两步。**绕行**：
     逻辑层输入直接用电平语义（`AscentInput::jump` 按住即跳，落地即
-    触发）。**建议**：无（记录语义选择，下游游戏按玩法挑一边）。
+    触发）。**建议**：无（记录语义选择，下游游戏按玩法挑一边）→
+    **已闭合（文档）**：`iris-platform` input 模块文档新增「输入语义
+    选择指南」——电平 / 边沿的判定法则（动作是否应按住持续生效）、
+    电平 + 玩法门控的组合范式、脚本注入差异。
 
 ## 9. 关键设计取舍记录
 

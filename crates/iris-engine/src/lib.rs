@@ -17,6 +17,8 @@
 pub mod app;
 pub mod assets;
 pub mod audio;
+pub mod camera_rig;
+pub mod gltf_builder;
 pub mod plugin;
 pub mod scene;
 pub mod spatial;
@@ -40,6 +42,11 @@ pub mod prelude {
     pub use crate::scene::{
         GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError, load_scene, save_scene,
     };
+    // 编程式 glTF / GLB 构造器（打磨 IV）：记账归 builder，人只声明
+    // 几何 / 层级 / 关键帧
+    pub use crate::gltf_builder::{AnimChannel, GltfBuilder, GltfNodeDesc};
+    // 平滑追随范式（打磨 IV）：子实体相机 + 帧率无关指数趋近
+    pub use crate::camera_rig::{SmoothFollow, update_smooth_follow};
     // 空间音频 v1（听者 / 声源组件与每帧同步系统）
     pub use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
     // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）

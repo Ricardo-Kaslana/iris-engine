@@ -255,3 +255,94 @@ fn crossfade_quad_midframe_between_extremes() {
         "过渡完成后 blend 应清除"
     );
 }
+
+/// 打磨 IV 摩擦① GPU 端到端：rest 已捕获时，crossfade 完成后「仅源有」
+/// 的平移通道回到基姿势——完成帧与播放动画前的画面**逐像素一致**
+/// （rest 语义贯穿 GLB 加载 → capture_rest → 状态机混合 → 渲染全链路，
+/// 过渡完成瞬间无跳变、无定格残留）。
+#[test]
+fn crossfade_source_only_channel_settles_to_rest_on_screen() {
+    let dir = std::env::temp_dir().join("iris-anim-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("quad.glb");
+    std::fs::write(&path, animated_quad_glb()).unwrap();
+
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+
+    let mut world = World::new();
+    world.insert_resource(MeshStore::new());
+    world.insert_resource(MaterialStore::new());
+    world.insert_resource(TextureStore::new());
+    world.insert_resource(Camera {
+        eye: Vec3::new(0.0, 0.0, 3.0),
+        ..Camera::default()
+    });
+    world.insert_resource(DirectionalLight::default());
+
+    let instance = spawn_gltf_instance(&mut world, &path).expect("GLB 应加载成功");
+    let root = instance.roots[0];
+
+    // 基准帧：节点初始变换（rest）下的画面
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let at_rest = renderer.read_pixels();
+
+    // 剪辑 A：恒定平移 x+1.2（仅此一条通道——源）；剪辑 B：空（目标无
+    // 任何通道）。混合期平移从源值淡向 rest，完成后节点回到初始位置。
+    let clip_offset = AnimationClip {
+        name: "offset".into(),
+        channels: vec![AnimationChannel {
+            node: 0,
+            path: AnimationPath::Translation,
+            interpolation: AnimationInterpolation::Linear,
+            times: vec![0.0],
+            values: vec![1.2, 0.0, 0.0],
+        }],
+        duration: 1.0,
+        events: Vec::new(),
+    };
+    let clip_none = AnimationClip {
+        name: "none".into(),
+        channels: vec![],
+        duration: 1.0,
+        events: Vec::new(),
+    };
+    let mut player =
+        AnimationPlayer::new(vec![clip_offset, clip_none], instance.node_entities.clone());
+    player.capture_rest(&world);
+    world.insert(root, player);
+    world.insert_resource(Time::default());
+
+    // 混合前：纯源姿势（x + 1.2）——画面应偏离基准
+    update_animations(&world);
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    let at_offset = renderer.read_pixels();
+    assert_ne!(at_offset, at_rest, "源姿势（平移 1.2）应偏离 rest 画面");
+
+    // 过渡 1 s（4 × 0.25 s）：完成后平移淡回 rest = 0，画面与基准逐像素一致
+    world
+        .get_mut::<AnimationPlayer>(root)
+        .unwrap()
+        .transition(1, 1.0);
+    for _ in 0..4 {
+        world
+            .resource_mut::<Time>()
+            .advance(std::time::Duration::from_secs_f64(0.25));
+        update_animations(&world);
+        propagate_transforms(&mut world);
+    }
+    assert!(
+        world.get::<AnimationPlayer>(root).unwrap().blend.is_none(),
+        "过渡应已完成清除"
+    );
+    renderer.render(&world);
+    let at_settled = renderer.read_pixels();
+    assert_eq!(
+        at_settled, at_rest,
+        "完成后「仅源有」通道应停在 rest：画面应与基准逐像素一致"
+    );
+}

@@ -5,6 +5,101 @@
 
 ## [Unreleased]
 
+### Added（打磨 IV：引擎 API 打磨 IV——闭合 Iris Ascent dogfooding 的六条引擎摩擦）
+
+延续「打磨 I / II / III」模式：**引擎侧修复 + iris-ascent 侧绕行删除
+验证**——每条修完 iris-ascent 测试仍绿才算闭合（headless 7 项 + 纯
+核心 14 项 + 全部单测通过；摩擦原文见 ARCHITECTURE §8.18）。
+
+- **① crossfade 缺通道平滑淡回基姿势（rest pose，正确性核心）**：
+  `AnimationPlayer` 新增 `rest: Vec<(Entity, AnimatedField)>` 字段与
+  `capture_rest(&World)` 方法——把全部 `node_entities` 目标实体的
+  当前 `Transform`（平移 / 旋转 / 缩放三通道）记为基姿势快照（调用
+  时机 = 实体生成后、动画推进前；`spawn_gltf_instance` 的先 spawn 后
+  new 调用序满足）。混合采样语义修正：crossfade 期「目标剪辑没有」
+  的通道值 = `lerp/slerp(源值, rest 值, w)`——过渡完成时恰为 rest、
+  `blend` 清除后该通道不再被任何剪辑覆写、Transform 停在 rest（与
+  「未被动画的字段保持当前值」的覆写语义自洽），**完成瞬间无跳变、
+  不再定格在源值**（旧「idle 只有 scale / walk 只有 rotation 会让呼吸
+  缩放起跑后冻住」的正确性缺陷闭合）。诚实边界写入文档：rest 是
+  捕获时刻快照（捕获后 Transform 被改过仍淡回捕获值）；退化零四元数
+  （glTF 节点缺省 rotation 的加载产物）按恒等捕获（不可作 slerp
+  端点）。**兼容性承诺**：rest 缺省空表 = 未捕获，保持 v2「仅源有
+  恒取源值、完成后定格」语义——既有动画测试零改动全过（逐个确认：
+  全部既有混合用例的通道双方齐备或走未捕获路径）。CPU 测试：
+  `crossfade_source_only_channel_settles_to_rest`（中点混合值 + 完成帧
+  = rest + 完成后停留）、`crossfade_completion_frame_is_rest_without_
+  jump`（帧序列 smoothstep 收敛、完成帧恰为 rest）、
+  `crossfade_without_rest_keeps_v2_freeze_semantics`（兼容路径锁定）、
+  `rest_pose_is_capture_time_snapshot`（快照边界）、
+  `capture_rest_sanitizes_degenerate_rotation`（零四元数）；GPU 端到端
+  `crossfade_source_only_channel_settles_to_rest_on_screen`（完成后画面
+  与播放动画前**逐像素一致**）。iris-ascent 侧绕行删除：GLB 与降级
+  代码剪辑**不再写恒值对齐通道**（idle 只写 scale、walk 只写 rotation），
+  模型装配处 `capture_rest`；回归测试
+  `crossfade_missing_channels_settle_to_rest_pose`（idle↔walk 过渡后
+  scale / rotation 回基姿势）。
+- **② GltfBuilder 编程式 GLB 构造（投入最大项）**：iris-engine 新模块
+  `gltf_builder`——「**记账归 builder，人只声明几何 / 层级 / 关键帧**」：
+  `material(base_color, metallic, roughness, emissive)` /
+  `mesh(name, &MeshData, material)`（单 primitive；二进制段自动追加、
+  4 字节对齐自动填充、POSITION min/max 包围盒自动计算、索引按顶点数
+  自动选 u16/u32、蒙皮自动写 JOINTS_0/WEIGHTS_0）/
+  `node(GltfNodeDesc)` + `add_child`（场景顶层自动推断）/
+  `skin(name, joints, ibm)` + `attach_skin`（后置补挂）/ `animation(name,
+  channels)`（`AnimChannel` 复用运行时 `AnimationPath` /
+  `AnimationInterpolation`；时间轴内容一致的通道自动共享 times
+  accessor；关键帧数量不齐立即中文断言）/ `build_glb()`（GLB 容器）+
+  `build_json_and_bin(uri)`（外部 buffer 的 .gltf）。旧手写 JSON 的
+  隐式对齐假设（anim_render 测试注释的「times 声明在偏移 112」类）由
+  builder 对齐逻辑统一消化。**gen_asset 五个生成函数全部迁移**（cube
+  外部 buffer + anim_cube / skin_arm / enemy_worm / ascent_bot 四个
+  GLB），重新生成的资产与旧文件**加载语义等价**：节点 TRS / 剪辑
+  channels（times + values 逐位）/ 蒙皮 ibm 矩阵逐位一致，节点旋转从
+  「缺省零四元数（按恒等处理）」变为显式恒等（唯一已知差异，行为等
+  价且更正确）；gltf_render（cube.gltf）等加载侧 GPU 测试零改动全过
+  = 等价性证据。单测 4 项：`built_triangle_glb_loads_and_animates`
+  （builder 构造 → write_glb → 引擎加载 → 剪辑时长 / 节点映射 / 采样
+  推进正确）、`built_skinned_glb_loads_skin_and_ibm`（Skin 组件挂载 +
+  关节映射 + ibm 逐值）、`built_json_and_bin_roundtrips`（外部 buffer
+  往返）、`animation_rejects_mismatched_keyframes`（断言消息）。
+- **③ 状态机无边硬切换留调试线索**：`request_state` 无边分支新增
+  `log::debug!`（含 from / to 状态与边表长度——调试期清空 edges 导致
+  全部过渡变成跳变时可由此定位）；文档写明「无边不是错误、显式硬
+  切换是合法用法」。
+- **④ SmoothFollow 平滑追随范式**：iris-engine 新模块 `camera_rig`——
+  `SmoothFollow` 组件（target / offset / lerp_per_sec / snap_on_first_
+  frame + 记忆态 `pos`）+ `update_smooth_follow` 并行系统：平滑世界位
+  朝「目标当帧世界位 + offset」以 `1 − exp(−lerp·dt)` **帧率无关**
+  指数趋近，追随者局部平移写成 `parent⁻¹ × pos`（父链存在旋转 /
+  缩放也精确）；`snap()` 标记下一次更新直接对齐（复活 / 传送）；
+  首帧吸附。编排契约写入模块文档：在目标写入系统**之后**注册（目标
+  本帧位移当帧即被追随）；目标世界位沿父链用局部 `Transform` 现值
+  合成——**不读滞后一帧的 GlobalTransform**（读上帧的口径亦可接受，
+  代价是目标本帧位移迟到一帧，文档写明）；Update 写局部、PostUpdate
+  传播，传播后的消费方当帧读到新全局位；只管理位置（机位俯仰不动）。
+  单测 5 项：首帧吸附 / 收敛的帧率无关（1/60×60 vs 1/20×20 终点
+  一致）/ snap 逐位吸附 / 追随者旋转不动 / 使用目标当帧位置。
+  iris-ascent 侧绕行删除：约 30 行的 `CameraRig` 资源及其积分代码
+  删除，相机子实体改挂 `SmoothFollow::new(player_root, CAMERA_OFFSET,
+  CAMERA_STIFFNESS)`，`update_smooth_follow` 注册在 `run_ascent` 之后，
+  复活帧 `follow.snap()`；headless 吸附断言改读组件记忆态（逐位一致
+  语义不变）。
+- **⑤ 输入语义选择指南（文档闭合，无引擎改动）**：`iris-platform`
+  input 模块文档新增「电平（`key`）vs 边沿（`key_pressed`）选择指南」
+  ——判定法则「动作是否应该按住就持续生效」、电平 + 玩法门控（如
+  grounded / 土狼时间）对跳跃类玩法的优势、脚本注入差异（电平一帧
+  置位、边沿需 release+press 两步）；判定为合理设计语义（iris-ascent
+  的 `AscentInput::jump` 即电平 + grounded 门控 = 自动 bunny-hop 友好）。
+- **⑥ move_and_slide 衔接参数表（文档闭合，无引擎改动）**：
+  `iris-core::character` 模块文档新增「平台跳跃衔接参数表」——低台阶
+  （落差 ≤ `step_height`）/ 走落（落差 ≤ `snap_distance`）/ 水平缝
+  （< `2 × radius`）/ 落点窗口（≥ `radius` 且落点法线可站立）/ 平台
+  厚度（≥ `radius`）的可靠域与推导，超域失败模式（贴边落在台缘角点
+  的 45° 法线卡墙、缝宽 + 落差双超域、薄板穿通）的症状 / 复现特征 /
+  诊断建议（打印 `ground_normal`、以关卡不变量单测固化衔接域——
+  iris-ascent 先例）。
+
 ### Added（R32：示范游戏 IV——iris-ascent《Iris Ascent》3D 平台跳跃，dogfooding R28–R31）
 
 - **新 crate `iris-ascent`**（下游示范游戏 IV）：第三人称线性上升平台

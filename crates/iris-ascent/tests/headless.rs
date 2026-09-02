@@ -22,14 +22,14 @@ use std::time::Duration;
 use glam::Vec3;
 
 use iris_ascent::{
-    AscentPlugin, AscentState, AutoPilot, BannerTimer, CHECKPOINTS, CameraRig, DECOR_COUNT,
-    FALLS_TEXT_NAME, FxPool, GEMS, GEMS_TEXT_NAME, HALF_HEIGHT, Phase, STATE_IDLE, STATE_WALK,
+    AscentPlugin, AscentState, AutoPilot, BannerTimer, CHECKPOINTS, DECOR_COUNT, FALLS_TEXT_NAME,
+    FxPool, GEMS, GEMS_TEXT_NAME, HALF_HEIGHT, Phase, STATE_IDLE, STATE_WALK,
 };
 use iris_core::prelude::Stage;
 use iris_engine::prelude::{
     AnimationPlayer, App, Audio, Camera, DirectionalLight, HierarchyPlugin, Input, KeyCode,
-    LodMesh, MeshStore, OffscreenRenderer, ParticleEmitter, ParticlePlugin, Plugin, Time,
-    Transform, UiText, Visibility,
+    LodMesh, MeshStore, OffscreenRenderer, ParticleEmitter, ParticlePlugin, Plugin, SmoothFollow,
+    Time, Transform, UiText, Visibility,
 };
 
 /// headless 测试台：世界 + AscentPlugin 系统链 + 层级 / 粒子 / 动画插件 +
@@ -460,11 +460,17 @@ fn respawn_snaps_camera_and_updates_hud() {
     harness.frame();
     assert!(harness.state().checkpoints[0], "检查点 1 应已激活");
     // 记录相机平滑位（此刻应跟随在玩家旁）
-    let rig_before = *harness
+    let ents = harness
         .app
         .world
-        .try_resource::<CameraRig>()
-        .expect("CameraRig 在位");
+        .try_resource::<iris_ascent::AscentEntities>()
+        .expect("实体索引在位")
+        .clone();
+    let follow_before = *harness
+        .app
+        .world
+        .get::<SmoothFollow>(ents.camera)
+        .expect("相机应挂 SmoothFollow");
     // 坠落：低于坠落线 → 复活
     {
         let mut state = harness.app.world.resource_mut::<AscentState>();
@@ -477,18 +483,18 @@ fn respawn_snaps_camera_and_updates_hud() {
         let want = CHECKPOINTS[0].respawn_foot + Vec3::new(0.0, HALF_HEIGHT, 0.0);
         assert_eq!(state.pos, want, "复活位置应逐位等于检查点复活位");
     }
-    // 相机吸附：rig 直接等于目标（玩家 + 固定偏移），无逐帧趋近的长距离
-    // 甩镜（数值上 rig 与目标逐位一致即证明吸附）
+    // 相机吸附：SmoothFollow 记忆态直接等于目标（玩家 + 固定偏移），
+    // 无逐帧趋近的长距离甩镜（数值上 pos 与目标逐位一致即证明吸附）
     {
-        let rig = *harness
+        let follow = *harness
             .app
             .world
-            .try_resource::<CameraRig>()
-            .expect("CameraRig 在位");
+            .get::<SmoothFollow>(ents.camera)
+            .expect("相机应挂 SmoothFollow");
         let target = harness.state().pos + iris_ascent::CAMERA_OFFSET;
-        assert_eq!(rig.pos, target, "复活帧相机应整体吸附到目标位");
+        assert_eq!(follow.pos, target, "复活帧相机应整体吸附到目标位");
         assert_ne!(
-            rig.pos, rig_before.pos,
+            follow.pos, follow_before.pos,
             "相机位应发生显著变化（长距离传送）"
         );
     }
@@ -508,6 +514,85 @@ fn respawn_snaps_camera_and_updates_hud() {
         .try_resource::<BannerTimer>()
         .expect("BannerTimer 在位");
     assert_eq!(timer.0, 0.0, "横幅计时应归零");
+}
+
+/// 打磨 IV 摩擦①闭合回归：GLB 双剪辑**不再强制路径对齐**（idle 只写
+/// Body 的 scale、walk 只写 Body 的 rotation）——idle→walk 过渡完成后，
+/// idle 独有的 scale 通道应回到基姿势（rest = capture_rest 捕获的初始
+/// TRS），walk→idle 完成后 rotation 同样回到基姿势，而不是定格在源
+/// 剪辑的最后值。
+#[test]
+fn crossfade_missing_channels_settle_to_rest_pose() {
+    let mut harness = Harness::new();
+    let ents = harness
+        .app
+        .world
+        .try_resource::<iris_ascent::AscentEntities>()
+        .expect("实体索引在位")
+        .clone();
+    // 动画目标节点（Body）：取 idle 剪辑通道声明的节点下标——对 GLB 与
+    // 降级路径都成立
+    let body = {
+        let player = harness
+            .app
+            .world
+            .get::<AnimationPlayer>(ents.player_model)
+            .expect("AnimationPlayer 在位");
+        let node = player.clips[STATE_IDLE].channels[0].node;
+        player.node_entities[node].expect("动画目标节点应在场景内")
+    };
+    // rest 基姿势：Startup 后、任何动画推进前的初始 TRS
+    let rest = *harness.app.world.get::<Transform>(body).unwrap();
+    // 按住 W 20 帧（> 过渡时长 0.15 s）：进入纯 walk，blend 清除
+    harness.hold_forward(true);
+    harness.frames(20);
+    {
+        let player = harness
+            .app
+            .world
+            .get::<AnimationPlayer>(ents.player_model)
+            .expect("AnimationPlayer 在位");
+        assert_eq!(player.current_state, STATE_WALK);
+        assert!(player.blend.is_none(), "idle→walk 过渡应已完成");
+    }
+    {
+        let transform = harness.app.world.get::<Transform>(body).unwrap();
+        assert!(
+            (transform.scale.y - rest.scale.y).abs() < 1e-6
+                && (transform.scale.x - rest.scale.x).abs() < 1e-6,
+            "过渡后 scale 应回到基姿势 {:?}（而非定格在 idle 呼吸的冻结值），实际 {:?}",
+            rest.scale,
+            transform.scale
+        );
+    }
+    // 松开 W 20 帧：回到纯 idle，rotation（walk 独有通道）淡回基姿势
+    harness.hold_forward(false);
+    harness.frames(20);
+    {
+        let player = harness
+            .app
+            .world
+            .get::<AnimationPlayer>(ents.player_model)
+            .expect("AnimationPlayer 在位");
+        assert_eq!(player.current_state, STATE_IDLE);
+        assert!(player.blend.is_none(), "walk→idle 过渡应已完成");
+    }
+    {
+        let transform = harness.app.world.get::<Transform>(body).unwrap();
+        let angle = 2.0
+            * transform
+                .rotation
+                .dot(rest.rotation)
+                .abs()
+                .clamp(0.0, 1.0)
+                .acos();
+        assert!(
+            angle < 1e-4,
+            "过渡后 rotation 应回到基姿势 {:?}（而非定格在 walk 摇摆值），实际 {:?}",
+            rest.rotation,
+            transform.rotation
+        );
+    }
 }
 
 /// LOD（R30）量化（记录性断言）：同一世界近景 / 拉远两帧——远景装饰
