@@ -428,6 +428,9 @@ fn build_scene(world: &mut World, scene_path: &Path, enemy_model_path: &Path) {
                 half_x: half_extents.x,
                 half_z: half_extents.z,
             },
+            // 竖直胶囊在俯视 XZ 面的投影 = 同半径圆：胶囊轴恒竖直，俯视
+            // 玩法的阻挡范围由半径决定（half_height 只影响竖直方向）
+            ColliderShape::Capsule { radius, .. } => StaticShape::Sphere { radius },
         };
         statics.0.push((transform.position, shape));
     });

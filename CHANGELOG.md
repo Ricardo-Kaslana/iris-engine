@@ -5,6 +5,70 @@
 
 ## [Unreleased]
 
+### Added（R31：物理角色控制器——竖直 Capsule 碰撞体 + move_and_slide 运动学控制器）
+
+- **竖直 Capsule 碰撞体**（iris-core `physics`）：`ColliderShape::Capsule
+  { radius, half_height }`——轴段恒沿世界 ±Y（端点 = 中心 ±
+  (half_height − radius)·Y，`half_height ≥ radius` 构造断言，取等号退化
+  为球），角色直立人体的标准形状；构造辅助 `Collider::static_capsule` /
+  `dynamic_capsule`。作为一等形状放进 `ColliderShape` 的意义：broadphase
+  （collider_aabb → 中心 ± (radius, half_height, radius)，**胶囊轴恒竖直
+  故 AABB 简单**）、`detect_pair` 配对、射线、扫掠**全部自动获得胶囊
+  支持**。`detect_pair` 新增三对配对（+反向共 6 分支，形状对穷举 9 分支）：
+  capsule-球 = 轴段最近点（解析投影 clamp [0,1]，段-点最近点）退化到
+  球-球（段内最近点等价球-球、端点即端帽判定）；capsule-AABB = 轴段-盒
+  **交替投影 4 轮收敛**（来回 clamp 段参数与盒范围——迭代近似非解析，
+  竖直段 × 轴对齐盒按 XZ/Y 分解 2 轮内即收敛，4 轮为确定性裕度；盒内
+  照 sphere_box 最浅穿透轴退出的既有语义）；capsule-capsule = 段-段最近
+  距离（标准钳制交替解法 4 轮；竖直轴恒平行，距离与解析对照一致）。
+  法线方向约定与既有 Contact 一致（a → b）。`ray_vs_shape` 增胶囊分支：
+  无限圆柱 slab 解（推导入文档：水平距离约束代入射线得 a·t² + 2b·t + c
+  = 0，近根 + 轴段 y 范围裁剪）+ 上下端帽两球解析解取最小正 t，起点在
+  内部 → t = 0 照既有 ray_sphere 语义（法线 = 离轴方向、重合退化 −dir）。
+  精确数值单测：侧向 / 端帽 / 反向法线翻转 / 平行轴解析对照 / 退化胶囊
+  ≡ 球 / 射线正交命中 t 精确 / 端帽斜法线 / 未命中 / 内部起点 / max_t
+  裁剪 / 胶囊经完整 step_physics 管线（网格 broadphase + 检测 + 求解）
+  落地静止。
+- **扫掠重叠判定阈值**：`sphere_sweep` 泛化为 `shape_sweep`（任意
+  `ColliderShape`，同款保守推进二分 24 次；`sphere_sweep` 变为其球便捷
+  封装，行为不变），并引入 `SWEEP_CONTACT_EPSILON = 1e-6`——穿透低于
+  阈值按「恰好相切 / f32 舍入噪声」处理不算重叠（静置贴合面经浮点路径
+  可产生 ~1e-8 名义穿透，若算重叠会把「起点已重叠」误判、贴地角色原地
+  卡死）。
+- **运动学角色控制器**（iris-core 新模块 `character`）：`move_and_slide`
+  （世界封装，收集语义与 `resolve_against_statics` 一致）/
+  `move_and_slide_statics`（纯函数核心，静态体列表入参可脱离世界单测，
+  R21 球扫掠的正式消费）——竖直胶囊 + 五步管线（顺序即文档）：① 重力
+  （`v.y += g·gravity_scale·dt`）；② 水平**最多 4 次扫掠迭代**：形状
+  扫掠求首次碰撞 → 推进到命中点 → 速度与剩余位移切掉法向分量（法线
+  水平归一，陡坡斜法线不把水平推力转成沿坡上滑分量；可站立坡面不切
+  速度）→ 贴墙滑行；③ 台阶「抬起重试」：`vel.y ≤ 0` 且脚下 snap 距离
+  内有地面（防空中跨步）且正上方畅通才抬升 `step_height`，前向位移完整
+  走完 + 向下扫掠落回 + 落点法线可站立才接受——不可站立阻挡（台阶迎风
+  面）前向距离至少 `radius`（中心须送进台面落到平顶，贴台缘角点法线
+  倾斜永不成立；半径前跳的速度红利仅限「撞墙迈台阶」一种情形），可站立
+  坡面按剩余位移原样（缓坡上坡 = 逐帧低台阶）；④ 斜坡限 + **贴地吸附**
+  （同一 次向下扫掠，探测距离 = `max(|vel.y·dt|, snap_distance)`）：法线
+  `n.y ≥ cos(slope_limit)` → grounded、`vel.y = 0`；过陡 → 不 grounded、
+  速度切掉入坡法向（下滑分量保留，重力逐帧沿坡加速自然下滑）；⑤ 跳跃
+  （`vel.y > 0`）不吸附，向上扫掠命中天花板贴住。输出
+  `CharacterOutput { position, velocity, grounded, ground_normal }` 由
+  调用方写回组件。全程纯函数、固定迭代轮数、无随机源——同输入两次调用
+  逐位一致（单测守护）。场景测试全坐标写死：平地行走 / 墙前 radius 停止
+  与切向滑行 / 低台阶一步迈上 / 高墙照撞 / 缓坡（30°，大山球解析斜面）
+  上坡贴地 / 陡坡（60°）不 grounded 下滑加速 / 下小坡 snap 不腾空 /
+  跳跃抛物线回落 / 确定性 / 空静态体自由运动。诚实边界（模块文档）：
+  起点嵌入不去穿、一步一台阶、全贯穿不检出。
+- **三处 `ColliderShape` 穷举匹配同步**：iris-arena（俯视投影：胶囊
+  `Capsule { radius, .. }` → 同半径圆——轴竖直、俯视阻挡由半径决定）；
+  iris-engine 场景序列化（`ColliderShapeSection::Capsule`，外部标签
+  `{"capsule": {"radius", "half_height"}}`，加载鲁棒 clamp 半高 ≥ 半径、
+  旧文件不受影响，往返单测守护）；iris-render 无 `ColliderShape` 消费
+  点（grep 确认）。iris-game 未迁移 `move_and_slide`：玩家移动积分在纯
+  逻辑 `logic::step`（跳跃 / y 积分 / 钳制安全网，既有测试锁定行为），
+  迁移必改测试语义，违背「既有测试零改动」约束——`character` 模块文档
+  附用法示例作为消费范式。
+
 ### Added（R30：内存与规模——BC1 纹理压缩 + 距离 LOD + 内存占用统计）
 
 - **纹理 BC1 GPU 压缩**（iris-render `texture_bcn`）：上传决策树「设备

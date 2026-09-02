@@ -545,12 +545,14 @@ struct ColliderSection {
 }
 
 /// 碰撞形状段：`{"sphere": {"radius": ..}}` / `{"box": {"half_extents": [..]}}`
-/// （外部标签形式）。AABB 不随实体旋转（物理 v1 约定，见 iris-core::physics）。
+/// / `{"capsule": {"radius": .., "half_height": ..}}`（外部标签形式）。
+/// AABB 不随实体旋转、胶囊轴恒竖直（物理 v1 约定，见 iris-core::physics）。
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum ColliderShapeSection {
     Sphere { radius: f32 },
     Box { half_extents: [f32; 3] },
+    Capsule { radius: f32, half_height: f32 },
 }
 
 impl ColliderShapeSection {
@@ -560,6 +562,15 @@ impl ColliderShapeSection {
             Self::Box { half_extents } => ColliderShape::Box {
                 half_extents: half_extents.into(),
             },
+            Self::Capsule {
+                radius,
+                half_height,
+            } => ColliderShape::Capsule {
+                radius,
+                // 加载鲁棒性：半高 < 半径的退化文件按球（half_height =
+                // radius 的胶囊）处理，不在加载路径 panic
+                half_height: half_height.max(radius),
+            },
         }
     }
 
@@ -568,6 +579,13 @@ impl ColliderShapeSection {
             ColliderShape::Sphere { radius } => Self::Sphere { radius: *radius },
             ColliderShape::Box { half_extents } => Self::Box {
                 half_extents: half_extents.to_array(),
+            },
+            ColliderShape::Capsule {
+                radius,
+                half_height,
+            } => Self::Capsule {
+                radius: *radius,
+                half_height: *half_height,
             },
         }
     }
@@ -1258,6 +1276,49 @@ mod tests {
             body.velocity,
             Vec3::ZERO,
             "场景物体从静止开始（v1 不序列化速度）"
+        );
+    }
+
+    /// 胶囊形状段（R31）：`{"capsule": {"radius", "half_height"}}` 加载为
+    /// [`ColliderShape::Capsule`]，save ↔ load 往返保持（外部标签
+    /// snake_case）；旧格式文件（无 capsule 段）不受影响。
+    #[test]
+    fn capsule_shape_loads_and_roundtrips() {
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "capsule.scene.json",
+            r#"{
+                "entities": [{
+                    "transform": { "position": [0.0, 0.9, 0.0] },
+                    "collider": { "shape": { "capsule": { "radius": 0.4, "half_height": 0.9 } }, "static": true }
+                }]
+            }"#,
+        );
+        let collider = *world.get::<Collider>(entities[0]).unwrap();
+        assert_eq!(
+            collider.shape,
+            ColliderShape::Capsule {
+                radius: 0.4,
+                half_height: 0.9
+            }
+        );
+        assert!(collider.is_static);
+
+        // save ↔ load 往返：再加载的形状 bit 级一致
+        let out = test_dir().join("capsule_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            text.contains(r#""capsule""#),
+            "保存的 JSON 应含 capsule 形状段：{text}"
+        );
+        let mut world_b = fresh_world();
+        let (entities_b, _) = load_str(&mut world_b, "capsule_in.json", &text);
+        assert_eq!(
+            world_b.get::<Collider>(entities_b[0]).unwrap().shape,
+            collider.shape,
+            "往返后形状应 bit 级一致"
         );
     }
 

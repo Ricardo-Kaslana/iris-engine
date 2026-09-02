@@ -175,16 +175,21 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   独占屏障可见性，均有确定性测试；诚实性由「冲突即 panic」兜底——
   声明不诚实的并行系统会在运行期被锁检查当场击穿。
 
-### 3.8 物理子系统（iris-core/physics）
+### 3.8 物理子系统（iris-core/physics + iris-core/character）
 
-轻量刚体物理 v1（Sphere / AABB）：与变换层级同款的「组件 + 单一系统」模型，
-零新依赖（全部数学基于 glam 手写）。
+轻量刚体物理 v1（Sphere / AABB / 竖直 Capsule）：与变换层级同款的
+「组件 + 单一系统」模型，零新依赖（全部数学基于 glam 手写）。
 
-- **组件模型**：`Collider`（形状 Sphere/AABB + `is_static` + `restitution`）与
-  `RigidBody`（速度 / `gravity_scale` / 摩擦 / 线性阻尼）。**组件缺席语义**：
-  只有 `Collider`（无 `RigidBody`）= 静态体（与 `is_static` 取或）——不积分
-  不移动，只作碰撞对象；只有 `RigidBody`（无 `Collider`）= 仅受力积分，
-  不参与碰撞；两者都有且非静态 = 完整刚体。
+- **组件模型**：`Collider`（形状 Sphere / AABB / **竖直 Capsule** +
+  `is_static` + `restitution`）与 `RigidBody`（速度 / `gravity_scale` /
+  摩擦 / 线性阻尼）。**组件缺席语义**：只有 `Collider`（无 `RigidBody`）
+  = 静态体（与 `is_static` 取或）——不积分不移动，只作碰撞对象；只有
+  `RigidBody`（无 `Collider`）= 仅受力积分，不参与碰撞；两者都有且非静态
+  = 完整刚体。**竖直 Capsule**（R31）：轴段恒沿世界 ±Y（端点 = 中心 ±
+  (half_height − radius)·Y，`half_height ≥ radius` 构造断言）——角色
+  控制器的标准形状；因为放进 `ColliderShape` 成为一等形状，broadphase
+  （网格 AABB：中心 ± (radius, half_height, radius)）、detect_pair 配对、
+  射线（圆柱 slab + 端帽球解析）、扫掠**全部自动获得胶囊支持**。
 - **求解管线**（`step_physics`，系统只做编排，数值逻辑全在纯函数中）：
   两阶段收集（读 `Time.delta`，缺席视为 0；照 `update_animations` 的
   「收集 → 写回」两段式，迭代期间不持组件借用）→ 半隐式欧拉积分
@@ -203,11 +208,14 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   （`SOLVER_ITERATIONS`，速度响应只在首轮施加——重复施加会把摩擦/反弹
   多次结算）→ 写回 `Transform` / `RigidBody`。
 - **纯函数与确定性**：检测（`detect_pair`：球-球 / 球-AABB 含盒内最近面
-  退出 / AABB-AABB 最小穿透轴）与求解（`solve_contact`：分离 + 反弹 + 摩擦）
-  均为不触碰世界的纯函数，「穿透量 / 法线 / 反弹量」可脱离 ECS 单测。
-  系统内部严格单线程、固定遍历序（收集序 = 组件存储序），同一输入两次
-  模拟逐采样 bit 级一致（单测守护）——配 `Time::advance` / 固定步长即可
-  确定性回放。
+  退出 / AABB-AABB 最小穿透轴 / **胶囊三对**——capsule-球用轴段最近点
+  （解析投影 clamp）退化到球-球、capsule-AABB 用轴段-盒**交替投影 4 轮
+  收敛**（迭代近似，竖直段 × 轴对齐盒 2 轮内收敛，盒内照球-盒最浅轴
+  退出）、capsule-capsule 用段-段钳制交替解法 4 轮（竖直轴恒平行））
+  与求解（`solve_contact`：分离 + 反弹 + 摩擦）均为不触碰世界的纯函数，
+  「穿透量 / 法线 / 反弹量」可脱离 ECS 单测。系统内部严格单线程、固定
+  遍历序（收集序 = 组件存储序），同一输入两次模拟逐采样 bit 级一致
+  （单测守护）——配 `Time::advance` / 固定步长即可确定性回放。
 - **编排**：`PhysicsPlugin` 把 `step_physics` 注册为 Update 阶段的**并行
   系统**（访问集写 Transform / Collider / RigidBody + 读 Time；Collider
   v1 只读，属保守声明），层级传播在 PostUpdate——「物理在 Update 内求解、
@@ -239,14 +247,35 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 - **球扫掠 shapecast（角色控制器地基）**：`sphere_sweep`（纯函数：保守
   推进二分 24 次收敛，复用 `detect_pair`；「终点重叠、起点自由」为检出
   括弧——返回首次碰撞的位移分数 t∈[0,1] 与阻挡法线【从静态体指向扫掠球】，
-  「无重叠侧」边界减 epsilon 收缩留皮肤）与 `sphere_sweep_statics`（世界
-  静态体收集封装，缺席语义同 `resolve_against_statics`）。检出范围的诚实
-  边界（起点与终点都自由的完全贯穿返回 `None`，调用方按需分步）写在函数
-  文档。
+  「无重叠侧」边界减 epsilon 收缩留皮肤；穿透 ≤ `SWEEP_CONTACT_EPSILON`
+  （1e-6，静置贴合面的 f32 舍入名义穿透 ~1e-8）不算重叠——否则贴地角色
+  会被误判「起点已重叠」原地卡死）与 `sphere_sweep_statics`（世界静态体
+  收集封装，缺席语义同 `resolve_against_statics`）。任意形状泛化
+  `shape_sweep`（R31）同款算法供胶囊扫掠。检出范围的诚实边界（起点与
+  终点都自由的完全贯穿返回 `None`，调用方按需分步）写在函数文档。
+- **运动学角色控制器（iris-core/character，R31）**：`move_and_slide` /
+  `move_and_slide_statics`（纯函数核心，静态体列表入参可脱离世界单测）——
+  竖直胶囊 + 五步管线：① 重力（`v.y += g·gravity_scale·dt`）；② 水平
+  **最多 4 次扫掠迭代**：形状扫掠求首次碰撞 → 推进到命中点 → 速度与剩余
+  位移切掉法向分量（法线水平归一；**可站立坡面不切速度**，避免水平推力
+  转成沿坡上滑分量）→ 贴墙滑行；③ 台阶「抬起重试」：`vel.y ≤ 0` 且脚下
+  snap 内有地面且上方畅通才抬升 `step_height`，前向位移完整走完 + 向下
+  扫掠落回 + 落点法线可站立才接受——不可站立阻挡（台阶迎风面）前向距离
+  至少 `radius`（中心送进台面落到平顶，贴台缘角点法线倾斜永不成立），
+  可站立坡面按剩余位移原样（缓坡上坡 = 逐帧低台阶）；④ 斜坡限：垂直向下
+  扫掠（探测距离 `max(|vel.y·dt|, snap_distance)`，即**贴地吸附**并入同一
+  次扫掠）命中：法线 `n.y ≥ cos(slope_limit)` → grounded、`vel.y = 0`；
+  过陡 → 不 grounded、速度切掉入坡法向（沿坡下滑分量保留，重力逐帧沿坡
+  加速自然下滑）；⑤ `vel.y > 0`（跳跃）不吸附，向上扫掠命中天花板贴住。
+  输出 `CharacterOutput { position, velocity, grounded, ground_normal }`
+  由调用方写回组件。诚实边界：起点嵌入不去穿（出生点须合法）、一步一台
+  阶、全贯穿不检出。
 - **v1 限制（诚实清单）**：
   1. **AABB 不随实体旋转**：`ColliderShape::Box` 是世界轴对齐包围盒，
      旋转实体的碰撞盒不跟着转（物理体应使用不旋转的实体，或把旋转只给
-     表现子实体）；
+     表现子实体）；**胶囊同理恒竖直**：`ColliderShape::Capsule` 轴段固定
+     沿世界 ±Y、不随实体倒下——斜置胶囊（横倒圆柱）请用球串或 AABB
+     近似；
   2. **物理体须为根实体**：`step_physics` 把 `Transform.position` 当世界
      坐标读写，与层级并用时须自行保证物理体无父级（或父级变换恒等）；
   3. **非迭代完整求解器**：等质量冲量 + 2 次位置松弛，重堆叠会松弛不
@@ -254,7 +283,11 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   4. **粗检测为 AABB 网格快照**：均匀网格按「积分后、求解前」的 AABB 一次
      构建，求解期位置修正（穿透量级）不重建——常规场景修正量远小于 cell
      尺寸、候选为保守超集（LCG 生成 ~200 AABB 的单测守护）；极端穿透
-     （接近 cell 尺寸）理论上可能漏对。
+     （接近 cell 尺寸）理论上可能漏对；
+  5. **胶囊最近点为迭代近似**：capsule-AABB / capsule-capsule 的最近点
+     用交替投影 4 轮收敛（竖直轴配对下 2 轮内即精确），非解析解但同输入
+     恒同结果；角色控制器的台阶前跳（不可站立阻挡时前向 ≥ radius）带来
+     单帧至多一个 radius 的水平速度红利。
 
 ## 4. 渲染管线（iris-render）
 

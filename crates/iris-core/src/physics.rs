@@ -1,4 +1,5 @@
-//! 物理与碰撞 v1：轻量刚体物理（Sphere / AABB），积分 → 检测 → 响应 → 迭代松弛。
+//! 物理与碰撞 v1：轻量刚体物理（Sphere / AABB / 竖直 Capsule），
+//! 积分 → 检测 → 响应 → 迭代松弛。
 //!
 //! 与 [`crate::transform`] / [`crate::hierarchy`] 同款的「组件 + 单一系统」模型：
 //! - [`Collider`]：碰撞体（形状 + 是否静态 + 弹性）；
@@ -65,13 +66,19 @@
 //! [`sphere_sweep`] / [`sphere_sweep_statics`]：半径 `r` 的球从 `origin`
 //! 位移 `displacement`，问「首次碰到静态体的位移分数 t∈[0,1] 与阻挡
 //! 法线」。实现为保守推进二分（复用 [`detect_pair`]，24 次收敛）——
-//! 非解析解但确定性：同输入恒同输出。
+//! 非解析解但确定性：同输入恒同输出。任意形状的泛化版本
+//! [`shape_sweep`](crate::physics::shape_sweep) 同款算法——竖直胶囊
+//! （[`ColliderShape::Capsule`]）扫掠即由此获得；角色控制器的正式消费方
+//! 见 [`crate::character`]（`move_and_slide` 运动学控制器）。
 //!
 //! # v1 限制（诚实清单）
 //!
 //! - **AABB 不随实体旋转**：[`ColliderShape::Box`] 是世界轴对齐包围盒，
 //!   旋转实体的碰撞盒不跟着转——物理体应使用不旋转的实体（或把旋转只用于
-//!   表现子实体）；
+//!   表现子实体）；**胶囊同理恒竖直**：[`ColliderShape::Capsule`] 的轴段
+//!   固定沿世界 ±Y（中心 ± (half_height − radius)·Y），旋转实体的胶囊
+//!   不跟着倒——竖直胶囊正是角色控制器（直立人体）的形状，斜置胶囊
+//!   （如横倒圆柱）v1 不支持，请用球串或 AABB 近似；
 //! - **物理体须为根实体**：`step_physics` 把 `Transform.position` 当世界
 //!   坐标读写——与变换层级并用时请自行保证物理体没有父级（或父级变换恒等）；
 //! - **非迭代完整求解器**：等质量冲量 + 2 次位置松弛，重堆叠场景松弛不
@@ -96,6 +103,12 @@
 //!     Collider::dynamic_sphere(0.5, 0.8),
 //!     RigidBody { friction: 0.4, linear_damping: 0.1, ..RigidBody::default() },
 //! ));
+//! // 竖直胶囊（角色碰撞体：半高 0.9 ≥ 半径 0.4，脚底 = 中心 y − 0.9）——
+//! // 配 iris-core::character 的 move_and_slide 做运动学角色控制器
+//! world.spawn((
+//!     Transform::from_xyz(0.0, 0.9, 0.0),
+//!     Collider::static_capsule(0.4, 0.9),
+//! ));
 //! ```
 
 use glam::Vec3;
@@ -115,7 +128,8 @@ pub const PHYSICS_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 /// 减弱堆叠场景的单帧残余穿透（速度响应只在首轮施加，见 [`solve_contact`]）。
 pub const SOLVER_ITERATIONS: usize = 2;
 
-/// 碰撞形状。v1 支持 Sphere 与世界轴对齐 Box（AABB 不随实体旋转，见模块文档）。
+/// 碰撞形状。v1 支持 Sphere、世界轴对齐 Box（AABB 不随实体旋转）与
+/// **竖直** Capsule（轴段恒沿 ±Y，不随实体旋转，见模块文档 v1 清单）。
 #[derive(Clone, Copy, Debug, PartialEq, Component)]
 pub enum ColliderShape {
     /// 球体。
@@ -127,6 +141,15 @@ pub enum ColliderShape {
     Box {
         /// 半边长（米）。
         half_extents: Vec3,
+    },
+    /// 竖直胶囊：圆柱段 + 上下两半球端帽（角色控制器的标准形状）。
+    /// 轴段端点 = 中心 ± (half_height − radius)·Y——`half_height ≥ radius`
+    /// （构造辅助有断言；取等号时退化为球）。
+    Capsule {
+        /// 端帽半球半径（米），也是水平方向的最大半宽。
+        radius: f32,
+        /// 胶囊半高（米）：整体包围盒的半高（须 ≥ radius）。
+        half_height: f32,
     },
 }
 
@@ -175,6 +198,39 @@ impl Collider {
             shape: ColliderShape::Box { half_extents },
             is_static: false,
             restitution,
+        }
+    }
+
+    /// 静态竖直胶囊（角色 / 胶囊柱），弹性 0。`half_height ≥ radius` 断言。
+    pub fn static_capsule(radius: f32, half_height: f32) -> Self {
+        Self {
+            shape: ColliderShape::capsule(radius, half_height),
+            is_static: true,
+            restitution: 0.0,
+        }
+    }
+
+    /// 动态竖直胶囊。
+    pub fn dynamic_capsule(radius: f32, half_height: f32, restitution: f32) -> Self {
+        Self {
+            shape: ColliderShape::capsule(radius, half_height),
+            is_static: false,
+            restitution,
+        }
+    }
+}
+
+impl ColliderShape {
+    /// 构造竖直胶囊形状：`half_height ≥ radius` 断言（中文断言消息，
+    /// 半高小于半径的「胶囊」不再是凸的竖直胶囊语义）。
+    pub fn capsule(radius: f32, half_height: f32) -> Self {
+        assert!(
+            half_height >= radius,
+            "胶囊 half_height {half_height} 须 ≥ radius {radius}（半高小于半径退化为非胶囊形状）"
+        );
+        Self::Capsule {
+            radius,
+            half_height,
         }
     }
 }
@@ -256,6 +312,11 @@ pub struct ContactResponse {
 
 /// 形状对碰撞检测（纯函数）：穿透时返回接触，否则 `None`。
 /// 只依赖几何入参、不触碰世界——「穿透量 / 法线」可直接单测。
+///
+/// 三种形状两两配对共 9 分支（3 对称 + 6 有序）：胶囊相关的新对为
+/// capsule-sphere（轴段最近点 → 球-球）、capsule-AABB（轴段-盒交替投影 →
+/// 复用球-盒）、capsule-capsule（段-段最近距离）；法线方向约定与既有
+/// [`Contact`] 一致（a → b），反向对翻转入参后取反法线。
 pub fn detect_pair(
     a_pos: Vec3,
     a_shape: &ColliderShape,
@@ -282,6 +343,62 @@ pub fn detect_pair(
         }
         (ColliderShape::Box { half_extents: a_he }, ColliderShape::Box { half_extents: b_he }) => {
             box_box(a_pos, a_he, b_pos, b_he)
+        }
+        // 胶囊在前：capsule_sphere / capsule_box 返回「从胶囊指向对方」的法线，恰为 a → b
+        (
+            ColliderShape::Capsule {
+                radius: r,
+                half_height: hh,
+            },
+            ColliderShape::Sphere { radius: rb },
+        ) => capsule_sphere(a_pos, *r, *hh, b_pos, *rb).map(|(normal, penetration)| Contact {
+            normal,
+            penetration,
+        }),
+        (
+            ColliderShape::Capsule {
+                radius: r,
+                half_height: hh,
+            },
+            ColliderShape::Box { half_extents },
+        ) => {
+            capsule_box(a_pos, *r, *hh, b_pos, half_extents).map(|(normal, penetration)| Contact {
+                normal,
+                penetration,
+            })
+        }
+        (
+            ColliderShape::Capsule {
+                radius: ra,
+                half_height: ahh,
+            },
+            ColliderShape::Capsule {
+                radius: rb,
+                half_height: bhh,
+            },
+        ) => capsule_capsule(a_pos, *ra, *ahh, b_pos, *rb, *bhh),
+        // 胶囊在后：交换到「胶囊在前」求解，再把法线翻回 a → b
+        (
+            ColliderShape::Sphere { radius: r },
+            ColliderShape::Capsule {
+                radius: rc,
+                half_height: hh,
+            },
+        ) => capsule_sphere(b_pos, *rc, *hh, a_pos, *r).map(|(normal, penetration)| Contact {
+            normal: -normal,
+            penetration,
+        }),
+        (
+            ColliderShape::Box { half_extents },
+            ColliderShape::Capsule {
+                radius: rc,
+                half_height: hh,
+            },
+        ) => {
+            capsule_box(b_pos, *rc, *hh, a_pos, half_extents).map(|(normal, penetration)| Contact {
+                normal: -normal,
+                penetration,
+            })
         }
     }
 }
@@ -467,8 +584,130 @@ fn signum(x: f32) -> f32 {
     if x >= 0.0 { 1.0 } else { -1.0 }
 }
 
+// ---------------------------------------------------------------------------
+// 竖直胶囊几何（detect_pair 的 capsule 系列辅助，全部纯函数、确定性）
+// ---------------------------------------------------------------------------
+
+/// 交替投影收敛轮数：胶囊轴段与盒 / 段-段最近点的迭代近似轮数。竖直胶囊
+/// 与 AABB / 竖直胶囊配对时问题可分解（XZ 与 Y 独立），2 轮内即收敛——
+/// 取 4 轮留裕度；同输入恒同轮数同结果（确定性优先于解析精确，见各函数文档）。
+const CAPSULE_PROJECTION_ROUNDS: usize = 4;
+
+/// 段-点最近点判定容差：段方向 `length²` 低于此值按「零长段」处理
+/// （half_height = radius 的退化胶囊，任意参数等价）。
+const SEGMENT_EPSILON_SQ: f32 = 1e-12;
+
+/// 竖直胶囊的轴段端点：中心 ± (half_height − radius)·Y（轴恒竖直，见
+/// [`ColliderShape::Capsule`]）。
+fn capsule_axis(center: Vec3, half_height: f32, radius: f32) -> (Vec3, Vec3) {
+    let half_axis = half_height - radius;
+    (center - Vec3::Y * half_axis, center + Vec3::Y * half_axis)
+}
+
+/// 段 `a → a + ab` 上到点 `p` 最近的参数（解析投影 clamp 到 [0,1]）。
+/// 零长段（ab 退化）取 0.5——端点重合时任意参数等价，取中值定死确定性。
+fn closest_on_segment(a: Vec3, ab: Vec3, p: Vec3) -> f32 {
+    let denom = ab.length_squared();
+    if denom <= SEGMENT_EPSILON_SQ {
+        return 0.5;
+    }
+    ((p - a).dot(ab) / denom).clamp(0.0, 1.0)
+}
+
+/// 胶囊-球检测：轴段上到球心的最近点（解析投影 clamp）→ 球-球。
+/// 最近点落在轴段内时等价于「半径 radius 的球在最近点处」的球-球；
+/// 落在端点时即端帽半球判定。返回（从胶囊指向球的法线，穿透深度）。
+fn capsule_sphere(
+    capsule_pos: Vec3,
+    radius: f32,
+    half_height: f32,
+    sphere_pos: Vec3,
+    sphere_radius: f32,
+) -> Option<(Vec3, f32)> {
+    let (a, b) = capsule_axis(capsule_pos, half_height, radius);
+    let ab = b - a;
+    let t = closest_on_segment(a, ab, sphere_pos);
+    sphere_sphere(a + ab * t, radius, sphere_pos, sphere_radius)
+        .map(|contact| (contact.normal, contact.penetration))
+}
+
+/// 胶囊-AABB 检测：轴段与盒的最近点——**交替投影**（段上点投影到盒范围
+/// （clamp），再把盒上点投影回段参数（clamp），来回 [`CAPSULE_PROJECTION_ROUNDS`]
+/// 轮收敛）。这是迭代近似而非解析解：竖直段 × 轴对齐盒的问题按 XZ / Y
+/// 分解后 2 轮内收敛，4 轮为确定性裕度（同输入恒同结果）。盒内情形（段上
+/// 最近点进入盒内）照 [`sphere_box`] 的盒内逻辑——沿最浅穿透轴退出。
+/// 返回（从胶囊指向盒的法线，穿透深度）。
+fn capsule_box(
+    capsule_pos: Vec3,
+    radius: f32,
+    half_height: f32,
+    box_pos: Vec3,
+    half_extents: &Vec3,
+) -> Option<(Vec3, f32)> {
+    let (a, b) = capsule_axis(capsule_pos, half_height, radius);
+    let ab = b - a;
+    let min = box_pos - *half_extents;
+    let max = box_pos + *half_extents;
+    let mut t = 0.5; // 起始参数取段中点（确定性；首轮投影即修正到真实邻域）
+    for _ in 0..CAPSULE_PROJECTION_ROUNDS {
+        let on_segment = a + ab * t;
+        let on_box = on_segment.clamp(min, max);
+        t = closest_on_segment(a, ab, on_box);
+    }
+    let closest = a + ab * t;
+    sphere_box(closest, radius, box_pos, half_extents)
+}
+
+/// 胶囊-胶囊检测：段-段最近距离（标准钳制解法——固定对方参数解析投影
+/// 己方、clamp 到 [0,1]，交替 [`CAPSULE_PROJECTION_ROUNDS`] 轮收敛），
+/// 距离对比半径和。竖直胶囊的轴恒平行（都沿 ±Y），交替投影 2 轮内收敛；
+/// 4 轮为确定性裕度。法线从 a 指向 b；两轴段最近点重合（穿透中心重合等
+/// 退化）时取 +Y（与 [`sphere_sphere`] 同约定）。
+fn capsule_capsule(
+    a_pos: Vec3,
+    a_radius: f32,
+    a_half_height: f32,
+    b_pos: Vec3,
+    b_radius: f32,
+    b_half_height: f32,
+) -> Option<Contact> {
+    let (a0, a1) = capsule_axis(a_pos, a_half_height, a_radius);
+    let (b0, b1) = capsule_axis(b_pos, b_half_height, b_radius);
+    let d1 = a1 - a0;
+    let d2 = b1 - b0;
+    let mut s = 0.5;
+    let mut t = 0.5;
+    for _ in 0..CAPSULE_PROJECTION_ROUNDS {
+        let on_b = b0 + d2 * t;
+        s = closest_on_segment(a0, d1, on_b);
+        let on_a = a0 + d1 * s;
+        t = closest_on_segment(b0, d2, on_a);
+    }
+    let closest_a = a0 + d1 * s;
+    let closest_b = b0 + d2 * t;
+    let delta = closest_b - closest_a;
+    let r_sum = a_radius + b_radius;
+    let dist_sq = delta.length_squared();
+    if dist_sq >= r_sum * r_sum {
+        return None;
+    }
+    if dist_sq <= SEGMENT_EPSILON_SQ {
+        // 最近点重合：方向退化，取 +Y（确定性任意方向）
+        return Some(Contact {
+            normal: Vec3::Y,
+            penetration: r_sum,
+        });
+    }
+    let dist = dist_sq.sqrt();
+    Some(Contact {
+        normal: delta / dist,
+        penetration: r_sum - dist,
+    })
+}
+
 /// 碰撞体的世界 AABB（球 → 中心 ± 半径；盒 → 中心 ± 半边长——盒本就
-/// 轴对齐，无需旋转）。供 broadphase 网格的插入与查询使用。
+/// 轴对齐，无需旋转；胶囊 → 中心 ± (radius, half_height, radius)——**轴
+/// 恒竖直**，AABB 即简单的外扩盒）。供 broadphase 网格的插入与查询使用。
 fn collider_aabb(pos: Vec3, shape: &ColliderShape) -> (Vec3, Vec3) {
     match *shape {
         ColliderShape::Sphere { radius } => {
@@ -476,6 +715,13 @@ fn collider_aabb(pos: Vec3, shape: &ColliderShape) -> (Vec3, Vec3) {
             (pos - r, pos + r)
         }
         ColliderShape::Box { half_extents } => (pos - half_extents, pos + half_extents),
+        ColliderShape::Capsule {
+            radius,
+            half_height,
+        } => {
+            let half = Vec3::new(radius, half_height, radius);
+            (pos - half, pos + half)
+        }
     }
 }
 
@@ -822,6 +1068,94 @@ pub fn ray_box(origin: Vec3, dir: Vec3, center: Vec3, half_extents: &Vec3) -> Op
     Some((t_min, normal))
 }
 
+/// 射线-竖直胶囊求交（纯函数，解析解）。
+///
+/// `dir` 须为**单位方向**（零长度方向返回 `None`）。胶囊 = 无限圆柱侧壁
+/// （轴段范围裁剪）+ 上下两个端帽球，取三者中最小正 `t`。推导：
+///
+/// - **侧壁（无限圆柱 slab）**：射线 `p(t) = origin + dir·t`，轴为过
+///   `center` 的竖直线。水平距离约束 `(p.x − c.x)² + (p.z − c.z)² = R²`
+///   代入射线得 `a·t² + 2b·t + c₀ = 0`，其中 `(ox, oz) = (origin − c).xz`、
+///   `a = dx² + dz²`、`b = ox·dx + oz·dz`、`c₀ = ox² + oz² − R²`（dir 单位
+///   长故一次项系数为 2b）。判别式 `Δ = b² − a·c₀ ≥ 0` 时近根
+///   `t = (−b − √Δ) / a`；命中点 y 须落在轴段范围
+///   `[c.y − (half_height − R), c.y + (half_height − R)]` 内，否则该命中
+///   实属端帽区（交给端帽球判定）。`a ≈ 0`（射线竖直、与侧壁平行）时
+///   无侧壁命中，只试端帽。侧壁外法线 = 命中点的水平径向
+///   `((p − c).xz / R, 0)`。
+/// - **端帽**：上下两球（`center ± (half_height − R)·Y`，半径 R）各走
+///   [`ray_sphere`]——外法线（指向射线来侧）天然正确。
+/// - **内部起点**：起点到轴段的最近距离 < R → `t = 0`，法线 = 离轴方向
+///   `(origin − 轴段最近点)` 归一（照 [`ray_sphere`] 的球内语义）；最近点
+///   与起点重合的退化取 `-dir`。并列 `t`（擦着端帽缘）按
+///   「侧壁 → 下帽 → 上帽」先检查先保留（确定性）。
+pub fn ray_capsule(
+    origin: Vec3,
+    dir: Vec3,
+    center: Vec3,
+    radius: f32,
+    half_height: f32,
+) -> Option<(f32, Vec3)> {
+    if dir.length_squared() <= DIR_EPSILON_SQ {
+        return None;
+    }
+    let half_axis = half_height - radius;
+    // 内部起点：到轴段（竖直）最近点的距离 < 半径 → t = 0、离轴法线
+    let closest_axis = Vec3::new(
+        center.x,
+        origin.y.clamp(center.y - half_axis, center.y + half_axis),
+        center.z,
+    );
+    let to_axis = origin - closest_axis;
+    if to_axis.length_squared() < radius * radius {
+        let normal = to_axis.normalize_or_zero();
+        return Some((0.0, if normal == Vec3::ZERO { -dir } else { normal }));
+    }
+    // 侧壁：无限圆柱 slab 解 + 轴段 y 范围裁剪
+    let mut best: Option<(f32, Vec3)> = None;
+    let ox = origin.x - center.x;
+    let oz = origin.z - center.z;
+    let a = dir.x * dir.x + dir.z * dir.z;
+    if a > DIR_EPSILON_SQ {
+        let b = ox * dir.x + oz * dir.z;
+        let c = ox * ox + oz * oz - radius * radius;
+        let discriminant = b * b - a * c;
+        if discriminant >= 0.0 {
+            let t = (-b - discriminant.sqrt()) / a; // 近根（外表面入射）
+            if t >= 0.0 {
+                let hit_y = origin.y + dir.y * t;
+                if (hit_y - center.y).abs() <= half_axis {
+                    // 侧壁外法线 = 水平径向（命中点绕轴指出）
+                    let normal =
+                        Vec3::new((ox + dir.x * t) / radius, 0.0, (oz + dir.z * t) / radius);
+                    best = Some((t, normal));
+                }
+            }
+        }
+    }
+    // 端帽两球：取最小正 t（严格小于才替换——并列保留先检查者，确定性）
+    let mut consider = |candidate: Option<(f32, Vec3)>| {
+        if let Some((t, n)) = candidate {
+            if best.is_none_or(|(current, _)| t < current) {
+                best = Some((t, n));
+            }
+        }
+    };
+    consider(ray_sphere(
+        origin,
+        dir,
+        center - Vec3::Y * half_axis,
+        radius,
+    ));
+    consider(ray_sphere(
+        origin,
+        dir,
+        center + Vec3::Y * half_axis,
+        radius,
+    ));
+    best
+}
+
 /// 射线-形状求交（[`ColliderShape`] 分发）＋ `t ≤ max_t` 裁剪。
 ///
 /// `dir` 须为**单位方向**；`t > max_t` 视为未命中（命中点超出查询范围）。
@@ -836,6 +1170,10 @@ pub fn ray_vs_shape(
     let (t, normal) = match shape {
         ColliderShape::Sphere { radius } => ray_sphere(origin, dir, pos, *radius)?,
         ColliderShape::Box { half_extents } => ray_box(origin, dir, pos, half_extents)?,
+        ColliderShape::Capsule {
+            radius,
+            half_height,
+        } => ray_capsule(origin, dir, pos, *radius, *half_height)?,
     };
     if t > max_t {
         return None;
@@ -923,10 +1261,37 @@ const SWEEP_BISECTION_STEPS: usize = 24;
 /// 留一层防抖皮肤。
 const SWEEP_SKIN: f32 = 1e-4;
 
+/// 扫掠重叠判定阈值：穿透深度低于此值按「恰好相切 / f32 舍入噪声」
+/// 处理、不算重叠——静置在面上的形状经舍入可产生 ~1e-8 量级的名义
+/// 穿透（如 0.9 − 0.5 + 1.4 的浮点路径），若算重叠会把「起点已重叠」
+/// 误判、角色原地卡死。
+const SWEEP_CONTACT_EPSILON: f32 = 1e-6;
+
 /// 球扫掠（纯函数）：半径 `radius` 的球从 `origin` 位移 `displacement`，
 /// 对一组静态体问「首次碰撞」。返回 `(位移分数 t ∈ [0,1], 阻挡法线)`——
 /// 法线为**从静态体指向扫掠球**的单位向量（消费方沿法线切掉位移的法向
 /// 分量即得滑动）。未命中返回 `None`。
+///
+/// [`shape_sweep`] 的球便捷封装（算法、退化与诚实边界见其文档）。
+pub fn sphere_sweep(
+    origin: Vec3,
+    displacement: Vec3,
+    radius: f32,
+    statics: &[(Vec3, ColliderShape)],
+) -> Option<(f32, Vec3)> {
+    shape_sweep(
+        origin,
+        displacement,
+        &ColliderShape::Sphere { radius },
+        statics,
+    )
+}
+
+/// 形状扫掠（纯函数，[`sphere_sweep`] 的任意形状泛化）：`shape`（如竖直
+/// 胶囊 [`ColliderShape::Capsule`]）从 `origin` 位移 `displacement`，对一组
+/// 静态体问「首次碰撞」。返回 `(位移分数 t ∈ [0,1], 阻挡法线)`——法线为
+/// **从静态体指向扫掠形状**的单位向量（消费方沿法线切掉位移的法向分量即得
+/// 滑动）。未命中返回 `None`。
 ///
 /// 实现为**保守推进二分**（复用 [`detect_pair`]，非解析解但确定性）：
 /// - 终点（t = 1）无任何重叠 → `None`；
@@ -934,25 +1299,28 @@ const SWEEP_SKIN: f32 = 1e-4;
 ///   **首个**检出接触的静态体（确定性）；
 /// - 否则以「lo 无重叠、hi 重叠」为不变式二分 24 次收敛到首次接触
 ///   边界，命中分数取**无重叠侧**边界 `lo` 再减 [`SWEEP_SKIN`] 收缩；
-///   法线 = `−detect_pair(球@t, 静态).normal`（接触法线从球指向静态，
-///   翻转即阻挡方向），静态体取迭代序首个；浮点噪声致收缩点测不出
+///   法线 = `−detect_pair(形状@t, 静态).normal`（接触法线从扫掠方指向
+///   静态，翻转即阻挡方向），静态体取迭代序首个；浮点噪声致收缩点测不出
 ///   接触时回退重叠侧边界 `hi`（两者相差 ≤ 2⁻²⁴）。
 ///
 /// **检出范围（诚实边界）**：只检出「终点重叠」括起的首次接触——
 /// 起点与终点都自由的**完全贯穿**（薄障碍被整段跳过）返回 `None`。
 /// 典型用法（角色控制器单帧位移被墙挡住，终点即嵌入处）恰为括弧
 /// 情形；位移可能贯穿薄障碍的调用方请分步扫掠。
-pub fn sphere_sweep(
+pub fn shape_sweep(
     origin: Vec3,
     displacement: Vec3,
-    radius: f32,
+    shape: &ColliderShape,
     statics: &[(Vec3, ColliderShape)],
 ) -> Option<(f32, Vec3)> {
-    let shape = ColliderShape::Sphere { radius };
-    // 指定位置上首个检出接触的静态体（迭代序，确定性）→ 阻挡法线
+    // 指定位置上首个检出**真实重叠**的静态体（迭代序，确定性）→ 阻挡
+    // 法线。穿透 ≤ SWEEP_CONTACT_EPSILON（恰好相切 / 舍入噪声）不算
+    // 重叠——「起点已重叠」语义要求实际嵌入。
     let blocker_at = |pos: Vec3| -> Option<Vec3> {
         statics.iter().find_map(|(static_pos, static_shape)| {
-            detect_pair(pos, &shape, *static_pos, static_shape).map(|c| -c.normal)
+            detect_pair(pos, shape, *static_pos, static_shape)
+                .filter(|contact| contact.penetration > SWEEP_CONTACT_EPSILON)
+                .map(|contact| -contact.normal)
         })
     };
     // 终点必须重叠（完全贯穿的诚实边界见函数文档）——`?` 在此只做
@@ -2125,5 +2493,284 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- 竖直胶囊：capsule-sphere / capsule-AABB / capsule-capsule ----
+
+    /// 半径 0.5、半高 1.5 的竖直胶囊（轴段 y ∈ [−1, 1]）。
+    fn capsule() -> ColliderShape {
+        ColliderShape::Capsule {
+            radius: 0.5,
+            half_height: 1.5,
+        }
+    }
+
+    /// capsule-球：侧向（最近点在轴段内，等价最近点处的球-球）/ 端帽
+    ///（最近点 = 轴段端点，法线斜向）/ 反向参数序法线翻转 / 分离。
+    #[test]
+    fn capsule_sphere_lateral_end_cap_and_reverse() {
+        // 侧向：球心 (0.9, 0.3, 0)，轴段最近点 (0, 0.3, 0)（参数 0.65，
+        // 段内）→ 等价球-球：中心距 0.9 < 半径和 1.0
+        let sphere = ColliderShape::Sphere { radius: 0.5 };
+        let side = detect_pair(Vec3::new(0.9, 0.3, 0.0), &sphere, Vec3::ZERO, &capsule())
+            .expect("侧向应接触");
+        assert!(
+            (side.normal - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-5,
+            "球在前：法线应从球指向胶囊（−X），实际 {:?}",
+            side.normal
+        );
+        assert!((side.penetration - 0.1).abs() < 1e-5, "穿透 = 1.0 − 0.9");
+
+        // 胶囊在前：法线从胶囊指向球（+X），穿透不变
+        let forward = detect_pair(Vec3::ZERO, &capsule(), Vec3::new(0.9, 0.3, 0.0), &sphere)
+            .expect("侧向应接触");
+        assert!(
+            (forward.normal - Vec3::X).length() < 1e-5,
+            "胶囊在前：法线应从胶囊指向球（+X），实际 {:?}",
+            forward.normal
+        );
+        assert_eq!(forward.penetration, side.penetration);
+
+        // 端帽：球心 (0.9, 1.4, 0)，最近点 = 轴段上端点 (0, 1, 0)，
+        // 距离 √(0.81 + 0.16) = √0.97 → 穿透 1 − √0.97、法线斜向
+        let cap = detect_pair(Vec3::ZERO, &capsule(), Vec3::new(0.9, 1.4, 0.0), &sphere)
+            .expect("端帽应接触");
+        let dist = 0.97f32.sqrt();
+        let want_normal = Vec3::new(0.9 / dist, 0.4 / dist, 0.0);
+        assert!(
+            (cap.normal - want_normal).length() < 1e-5,
+            "端帽法线应从端点指向球心，实际 {:?}",
+            cap.normal
+        );
+        assert!((cap.penetration - (1.0 - dist)).abs() < 1e-5);
+
+        // 分离：球心距上端点 √(1.44 + 0.16) = 1.265 > 半径和 1.0
+        assert!(
+            detect_pair(Vec3::ZERO, &capsule(), Vec3::new(1.2, 1.4, 0.0), &sphere).is_none(),
+            "距端点 1.265 > 1.0 不应接触"
+        );
+    }
+
+    /// capsule-AABB：侧面（法线 −X）/ 端帽悬于顶面上方（法线 −Y、最近点
+    /// = 轴段下端点）/ 反向参数序 / 完全分离。
+    #[test]
+    fn capsule_box_side_end_cap_and_reverse() {
+        let box_ = ColliderShape::Box {
+            half_extents: Vec3::new(1.0, 0.5, 1.0),
+        };
+
+        // 侧面：胶囊轴 x = 1.35（盒右缘 1.0），轴段 y ∈ [−0.8, 1.2] 与盒
+        // y ∈ [−0.5, 0.5] 重叠 → 交替投影收敛到最近点 (1.35, 0.2, 0)，
+        // 间距 0.35 < 半径 0.5 → 穿透 0.15、法线从胶囊指向盒（−X）
+        let side = detect_pair(Vec3::new(1.35, 0.2, 0.0), &capsule(), Vec3::ZERO, &box_)
+            .expect("侧面应接触");
+        assert_eq!(side.normal, Vec3::new(-1.0, 0.0, 0.0));
+        assert!((side.penetration - 0.15).abs() < 1e-6);
+
+        // 端帽：胶囊悬于盒顶上方（中心 y = 1.75，轴段下端点 (0, 0.75, 0)），
+        // 最近点 = 下端点、到顶面 (0, 0.5, 0) 间距 0.25 → 穿透 0.25、法线 −Y
+        let cap = detect_pair(Vec3::new(0.0, 1.75, 0.0), &capsule(), Vec3::ZERO, &box_)
+            .expect("顶面端帽应接触");
+        assert_eq!(
+            cap.normal,
+            Vec3::new(0.0, -1.0, 0.0),
+            "法线从胶囊指向盒（−Y）"
+        );
+        assert!((cap.penetration - 0.25).abs() < 1e-6);
+
+        // 反向参数序（盒在前）：法线翻回 a → b（+Y），穿透不变
+        let flipped = detect_pair(Vec3::ZERO, &box_, Vec3::new(0.0, 1.75, 0.0), &capsule())
+            .expect("参数序无关，接触仍存在");
+        assert_eq!(flipped.normal, Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(flipped.penetration, cap.penetration);
+
+        // 完全分离：轴段下端点 (0, 1.2, 0) 距顶面 0.7 > 半径 0.5
+        assert!(
+            detect_pair(Vec3::new(0.0, 2.2, 0.0), &capsule(), Vec3::ZERO, &box_).is_none(),
+            "距顶面 0.7 > 0.5 不应接触"
+        );
+    }
+
+    /// capsule-capsule：平行轴（都竖直）距离解析对照——y 区间重叠时距离
+    /// = 轴线水平距；区间错开时端点距离；反向参数序法线翻转。
+    #[test]
+    fn capsule_capsule_parallel_axis_analytic() {
+        // 同尺寸胶囊 B 挪到 (0.8, 1.6, 0)：轴段 y ∈ [0.6, 2.6] 与 A 的
+        // [−1, 1] 重叠 → 最近距离 = 轴线水平距 0.8 < 半径和 1.0
+        let b_pos = Vec3::new(0.8, 1.6, 0.0);
+        let pair = detect_pair(Vec3::ZERO, &capsule(), b_pos, &capsule()).expect("平行轴应接触");
+        assert_eq!(pair.normal, Vec3::X, "法线从 a 指向 b（+X）");
+        assert!((pair.penetration - 0.2).abs() < 1e-6, "穿透 = 1.0 − 0.8");
+
+        // 反向参数序：法线翻转（−X），穿透不变
+        let flipped = detect_pair(b_pos, &capsule(), Vec3::ZERO, &capsule()).expect("应接触");
+        assert_eq!(flipped.normal, Vec3::new(-1.0, 0.0, 0.0));
+        assert_eq!(flipped.penetration, pair.penetration);
+
+        // y 区间错开 + 水平错开：B 轴段 y ∈ [2.6, 4.6]，最近点对为
+        // A 上端点 (0, 1, 0) 与 B 下端点 (1.2, 2.6, 0)，距离
+        // √(1.44 + 2.56) = 2.0 > 半径和 → 不接触
+        let apart = Vec3::new(1.2, 3.6, 0.0);
+        assert!(
+            detect_pair(Vec3::ZERO, &capsule(), apart, &capsule()).is_none(),
+            "端点距 2.0 = 半径和恰相切，不应接触"
+        );
+    }
+
+    /// half_height = radius 的退化胶囊按球语义求解（零长轴段）；
+    /// half_height < radius 的构造断言失败（中文断言消息）。
+    #[test]
+    fn degenerate_capsule_behaves_as_sphere() {
+        let degenerate = ColliderShape::Capsule {
+            radius: 0.5,
+            half_height: 0.5,
+        };
+        let sphere = ColliderShape::Sphere { radius: 0.5 };
+        let from_capsule = detect_pair(Vec3::ZERO, &degenerate, Vec3::new(0.9, 0.0, 0.0), &sphere)
+            .expect("退化胶囊应接触");
+        let from_sphere = detect_pair(Vec3::ZERO, &sphere, Vec3::new(0.9, 0.0, 0.0), &sphere)
+            .expect("对照球应接触");
+        assert_eq!(from_capsule, from_sphere, "退化胶囊应与同半径球完全一致");
+    }
+
+    #[test]
+    #[should_panic(expected = "须 ≥ radius")]
+    fn capsule_constructor_rejects_half_height_below_radius() {
+        let _ = ColliderShape::capsule(0.5, 0.4);
+    }
+
+    // ---- 射线-胶囊：ray_capsule（圆柱 slab + 端帽球，取最小正 t）----
+
+    /// 正交命中圆柱段 t 解析精确 / 端帽命中（斜法线）/ 未命中 / 内部起点
+    /// t = 0 / 背后射线 / ray_vs_shape 的 max_t 裁剪。
+    #[test]
+    fn ray_capsule_cylinder_cap_miss_inside_and_clipping() {
+        let shape = capsule();
+
+        // 正交命中圆柱段：起点 (5, 0.3, 0) 沿 −X → t = 5 − 0.5 = 4.5、
+        // 命中点 (0.5, 0.3, 0)、外法线 +X（全部二进制可精确保留）
+        let (t, normal) = ray_capsule(
+            Vec3::new(5.0, 0.3, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            1.5,
+        )
+        .expect("正交命中圆柱段");
+        assert_eq!(t, 4.5, "t = 起距 − 半径");
+        assert_eq!(normal, Vec3::X, "侧壁外法线 = 水平径向");
+
+        // 端帽命中：起点 (5, 1.3, 0) 高于圆柱段（y > 1）→ 上端帽球
+        //（心 (0, 1, 0)）解：(5−t)² + 0.09 = 0.25 → t = 4.6、
+        // 法线 = (0.4, 0.3, 0)/0.5 = (0.8, 0.6, 0)
+        let (t_cap, n_cap) = ray_capsule(
+            Vec3::new(5.0, 1.3, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            1.5,
+        )
+        .expect("端帽应命中");
+        assert!((t_cap - 4.6).abs() < 1e-5, "t = 4.6，实际 {t_cap}");
+        assert!(
+            (n_cap - Vec3::new(0.8, 0.6, 0.0)).length() < 1e-5,
+            "端帽法线应斜向，实际 {n_cap:?}"
+        );
+
+        // 未命中：起点 (5, 1.6, 0) 高于端帽顶（1.5）且判别式 < 0
+        assert!(
+            ray_capsule(
+                Vec3::new(5.0, 1.6, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::ZERO,
+                0.5,
+                1.5
+            )
+            .is_none(),
+            "从胶囊上方掠过不应命中"
+        );
+
+        // 内部起点：(0.2, 0, 0) 距轴 0.2 < 0.5 → t = 0、法线 = 离轴方向
+        let (t_in, n_in) = ray_capsule(
+            Vec3::new(0.2, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            1.5,
+        )
+        .expect("内部起点应命中 t = 0");
+        assert_eq!(t_in, 0.0);
+        assert_eq!(n_in, Vec3::X, "法线 = 离轴方向");
+        // 起点在轴上：离轴向量退化 → 取 −dir（确定性任意方向）
+        let (t_axis, n_axis) =
+            ray_capsule(Vec3::ZERO, Vec3::new(-1.0, 0.0, 0.0), Vec3::ZERO, 0.5, 1.5)
+                .expect("轴上起点应命中 t = 0");
+        assert_eq!(t_axis, 0.0);
+        assert_eq!(n_axis, Vec3::X, "重合退化取 −dir");
+
+        // 背后：胶囊在射线背后（近根为负）
+        assert!(
+            ray_capsule(
+                Vec3::new(5.0, 0.3, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::ZERO,
+                0.5,
+                1.5
+            )
+            .is_none(),
+            "背向胶囊的射线不应命中"
+        );
+
+        // ray_vs_shape 分发 + max_t 裁剪：4.5 > 4.0 视为未命中；放宽到 5 命中
+        assert!(
+            ray_vs_shape(
+                Vec3::new(5.0, 0.3, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+                4.0,
+                Vec3::ZERO,
+                &shape
+            )
+            .is_none(),
+            "命中点超出 max_t 应视为未命中"
+        );
+        let hit = ray_vs_shape(
+            Vec3::new(5.0, 0.3, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            5.0,
+            Vec3::ZERO,
+            &shape,
+        )
+        .expect("max_t 覆盖命中点应命中");
+        assert_eq!(hit.t, 4.5);
+        assert_eq!(hit.point, Vec3::new(0.5, 0.3, 0.0));
+    }
+
+    /// 胶囊经完整 step_physics 管线（网格 broadphase 的胶囊 AABB + capsule
+    /// 检测 + 求解）落地静止：中心稳定在 half_height（穿透 < 1e-3）、不抖。
+    #[test]
+    fn capsule_body_settles_on_floor_through_pipeline() {
+        const FINE: f32 = 1.0 / 120.0;
+        let mut world = make_world();
+        spawn_floor(&mut world);
+        let capsule_entity = world.spawn((
+            Transform::from_xyz(0.0, 5.0, 0.0),
+            Collider::dynamic_capsule(0.5, 1.5, 0.0),
+            RigidBody::default(),
+        ));
+        let steps = (3.0 / FINE) as usize;
+        for i in 0..steps {
+            step(&world, FINE);
+            if i >= steps - 10 {
+                let y = ball_position(&world, capsule_entity).y;
+                assert!(
+                    (y - 1.5).abs() < 1e-3,
+                    "静止穿透应 < 1e-3（中心 y = half_height 1.5），实际 {y}"
+                );
+            }
+        }
+        assert!(
+            ball_velocity(&world, capsule_entity).length() < 1e-4,
+            "静止后速度应 ≈ 0"
+        );
     }
 }

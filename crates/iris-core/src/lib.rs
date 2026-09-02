@@ -15,6 +15,7 @@
 extern crate self as iris_core;
 
 pub mod broadphase;
+pub mod character;
 pub mod component;
 pub mod entity;
 pub mod event;
@@ -37,6 +38,9 @@ pub use iris_macros::{Component, Event, Resource};
 pub mod prelude {
     // 同名 trait 与派生宏分属不同命名空间，可同时导出：
     // `use iris_core::prelude::*;` 后即可直接 `#[derive(Component)]`
+    pub use crate::character::{
+        CharacterOutput, CharacterParams, move_and_slide, move_and_slide_statics,
+    };
     pub use crate::component::Component;
     pub use crate::entity::Entity;
     pub use crate::event::{AppExit, Event, Events};
