@@ -5,6 +5,47 @@
 
 ## [Unreleased]
 
+### Added（R29：阴影 v2——方向光级联阴影 CSM，3 级）
+
+- **级联阴影贴图**（iris-render）：方向光阴影贴图从单张 2048² 升级为
+  **2048² × 3 层 `texture_2d_array`**——逐级联一个渲染 pass（每层独立的
+  D2 颜色/深度视图），采样侧全层数组视图按级联选层；「R32Float 颜色附件
+  存深度 + Depth32Float 深度附件 Less 测试」的双附件方案原样保留（§4.7
+  的 DX12 depth-only 教训对数组同样适用），点光 cubemap 阴影不动。
+  近处纹素密度提升约一个量级（默认相机下首级联 ~100 texel/m，v1 单张
+  ~42），解决大场景「近处阴影糊、远处无影」。
+- **实用分割（PFS）**：`cascade_splits(near, far)` 纯函数——对数/线性
+  分割按 λ = 0.6 混合，`near` 取 `min(z_near, 1.0)`，`far` 钳制到覆盖
+  距离常量 **`SHADOW_DISTANCE = 120 m`**：级联只铺到此处，覆盖带之外的
+  片元不投影、保持受光（远级联接触阴影 peter-panning 随窗口增大，v1 接受）。
+- **拟合与纹素对齐**：`cascade_fit` 纯函数——相机深度片 8 角变换到光空间
+  （朝向逻辑与 v1 一致、光源眼点固定世界原点，深度窗口宽度与相机离原点
+  距离解耦）求 AABB，深度窗口向光/背光各外扩一个包围球半径（切片外的
+  高遮挡物与足印内的地面都在窗口内）；**XY 纹素对齐**（`snap_aabb_to_texels`，
+  min 向下/max 向上取整只扩不缩）——正交投影平移恒为纹素整数倍，相机
+  平移时阴影图采样相位只整纹素跳变，消除阴影边缘闪烁；Z 不对齐（深度
+  无可见相位漂移）。关键单测断言：对齐后跨度为 texel 整数倍、幂等、
+  拟合含住 8 角点、亚纹素平移 UV 漂移 ≤ 2 texel。
+- **级联选择（片元）**：`view_z = dot(world_pos − eye, cam_forward)`
+  （view 深度而非欧氏距离/clip z），`view_z < splits[i]` 即第 i 级；
+  `CsmParams`（224B：3 × 光空间矩阵 + 相机前向 + 分割点）独立 uniform
+  缓冲走 globals 组 **binding 8**（排现有最大 binding 7 之后，不扩
+  Globals——单一 `light_view_proj` 字段移除，Globals 576B → 512B，
+  skybox 同步）；阴影 pass 每级联一个 64B 矩阵小缓冲（一级联一缓冲，
+  规避 write_buffer 合并问题）。`textureSample` 的 uniform 控制流掩码
+  模式不变：选择/越界非均匀分支照常采样、事后混向受光。
+- **实例区间沿用主 pass**：三个级联 pass 复用主 pass 视锥剔除后的不透明
+  区间全部重画（保守不漏影；按级联视锥细化列为后续优化），透明项与粒子
+  不投影语义不变，`FrameStats` 口径不变。既有 shadow/point shadow/transparent
+  等全部 GPU 测试零改动通过；新 `csm_render.rs`：~80 m 大场景断言近/远
+  级联物体脚下都有阴影（远处脚下带像素证据）、级联边界两侧阴影带连续
+  （无接缝，窗口容差见测试注释）。
+- **验收图**：新示例 `csm_snapshot`（iris-engine，输出 `docs/csm.png`）：
+  近/中/远三距物体 + 大地面俯斜视——近处影子锐利、~104 m 处影子仍在、
+  136 m 处（覆盖带外）正确无影、级联过渡带无跳变。
+- **文档**：ARCHITECTURE §4.7.2（分割公式/纹素对齐原理/级联选择/覆盖
+  距离外无影）、README 阴影条目同步。
+
 ### Added（R28：动画 v2——crossfade 混合 + 轻量状态机 + 动画事件轨道）
 
 - **crossfade 姿势混合**（iris-render `animation`）：`AnimationPlayer`

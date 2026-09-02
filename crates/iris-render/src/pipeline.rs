@@ -3,6 +3,19 @@
 /// 阴影贴图分辨率（正方形边长）。
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
+/// 方向光级联阴影（CSM）的级联数量（R29）。
+///
+/// 阴影贴图是 2048² × [`SHADOW_CASCADES`] 层的 `texture_2d_array`，
+/// 每级联一次渲染 pass 写入对应层；片元按 view 深度选级联采样。
+pub const SHADOW_CASCADES: usize = 3;
+
+/// 方向光阴影的覆盖距离（世界单位，米；v1 常量）。
+///
+/// 级联沿相机视锥深度只铺到该距离：超出最远级联的片元**不投影、保持
+/// 受光**（远处背景不吃阴影开销与精度）。更远的投影（如地形级阴影）
+/// 留待后续路线。
+pub const SHADOW_DISTANCE: f32 = 120.0;
+
 /// 点光 cubemap 阴影贴图分辨率（每面边长；6 面 × 512² R32Float）。
 pub const POINT_SHADOW_MAP_SIZE: u32 = 512;
 
@@ -42,9 +55,9 @@ pub(crate) struct PipelineBundle {
     /// 一致；实例按视深降序绘制）。
     pub particle_alpha_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
-    /// 阴影 pass 专用的精简全局布局（只含 uniform，
-    /// 不绑定阴影贴图本身——避免同 pass 内读写冲突）。
-    pub shadow_globals_layout: wgpu::BindGroupLayout,
+    /// 级联阴影 pass 的每级联精简布局：binding 0 = 64B 级联视图投影矩阵
+    /// uniform（顶点算裁剪位置；一缓冲一级联，同 pass 内不读写阴影贴图）。
+    pub cascade_layout: wgpu::BindGroupLayout,
     /// 点光阴影每面参数布局：binding 0 = 独立小 uniform
     /// （面视图投影矩阵 + 灯位置/range；顶点算裁剪、片段算归一化距离）。
     pub point_shadow_layout: wgpu::BindGroupLayout,
@@ -79,7 +92,8 @@ pub(crate) fn create_pipeline(
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadow.wgsl").into()),
     });
 
-    // 全局组：uniform + 阴影深度纹理（Rgba32Float 颜色缓冲）+ 普通采样器。
+    // 全局组：uniform + 级联阴影贴图（R32Float 2D 数组，3 层）+ 普通采样器
+    // + 级联参数 uniform（binding 8，R29 CSM）。
     // 深度比较在 shader 内手工完成（见 standard.wgsl shadow_factor）。
     let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("iris.layout.globals"),
@@ -94,12 +108,14 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // 方向光级联阴影贴图：R32Float 2D 数组（SHADOW_CASCADES 层，
+            // 深度存 R 通道），片元按 view 深度选层采样。
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                 },
                 count: None,
@@ -157,6 +173,19 @@ pub(crate) fn create_pipeline(
                     multisampled: false,
                     view_dimension: wgpu::TextureViewDimension::Cube,
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+            // 级联阴影参数（R29 CSM，224B）：3 × 光空间视图投影矩阵 +
+            // 相机前向（片元 view 深度）+ 级联分割点。独立缓冲独立绑定槽，
+            // 不扩 Globals（绑定号排在现有最大 binding 7 之后）。
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
                 count: None,
             },
@@ -385,9 +414,11 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
-    // 阴影 pass 的精简全局组：只含 uniform（VERTEX），不引用阴影贴图
-    let shadow_globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("iris.layout.shadow_globals"),
+    // 级联阴影 pass 的精简组：binding 0 = 64B 级联矩阵 uniform（VERTEX）。
+    // 不引用阴影贴图本身——完整全局组引用了阴影贴图，同一 render pass
+    // 内读写会触发资源互斥校验错误（教训见 ARCHITECTURE §4.7）。
+    let cascade_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.cascade"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::VERTEX,
@@ -400,11 +431,11 @@ pub(crate) fn create_pipeline(
         }],
     });
 
-    // 阴影管线：从光源视角把深度写入 Rgba32Float 颜色附件（详见 shadow.wgsl）。
-    // 独立 pipeline layout：只含精简全局组，无需材质与阴影采样绑定。
+    // 阴影管线：从本级联光视角把深度写入 R32Float 颜色附件（详见 shadow.wgsl）。
+    // 独立 pipeline layout：只含级联矩阵组，无需材质与阴影采样绑定。
     let shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("iris.shadow.pipeline.layout"),
-        bind_group_layouts: &[Some(&shadow_globals_layout)],
+        bind_group_layouts: &[Some(&cascade_layout)],
         immediate_size: 0,
     });
     let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -454,7 +485,7 @@ pub(crate) fn create_pipeline(
     // 阴影蒙皮变体：组 1 绑定关节矩阵，蒙皮几何体的阴影随骨骼变形。
     let skinned_shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("iris.skinned.shadow.pipeline.layout"),
-        bind_group_layouts: &[Some(&shadow_globals_layout), Some(&joints_layout)],
+        bind_group_layouts: &[Some(&cascade_layout), Some(&joints_layout)],
         immediate_size: 0,
     });
     let skinned_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -976,7 +1007,7 @@ pub(crate) fn create_pipeline(
         particle_additive_pipeline,
         particle_alpha_pipeline,
         globals_layout,
-        shadow_globals_layout,
+        cascade_layout,
         point_shadow_layout,
         material_layout,
         joints_layout,

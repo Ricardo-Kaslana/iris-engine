@@ -1,7 +1,8 @@
 // Iris 标准材质着色器：Cook-Torrance PBR（金属度/粗糙度工作流）。
 // 照明 = 环境光（Lambert 近似）+ 1 个方向光 + 最多 8 个点光（物理平方衰减）。
-// 方向光带阴影贴图（R 通道深度 + 3×3 手工比较 PCF）；首盏点光带 cubemap
-// 阴影贴图（R 通道存归一化线性距离，单采样无 PCF）。
+// 方向光带级联阴影 CSM v2（R29）：3 层 2D 数组深度贴图（R 通道存光空间
+// 深度），片元按 view 深度选级联后做 3×3 手工比较 PCF；首盏点光带
+// cubemap 阴影贴图（R 通道存归一化线性距离，单采样无 PCF）。
 // 渲染在线性 HDR 空间，色调映射由 blit pass 完成。
 // 实例化绘制：每个实例携带模型矩阵（4 个 vec4 列）与法线矩阵（3 个 vec4 列）。
 
@@ -25,9 +26,7 @@ struct Globals {
     // x: 实际点光数量
     point_count: vec4<f32>,
     point_lights: array<PointLight, 8>,
-    // 方向光阴影矩阵（世界 -> 光源裁剪空间）
-    light_view_proj: mat4x4<f32>,
-    // x: 阴影贴图 texel 尺寸, y: 深度偏移 bias, z: 阴影强度, w: 是否启用
+    // x: 阴影贴图 texel 尺寸(1/2048), y: 深度偏移 bias, z: 阴影强度, w: 是否启用
     shadow_params: vec4<f32>,
     // x: 预滤波环境最大 mip 级, y: IBL 强度
     env_params: vec4<f32>,
@@ -35,6 +34,18 @@ struct Globals {
     inv_view_proj: mat4x4<f32>,
     // x: 是否启用点光阴影, y: bias（米）, z: 投影灯 range, w: 保留
     point_shadow_params: vec4<f32>,
+};
+
+// 级联阴影参数（224 字节，POD；独立 uniform 缓冲，不占 Globals）。
+// 与 Rust 侧 CsmParamsRaw 逐字段对齐（array<mat4,3> = 192B + 2×vec4）。
+struct CsmParams {
+    // 每级联的光空间视图投影矩阵（世界 -> 第 i 级光源裁剪空间）
+    view_proj: array<mat4x4<f32>, 3>,
+    // xyz: 相机前向单位向量（片元级联选择用），w: 保留
+    cam_forward: vec4<f32>,
+    // x/y/z: 级联分割点（沿相机前向的距离，递增；与 CPU cascade_splits
+    // 同源），w: 保留。级联 i 覆盖 [splits[i-1], splits[i]]。
+    splits: vec4<f32>,
 };
 
 struct MaterialParams {
@@ -45,7 +56,10 @@ struct MaterialParams {
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var shadow_map: texture_2d<f32>;
+// 级联阴影贴图：R32Float 2D 数组，层序 = 级联序（R 通道存光空间深度，
+// 清空值 1.0 = 无遮挡）；采样复用 binding 2 的 NonFiltering 采样器
+// （R32Float 双线性过滤需要 float32-filterable 扩展，不依赖）。
+@group(0) @binding(1) var shadow_map: texture_2d_array<f32>;
 @group(0) @binding(2) var shadow_sampler: sampler;
 // IBL 分割求和：辐照度立方体贴图 / 预滤波环境立方体贴图 / BRDF LUT
 @group(0) @binding(3) var irradiance_map: texture_cube<f32>;
@@ -53,9 +67,10 @@ struct MaterialParams {
 @group(0) @binding(5) var brdf_lut: texture_2d<f32>;
 @group(0) @binding(6) var env_sampler: sampler;
 // 点光 cubemap 阴影贴图（R 存归一化线性距离 length(world-light)/range，
-// 清空值 1.0 = 无遮挡）；采样复用 binding 2 的 NonFiltering 采样器
-// （R32Float 双线性过滤需要 float32-filterable 扩展，不依赖）。
+// 清空值 1.0 = 无遮挡）。
 @group(0) @binding(7) var point_shadow_cube: texture_cube<f32>;
+// 级联阴影参数（排在现有最大 binding 7 之后，不扩 Globals）
+@group(0) @binding(8) var<uniform> csm: CsmParams;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -76,12 +91,13 @@ struct VertexInput {
     @location(9) normal2: vec4<f32>,
 };
 
+// 阴影投影改在片元做（按 view 深度选级联后乘该级联矩阵），
+// 顶点不再输出 shadow_pos（R29 CSM 前为 light_view_proj × world_pos）。
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
-    @location(3) shadow_pos: vec4<f32>,
 };
 
 @vertex
@@ -94,7 +110,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.world_pos = world_pos.xyz;
     out.world_normal = normal_mat * in.normal;
     out.uv = in.uv;
-    out.shadow_pos = globals.light_view_proj * world_pos;
     return out;
 }
 
@@ -134,7 +149,6 @@ fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     out.world_pos = skinned_pos.xyz;
     out.world_normal = normal_mat * (skin_nrm * in.normal);
     out.uv = in.uv;
-    out.shadow_pos = globals.light_view_proj * skinned_pos;
     return out;
 }
 
@@ -187,35 +201,57 @@ fn pbr_light(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
     return (kd * albedo / 3.14159265 + specular) * radiance * nol;
 }
 
-/// 3×3 PCF 百分比渐近软阴影，手工深度比较（R 通道存光源空间深度，
-/// 清空值 1.0 代表无遮挡）。返回阴影后保留的光照比例。
+/// 级联阴影采样（CSM v2）：按片元的 view 深度选级联，用该级联的光空间
+/// 矩阵投影后做 3×3 PCF 百分比渐近软阴影（R 通道存光源空间深度，清空值
+/// 1.0 代表无遮挡）。返回阴影后保留的光照比例。
 ///
-/// 阴影相机覆盖范围外、光源背后或阴影关闭的片段直接视为受光。
-/// textureSample 要求 uniform 控制流，因此不做越界提前返回，
-/// 采样照常执行、最后用掩码把结果混向「受光」。
-fn shadow_factor(shadow_pos: vec4<f32>) -> f32 {
-    let w = max(shadow_pos.w, 1e-6);
-    let ndc = shadow_pos.xy / w;
-    let depth = shadow_pos.z / w;
-    // NDC -> UV：NDC y 正方向 = 贴图上端（与 blit 的 V 翻转约定一致）
+/// **级联选择用 view 深度**（世界位置到相机的前向投影距离
+/// `dot(world_pos − eye, cam_forward)`），而非欧氏距离——欧氏距离在视锥
+/// 边缘会把本属近级联的片元误分到远级联；也不直接用 clip z（透视下
+/// 非线性，分割点得先在 CPU 做一次非线性换算，view 深度更直白）。
+/// 选择条件与 CPU 分割同源：`view_z < splits[i]` 即落入第 i 级。
+///
+/// **越最远级联（view_z ≥ splits.z，即超过 SHADOW_DISTANCE 覆盖带）的
+/// 片元不投影、保持受光**（lit = 1）——级联只铺到覆盖距离。
+///
+/// textureSample 要求 uniform 控制流，因此级联越界/阴影关闭都不做提前
+/// 返回：级联序号钳制在 [0, 2] 后照常采样，最后用掩码把结果混向「受光」。
+/// 阴影相机覆盖范围外（NDC/深度越界，含光空间背后）的片段同样混向受光。
+fn shadow_factor(world_pos: vec3<f32>) -> f32 {
+    let view_z = dot(world_pos - globals.eye_pos.xyz, csm.cam_forward.xyz);
+    var cascade = 2u;
+    if (view_z < csm.splits.x) {
+        cascade = 0u;
+    } else if (view_z < csm.splits.y) {
+        cascade = 1u;
+    }
+    let beyond = view_z >= csm.splits.z || globals.shadow_params.w < 0.5;
+    let sp = csm.view_proj[cascade] * vec4<f32>(world_pos, 1.0);
+    let w = max(sp.w, 1e-6);
+    let ndc = sp.xy / w;
+    let depth = sp.z / w;
+    // NDC -> UV：NDC y 正方向 = 贴图上端（与 blit 的 V 翻转约定一致）；
+    // 数组层 = 级联序。PCF texel 尺寸各级相同（各级都铺满同一张
+    // 2048² 贴图，UV 空间 1/2048），循环共用。
     let uv = ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
     let texel = globals.shadow_params.x;
     var lit = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
             let d = textureSample(shadow_map, shadow_sampler,
-                                  uv + vec2<f32>(f32(dx), f32(dy)) * texel).r;
+                                  uv + vec2<f32>(f32(dx), f32(dy)) * texel,
+                                  i32(cascade)).r;
             // 遮挡物深度 >= 片段参考深度 -> 未被遮挡
             lit = lit + select(0.0, 1.0, d >= depth - globals.shadow_params.y);
         }
     }
     lit = lit / 9.0;
     let shaded = mix(1.0 - globals.shadow_params.z, 1.0, lit);
-    let outside = shadow_pos.w <= 0.0
+    let outside = beyond
+        || sp.w <= 0.0
         || ndc.x < -1.0 || ndc.x > 1.0
         || ndc.y < -1.0 || ndc.y > 1.0
-        || depth < 0.0 || depth > 1.0
-        || globals.shadow_params.w < 0.5;
+        || depth < 0.0 || depth > 1.0;
     return mix(shaded, 1.0, select(0.0, 1.0, outside));
 }
 
@@ -230,9 +266,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
     let v = normalize(globals.eye_pos.xyz - in.world_pos);
 
-    // 方向光（受阴影遮挡）
+    // 方向光（受级联阴影遮挡）
     let l = normalize(globals.light_dir.xyz);
-    let sun = shadow_factor(in.shadow_pos);
+    let sun = shadow_factor(in.world_pos);
     let radiance = globals.light_color.rgb * sun;
     var color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
 

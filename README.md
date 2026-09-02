@@ -38,7 +38,7 @@ fn gameplay(world: &mut World) {
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ **3D 空间音频 v1**（距离软倒数衰减 + 恒功率立体声声像的纯函数增益模型，`play_spatial` / `set_listener` / `set_sound_position` 逐帧重算；`SpatialListener` / `SpatialSource` 组件 + PostUpdate 同步系统，组件移除帧间差分自动停止；身后不消音 v1 限制）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → **均匀网格 broadphase 候选筛选**（BTreeMap 字典序 = 确定性；候选升序 + `j > i` 过滤使配对遍历序与 O(n²) 完全一致，bit 级确定性测试无需改动即守护等价性）→ 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」；**射线 / 线段查询**（`raycast` / `raycast_filtered` / `segment_hits_shape`——最近命中优先、`t` 并列取存储序先遍历者，线段扫掠判定防高速穿模）；**球扫掠 shapecast**（`sphere_sweep` / `sphere_sweep_statics`——保守推进二分求首次碰撞分数与阻挡法线，角色控制器地基） |
 | **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤，**层级级联**：任一祖先隐藏 ⇒ 子树全隐藏，组件缺席 = 可见）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机 + 屏幕射线反投影**（`screen_ray`：NDC 点 → 世界射线，拾取的基础操作；`Viewport` 视口尺寸资源随窗口缩放自动同步）；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮** + **动画 v2**：剪辑间 **crossfade** 姿势混合（smoothstep 权重、平移/缩放 lerp、旋转 slerp、缺方通道不拖拽）、轻量**动画状态机**（states/edges + 过渡时长，条件判定留游戏侧）、**动画事件轨道**（跨界检测纯函数、循环 multi-fire 确定性、`take_events` 每帧消费））；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + 后处理链**（Rgba16Float 中间缓冲 + ACES 色调映射；pass 串联框架 v1：泛光 / **曝光** / **暗角** 三 pass 有序链接，`ExposureSettings` / `VignetteSettings` 资源缺席 = 中性 / 关闭、默认画面零变化，ping-pong 中间纹理按半 / 全分辨率分配复用）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设，`reset()` / `trigger_burst()` 池槽位就地复用与命令式爆发）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤，**层级级联**：任一祖先隐藏 ⇒ 子树全隐藏，组件缺席 = 可见）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机 + 屏幕射线反投影**（`screen_ray`：NDC 点 → 世界射线，拾取的基础操作；`Viewport` 视口尺寸资源随窗口缩放自动同步）；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮** + **动画 v2**：剪辑间 **crossfade** 姿势混合（smoothstep 权重、平移/缩放 lerp、旋转 slerp、缺方通道不拖拽）、轻量**动画状态机**（states/edges + 过渡时长，条件判定留游戏侧）、**动画事件轨道**（跨界检测纯函数、循环 multi-fire 确定性、`take_events` 每帧消费））；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + 后处理链**（Rgba16Float 中间缓冲 + ACES 色调映射；pass 串联框架 v1：泛光 / **曝光** / **暗角** 三 pass 有序链接，`ExposureSettings` / `VignetteSettings` 资源缺席 = 中性 / 关闭、默认画面零变化，ping-pong 中间纹理按半 / 全分辨率分配复用）；**方向光级联阴影 CSM v2**（2048² × 3 层 2D 数组深度图 + PFS 分割 + 纹素对齐拟合 + 3×3 PCF 软阴影，覆盖距离 120 m 外保持受光）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设，`reset()` / `trigger_burst()` 池槽位就地复用与命令式爆发）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -72,6 +72,11 @@ cargo run --example gltf_snapshot --release
 # PBR / HDR / 阴影验收场景（离屏渲染），输出 iris_shadow_preview.bmp：
 # 金属球粗糙度梯度 + 绝缘体球 + 地面软阴影 + ACES 色调映射
 cargo run --example shadow_snapshot --release
+
+# 方向光级联阴影（CSM）验收场景（离屏渲染），输出 docs/csm.png：
+# 近 / 中 / 远三距物体排开俯斜视——近处影子锐利、远处影子仍在（120 m
+# 覆盖带之外正确无影）、级联过渡带无跳变
+cargo run --example csm_snapshot --release
 
 # 点光 cubemap 阴影验收场景（离屏渲染），输出 iris_point_shadow.bmp：
 # 暗色房间中央点光，环灯物体的阴影背离灯的方向径向拉伸（点光阴影特征）
@@ -198,7 +203,7 @@ iris-engine/
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
 │   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 示例
-│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / scene_snapshot / particle_snapshot / web（wasm 专用入口，见「Web 构建」）
+│   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / csm_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / scene_snapshot / particle_snapshot / web（wasm 专用入口，见「Web 构建」）
 │   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
 │   ├── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
 │   └── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
@@ -237,8 +242,17 @@ buffer + POSITION/NORMAL/TEXCOORD + 45° 旋转节点）加载渲染，材质因
 
 ![glTF 资产渲染](docs/gltf_preview.png)
 
-方向光阴影实测（`docs/shadow_preview.png`）：立方体与球体向地面投射软阴影，
-PCF 边缘自然、无 acne 条纹；`DirectionalLight.shadows = false` 可整帧关闭。
+方向光级联阴影 CSM v2 实测（`docs/csm.png`）：2048² × 3 层 2D 数组深度图，
+级联沿相机视锥深度按 PFS（λ=0.6 对数/线性混合）分割、逐级联拟合光空间
+正交矩阵（XY 纹素对齐消除相机平移闪烁）——近 / 中 / 远三距物体排开俯斜视：
+近处影子锐利（首级联 ~100 texel/m），~104 m 处影子仍在，136 m 处（超出
+120 m 覆盖距离）正确无影，级联过渡带无可见跳变；片元按 view 深度选级联后
+3×3 PCF 软阴影，`DirectionalLight.shadows = false` 可整帧关闭。
+
+![方向光级联阴影](docs/csm.png)
+
+小场景单张对照（`docs/shadow_preview.png`）：立方体与球体向地面投射软阴影，
+PCF 边缘自然、无 acne 条纹（v1 单张路径的验收图，CSM 下同场景近景更清晰）。
 
 ![方向光阴影](docs/shadow_preview.png)
 

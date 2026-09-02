@@ -19,11 +19,11 @@ use crate::camera::{ActiveCamera, Camera, view_from_global};
 use crate::context::Gpu;
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
-use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight};
+use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight, cascade_fit, cascade_splits};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
 use crate::mesh::{MeshHandle, MeshStore, upload_mesh};
 use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
-use crate::pipeline::create_pipeline;
+use crate::pipeline::{SHADOW_CASCADES, create_pipeline};
 use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
 use crate::visibility::Visibility;
@@ -59,7 +59,10 @@ struct PointLightRaw {
     color: [f32; 4], // rgb × intensity, w = range
 }
 
-/// 与 WGSL `Globals` 结构对齐（576 字节，POD）。
+/// 与 WGSL `Globals` 结构对齐（512 字节，POD）。
+///
+/// R29 起方向光阴影为 CSM：单一 `light_view_proj` 字段移除（每级联矩阵
+/// 在独立的 [`CsmParamsRaw`] 缓冲），576B → 512B。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsRaw {
@@ -70,7 +73,6 @@ struct GlobalsRaw {
     ambient: [f32; 4],
     point_count: [f32; 4],
     point_lights: [PointLightRaw; MAX_POINT_LIGHTS],
-    light_view_proj: [[f32; 4]; 4],
     shadow_params: [f32; 4],      // texel_size, bias, strength, enabled
     env_params: [f32; 4],         // 预滤波最大 mip 级, IBL 强度, 保留
     inv_view_proj: [[f32; 4]; 4], // 天空盒射线重建用
@@ -79,8 +81,42 @@ struct GlobalsRaw {
 }
 
 const _: () = assert!(
-    std::mem::size_of::<GlobalsRaw>() == 576,
+    std::mem::size_of::<GlobalsRaw>() == 512,
     "Globals 必须与 WGSL 布局一致"
+);
+
+/// 与 WGSL `CsmParams` 对齐（224 字节，POD）：方向光级联阴影参数
+/// （R29 CSM）。独立缓冲 + 独立绑定槽（globals 组 binding 8），不扩
+/// Globals——级联矩阵只有主 pass 片元消费，阴影 pass 用每级联 64B 小缓冲。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CsmParamsRaw {
+    /// 每级联的光空间视图投影矩阵（cascade_fit 逐帧拟合）。
+    view_proj: [[[f32; 4]; 4]; SHADOW_CASCADES],
+    /// xyz: 相机前向单位向量（片元 view 深度 = dot(world−eye, forward)），
+    /// w: 保留。
+    cam_forward: [f32; 4],
+    /// x/y/z: 级联分割点（沿相机前向的距离，递增），w: 保留。
+    splits: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<CsmParamsRaw>() == 224,
+    "CsmParams 必须与 WGSL 布局一致（3×64B 矩阵 + 2×16B 向量）"
+);
+
+/// 与 WGSL `CascadeParams` 对齐（64 字节，POD）：阴影 pass 的每级联
+/// 光空间矩阵。一级联一缓冲（同 submit 内对同一缓冲的多次 write_buffer
+/// 会在执行前合并，泛光/点光参数的既有教训）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CascadeParamsRaw {
+    view_proj: [[f32; 4]; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<CascadeParamsRaw>() == 64,
+    "CascadeParams 必须与 WGSL 布局一致"
 );
 
 /// 与 WGSL `PointFaceParams` 对齐（80 字节，POD）：点光阴影每面独立小 uniform。
@@ -183,7 +219,12 @@ pub struct Renderer {
     bundle: crate::pipeline::PipelineBundle,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
-    shadow_globals_bg: wgpu::BindGroup,
+    /// 级联阴影参数（CsmParamsRaw）缓冲（globals 组 binding 8 的资源，
+    /// 绑定组由 build_globals_bind_group 一并写入）。
+    csm_params_buf: wgpu::Buffer,
+    /// 阴影 pass 的每级联 64B 矩阵缓冲与绑定组（一级联一份，一缓冲一级联）。
+    cascade_bufs: [wgpu::Buffer; SHADOW_CASCADES],
+    cascade_bgs: [wgpu::BindGroup; SHADOW_CASCADES],
     instance_buf: Option<wgpu::Buffer>,
     instance_capacity: usize,
     /// 上一帧已上传实例的 CPU 镜像（与 GPU 缓冲前 `len` 个实例内容一致），
@@ -195,14 +236,20 @@ pub struct Renderer {
     material_gpu: HashMap<u32, GpuMaterial>,
     /// 蒙皮实体位标识 → 关节矩阵缓冲。
     skin_gpu: HashMap<u64, GpuSkin>,
-    /// 持有纹理以保证对应 view 在渲染器存活期间有效。
+    /// 方向光级联阴影贴图：R32Float 2D 数组（2048² × SHADOW_CASCADES 层，
+    /// R 存光空间深度），持有纹理以保证 view 有效。
     #[allow(dead_code)]
     shadow_map: wgpu::Texture,
+    /// 全层数组采样视图（进全局绑定组 binding 1，片元按级联选层）。
     shadow_map_view: wgpu::TextureView,
-    /// 阴影 pass 的深度测试附件（保证贴图存最近面深度）。
+    /// 阴影 pass 的深度测试附件（Depth32Float 数组，同层数——保证贴图
+    /// 存最近面深度）。
     #[allow(dead_code)]
     shadow_depth_buf: wgpu::Texture,
-    shadow_depth_buf_view: wgpu::TextureView,
+    /// 每级联一个颜色/深度渲染视图（D2 + base_array_layer = 级联序），
+    /// 逐级联 pass 渲染到对应层。
+    shadow_color_views: [wgpu::TextureView; SHADOW_CASCADES],
+    shadow_depth_views: [wgpu::TextureView; SHADOW_CASCADES],
     /// 点光 cubemap 阴影贴图：R32Float 6 层，R 存归一化线性距离
     /// （length(world − light) / range，1.0 = 无遮挡）。
     #[allow(dead_code)]
@@ -401,8 +448,8 @@ const _: () = assert!(
 
 /// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、透明 pass
 /// 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17）：UI pass 只计入
-/// `draw_calls` 的单批，阴影 pass（复用不透明实例区间，透明项与粒子
-/// 不进阴影）与天空 / 后处理 pass 全部不计。
+/// `draw_calls` 的单批，阴影 pass（3 级联各一遍，复用不透明实例区间，
+/// 透明项与粒子不进阴影）与天空 / 后处理 pass 全部不计。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
     /// 主几何 draw call 数：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 +
@@ -469,11 +516,13 @@ fn diff_changed_ranges(prev: &[InstanceRaw], next: &[InstanceRaw]) -> Vec<std::o
 
 /// 构建全局绑定组。其中的 env 视图随每次环境重烘焙而更换，重烘后必须
 /// 重建本绑定组——初建（`Renderer::new`）与重烘重建（`ensure_environment`）
-/// 共用此逻辑，避免两处条目清单漂移。
+/// 共用此逻辑，避免两处条目清单漂移。级联参数（binding 8）与级联矩阵
+/// 缓冲同属固定资源，一并写入。
 fn build_globals_bind_group(
     gpu: &Gpu,
     bundle: &crate::pipeline::PipelineBundle,
     globals_buf: &wgpu::Buffer,
+    csm_params_buf: &wgpu::Buffer,
     shadow_map_view: &wgpu::TextureView,
     point_shadow_cube_view: &wgpu::TextureView,
     env: &crate::environment::EnvironmentMaps,
@@ -531,6 +580,10 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 7,
                 resource: wgpu::BindingResource::TextureView(point_shadow_cube_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: csm_params_buf.as_entire_binding(),
             },
         ],
     })
@@ -835,16 +888,20 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // 方向光阴影贴图（固定分辨率，不随窗口尺寸重建）：
-        // 深度值写入颜色附件 R 通道（绕开 depth-only 管线写入异常，见 ARCHITECTURE §4.7），
-        // 同时挂真实深度附件做 Less 测试——没有它重叠表面会按绘制顺序互相覆盖，
+        // 方向光级联阴影贴图（CSM，R29）：固定分辨率 2048² × 3 层的
+        // texture_2d_array，不随窗口尺寸重建。深度值写入颜色附件 R 通道
+        // （绕开 depth-only 管线写入异常，见 ARCHITECTURE §4.7），同时挂
+        // 真实深度附件做 Less 测试——没有它重叠表面会按绘制顺序互相覆盖，
         // 背面深度会污染贴图（实测症状：贴图值系统性偏大、阴影整体失效）。
+        // 逐级联一个渲染 pass（每层一个 D2 颜色/深度视图），采样侧用全层
+        // 数组视图按级联选层——纹理方案与 v1 单张一致（R32Float 双附件），
+        // 仅维度扩为 2D 数组，最小改动且与既有测试兼容。
         let shadow_map = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.shadow.map"),
             size: wgpu::Extent3d {
                 width: crate::pipeline::SHADOW_MAP_SIZE,
                 height: crate::pipeline::SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: SHADOW_CASCADES as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -853,13 +910,26 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let shadow_map_view = shadow_map.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_map_view = shadow_map.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iris.shadow.array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let shadow_color_views: [wgpu::TextureView; SHADOW_CASCADES] = std::array::from_fn(|i| {
+            shadow_map.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("iris.shadow.color_layer_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
         let shadow_depth_buf = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.shadow.depth"),
             size: wgpu::Extent3d {
                 width: crate::pipeline::SHADOW_MAP_SIZE,
                 height: crate::pipeline::SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: SHADOW_CASCADES as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -868,8 +938,42 @@ impl Renderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let shadow_depth_buf_view =
-            shadow_depth_buf.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_depth_views: [wgpu::TextureView; SHADOW_CASCADES] = std::array::from_fn(|i| {
+            shadow_depth_buf.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("iris.shadow.depth_layer_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        // 级联参数（主 pass binding 8）与每级联 64B 矩阵（阴影 pass 组 0）。
+        // 一级联一缓冲：同一 submit 内对同一缓冲的多次 write_buffer 会在
+        // 执行前全部合并（泛光 / 点光面参数的既有教训）。
+        let csm_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.csm.params"),
+            size: std::mem::size_of::<CsmParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cascade_bufs: [wgpu::Buffer; SHADOW_CASCADES] = std::array::from_fn(|_| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.csm.cascade_params"),
+                size: std::mem::size_of::<CascadeParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let cascade_bgs: [wgpu::BindGroup; SHADOW_CASCADES] = std::array::from_fn(|i| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.csm.cascade.bg"),
+                layout: &bundle.cascade_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cascade_bufs[i].as_entire_binding(),
+                }],
+            })
+        });
         // 点光 cubemap 阴影贴图：R32Float 6 层（层序 = OpenGL 约定
         // [+X, −X, +Y, −Y, +Z, −Z]，与 PointLight::shadow_face_view_proj 配对）。
         // 复刻方向光阴影的双附件教训：颜色附件存值的同时必须挂深度附件做
@@ -945,14 +1049,6 @@ impl Renderer {
         });
         // IBL 环境贴图一次性烘焙（供主 pass 的分割求和环境光采样）
         let env = crate::environment::bake_environment(&gpu);
-        let shadow_globals_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("iris.shadow.globals.bg"),
-            layout: &bundle.shadow_globals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buf.as_entire_binding(),
-            }],
-        });
         // 内置 0 号白色兜底纹理：材质未指定贴图时使用
         let white = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.texture.white"),
@@ -1071,6 +1167,7 @@ impl Renderer {
             &gpu,
             &bundle,
             &globals_buf,
+            &csm_params_buf,
             &shadow_map_view,
             &point_shadow_cube_view,
             &env,
@@ -1095,7 +1192,9 @@ impl Renderer {
             bundle,
             globals_buf,
             globals_bg,
-            shadow_globals_bg,
+            csm_params_buf,
+            cascade_bufs,
+            cascade_bgs,
             instance_buf: None,
             instance_capacity: 0,
             last_instances: Vec::new(),
@@ -1106,7 +1205,8 @@ impl Renderer {
             shadow_map,
             shadow_map_view,
             shadow_depth_buf,
-            shadow_depth_buf_view,
+            shadow_color_views,
+            shadow_depth_views,
             point_shadow_map,
             point_shadow_cube_view,
             point_shadow_face_views,
@@ -1152,6 +1252,7 @@ impl Renderer {
             &self.gpu,
             &self.bundle,
             &self.globals_buf,
+            &self.csm_params_buf,
             &self.shadow_map_view,
             &self.point_shadow_cube_view,
             &self.env,
@@ -1368,18 +1469,18 @@ impl Renderer {
             .try_resource::<DirectionalLight>()
             .map(|l| (*l).clone())
             .unwrap_or_default();
-        // 阴影覆盖以注视点（资源相机 target / 挂载相机跟随场景原点附近）为中心。
-        // 挂载相机没有显式 target：沿视线前方中等距离处作为覆盖中心。
-        let shadow_center = if let Some((v, _, cam_eye)) = mounted {
-            let forward = -v.z_axis.truncate().normalize_or_zero();
-            cam_eye + forward * 10.0
-        } else {
-            world
-                .try_resource::<Camera>()
-                .map(|c| c.target)
-                .unwrap_or(Vec3::ZERO)
-        };
-        let light_vp = light.shadow_view_proj(shadow_center, light.shadow_range);
+        // 阴影 v2（CSM，R29）：沿相机视锥深度分割出 SHADOW_CASCADES 个
+        // 级联，各自拟合光空间正交矩阵（PFS 分割 + 纹素对齐，纯函数见
+        // light.rs）。v1 的「以注视点为中心、shadow_range 为半径」单张
+        // 覆盖废止：级联范围由相机视锥深度片直接决定，覆盖距离由
+        // SHADOW_DISTANCE 常量钳制（之外的片元保持受光，无影）。
+        let cam_forward = (-view.z_axis.truncate()).normalize_or_zero();
+        let splits = cascade_splits(z_near, z_far);
+        let csm_near = z_near.min(1.0);
+        let light_vps: [Mat4; SHADOW_CASCADES] = std::array::from_fn(|i| {
+            let z_start = if i == 0 { csm_near } else { splits[i - 1] };
+            cascade_fit(light.direction, &view, fov, aspect, z_start, splits[i])
+        });
         // 资源目录按引用借用（不复制数据），生命周期覆盖整个 draw 过程
         let Some(mesh_store) = world.try_resource::<MeshStore>() else {
             return;
@@ -1461,7 +1562,6 @@ impl Renderer {
             ambient: [light.ambient.x, light.ambient.y, light.ambient.z, 0.0],
             point_count: [point_count as f32, 0.0, 0.0, 0.0],
             point_lights,
-            light_view_proj: light_vp.to_cols_array_2d(),
             shadow_params: [
                 1.0 / crate::pipeline::SHADOW_MAP_SIZE as f32,
                 SHADOW_BIAS,
@@ -1480,6 +1580,27 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        // 级联参数上传（恒写，含阴影关闭帧）：片元着色器的采样路径无条件
+        // 执行（uniform 控制流要求），关闭语义由 shadow_params.w 掩码兜底
+        // 混向受光，但 uniform 本身必须有定义。主 pass 读 CsmParamsRaw
+        // （binding 8），阴影 pass 逐级联读各自的 64B 矩阵（一级联一缓冲，
+        // 规避同 submit 多次 write_buffer 合并问题）。
+        let csm_raw = CsmParamsRaw {
+            view_proj: light_vps.map(|m| m.to_cols_array_2d()),
+            cam_forward: [cam_forward.x, cam_forward.y, cam_forward.z, 0.0],
+            splits: [splits[0], splits[1], splits[2], 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.csm_params_buf, 0, bytemuck::bytes_of(&csm_raw));
+        for (i, light_vp) in light_vps.iter().enumerate() {
+            let raw = CascadeParamsRaw {
+                view_proj: light_vp.to_cols_array_2d(),
+            };
+            self.gpu
+                .queue
+                .write_buffer(&self.cascade_bufs[i], 0, bytemuck::bytes_of(&raw));
+        }
 
         // 2. 收集实例（ECS 查询 -> Visibility 过滤 + 视锥剔除 + alpha 分区
         //    -> 排序：不透明按 (网格, 材质) 键，透明按视深降序）
@@ -1713,79 +1834,86 @@ impl Renderer {
         let opaque_total = total + skinned_total;
         if shadow_enabled && opaque_total > 0 {
             let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
-            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("iris.pass.shadow"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.shadow_map_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // 清空为 1.0（光源远平面）：贴图空缺处视为无遮挡
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 1.0,
+            // 逐级联一个渲染 pass（各写数组纹理的对应层）。v1 策略保留：
+            // 实例收集沿用主 pass 视锥剔除后的不透明区间，三个级联全部
+            // 重画同一区间——保守不漏影（按级联视锥再剔除是后续优化点，
+            // 见 ARCHITECTURE §4.7.2）。
+            for cascade_i in 0..SHADOW_CASCADES {
+                let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("iris.pass.shadow_cascade"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.shadow_color_views[cascade_i],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // 清空为 1.0（光源远平面）：贴图空缺处视为无遮挡
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 1.0,
+                                g: 1.0,
+                                b: 1.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.shadow_depth_views[cascade_i],
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_depth_buf_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            shadow_pass.set_pipeline(&self.bundle.shadow_pipeline);
-            shadow_pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-            shadow_pass.set_vertex_buffer(
-                1,
-                self.instance_buf
-                    .as_ref()
-                    .expect("实例缓冲已就绪")
-                    .slice(..),
-            );
-            index = 0;
-            while index < total {
-                let key = items[index].key;
-                let mut count = 1;
-                while index + count < total && items[index + count].key == key {
-                    count += 1;
-                }
-                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
-                shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                shadow_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                let first = index as u32;
-                let last = (index + count) as u32;
-                shadow_pass.draw_indexed(0..mesh.num_indices, 0, first..last);
-                index += count;
-            }
-            // 蒙皮几何体：独立阴影管线（组 1 = 关节矩阵），阴影随骨骼变形
-            if !skinned.is_empty() {
-                shadow_pass.set_pipeline(&self.bundle.skinned_shadow_pipeline);
-                shadow_pass.set_vertex_buffer(2, instance_buf.slice(..));
-                for (i, item) in skinned.iter().enumerate() {
-                    let mesh = &self.mesh_gpu[&item.mesh];
-                    let skin = &self.skin_gpu[&item.skin_entity];
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                shadow_pass.set_pipeline(&self.bundle.shadow_pipeline);
+                shadow_pass.set_bind_group(0, &self.cascade_bgs[cascade_i], &[]);
+                shadow_pass.set_vertex_buffer(
+                    1,
+                    self.instance_buf
+                        .as_ref()
+                        .expect("实例缓冲已就绪")
+                        .slice(..),
+                );
+                index = 0;
+                while index < total {
+                    let key = items[index].key;
+                    let mut count = 1;
+                    while index + count < total && items[index + count].key == key {
+                        count += 1;
+                    }
+                    let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                     shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                    shadow_pass.set_vertex_buffer(
-                        1,
-                        mesh.skin_buf
-                            .as_ref()
-                            .expect("蒙皮网格应有蒙皮属性缓冲")
-                            .slice(..),
-                    );
                     shadow_pass
                         .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    shadow_pass.set_bind_group(1, &skin.bind_group, &[]);
-                    let base = (total + i) as u32;
-                    shadow_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                    let first = index as u32;
+                    let last = (index + count) as u32;
+                    shadow_pass.draw_indexed(0..mesh.num_indices, 0, first..last);
+                    index += count;
+                }
+                // 蒙皮几何体：独立阴影管线（组 1 = 关节矩阵），阴影随骨骼变形
+                if !skinned.is_empty() {
+                    shadow_pass.set_pipeline(&self.bundle.skinned_shadow_pipeline);
+                    shadow_pass.set_vertex_buffer(2, instance_buf.slice(..));
+                    for (i, item) in skinned.iter().enumerate() {
+                        let mesh = &self.mesh_gpu[&item.mesh];
+                        let skin = &self.skin_gpu[&item.skin_entity];
+                        shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        shadow_pass.set_vertex_buffer(
+                            1,
+                            mesh.skin_buf
+                                .as_ref()
+                                .expect("蒙皮网格应有蒙皮属性缓冲")
+                                .slice(..),
+                        );
+                        shadow_pass
+                            .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        shadow_pass.set_bind_group(1, &skin.bind_group, &[]);
+                        let base = (total + i) as u32;
+                        shadow_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                    }
                 }
             }
         }

@@ -13,7 +13,8 @@ struct Globals {
     ambient: vec4<f32>,
     point_count: vec4<f32>,
     point_lights: array<vec4<f32>, 16>, // 8 个 PointLight（2×vec4）平铺，保持与 standard.wgsl 同布局
-    light_view_proj: mat4x4<f32>,
+    // R29 起方向光阴影为 CSM（每级联矩阵在独立 uniform，binding 8），
+    // 单一 light_view_proj 字段已从全局缓冲移除，布局与 Rust GlobalsRaw 对齐。
     shadow_params: vec4<f32>,
     env_params: vec4<f32>,
     inv_view_proj: mat4x4<f32>,

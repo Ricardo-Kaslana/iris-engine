@@ -9,7 +9,8 @@
 //! - 透明渲染（alpha 混合材质 + 按视深排序的透明 pass，不写深度、不投影）；
 //! - 粒子系统 v1（Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染，
 //!   additive / alpha 双混合）；
-//! - 方向光阴影贴图（2048² 深度图 + PCF）与点光 cubemap 阴影
+//! - 方向光级联阴影 CSM v2（2048² × 3 层 2D 数组深度图 + PFS 分割 +
+//!   纹素对齐拟合 + PCF；覆盖距离 120 m 之外保持受光）与点光 cubemap 阴影
 //!   （首灯 6 面 × 512²，R32Float 存归一化线性距离）；
 //! - HDR 中间缓冲 + ACES 色调映射 + 后处理链（泛光 / 曝光 / 暗角，
 //!   pass 串联框架：描述 → 编码 + ping-pong 中间纹理分配）；
@@ -58,7 +59,10 @@ pub mod prelude {
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;
-    pub use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_FACES, PointLight};
+    pub use crate::light::{
+        DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_FACES, PointLight, cascade_fit,
+        cascade_splits, snap_aabb_to_texels,
+    };
     pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{MeshData, MeshHandle, MeshStore, SkinVertex, Vertex, primitives};
     pub use crate::offscreen::OffscreenRenderer;
