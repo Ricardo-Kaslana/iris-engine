@@ -33,7 +33,7 @@ fn gameplay(world: &mut World) {
 |------|----------|
 | **跨平台** | wgpu 统一封装 Vulkan / DirectX 12 / Metal（WebGPU 标准 API），winit 跨平台窗口；同一份代码编译 Windows / macOS / Linux，并可交叉编译至 ARM64 与 wasm32 |
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
-| **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（普通包围球 + **蒙皮关节变换保守并集 AABB**——凸组合保证只多画不漏画）；**FrameStats 帧统计**（draw calls / 可见实例 / 剔除数 / 三角形数 / 实例上传字节）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交 |
+| **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（普通包围球 + **蒙皮关节变换保守并集 AABB**——凸组合保证只多画不漏画）；**FrameStats 帧统计**（draw calls / 可见实例 / 剔除数 / 三角形数 / 实例上传字节）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交；**criterion 性能基准 + release 预算测试**（R33：CPU 热路径正式基准 `cargo bench` + CI 门禁，基线数字见 ARCHITECTURE §7.1） |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1`；**纹理 BC1 GPU 压缩**（确定性编码器 + 「特性 + 尺寸对齐 + 全不透明」决策树，显存 8 倍节省实测 64 MiB → 8 MiB，wasm / 无特性自动回退 RGBA8）+ **网格距离 LOD**（`LodMesh` 组件：近 high / 远 low，远景三角形 64x 削减实测，`triangles_drawn` 即验收口径）+ **内存占用统计**（`memory_bytes` 源数据 / `gpu_bytes_estimate` 显存估算，基准示例输出真实对比数字） |
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ **3D 空间音频 v1**（距离软倒数衰减 + 恒功率立体声声像的纯函数增益模型，`play_spatial` / `set_listener` / `set_sound_position` 逐帧重算；`SpatialListener` / `SpatialSource` 组件 + PostUpdate 同步系统，组件移除帧间差分自动停止；身后不消音 v1 限制）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **物理与碰撞（Sphere/AABB/竖直 Capsule 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → **均匀网格 broadphase 候选筛选**（BTreeMap 字典序 = 确定性；候选升序 + `j > i` 过滤使配对遍历序与 O(n²) 完全一致，bit 级确定性测试无需改动即守护等价性）→ 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」；**射线 / 线段查询**（`raycast` / `raycast_filtered` / `segment_hits_shape`——最近命中优先、`t` 并列取存储序先遍历者，线段扫掠判定防高速穿模）；**球扫掠 shapecast**（`sphere_sweep` / `shape_sweep` / `sphere_sweep_statics`——保守推进二分求首次碰撞分数与阻挡法线，角色控制器地基）；**竖直 Capsule**（R31：轴段恒沿 ±Y 的一等形状，broadphase / 检测 / 射线 / 扫掠自动获得）+ **运动学角色控制器**（`iris-core::character` 的 `move_and_slide`：重力 → 水平滑行（最多 4 次扫掠迭代，切向速度保留）→ 台阶抬起重试（低台阶自动迈上、高墙照撞）→ 斜坡限（坡内 grounded、过陡下滑）→ 贴地吸附（下坡不腾空）、跳跃不吸附，纯函数确定性可单测） |
@@ -152,11 +152,9 @@ cargo run -p iris-engine --example scene_snapshot --release
 cargo run --example gen_asset --release
 cargo run --example hdr_snapshot --release
 
-# 并行调度基准：8 个互不冲突系统 串行 vs 并行加速比
-cargo run -p iris-core --example bench_parallel --release
-
-# ECS 吞吐基准
-cargo run -p iris-core --example bench_ecs --release
+# CPU 热路径 criterion 基准（ECS / 调度 / 物理 / 角色控制器 / broadphase /
+# 确定性模拟 + 渲染 CPU 收集 / BC1 / 空间音频），全量运行：
+cargo bench --workspace
 ```
 
 ### 添加为依赖
@@ -203,7 +201,7 @@ iris-engine/
 ├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成；collect_arena.scene.json / arena_battle.scene.json 为手写关卡，enemy_worm.glb 由 gen_asset 生成）
 ├── crates/
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
-│   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞
+│   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞（benches/ criterion 基准 + tests/budgets.rs release 预算门禁）
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
 │   ├── iris-platform/   # 窗口配置、键鼠输入
 │   ├── iris-audio/      # 软件混音器、WAV 加载、程序化音效、cpal 设备层
@@ -228,12 +226,12 @@ iris-engine/
 | GPU 合批：25 实例 + 地面（全部在视锥内） | **2 个 draw call**（同网格同材质自动合并） |
 | 视锥剔除：相机背后 27 实体 | **0 次提交**（包围球 × 6 平面，测试断言） |
 | 示例二进制（含 wgpu 全套渲染栈） | cube.exe **7.8 MB** / offscreen.exe 7.4 MB |
-| 纯 ECS 工具体积上限 | bench_ecs.exe **0.17 MB** |
 | 离屏渲染一帧 1280×720（含 GPU 初始化 + BMP 落盘） | < 1 s |
 
 ```sh
 # 复现
-cargo run -p iris-core --example bench_ecs --release
+cargo bench -p iris-core            # ECS 生成 / 遍历基准（criterion 正式版，
+                                    # 完整基线表见 ARCHITECTURE §7.1）
 cargo run --example offscreen --release   # 产出 iris_offscreen.bmp
 ls -l target/release/examples/*.exe
 ```

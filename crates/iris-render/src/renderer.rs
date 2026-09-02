@@ -497,7 +497,13 @@ const INSTANCE_DIFF_FULL_FALLBACK_RATIO: f32 = 0.5;
 ///   `next` 即返回覆盖整个 `next` 的单区间）；
 /// - `prev` 比 `next` 长：缩短部分无需写入 GPU，不产生区间——调用方在
 ///   实例数不等时本就走全量上传，此分支仅保证函数语义自洽。
-fn diff_changed_ranges(prev: &[InstanceRaw], next: &[InstanceRaw]) -> Vec<std::ops::Range<usize>> {
+///
+/// 公开导出（R33）：增量上传决策是「最接近帧预算的 CPU 纯函数路径」之一，
+/// criterion 基准（`benches/render_cpu.rs`）与预算测试直接测量它。
+pub fn diff_changed_ranges(
+    prev: &[InstanceRaw],
+    next: &[InstanceRaw],
+) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let common = prev.len().min(next.len());
     let mut start: Option<usize> = None;
@@ -843,6 +849,74 @@ fn collect_instances(
     CollectCounts {
         visible: items.len() + skinned.len() + transparent.len() + transparent_skinned.len(),
         culled,
+    }
+}
+
+/// [`CpuCollector::collect`] 的结果（与内部 `CollectCounts` 同口径）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuCollectResult {
+    /// 进入本帧绘制的实例数（普通 + 蒙皮 + 透明合计）。
+    pub visible: usize,
+    /// 被视锥剔除的实例数。
+    pub culled: u32,
+}
+
+/// 帧收集 CPU 路径的基准 / 测试入口（R33，GPU 无关）。
+///
+/// [`Renderer::draw`] 每帧在 GPU 编码前先做纯 CPU 的实例收集：可见性
+/// 过滤 + 包围球 / 保守 AABB 视锥剔除 + alpha 分区（`collect_instances`）。
+/// 这段是「最接近帧预算」的 CPU 热路径，但不构造 GPU 设备就测不到——
+/// 本结构把收集逻辑以公开入口暴露：语义与渲染器帧内调用完全一致
+/// （四个输出列表 + scratch 缓冲跨帧复用，与真实渲染路径的每帧成本
+/// 同构），只测收集本身、不做排序与上传（排序由调用方完成，见
+/// `collect_instances` 文档）。
+///
+/// 基准用法：`World` + `MeshStore` + `MaterialStore` + 视图矩阵 +
+/// [`Frustum`] 构造一次，反复调用 [`CpuCollector::collect`]——
+/// 见 `crates/iris-render/benches/render_cpu.rs` 的 `collect_instances_5k`
+/// 与 `crates/iris-render/tests/budgets.rs`。
+#[derive(Default)]
+pub struct CpuCollector {
+    items: Vec<DrawItem>,
+    skinned: Vec<SkinnedItem>,
+    transparent: Vec<TransparentItem>,
+    transparent_skinned: Vec<TransparentSkinnedItem>,
+}
+
+impl CpuCollector {
+    /// 创建收集器（scratch 缓冲随首次收集按需增长，跨调用复用）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 执行一次帧收集（语义 = 渲染器帧内 `collect_instances` 调用：
+    /// `Visibility` 过滤 + 祖先级联 + 包围球 / 保守 AABB 视锥剔除 +
+    /// 不透明 / 透明分区）。
+    pub fn collect(
+        &mut self,
+        world: &iris_core::world::World,
+        mesh_store: &MeshStore,
+        material_store: &MaterialStore,
+        view: &Mat4,
+        eye: Vec3,
+        frustum: &Frustum,
+    ) -> CpuCollectResult {
+        let counts = collect_instances(
+            world,
+            mesh_store,
+            material_store,
+            view,
+            eye,
+            frustum,
+            &mut self.items,
+            &mut self.skinned,
+            &mut self.transparent,
+            &mut self.transparent_skinned,
+        );
+        CpuCollectResult {
+            visible: counts.visible,
+            culled: counts.culled,
+        }
     }
 }
 

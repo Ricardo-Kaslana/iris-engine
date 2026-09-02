@@ -274,6 +274,22 @@ impl Schedule {
         }
     }
 
+    /// 某阶段各批的系统数（诊断 / 基准入口，R33）。
+    ///
+    /// 对当前注册系统跑一遍贪心分批（[`Self::build_batches`]），返回每批
+    /// 的成员数（独占批恒为 1）——批次划分本身的只读视图，**不执行任何
+    /// 系统**。criterion 基准 `schedule_build_batches` 用它测量「30 个
+    /// 系统读写集的冲突分批」的纯构建开销。
+    pub fn batch_sizes(&self, stage: Stage) -> Vec<usize> {
+        Self::build_batches(self.entry(stage))
+            .into_iter()
+            .map(|batch| match batch {
+                Batch::Solo(_) => 1,
+                Batch::Parallel(members) => members.len(),
+            })
+            .collect()
+    }
+
     /// 某阶段的批次划分（测试与诊断用：各批 (是否并行, 系统名)）。
     #[cfg(test)]
     fn batch_layout(&self, stage: Stage) -> Vec<(bool, Vec<&'static str>)> {
@@ -290,7 +306,6 @@ impl Schedule {
             .collect()
     }
 
-    #[cfg(test)]
     fn entry(&self, stage: Stage) -> &Vec<Entry> {
         match stage {
             Stage::Startup => &self.startup,

@@ -182,8 +182,9 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 - **阶段编排**：每帧 `FixedUpdate × N → Update → PostUpdate`（PostUpdate
   每帧一次、不在固定步长循环内），由 `App` 主循环驱动；Startup 在首帧前
   执行一次。
-- **实测**：16 核上 8 个互不冲突分量系统 3.27× 加速
-  （`cargo run -p iris-core --example bench_parallel --release`）。
+- **实测**：criterion 基准 `parallel_run_8_systems`（8 个互不冲突分量系统
+  × 1 万实体，`cargo bench -p iris-core`）守护并行路径的回归；历史实测
+  16 核上加速 3.27×（旧 example 版基准，已并入 criterion benches）。
   未达线性是每系统内部仍为单线程遍历 + 线程启动开销 + 内存带宽上限。
 - **正确性断言**：并发观测（原子计数器峰值 ≥ 2）、冲突系统分批保序、
   独占屏障可见性，均有确定性测试；诚实性由「冲突即 panic」兜底——
@@ -1374,6 +1375,42 @@ glTF / HDR 错误经 `From` 映射保上下文）。
 | 提交 | wgpu 命令编码 → 队列异步提交，CPU/GPU 并行 |
 | 内存 | 无 GC；实体索引复用；scratch 缓冲跨帧复用（批处理排序数组）；纹理/网格内存占用统计口径（`memory_bytes` / `gpu_bytes_estimate`，§4.18） |
 | 构建 | `lto = "thin"`、`codegen-units = 1`、`strip = "debuginfo"` |
+
+### 7.1 性能基线与预算门禁（R33）
+
+**方法论**：CPU 纯函数热路径以 criterion 正式基准守护（`cargo bench
+--workspace`；`iris-core/benches/core.rs`、`iris-render/benches/render_cpu.rs`、
+`iris-audio/benches/audio.rs`），全部 GPU 无关（不构造设备即可测）。
+基准只测量、不断言——回归检测靠 criterion 的逐次基线对比报告。
+
+**基线数字表**（测量机器：Windows 11 笔记本，i7-13620H + RTX 4060，
+release 构建，2026-09-03；**仅供量级参考**——CI 虚拟机数字不可与本地
+横向比较，只作 CI 自身纵向参考）：
+
+| 基准 | mean | 含义 |
+|------|------|------|
+| `ecs_spawn_10k` | 2.31 ms | 1 万实体生成（2 组件/实体） |
+| `ecs_query_iterate_10k` | 60.1 µs | 1 万实体双组件遍历 + 写回（帧循环最热路径） |
+| `schedule_build_batches` | 843 ns | 30 系统读写集冲突分批的纯构建（每帧调度前固定成本） |
+| `parallel_run_8_systems` | 3.47 ms | 8 个无冲突并行系统 × 1 万实体（含每批线程创建） |
+| `physics_step_100` | 4.56 ms | 100 体（60 动 + 40 静）持续接触一帧物理 |
+| `move_and_slide` | 1.59 µs | 角色控制器一帧（平地 + 撞墙滑行 + 贴地） |
+| `broadphase_200_aabb` | 168 µs | 200 AABB 建网格 + 全量候选查询 |
+| `determinism/trace_240` | 2.15 s | 确定性模拟 240 步 × 2 世界 + 逐采样记录（确定性测试开销上界；样本数 10，见 CHANGELOG R33） |
+| `frustum_extract_and_test` | 5.53 µs | 视锥平面提取 + 1000 次球 / AABB 混合测试 |
+| `bc1_encode_256` | 866 µs | 256² 纹理 BC1 编码（上传期一次性成本） |
+| `instance_diff_10k` | 99.6 µs | 1 万实例 10% 变化的增量上传分段 |
+| `collect_instances_5k` | 303 µs | 真实 World + MeshStore 下 5k 立方体收集 + 剔除（最接近帧预算） |
+| `mix_32_voices_1s` | 92.6 µs | 32 声道（8 空间）44100 Hz 单次 1024 帧块（回调粒度） |
+| `spatial_gain_10k` | 190 µs | 空间增益纯函数 1 万次 |
+
+**预算测试（`crates/*/tests/budgets.rs`，CI `test-release` job 生效）**
+是「防突然 10 倍劣化」的**烟雾报警**，不是精确基准：预算 = 上表 mean
+× 约 5（写死数值 + 测量机器与日期注释），断言 N 次实测的中位数不超
+预算。5 倍裕度吸收 CI 与本地机器差距与噪声——目标是误报率接近零，
+代价是只能抓住数量级劣化；精确回归检测靠 criterion 基线对比，两者
+互补。debug 构建自动跳过（数值无参照意义）。四个代表：ECS 遍历
+（300 µs）、物理步进（25 ms）、帧收集（1.5 ms）、混音块（500 µs）。
 
 ## 8. 已知限制（诚实清单）
 

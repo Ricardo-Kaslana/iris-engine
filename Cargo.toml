@@ -47,6 +47,10 @@ pollster = "0.4"
 log = "0.4"
 env_logger = "0.11"
 
+# 基准框架（dev-dependencies 专属，不进任何运行时依赖树）：
+# CPU 纯函数路径的正式基准（R33），默认 features（含 plotters 报告）
+criterion = "0.7"
+
 # 发布构建：更小体积、更快运行
 [profile.release]
 opt-level = 3

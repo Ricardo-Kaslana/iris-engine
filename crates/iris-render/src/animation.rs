@@ -398,17 +398,17 @@ impl AnimationPlayer {
     /// edges 会让全部过渡退化成跳变、画面闪变无线索，由此可定位，
     /// 打磨 IV 摩擦③）；两种情况下 `looping` / `speed` 都同步为目标
     /// 状态值，`current_state` 立即更新。与 [`AnimationPlayer::transition`]
-    /// 同款边界语义：同状态请求忽略、越界忽略 + `debug_assert!`。
+    /// 同款边界语义：同状态请求忽略、越界立即 panic（API 误用——
+    /// `request_state` 只在状态切换时调用、非每帧热点，无条件断言
+    /// 让 release 构建同样暴露调用方错误，与世界的尝试型锁冲突
+    /// panic 同一哲学）。
     /// **何时调用由游戏侧判定**（无参数黑板，见 [`AnimationEdge`]）。
     pub fn request_state(&mut self, state: usize) {
-        if state >= self.states.len() {
-            debug_assert!(
-                false,
-                "request_state 目标状态越界：{state} / {}",
-                self.states.len()
-            );
-            return;
-        }
+        assert!(
+            state < self.states.len(),
+            "request_state 目标状态越界：{state} / {}",
+            self.states.len()
+        );
         if state == self.current_state {
             return;
         }
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "目标状态越界")]
-    fn request_state_out_of_range_panics_in_debug() {
+    fn request_state_out_of_range_panics() {
         let mut player = AnimationPlayer::new(vec![], vec![]);
         player.states = vec![AnimationState {
             clip: 0,

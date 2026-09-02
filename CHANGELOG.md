@@ -100,6 +100,41 @@
   诊断建议（打印 `ground_normal`、以关卡不变量单测固化衔接域——
   iris-ascent 先例）。
 
+### Added（R33：基准与性能门禁——criterion 基准 + release 预算测试 + CI 扩展）
+
+32 轮成果的「性能防回归」保护层：CPU 热路径从 example 版基准升级为
+criterion 正式基准，配 release 预算测试与两条新 CI 门禁。
+
+- **criterion 基准 ×3 crate**（dev-dependencies `criterion 0.7` +
+  `[[bench]] harness = false`，全 GPU 无关纯 CPU 路径）：
+  `iris-core/benches/core.rs`（ecs_spawn_10k / ecs_query_iterate_10k /
+  schedule_build_batches / parallel_run_8_systems / physics_step_100 /
+  move_and_slide / broadphase_200_aabb / determinism trace_240）、
+  `iris-render/benches/render_cpu.rs`（frustum_extract_and_test /
+  bc1_encode_256 / instance_diff_10k / collect_instances_5k）、
+  `iris-audio/benches/audio.rs`（mix_32_voices_1s /
+  spatial_gain_10k）。全部均值基线整理进 ARCHITECTURE §7.1「性能基线」
+  （标注测量机器与日期，仅供量级参考）。
+- **release 预算测试**（`iris-core` / `iris-render` / `iris-audio` 的
+  `tests/budgets.rs`）：4 个代表路径（ECS 遍历 300 µs / 物理步进
+  25 ms / 帧收集 1.5 ms / 混音块 500 µs）各实测 N 次取中位数，断言
+  不超「基准 mean × ~5」的写死预算（注释记录测量机器与日期）。
+  **定位 = 防突然 10 倍劣化的烟雾报警**（5 倍裕度保证 CI 零误报），
+  精确回归检测归 criterion 基线对比；debug 构建自动跳过并打印原因。
+- **CI 扩展**（既有 test / wasm / lint 三 job 不动）：`test-release`
+  （`cargo test --workspace --release`——预算测试在此生效）与 `bench`
+  （`cargo bench --workspace`——记录性冒烟：全量可跑不 panic；CI 数字
+  不可与本地基线横向比较）。
+- **新公开入口（基准 / 诊断用）**：`iris-render::renderer` 的
+  `CpuCollector`（帧收集 CPU 路径的 GPU 无关入口：World + MeshStore +
+  Frustum 构造一次反复收集，语义与渲染器帧内 `collect_instances` 完全
+  一致、scratch 跨帧复用）与 `diff_changed_ranges` 公开导出；
+  `iris-core::Schedule::batch_sizes`（批次划分只读视图，不执行系统）。
+- **清理**：删除 example 版基准 `bench_ecs.rs` / `bench_parallel.rs`
+  （职责并入 criterion benches；README / ARCHITECTURE 引用同步更新）；
+  `determinism` 基准组样本数降至 10（单次迭代 ~2.2 s，默认 100 样本
+  单组耗时 220 s+，拖垮全量 bench 反馈周期）。
+
 ### Added（R32：示范游戏 IV——iris-ascent《Iris Ascent》3D 平台跳跃，dogfooding R28–R31）
 
 - **新 crate `iris-ascent`**（下游示范游戏 IV）：第三人称线性上升平台

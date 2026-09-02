@@ -18,3 +18,11 @@ log = { workspace = true }
 # native 构建完全不引入此依赖。
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = ["Window", "Performance"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# criterion 基准（harness = false：基准自管 main，见 benches/core.rs）
+[[bench]]
+name = "core"
+harness = false

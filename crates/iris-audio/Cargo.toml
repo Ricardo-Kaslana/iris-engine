@@ -18,3 +18,11 @@ glam = { workspace = true }
 # `AudioOutput::device()` 恒返回 None（cfg 分支集中在 device.rs 一处）。
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.15"
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# criterion 基准（harness = false：基准自管 main，见 benches/audio.rs）
+[[bench]]
+name = "audio"
+harness = false

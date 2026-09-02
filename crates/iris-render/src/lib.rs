@@ -76,7 +76,9 @@ pub mod prelude {
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };
     pub use crate::post::{BloomSettings, ExposureSettings, VignetteSettings};
-    pub use crate::renderer::{FrameStats, Renderer};
+    pub use crate::renderer::{
+        CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,
+    };
     pub use crate::skin::{Skin, skin_vertex};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};

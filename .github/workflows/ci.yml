@@ -32,6 +32,26 @@ jobs:
         with: { targets: wasm32-unknown-unknown }
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --target wasm32-unknown-unknown
+  test-release:
+    name: test (release, budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 预算测试（crates/*/tests/budgets.rs）只在 release 生效：宽松上限
+      # 烟雾报警（criterion mean × ~5），只抓数量级劣化、不容忍误报
+      - run: cargo test --workspace --release --quiet
+  bench:
+    name: bench (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 记录性验证：基准全量可跑、不 panic。CI 虚拟机的数字仅供自身
+      # 纵向参考，不可与本地开发机基线（ARCHITECTURE §7.1）横向比较
+      - run: cargo bench --workspace --quiet
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
