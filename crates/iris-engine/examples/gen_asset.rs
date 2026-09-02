@@ -21,9 +21,10 @@ fn main() {
     write_animated_cube_glb("assets/anim_cube.glb", &cube);
     write_skinned_arm_glb("assets/skin_arm.glb");
     write_enemy_worm_glb("assets/enemy_worm.glb");
+    write_ascent_bot_glb("assets/ascent_bot.glb");
     write_sunset_hdr("assets/sunset.hdr");
     println!(
-        "已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb、assets/enemy_worm.glb 与 assets/sunset.hdr"
+        "已生成 assets/cube.gltf、assets/cube0.bin、assets/anim_cube.glb、assets/skin_arm.glb、assets/enemy_worm.glb、assets/ascent_bot.glb 与 assets/sunset.hdr"
     );
 }
 
@@ -617,6 +618,199 @@ fn write_enemy_worm_glb(path: &str) {
         ibm_off = ibm_off,
         w_vtx = w_vtx,
         w_idx = w_idx,
+    );
+
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).expect("创建 assets 目录");
+    }
+    std::fs::write(path, write_glb(&json, &bin)).expect("写入 GLB");
+}
+
+/// 小机器人「Ascent Bot」（iris-ascent 玩家角色）：盒身 + 眼，双剪辑——
+/// `idle`（原地压缩伸展呼吸，2 s 循环）与 `walk`（身体前倾 10° + 左右
+/// 摇摆 ±6°，0.6 s 循环）。iris-ascent 插件运行时用动画状态机在两剪辑
+/// 间做 0.15 s crossfade。
+///
+/// 节点树：0=BotRoot 1=Body(T(0,0.9,0) 网格以身体中心为原点，旋转/缩放
+/// 围绕身体中心) 2=Eye(T(0,0.15,-0.27) 挂在 Body 下随动画联动)。两剪辑
+/// 都带 Body 的旋转与缩放两条通道——crossfade 按路径混合，结束后姿势
+/// 完全由目标剪辑定义（缺通道会被冻结在源姿势，见引擎动画文档）。
+fn write_ascent_bot_glb(path: &str) {
+    use iris_core::prelude::Quat;
+
+    // 网格：以自身中心为原点的缩放立方体（节点平移负责摆放）
+    let scaled_cube = |sx: f32, sy: f32, sz: f32| {
+        let cube = primitives::cube();
+        let mut data = MeshData::default();
+        for v in &cube.vertices {
+            data.vertices.push(Vertex {
+                position: [v.position[0] * sx, v.position[1] * sy, v.position[2] * sz],
+                normal: v.normal,
+                uv: v.uv,
+            });
+        }
+        data.indices = cube.indices.clone();
+        data
+    };
+    let body = scaled_cube(0.7, 0.8, 0.5);
+    let eye = scaled_cube(0.24, 0.1, 0.06);
+
+    let mut bin: Vec<u8> = Vec::new();
+    let put_mesh = |bin: &mut Vec<u8>, mesh: &MeshData| -> (usize, usize, usize, usize, usize) {
+        let pos_off = bin.len();
+        for v in &mesh.vertices {
+            bin.extend_from_slice(&v.position.map(f32::to_le_bytes).concat());
+        }
+        let normal_off = bin.len();
+        for v in &mesh.vertices {
+            bin.extend_from_slice(&v.normal.map(f32::to_le_bytes).concat());
+        }
+        let uv_off = bin.len();
+        for v in &mesh.vertices {
+            bin.extend_from_slice(&v.uv.map(f32::to_le_bytes).concat());
+        }
+        let idx_off = bin.len();
+        for i in &mesh.indices {
+            bin.extend_from_slice(&(*i as u16).to_le_bytes());
+        }
+        let idx_len = bin.len() - idx_off;
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        (pos_off, normal_off, uv_off, mesh.vertices.len(), idx_len)
+    };
+    let (b_pos, b_nrm, b_uv, b_vtx, b_idx_len) = put_mesh(&mut bin, &body);
+    let b_idx_off = b_uv + b_vtx * 8;
+    let (e_pos, e_nrm, e_uv, e_vtx, e_idx_len) = put_mesh(&mut bin, &eye);
+    let e_idx_off = e_uv + e_vtx * 8;
+
+    // 动画采样器数据：idle 呼吸（缩放 1 → 0.93 → 1）+ 恒等旋转；
+    // walk 前倾 10° + 左右摇摆 ±6°（Qz·Qx）+ 恒等缩放
+    let quat_bytes = |q: Quat| [q.x, q.y, q.z, q.w].map(f32::to_le_bytes).concat();
+    let identity = Quat::IDENTITY;
+    let lean_sway = |sway_deg: f32| {
+        Quat::from_rotation_z(sway_deg.to_radians()) * Quat::from_rotation_x(10.0_f32.to_radians())
+    };
+    let idle_times_off = bin.len();
+    bin.extend_from_slice(&[0.0f32, 1.0, 2.0].map(f32::to_le_bytes).concat());
+    let idle_scale_off = bin.len();
+    for sy in [1.0f32, 0.93, 1.0] {
+        bin.extend_from_slice(&[1.0f32, sy, 1.0].map(f32::to_le_bytes).concat());
+    }
+    let idle_rot_off = bin.len();
+    for q in [identity, identity, identity] {
+        bin.extend_from_slice(&quat_bytes(q));
+    }
+    let walk_times_off = bin.len();
+    bin.extend_from_slice(&[0.0f32, 0.3, 0.6].map(f32::to_le_bytes).concat());
+    let walk_rot_off = bin.len();
+    for q in [lean_sway(6.0), lean_sway(-6.0), lean_sway(6.0)] {
+        bin.extend_from_slice(&quat_bytes(q));
+    }
+    let walk_scale_off = bin.len();
+    for _ in 0..3 {
+        bin.extend_from_slice(&[1.0f32, 1.0, 1.0].map(f32::to_le_bytes).concat());
+    }
+
+    let json = format!(
+        r#"{{
+  "asset": {{ "version": "2.0", "generator": "iris gen_asset" }},
+  "buffers": [{{ "byteLength": {buffer_len} }}],
+  "bufferViews": [
+    {{ "buffer": 0, "byteOffset": {b_pos}, "byteLength": {b_pos_len} }},
+    {{ "buffer": 0, "byteOffset": {b_nrm}, "byteLength": {b_nrm_len} }},
+    {{ "buffer": 0, "byteOffset": {b_uv}, "byteLength": {b_uv_len} }},
+    {{ "buffer": 0, "byteOffset": {b_idx_off}, "byteLength": {b_idx_len} }},
+    {{ "buffer": 0, "byteOffset": {e_pos}, "byteLength": {e_pos_len} }},
+    {{ "buffer": 0, "byteOffset": {e_nrm}, "byteLength": {e_nrm_len} }},
+    {{ "buffer": 0, "byteOffset": {e_uv}, "byteLength": {e_uv_len} }},
+    {{ "buffer": 0, "byteOffset": {e_idx_off}, "byteLength": {e_idx_len} }},
+    {{ "buffer": 0, "byteOffset": {idle_times_off}, "byteLength": 12 }},
+    {{ "buffer": 0, "byteOffset": {idle_scale_off}, "byteLength": 36 }},
+    {{ "buffer": 0, "byteOffset": {idle_rot_off}, "byteLength": 48 }},
+    {{ "buffer": 0, "byteOffset": {walk_times_off}, "byteLength": 12 }},
+    {{ "buffer": 0, "byteOffset": {walk_rot_off}, "byteLength": 48 }},
+    {{ "buffer": 0, "byteOffset": {walk_scale_off}, "byteLength": 36 }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": {b_vtx}, "type": "VEC3" }},
+    {{ "bufferView": 1, "componentType": 5126, "count": {b_vtx}, "type": "VEC3" }},
+    {{ "bufferView": 2, "componentType": 5126, "count": {b_vtx}, "type": "VEC2" }},
+    {{ "bufferView": 3, "componentType": 5123, "count": 36, "type": "SCALAR" }},
+    {{ "bufferView": 4, "componentType": 5126, "count": {e_vtx}, "type": "VEC3" }},
+    {{ "bufferView": 5, "componentType": 5126, "count": {e_vtx}, "type": "VEC3" }},
+    {{ "bufferView": 6, "componentType": 5126, "count": {e_vtx}, "type": "VEC2" }},
+    {{ "bufferView": 7, "componentType": 5123, "count": 36, "type": "SCALAR" }},
+    {{ "bufferView": 8, "componentType": 5126, "count": 3, "type": "SCALAR" }},
+    {{ "bufferView": 9, "componentType": 5126, "count": 3, "type": "VEC3" }},
+    {{ "bufferView": 10, "componentType": 5126, "count": 3, "type": "VEC4" }},
+    {{ "bufferView": 11, "componentType": 5126, "count": 3, "type": "SCALAR" }},
+    {{ "bufferView": 12, "componentType": 5126, "count": 3, "type": "VEC4" }},
+    {{ "bufferView": 13, "componentType": 5126, "count": 3, "type": "VEC3" }}
+  ],
+  "materials": [
+    {{ "pbrMetallicRoughness": {{ "baseColorFactor": [0.2, 0.65, 0.6, 1.0], "metallicFactor": 0.1, "roughnessFactor": 0.5 }} }},
+    {{ "pbrMetallicRoughness": {{ "baseColorFactor": [0.1, 0.3, 0.32, 1.0] }}, "emissiveFactor": [0.3, 1.8, 1.8] }}
+  ],
+  "meshes": [
+    {{ "name": "Body", "primitives": [{{ "attributes": {{ "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 }}, "indices": 3, "material": 0 }}] }},
+    {{ "name": "Eye", "primitives": [{{ "attributes": {{ "POSITION": 4, "NORMAL": 5, "TEXCOORD_0": 6 }}, "indices": 7, "material": 1 }}] }}
+  ],
+  "nodes": [
+    {{ "name": "BotRoot", "children": [1] }},
+    {{ "name": "Body", "mesh": 0, "translation": [0.0, 0.9, 0.0], "children": [2] }},
+    {{ "name": "Eye", "mesh": 1, "translation": [0.0, 0.15, -0.27] }}
+  ],
+  "scenes": [{{ "nodes": [0] }}],
+  "scene": 0,
+  "animations": [
+    {{ "name": "idle",
+       "channels": [
+         {{ "sampler": 0, "target": {{ "node": 1, "path": "scale" }} }},
+         {{ "sampler": 1, "target": {{ "node": 1, "path": "rotation" }} }}
+       ],
+       "samplers": [
+         {{ "input": 8, "output": 9, "interpolation": "LINEAR" }},
+         {{ "input": 8, "output": 10, "interpolation": "LINEAR" }}
+       ]
+    }},
+    {{ "name": "walk",
+       "channels": [
+         {{ "sampler": 0, "target": {{ "node": 1, "path": "rotation" }} }},
+         {{ "sampler": 1, "target": {{ "node": 1, "path": "scale" }} }}
+       ],
+       "samplers": [
+         {{ "input": 11, "output": 12, "interpolation": "LINEAR" }},
+         {{ "input": 11, "output": 13, "interpolation": "LINEAR" }}
+       ]
+    }}
+  ]
+}}"#,
+        buffer_len = bin.len(),
+        b_pos = b_pos,
+        b_pos_len = b_nrm - b_pos,
+        b_nrm = b_nrm,
+        b_nrm_len = b_uv - b_nrm,
+        b_uv = b_uv,
+        b_uv_len = b_vtx * 8,
+        b_idx_off = b_idx_off,
+        b_idx_len = b_idx_len,
+        e_pos = e_pos,
+        e_pos_len = e_nrm - e_pos,
+        e_nrm = e_nrm,
+        e_nrm_len = e_uv - e_nrm,
+        e_uv = e_uv,
+        e_uv_len = e_vtx * 8,
+        e_idx_off = e_idx_off,
+        e_idx_len = e_idx_len,
+        b_vtx = b_vtx,
+        e_vtx = e_vtx,
+        idle_times_off = idle_times_off,
+        idle_scale_off = idle_scale_off,
+        idle_rot_off = idle_rot_off,
+        walk_times_off = walk_times_off,
+        walk_rot_off = walk_rot_off,
+        walk_scale_off = walk_scale_off,
     );
 
     if let Some(parent) = std::path::Path::new(path).parent() {

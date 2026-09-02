@@ -896,6 +896,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-ascent"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
+ "log",
+]
+
+[[package]]
 name = "iris-audio"
 version = "0.1.0"
 dependencies = [

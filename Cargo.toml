@@ -10,6 +10,7 @@ members = [
     "crates/iris-game",
     "crates/iris-arena",
     "crates/iris-bastion",
+    "crates/iris-ascent",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ iris-engine = { path = "crates/iris-engine", version = "0.1.0" }
 iris-game = { path = "crates/iris-game", version = "0.1.0" }
 iris-arena = { path = "crates/iris-arena", version = "0.1.0" }
 iris-bastion = { path = "crates/iris-bastion", version = "0.1.0" }
+iris-ascent = { path = "crates/iris-ascent", version = "0.1.0" }
 
 # 数学：SIMD 优化的线性代数库
 glam = "0.33"

@@ -24,7 +24,7 @@ iris-render ───────┘               │
 iris-engine（门面，用户唯一入口）────┘
     ↑
 iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
-          └── iris-bastion（下游示范游戏 III）
+          └── iris-bastion（下游示范游戏 III）── iris-ascent（下游示范游戏 IV）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -73,6 +73,20 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   后插入的会把先插入的**整个覆盖**且编译期 / 运行期均不报错（见
   `World::insert_resource` 文档的模式警示）。headless 自动玩家经鼠标
   点击全链路放塔、真实模拟 5 波全清获胜（经济 / 索敌闭环量化验证）。
+- **iris-ascent**：与前三作同层的第四作（示范游戏 Iris Ascent，第三人称
+  3D 平台跳跃）——同一依赖纪律（iris-engine 门面 + glam），把 R28–R31
+  的四个新能力当载荷压榨：**动画状态机 / crossfade / 事件轨道（R28）**
+  （双剪辑角色 GLB 程序化生成、`request_state` 双向 0.15 s 过渡、walk
+  剪辑注入 footstep 事件轨道驱动脚步声）、**CSM（R29）**（方向光斜照
+  ~130 m 场景，快照 + 阴影开 / 关逐像素差分作证据）、**距离 LOD（R30）**
+  （22 个远景装饰挂 `LodMesh`，相机拉远 `triangles_drawn` 9 440 →
+  7 324）、**运动学角色控制器（R31）**（`move_and_slide_statics` 就是
+  玩法物理——纯逻辑核心只依赖 glam + 引擎纯函数，headless 与窗口同一
+  模拟；跳板是游戏逻辑的一次竖直冲量而非物理）。线性上升关卡刻意设计成
+  「前进 + 两个定点跳」即可通关，headless 经真实键盘注入全关通关
+  （19.5 s / 宝石 14/14 / 检查点 3/3 / 坠落 0）。第四轮撞到的摩擦
+  （crossfade 缺通道定格 / GLB 手写 JSON / 子实体相机平滑范式 /
+  move_and_slide 衔接参数域）见 §8.18。
 
 ## 3. ECS 设计（iris-core）
 
@@ -1601,6 +1615,39 @@ glTF / HDR 错误经 `From` 映射保上下文）。
     （非对齐纹理回退 RGBA8，编码器 pad 能力未接入上传）；无 mipmap
     （远距离细节闪烁没有 mip 链缓解）；编码器为确定性暴力端点选择
     （质量敏感资产可用离线工具预压缩，运行时编码走同一管线）。
+18. **dogfooding IV 发现的引擎摩擦（iris-ascent 实践反馈）**——第四轮
+    （3D 平台跳跃）把 R28–R31 压榨一遍的「现象 → 绕行 → 建议修法」
+    清单；均未改引擎（绕行在游戏侧，作为下一轮打磨的输入）：
+    ① **crossfade 的缺通道混合语义**：混合只作用于「双方都有」的
+    「目标实体 + 路径」对，「仅源有」的通道在过渡期保持源姿势、过渡
+    结束后**定格在最后的源值**（不再被任何剪辑驱动）——idle 只有
+    scale、walk 只有 rotation 的自然写法会让呼吸缩放在起跑后冻住。
+    **绕行**：状态机用的剪辑强制路径对齐（两剪辑都写 scale + rotation
+    两通道，恒值通道也要写）。**建议**：blend 结束时把「仅源有」路径
+    淡回目标实体的静止姿势，或文档显式警告「crossfade 剪辑必须路径
+    对齐」；② **程序化 GLB 生成是手写 JSON 字符串**：bufferView 偏移 /
+    accessor 下标 / sampler 编号全靠手工记账（gen_asset 四个生成函数
+    均如此），错一位即加载失败或姿势错乱且无定位信息。**绕行**：复制
+    既有函数为模板改数。**建议**：引擎提供编程式组装 API
+    （`GltfBuilder`：append_mesh / add_animation_channel / write_glb）；
+    ③ **状态机无边时 `request_state` 静默硬切换**：调试期清空 edges
+    会让全部过渡变成跳变，画面闪变无任何日志线索。**建议**：硬切换
+    路径打 `log::debug`；④ **「子实体相机 + 平滑追随」无现成范式**：
+    平滑量必须写在子实体的**局部**位置（局部 = 平滑世界位 − 根位置，
+    层级传播还原世界位）；GlobalTransform 滞后一帧；瞬移（复活）需要
+    手动吸附，否则相机长距离甩镜。**绕行**：游戏侧约 30 行的
+    `CameraRig` 资源（iris-ascent plugin）。**建议**：引擎提供
+    `SmoothFollow` 组件或在下游游戏模板文档中固化该范式；⑤
+    **`move_and_slide` 的衔接参数域无指导**：`step_height 0.3` +
+    `snap_distance 0.2` 对「落差 ≤ 0.3、缝宽 ≤ 0.5（< 胶囊直径）」的
+    台间衔接恰好可靠；缝宽 > 2×snap_distance 且落差 > step_height 的
+    衔接会以「贴边落在台缘角点」的方式卡墙，且失败模式不易诊断。
+    **绕行**：iris-ascent 以关卡不变量单测固化衔接域（落差 ≤ 0.3、
+    缝宽 ≤ 0.5）。**建议**：character 模块文档附「平台跳跃衔接参数
+    表」；⑥ **跳跃输入的电平 vs 边沿**：`key_pressed` 边沿对「落地就
+    跳」（跳跃蓄压）不友好，脚本注入也要 release+press 两步。**绕行**：
+    逻辑层输入直接用电平语义（`AscentInput::jump` 按住即跳，落地即
+    触发）。**建议**：无（记录语义选择，下游游戏按玩法挑一边）。
 
 ## 9. 关键设计取舍记录
 

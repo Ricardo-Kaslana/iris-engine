@@ -5,6 +5,57 @@
 
 ## [Unreleased]
 
+### Added（R32：示范游戏 IV——iris-ascent《Iris Ascent》3D 平台跳跃，dogfooding R28–R31）
+
+- **新 crate `iris-ascent`**（下游示范游戏 IV）：第三人称线性上升平台
+  跳跃——悬浮台地（0.28 m 台阶）→ 大球坡面（R=14，走落 + 球顶定点跳）
+  → 四段跳板弹射（竖直冲量 18 m/s，弹高 ~16.5 m）向上攀登 61 m，14 颗
+  宝石 + 3 检查点 + 山顶信标胜利 + 坠落线复活。纯逻辑核心 `logic.rs`
+  只依赖 glam + 引擎纯函数：**`move_and_slide_statics` 就是玩法物理**
+  （刻意 dogfooding R31——headless 与窗口同一模拟，台阶迈上 / 贴墙滑行 /
+  坡限 / 贴地吸附全部由控制器五步管线承担）；跳板为游戏逻辑（AABB 判定
+  + `vel.y ≤ 0` 门禁的一次竖直冲量）；土狼时间 0.1 s；落地冲量阈值
+  3 m/s（防小台阶误触发落地尘土）；`AscentEvent` 七类事件自带世界坐标；
+  逐位确定性（两次模拟 to_bits 逐帧比对单测）。关卡刻意设计成「前进 +
+  两个定点跳」可通关——**headless 脚本化自动玩家经真实键盘注入
+  （Input → 相机相对翻译 → 逻辑 → 表现全链路）通关：19.5 s / 宝石
+  14/14 / 检查点 3/3 / 坠落 0**；纯核心单测 14 项（台阶行走 / 球面贴地 /
+  弹射顶点解析对照 / 土狼时间窗口 / 落地冲量阈值 / 检查点复活逐位精确 /
+  坠落复活 / 胜利冻结 / 全关通关 / 确定性）+ 插件层 headless 集成测试
+  6 项（启动装配 / 全关通关 / 状态机切换 / 事件→粒子音频 / 复活相机吸附
+  与 HUD / LOD 三角形对比，GPU 缺席自动跳过）。
+- **双剪辑角色 GLB（R28 载荷）**：`gen_asset` 示例新增
+  `write_ascent_bot_glb`——程序化生成 `assets/ascent_bot.glb`（盒身 +
+  眼小机器人）：`idle`（呼吸压缩 1→0.93→1，2 s 循环）与 `walk`（前倾
+  10° + 左右摇摆 ±6°，0.6 s 循环）两剪辑；运行时**状态机**
+  （states = [idle, walk]、双向边 duration 0.15 s）由移动意图
+  `request_state` 切换，crossfade 实测（headless 断言 blend 起止）。
+  **事件轨道**：GLB 解析不产事件，API 侧向 walk 剪辑注入「footstep」
+  标记（0.15 / 0.45 s），`take_events` 驱动脚步声（仅地面有效）。
+  模型加载失败自动降级为程序化几何 + 代码构建的同构剪辑（行为完全
+  一致，wasm / 资产缺失可玩）。**摩擦记录**：crossfade「仅源有」通道
+  在过渡后定格——两剪辑被迫路径对齐（scale + rotation 双写），见
+  ARCHITECTURE §8.18 ①。
+- **LOD（R30 载荷）**：22 个远景装饰（山景球 ×8 / 巨柱 ×8 / 浮岛 ×6）
+  挂 `LodMesh`（高 / 低模 + 60 m 切换）；量化证据：相机拉远 160 m 后
+  `triangles_drawn` 9 440 → 7 324（headless 断言 `far < near`）。
+- **CSM（R29 载荷）**：方向光斜照 ~130 m 场景（关卡高差 61 m）——无需
+  新代码；快照目检 + `shadows` 开 / 关逐像素差分 4 622 px（远景山体
+  受光 / 阴影面 + 角色 / 旗杆接触阴影）作证据。
+- **三层玩家结构 + 相机平滑追随**：根实体（逻辑位置，rotation 恒等）→
+  模型子实体（AnimationPlayer + 朝向 yaw）→ 相机子实体（固定偏移 +
+  指数趋近平滑，平滑量写局部位置 = rig 世界位 − 根位置；复活瞬移整体
+  吸附——范式与摩擦记录见 ARCHITECTURE §8.18 ④）。
+- **FX 池 + 空间音频**：七类事件（跳 / 落 / 弹 / 宝石 / 检查点 / 复活 /
+  胜利）→ FX 池 12 槽位 burst（参数全字段覆写 + `reset` 就地复用）+
+  `play_spatial` 事件定位音效（八种程序化剪辑，听者跟随第三人称相机，
+  复活横幅 2 s 计时）。
+- **快照**：`examples/ascent_snapshot.rs`——自动玩家真实打通第一段
+  登顶后定格中段战局（640×360 → `docs/ascent.png`，已目检）；打印
+  FrameStats 并断言 `culled_instances > 0` 与 LOD 近 / 远三角形对比。
+- 文档：README 新增「用 Iris 做的游戏 IV」+ 摩擦清单摘要；
+  ARCHITECTURE §2 补 iris-ascent 段、§8.18 补第四轮摩擦六条。
+
 ### Added（R31：物理角色控制器——竖直 Capsule 碰撞体 + move_and_slide 运动学控制器）
 
 - **竖直 Capsule 碰撞体**（iris-core `physics`）：`ColliderShape::Capsule

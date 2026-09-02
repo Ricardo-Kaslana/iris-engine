@@ -211,7 +211,8 @@ iris-engine/
 │   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / csm_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / culling_bench / memory_bench / scene_snapshot / particle_snapshot / web（wasm 专用入口，见「Web 构建」）
 │   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
 │   ├── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
-│   └── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
+│   ├── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
+│   └── iris-ascent/     # 引擎下游示范游戏 IV：3D 平台跳跃 Iris Ascent（同上）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -493,10 +494,89 @@ cargo run -p iris-bastion --release                  # 玩游戏（鼠标选格 
 cargo run -p iris-bastion --example bastion_snapshot --release   # 中期战局离屏验收帧
 ```
 
+### IV. Iris Ascent（`crates/iris-ascent`）——3D 平台跳跃
+
+**Dogfooding IV**——第三人称线性上升关卡：角色沿悬浮台地（0.28 m 台阶）
+→ 大球坡面（R = 14，走落 + 球顶定点跳）→ **四段跳板弹射**（竖直冲量
+18 m/s，弹高 ~16.5 m，承担主要爬升）一路向上攀登 61 m，沿途收集 14 颗
+宝石、激活 3 个检查点，抵达山顶信标获胜；坠落到坠落线（y = −12）回最近
+检查点复活。全部机制集中在纯逻辑核心 `logic.rs`。
+
+本作把 R28–R31 的四个新能力当载荷压榨：**动画状态机 / crossfade /
+事件轨道（R28）**——双剪辑角色 GLB（`assets/ascent_bot.glb` 由
+`gen_asset` 示例程序化生成：`idle` 呼吸压缩 2 s / `walk` 前倾摇摆
+0.6 s），运行时 `request_state` 双向 0.15 s crossfade；walk 剪辑注入
+「footstep」事件轨道（GLB 解析不产事件、API 侧构造），`take_events`
+驱动脚步声；**CSM 级联阴影（R29）**——方向光斜照 ~130 m 场景（无需新
+代码，快照目检 + 阴影开 / 关逐像素差分作证据）；**距离 LOD（R30）**——
+22 个远景装饰（山景球 / 巨柱 / 浮岛剪影）挂 `LodMesh`（高 / 低模 +
+60 m 切换），相机拉远 160 m 后 `triangles_drawn` 9 440 → 7 324 的量化
+下降；**运动学角色控制器（R31）**——`move_and_slide_statics` 就是本作
+的物理核心：纯逻辑核心只依赖 glam + 引擎纯函数（刻意 dogfooding），
+headless 与窗口走同一模拟，台阶迈上 / 贴墙滑行 / 陡坡下滑 / 贴地吸附
+全部由控制器五步管线承担。跳板不是物理——AABB 判定 + 一次竖直冲量
+（`vel.y ≤ 0` 门禁保证每段接触恰好触发一次）。土狼时间 0.1 s、落地
+冲量阈值 3 m/s（防小台阶误触发尘土）等手感参数集中在 `logic.rs` 顶部。
+
+**脚本化自动玩家**（headless 与纯核心单测共用同一 `AutoPilot` 脚本）：
+关卡被刻意设计成「前进 + 两个定点跳」（出生台地一跳 + 球顶一跳，其余
+全部由控制器自动迈上 / 走落衔接、跳板自动弹射）——headless 集成测试经
+**真实键盘注入**（Input → 相机相对翻译 → 逻辑 → 表现）全关通关：
+**用时 19.5 s、宝石 14/14、检查点 3/3、坠落 0**；纯核心单测另有逐位
+确定性（两次模拟 to_bits 逐帧比对）与弹射顶点解析对照。
+
+![平台跳跃中段验收](docs/ascent.png)
+
+实测（`docs/ascent.png`，640×360 离屏单帧）：自动玩家真实打通第一段
+登顶后定格在第一块弹射落点台 P6——角色（teal 机器人，落地尘土粒子
+扩散中）、检查点 1 旗已点亮（激活火花在飘）、前方 P7 跳板辉光盘、
+HUD（GEMS 7/14 / CHECKPOINT 1/3 / FALLS 0）完整、两侧远景 LOD 装饰
+（山景球 / 巨柱）；该帧 FrameStats：`draw_calls = 13` / `instances = 116`
+/ `culled_instances = 41`（远景装饰视锥剔除）/ `particles_drawn = 94`
+（落地尘土 + 检查点火花）。CSM 证据：方向光 `shadows = false` 与 `true`
+两帧逐像素差分 4 622 px（远景山体的受光 / 阴影面 + 角色 / 旗杆接触
+阴影——级联 0 近景锐利、级联 2 覆盖远景山体）。
+
+本轮 R32 的**摩擦清单**（现象 → 绕行 → 建议修法，全文见
+ARCHITECTURE.md §8.18）：
+
+1. **crossfade 只混「双方都有」的通道，缺通道保持源姿势且混完定格**
+   → 角色两剪辑都被迫写满同路径通道（idle/walk 都带 scale + rotation），
+   否则呼吸缩放会冻结在过渡时刻的值 → 建议：剪辑结束时对「仅源有」的
+   路径淡回静止姿势，或文档显式警告「crossfade 剪辑必须路径对齐」；
+2. **GLB 生成器是纯手写 JSON 字符串**（bufferView 偏移 / accessor 下标
+   全手工记账，错一位就加载失败或花屏）→ 绕行：以既有 gen_asset 三个
+   函数为模板复制粘贴改数 → 建议：引擎提供 `GltfBuilder` 类的编程式
+   组装 API（append_mesh / add_channel / write）；
+3. **动画状态机无边时 `request_state` 硬切换**——调试时临时清空 edges
+   会让所有过渡变成跳变，画面「闪一下」无任何告警 → 建议：无边硬切换
+   时打一条 `log::debug`；
+4. **第三人称「子实体相机 + 平滑追随」没有现成模式**：相机挂根实体后
+   平滑必须写在**局部**位置（局部 = 平滑世界位 − 根位置），且
+   GlobalTransform 滞后一帧、复活瞬移需手动吸附 → 本作把 rig 世界位放
+   资源里自行积分（约 30 行）→ 建议：引擎提供 `SmoothFollow` 组件或
+   在游戏模板文档中给出该范式；
+5. **`Input::press` 电平与 `key_pressed` 边沿的双轨**：脚本玩家「按住
+   跳跃键」要在每帧 release+press 注入边沿，电平语义对跳跃这类
+   「落地就跳」的玩法反而更自然 → 本作逻辑层直接采用电平语义
+   （`input.jump` 按住即跳），绕开了边沿翻译 → 建议：无（现状合理，
+   记录语义选择即可）；
+6. **`move_and_slide` 参数整定无指导**：`step_height` 0.3 / `snap_
+   distance` 0.2 的组合对「0.28 m 台阶 + 0.5 m 桥接缝」的走落衔接恰好
+   工作，但缝隙 > 2×snap_distance、落差 > step_height 的衔接会卡墙
+   （「贴边落在台缘角点」的失败模式）→ 本作以关卡不变量单测固化
+   「衔接高差 ≤ 0.3、缝宽 ≤ 0.5」→ 建议：character 模块文档附一段
+   「平台跳跃衔接参数表」（落差 / 缝宽 / 参数的可行的域）。
+
+```sh
+cargo run -p iris-ascent --release                  # 玩游戏（WASD 移动 / 空格跳 / R 回检查点）
+cargo run -p iris-ascent --example ascent_snapshot --release   # 中段战局离屏验收帧
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 384 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 465 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

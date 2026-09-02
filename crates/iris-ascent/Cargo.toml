@@ -1,0 +1,20 @@
+[package]
+name = "iris-ascent"
+description = "Iris 引擎下游示范游戏 IV：Iris Ascent 3D 平台跳跃（dogfooding IV——R28 动画状态机 × R29 CSM × R30 距离 LOD × R31 角色控制器 move_and_slide 的高强度真实用法）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# 依赖方向：iris-ascent 与 iris-game / iris-arena / iris-bastion 同为引擎最
+# 下游消费者（用户视角）。logic.rs 的纯逻辑核心只依赖 glam +
+# iris-core 的纯函数（move_and_slide_statics / ColliderShape——刻意
+# dogfooding：平台跳跃的物理就是引擎角色控制器，headless 与窗口走同一
+# 模拟）；插件层只允许依赖引擎门面 iris-engine。
+[dependencies]
+iris-core = { workspace = true }
+iris-engine = { workspace = true }
+glam = { workspace = true }
+# 场景 / 资产加载失败的 log 告警（log 已在全 workspace 依赖树内，无新 crate）
+log = { workspace = true }
