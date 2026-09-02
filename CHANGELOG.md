@@ -5,6 +5,69 @@
 
 ## [Unreleased]
 
+### Added（打磨 III：引擎 API 打磨 III——闭合 Iris Bastion dogfooding 的五条引擎摩擦）
+
+延续「打磨 I / II」模式：**引擎侧修复 + Bastion 侧绕行删除验证**——每条
+修完 iris-bastion 测试仍绿才算闭合（headless 7 项 + 全部单测通过）。
+
+- **① 屏幕射线辅助 + 视口尺寸可读**：iris-render camera 模块新增
+  `Camera::screen_ray(ndc, aspect) -> (origin, dir)`（NDC 点 → 世界射线：
+  vp 逆对近 / 远平面各取一点、两点连线即针孔射线，数学推导写入注释；
+  透视除法奇异时方向归零、由调用方按「射线无效」兜底）与实体相机版
+  `screen_ray_from_global(gt, cam, ndc, aspect)` + `view_proj_from_global`
+  （视图复用 `view_from_global`，投影 DirectX 深度约定与渲染器同款——
+  世界 → 屏幕的正向投影与屏幕 → 世界的反投影共用同一矩阵，引擎外不再
+  手工拼 vp）；单测覆盖「NDC 中心射线 ≈ eye→target」「左右缘射线发散
+  且与 NDC x 符号一致」「实体版原点 = 全局位置、与正向投影互逆」。
+  iris-engine 新资源 `Viewport { width, height }`（缺省 1280×720，与
+  缺省窗口一致）入 `DefaultPlugins`：`WindowPlugin` 以窗口初始尺寸首次
+  插入，此后主循环每次 `WindowEvent::Resized` 自动同步（照 `Input` 资源
+  的模式）；离屏 / headless 程序没有窗口事件，手动
+  `insert_resource(Viewport::new(w, h))`（资源文档写明）。
+  Bastion 侧绕行删除：`BastionViewport` 资源、`DEFAULT_VIEWPORT` 常量、
+  手工拼 vp 的 `active_camera_vp` 与错误分类 `BastionPickError` 全部
+  删除，拾取 / `world_to_screen` 改走引擎 `screen_ray_from_global` /
+  `view_proj_from_global` + `Viewport`（headless 路径由
+  `setup_resources` 兜底插入缺省视口，窗口路径以框架维护的为准）。
+- **② 粒子重置 API**：`ParticleEmitter::reset()`——清空活粒子池、
+  `burst_fired` 归 false（burst 重新上膛）、发射余量 / 发射器年龄 /
+  伪随机计数器与命令式进账一并归零，**参数字段不动**的前提下与刚构造
+  的同参数新实例逐位等价；`trigger_burst(count)`——命令式进账在下一次
+  `advance` 一次射出（dt = 0 亦触发、多次调用累加、消耗后不补发，不改
+  `burst_count` 配置语义）。单测：reset 后内部状态与活粒子行为和新实例
+  逐位一致 + 爆炸 burst 重新上膛；trigger_burst 的位置 / 确定性 / 累加 /
+  不补发。Bastion FX 池触发处改「参数全字段覆写 + `reset()` 就地复用」
+  （「换挂整只新发射器组件」的绕行删除；六个 `*_emitter()` 构造函数
+  改写为 `configure_*(&mut)` 全字段写入函数，池结构不动）。
+- **③ 粒子收集查 Visibility**：渲染器 `collect_particles` 查询带
+  `Option<&Visibility>`（缺席 = 可见，与网格 / 透明收集同语义），挂
+  `HIDDEN` 的发射器整池跳过；隐藏只是渲染过滤——`update_particles`
+  照常推进，粒子继续老化。GPU 测试：HIDDEN 后 `particles_drawn = 0`、
+  `draw_calls = 0` 且画面失去全部粒子像素（帧差分断言），恢复
+  `VISIBLE` 原样重现 320 颗。
+- **④ Visibility 层级级联（正确性核心）**：渲染收集期沿 `ChildOf`
+  父链上行遍历（`hidden_by_ancestor`，每实体 O(父链深度) 典型 ≤ 4、
+  防御性深度上限 64——不加新组件、不动 `hierarchy` 数据），任一祖先
+  `HIDDEN` ⇒ 子树全隐藏；普通 / 蒙皮 / 透明（含透明蒙皮）三条几何
+  收集路径与粒子发射器全覆盖；`visibility.rs` 模块头文档置顶改写
+  （旧「过滤逐实体、不级联」说明替换为级联语义）；可见性过滤不计入
+  `FrameStats.culled_instances`（口径不变）。GPU 回归测试复刻 Bastion
+  之坑——根 rig（HIDDEN）→ 子夹层（无网格无 Visibility）→ 孙子网格：
+  隐藏时 `instances = 0` 且零像素，根恢复可见则入画，夹层隐藏同样整树
+  隐藏（级联对每一层祖先生效）。Bastion 侧：塔池 / 敌池**还原**「根 →
+  形态 rig → 网格」三层结构（打磨 III 前级联缺失、孙子网格恒渲染，
+  被迫拍平成「网格直接挂根 + 名字含段识别形态」——即 draw calls 139
+  事故的绕行），形态切换回到「翻两个 rig 的可见性」；幽灵射程盘删除
+  逐实体 `Visibility`，改由层级级联随根一并隐藏（顺带修复幽灵待命时
+  射程盘滞留画面的缺陷）。快照 draw_calls 新旧对比见 README 的
+  bastion.png 目检记录。
+- **⑤ 同构池 type alias 警示**：`World::insert_resource` 文档新增模式
+  警示（资源按 `TypeId` 寻址——同型多实例资源互相整个覆盖且编译期 /
+  运行期均不报错，症状是「池凭空消失 / 数据串味」；同构池必须是
+  distinct newtype，type alias 只是同一类型的别名）；ARCHITECTURE 的
+  iris-bastion 段同步记录该模式。Bastion 代码不动（敌 / 弹 / 臼炮三池
+  本就是三个独立 newtype，此次只是把踩坑经验沉淀进引擎文档）。
+
 ### Added（R26：游戏三 dogfooding——塔防《Iris Bastion》，R21–R25 五能力整体压榨）
 
 - **新下游示范游戏 III：`crates/iris-bastion`**（塔防 Iris Bastion，依赖

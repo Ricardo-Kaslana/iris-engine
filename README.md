@@ -38,7 +38,7 @@ fn gameplay(world: &mut World) {
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ **3D 空间音频 v1**（距离软倒数衰减 + 恒功率立体声声像的纯函数增益模型，`play_spatial` / `set_listener` / `set_sound_position` 逐帧重算；`SpatialListener` / `SpatialSource` 组件 + PostUpdate 同步系统，组件移除帧间差分自动停止；身后不消音 v1 限制）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → **均匀网格 broadphase 候选筛选**（BTreeMap 字典序 = 确定性；候选升序 + `j > i` 过滤使配对遍历序与 O(n²) 完全一致，bit 级确定性测试无需改动即守护等价性）→ 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」；**射线 / 线段查询**（`raycast` / `raycast_filtered` / `segment_hits_shape`——最近命中优先、`t` 并列取存储序先遍历者，线段扫掠判定防高速穿模）；**球扫掠 shapecast**（`sphere_sweep` / `sphere_sweep_statics`——保守推进二分求首次碰撞分数与阻挡法线，角色控制器地基） |
 | **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机**；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤，**层级级联**：任一祖先隐藏 ⇒ 子树全隐藏，组件缺席 = 可见）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机 + 屏幕射线反投影**（`screen_ray`：NDC 点 → 世界射线，拾取的基础操作；`Viewport` 视口尺寸资源随窗口缩放自动同步）；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设，`reset()` / `trigger_burst()` 池槽位就地复用与命令式爆发）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -421,26 +421,40 @@ cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏�
 红蓝着色。
 
 本作把 R21–R25 的五个新能力当载荷压榨：**鼠标拾取（R21）**——`cursor_
-position()` 像素 → NDC → 相机 vp 逆 → 世界射线 → `raycast` 打地面静态
-Collider → 网格（刻意走引擎查询而非解析平面）；**透明材质（R23）**——
-幽灵塔身 `AlphaMode::Blend` 可放蓝 / 不可放红 + 半透明射程指示盘；
-**粒子（R24）**——枪口闪光 / 命中火花 / 死亡爆炸 / 漏怪告警四类 burst 挂
-FX 池槽位按需触发；**空间音频（R25）**——开火 / 命中 / 爆炸 / 死亡 / 漏怪
-五种程序化音效 `play_spatial` 定位到事件世界坐标，听者每帧跟随俯视相机。
-逻辑侧事件自带世界坐标（`BastionEvent`），表现层零反查。塔 / 敌 / 双弹 /
-FX 四池启动预热，运行期零 spawn / despawn（池守恒由测试守护）。纯逻辑核心
-（`logic.rs`，只 glam、零引擎依赖）含扫掠弹道命中、路径进度索敌（射程内
-**打最靠前**）、航点匀速推进、波次间歇与逐位确定性；headless 集成测试里的
-**脚本化自动玩家**经鼠标点击全链路放塔，真实模拟跑完 5 波**获胜且核心无
-损**（经济 / 索敌闭环可玩的量化证据）。
+position()` 像素 → NDC → 引擎 `screen_ray_from_global` 世界射线 →
+`raycast` 打地面静态 Collider → 网格（刻意走引擎查询而非解析平面）；
+**透明材质（R23）**——幽灵塔身 `AlphaMode::Blend` 可放蓝 / 不可放红 +
+半透明射程指示盘；**粒子（R24）**——枪口闪光 / 命中火花 / 死亡爆炸 /
+漏怪告警四类 burst 挂 FX 池槽位，参数覆写 + `reset()` 就地复用触发；
+**空间音频（R25）**——开火 / 命中 / 爆炸 / 死亡 / 漏怪五种程序化音效
+`play_spatial` 定位到事件世界坐标，听者每帧跟随俯视相机。逻辑侧事件自带
+世界坐标（`BastionEvent`），表现层零反查。塔 / 敌 / 双弹 / FX 四池启动
+预热，运行期零 spawn / despawn（池守恒由测试守护；三个同构池各自
+distinct newtype——资源按 TypeId 寻址，type alias 同型会互相覆盖）。
+纯逻辑核心（`logic.rs`，只 glam、零引擎依赖）含扫掠弹道命中、路径进度
+索敌（射程内**打最靠前**）、航点匀速推进、波次间歇与逐位确定性；
+headless 集成测试里的**脚本化自动玩家**经鼠标点击全链路放塔，真实模拟
+跑完 5 波**获胜且核心无损**（经济 / 索敌闭环可玩的量化证据）。本次实践
+撞到的 5 条引擎摩擦（屏幕射线辅助 + 视口资源 / 粒子重置 API / 粒子
+Visibility 过滤 / 可见性层级级联 / 同构池 type alias 模式警示）已在
+「引擎 API 打磨 III」轮全部闭合：游戏内的 `BastionViewport` 资源、手工
+vp 逆与「换挂整只新发射器组件」绕行删除改用新 API，塔 / 敌池还原
+「根 → 形态 rig → 网格」三层结构由级联真实生效（清单见
+ARCHITECTURE.md §8.15）。
 
 ![塔防中期战局验收](docs/bastion.png)
 
 实测（`docs/bastion.png`，640×360 离屏单帧）：四塔就位（哨兵压西段 / 臼炮
 守弯口）、第 1 波敌群在途（橙色疾行虫沿航点推进）、击杀爆炸粒子在扩散、
 幽灵预览（臼炮形态 + 射程盘）悬停待放格、HUD（CREDITS / WAVE 1/5 /
-CORE HP / 建造提示）完整；该帧 `culled_instances = 8`（界外岩柱全部被视锥
-剔除——剔除在真实场景生效的量化证据）。
+CORE HP / 建造提示）完整；该帧 FrameStats：`draw_calls = 17` /
+`instances = 366` / `culled_instances = 8`（界外岩柱全部被视锥剔除——
+剔除在真实场景生效的量化证据）/ `particles_drawn = 338`。对比打磨 III
+前的拍平池结构（`draw_calls = 18` / `instances = 367`）：旧逐实体可见性
+语义下击杀归还的池槽位只隐藏根实体、网格子实体自带 `VISIBLE` 不级联——
+被击杀敌人的机体**滞留在死亡点入画**（恰藏于 HUD 文字后，新旧帧逐像素
+差分定位）；层级级联闭合后该伪影消失，还原「根 → 形态 rig → 网格」三层
+池结构 draw_calls 18 → 17（与「旧结构 + 手工逐子隐藏」的帧逐字节一致）。
 
 ```sh
 cargo run -p iris-bastion --release                  # 玩游戏（鼠标选格 / 左键放塔 / 1·2·右键换塔种）
@@ -450,7 +464,7 @@ cargo run -p iris-bastion --example bastion_snapshot --release   # 中期战局�
 ## 测试
 
 ```sh
-cargo test --workspace   # 376 个测试：单元 + GPU 端到端离屏渲染
+cargo test --workspace   # 384 个测试：单元 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

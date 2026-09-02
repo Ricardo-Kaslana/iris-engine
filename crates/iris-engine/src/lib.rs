@@ -34,7 +34,7 @@ pub mod prelude {
     pub use crate::assets::asset_path;
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin, ParticlePlugin,
-        PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin, WindowPlugin,
+        PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin, Viewport, WindowPlugin,
     };
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记
     pub use crate::scene::{

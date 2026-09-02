@@ -7,16 +7,17 @@
 //!   靶子）+ 航点路径带 + 边框 + 核心水晶 + 界外岩柱 + 灯光 + 相机 +
 //!   幽灵预览 + **四池**（塔 / 敌 / 双弹 / FX，启动即全部隐藏待命，
 //!   运行期零 spawn / despawn））；
-//! - **Update**：`run_bastion`（读 `Input` / `Time` → **鼠标拾取**——
-//!   `cursor_position()` 像素 → NDC → 相机 vp 逆 → 世界射线 →
-//!   `iris_core::physics::raycast` 打地面静态 collider → 网格坐标；
-//!   左键边沿 = 放塔请求，数字键 / 右键 = 切换塔种 →
-//!   `BastionState::step` → 事件列表触发**空间音频**（`play_spatial`
-//!   定位事件世界坐标，听者每帧跟随俯视相机））→ `trigger_bastion_fx`
-//!   （事件 → **粒子**：发射器挂 FX 池槽位实体按需触发）→
-//!   `update_bastion_visuals`（幽灵预览 + 四池表现：塔池下标直映射、
-//!   敌池 / 弹池以稳定 id 映射）→ `update_bastion_hud`（积分 / 波次 /
-//!   核心 HP / 当前塔种与价格 / 胜负横幅，文本实体经 `Name` 按名定位）。
+//! - **Update**：`run_bastion`（读 `Input` / `Time` / `Viewport` →
+//!   **鼠标拾取**——`cursor_position()` 像素 → NDC → 引擎
+//!   `screen_ray_from_global` 世界射线 → `iris_core::physics::raycast`
+//!   打地面静态 collider → 网格坐标；左键边沿 = 放塔请求，数字键 /
+//!   右键 = 切换塔种 → `BastionState::step` → 事件列表触发**空间音频**
+//!   （`play_spatial` 定位事件世界坐标，听者每帧跟随俯视相机））→
+//!   `trigger_bastion_fx`（事件 → **粒子**：发射器挂 FX 池槽位实体，
+//!   参数覆写 + `reset` 重新上膛按需触发）→ `update_bastion_visuals`
+//!   （幽灵预览 + 四池表现：塔池下标直映射、敌池 / 弹池以稳定 id 映射）
+//!   → `update_bastion_hud`（积分 / 波次 / 核心 HP / 当前塔种与价格 /
+//!   胜负横幅，文本实体经 `Name` 按名定位）。
 //! - **层级传播**：交给 `HierarchyPlugin`（PostUpdate）；**粒子推进**：
 //!   交给 `ParticlePlugin`（PostUpdate、传播之后）——窗口路径由
 //!   `DefaultPlugins` 注册，headless 测试 / 离屏快照需自行
@@ -25,24 +26,25 @@
 //!
 //! # 鼠标拾取（R21 dogfooding 重点）
 //!
-//! 屏幕像素 → NDC（y 翻转）→ `vp.inverse()` 对近 / 远平面各取一点 →
-//! 世界射线 → `raycast(world, origin, dir, 400)` 打地面静态碰撞体 →
-//! 命中点 → 网格坐标。**刻意走引擎查询而非解析平面**：地面是场景里的
-//! 静态 Box collider，拾取与渲染 / 物理共用同一份几何事实来源。引擎
-//! 没有「屏幕 → 射线」辅助，`vp` 由相机实体 `GlobalTransform` +
-//! `ActiveCamera` 的 fov / near / far + 视口宽高手工拼装（见
-//! [`active_camera_vp`]；视口尺寸的引擎侧缺口见 [`BastionViewport`
-//! 文档](BastionViewport)）。
+//! 屏幕像素 → NDC（y 翻转）→ 引擎 `screen_ray_from_global`（vp 逆对近 /
+//! 远平面各取一点，见 `iris_render::camera`）→ 世界射线 →
+//! `raycast(world, origin, dir, 400)` 打地面静态碰撞体 → 命中点 → 网格
+//! 坐标。**刻意走引擎查询而非解析平面**：地面是场景里的静态 Box
+//! collider，拾取与渲染 / 物理共用同一份几何事实来源。屏幕 → 射线与视口
+//! 尺寸两个引擎缺口已于「打磨 III」闭合（`Camera::screen_ray` /
+//! `screen_ray_from_global` + `Viewport` 资源），本插件的手工 vp 逆与
+//! `BastionViewport` 绕行已删。
 //!
 //! # 幽灵预览（R23 dogfooding）
 //!
 //! 待放塔位置挂半透明塔身（`AlphaMode::Blend`）+ 射程半透明圆盘；
 //! [`BastionState::check_placement`] 三分支通过 = 蓝调、失败 = 红调。
-//! 光标离场 / 终局时整组隐藏。
+//! 光标离场 / 终局时整组隐藏（射程盘不挂 `Visibility`，由**层级级联**
+//! 随根一并隐藏——「打磨 III」前的逐实体过滤语义下它会滞留画面）。
 //!
 //! 本插件只使用引擎公开 API（dogfooding III）：不依赖引擎内部路径。
 
-use glam::{IVec2, Mat4, Quat, Vec2, Vec3, Vec4};
+use glam::{IVec2, Quat, Vec2, Vec3};
 
 use iris_core::physics::{Collider, raycast};
 use iris_core::prelude::{Access, Entity, Name, Schedule, Stage};
@@ -68,18 +70,13 @@ pub const POOL_BULLETS: usize = 32;
 /// 臼炮弹池容量。
 pub const POOL_SHELLS: usize = 8;
 /// FX（一次性粒子发射器）池容量：环形复用，单帧事件数超过容量时后者
-/// 覆盖前者（同一帧同槽重触发 = 换新发射器组件，先前的 burst 丢失——
-/// 60Hz 下实测单帧事件远小于 12，仅极端爆帧时退化）。
+/// 覆盖前者（同一帧同槽重触发 = 发射器就地重置，先前 burst 已出生的
+/// 粒子不受影响——粒子出生即世界坐标，与发射器解耦；60Hz 下实测单帧
+/// 事件远小于 12，仅极端爆帧时退化）。
 pub const POOL_FX: usize = 12;
 /// 空间音频距离参考（米）：俯视相机听者悬在 ~25 m 高空，若用混音器默认
 /// 4 m 参考全场音效会衰减到不可闻——按堡垒尺度放大到 25 m。
 pub const BASTION_REFERENCE_DISTANCE: f32 = 25.0;
-/// 默认视口（物理像素）：与 `DefaultPlugins` 的缺省窗口尺寸一致。
-/// **引擎缺口绕行**：引擎未把实际窗口尺寸暴露为资源（`WindowConfig`
-/// 只存初始配置、`WindowHandle` 不进 `World`），插件拿不到实时宽高比
-/// 做拾取——缺省 1280×720 与缺省窗口一致，窗口路径若改了初始尺寸需
-/// 同步覆写本资源（摩擦清单在案，待引擎补「视口资源」后删除）。
-pub const DEFAULT_VIEWPORT: (f32, f32) = (1280.0, 720.0);
 
 /// 弹道飞行高度（米，哨兵弹）。
 const BULLET_Y: f32 = 0.55;
@@ -127,25 +124,6 @@ pub struct HoverCell {
 }
 
 impl iris_core::resource::Resource for HoverCell {}
-
-/// 视口尺寸（物理像素，拾取投影用）：见 [`DEFAULT_VIEWPORT`] 的引擎
-/// 缺口说明。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BastionViewport {
-    pub width: f32,
-    pub height: f32,
-}
-
-impl Default for BastionViewport {
-    fn default() -> Self {
-        Self {
-            width: DEFAULT_VIEWPORT.0,
-            height: DEFAULT_VIEWPORT.1,
-        }
-    }
-}
-
-impl iris_core::resource::Resource for BastionViewport {}
 
 /// 预生成的程序化音效（全部确定性、Startup 一次生成）。
 #[derive(Clone, Resource)]
@@ -262,9 +240,19 @@ impl MappedPool {
 }
 
 /// 敌人池：按逻辑敌人稳定 id 映射槽位（独立 newtype：资源按 TypeId
-/// 寻址，三个同构池必须是三个不同类型，type alias 会互相覆盖）。
+/// 寻址，三个同构池必须是三个不同类型，type alias 会互相覆盖——见
+/// `World::insert_resource` 的模式警示）。
 #[derive(Resource)]
-pub struct EnemyPool(pub MappedPool);
+pub struct EnemyPool {
+    /// 槽位映射芯（稳定 id → 槽位根实体）。
+    pub slots: MappedPool,
+    /// 每槽的双形态 rig（`[疾行虫 rig, 重甲兽 rig]`，与
+    /// [`EnemyPool::slots`] 的槽位序平行）：夹层 rig 无网格，可见性 =
+    /// 本敌人的当前形态（**层级级联**下翻 rig 即整组切换，孙辈网格
+    /// 组件缺席 = 可见）。
+    pub forms: Vec<[Entity; 2]>,
+}
+
 /// 哨兵弹池：按逻辑弹道稳定 id 映射槽位。
 #[derive(Resource)]
 pub struct BulletPool(pub MappedPool);
@@ -276,13 +264,18 @@ pub struct ShellPool(pub MappedPool);
 /// 更简单：下标即稳定身份）。
 #[derive(Resource)]
 pub struct TowerPool {
-    /// 全部槽位（下标 = 逻辑 `towers` 下标）。
+    /// 槽位根实体（下标 = 逻辑 `towers` 下标；根可见性 = 塔在位与否）。
     pub slots: Vec<Entity>,
+    /// 每槽的双形态 rig（`[哨兵 rig, 臼炮 rig]`，与 [`TowerPool::slots`]
+    /// 平行）：夹层 rig 无网格，可见性 = 本塔的当前形态（**层级级联**
+    /// 下翻 rig 即整组切换，孙辈网格组件缺席 = 可见）。
+    pub forms: Vec<[Entity; 2]>,
 }
 
 /// FX 池：一次性粒子发射器的环形复用槽位（触发 = 槽位移到事件坐标 +
-/// 换挂新发射器组件——burst 一次性、v1 无重置 API，见 `ParticleEmitter`
-/// 文档；「重复爆炸需重建组件」的引擎限制即以此绕行）。
+/// 发射器组件**就地复用**：参数全字段覆写 + `ParticleEmitter::reset`
+/// 清上一发模拟态并让 burst 重新上膛——对象池槽位复用的正道，打磨 III
+/// 起「换挂整只新组件」的绕行已删）。
 #[derive(Resource)]
 pub struct FxPool {
     /// 环形槽位（触发顺序轮转）。
@@ -303,77 +296,54 @@ impl FxPool {
 // 拾取（R21 dogfooding：屏幕 → 世界射线 → 引擎 raycast → 网格）
 // ---------------------------------------------------------------------------
 
-/// 拾取前置缺失（无相机实体 / 无视口资源 / 相机在后方），光标拾取返回
-/// `None` 的原因分类（调试用）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BastionPickError {
-    /// 世界里没有可用的主动相机（`GlobalTransform` 未传播）。
-    NoCamera,
-    /// 视口资源缺席或宽高非正。
-    NoViewport,
-}
-
-/// 主动相机的 view-proj 矩阵（DirectX 深度约定 z ∈ [0, 1]，与渲染器
-/// 同款）：位姿取相机实体 `GlobalTransform`（上一帧层级传播结果，静止
-/// 相机无滞后），投影参数取 `ActiveCamera` 组件，宽高比由调用方给出。
-/// 引擎没有「屏幕 → 射线」辅助，本函数即手工拼装处（摩擦清单在案：
-/// 建议 iris-render 补 `screen_ray(camera, viewport, px)` 一类 API）。
-pub fn active_camera_vp(world: &World, aspect: f32) -> Result<Mat4, BastionPickError> {
-    let mut found: Option<Mat4> = None;
-    world.query::<(&GlobalTransform, &ActiveCamera)>(|(global, active)| {
-        if found.is_none() {
-            let view = view_from_global(global);
-            let proj = glam::camera::rh::proj::directx::perspective(
-                active.fov_y_radians,
-                aspect,
-                active.z_near,
-                active.z_far,
-            );
-            found = Some(proj * view);
-        }
-    });
-    found.ok_or(BastionPickError::NoCamera)
-}
-
-/// 屏幕像素（物理像素，原点左上）→ 世界射线 `(origin, dir)`：NDC（y
-/// 翻转）→ vp 逆对近 / 远平面各取一点。像素在视口外同样成立（射线照算，
+/// 屏幕像素（物理像素，原点左上）→ 世界射线 `(origin, dir)`：视口尺寸取
+/// 引擎 [`Viewport`] 资源（窗口程序由 `DefaultPlugins` 插入并在
+/// `Resized` 时同步；headless / 离屏路径由 [`setup_resources`] 兜底插入，
+/// 也可由调用方预插入覆写），NDC（y 翻转）→ 引擎
+/// [`screen_ray_from_global`](iris_render::camera::screen_ray_from_global)
+/// ——「屏幕 → 射线」与「视口资源」两个引擎缺口已于打磨 III 闭合，本
+/// 函数只做像素 → NDC 换算与相机查询。像素在视口外同样成立（射线照算，
 /// 合法性由调用方裁决）。
 pub fn screen_ray(world: &World, px: f64, py: f64) -> Option<(Vec3, Vec3)> {
-    let viewport = world.try_resource::<BastionViewport>()?;
-    let (w, h) = (viewport.width.max(1.0), viewport.height.max(1.0));
-    let ndc_x = 2.0 * px as f32 / w - 1.0;
-    let ndc_y = 1.0 - 2.0 * py as f32 / h;
-    let vp = active_camera_vp(world, w / h).ok()?;
-    let inv = vp.inverse();
-    let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
-    let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
-    if near.w.abs() < 1e-9 || far.w.abs() < 1e-9 {
-        return None;
-    }
-    let near = near.truncate() / near.w;
-    let far = far.truncate() / far.w;
-    let dir = (far - near).normalize_or_zero();
-    if dir == Vec3::ZERO {
-        return None;
-    }
-    Some((near, dir))
+    let viewport = world.try_resource::<Viewport>()?;
+    let (w, h) = (viewport.width.max(1), viewport.height.max(1));
+    let ndc = Vec2::new(
+        2.0 * px as f32 / w as f32 - 1.0,
+        1.0 - 2.0 * py as f32 / h as f32,
+    );
+    let aspect = w as f32 / h as f32;
+    let mut found: Option<(Vec3, Vec3)> = None;
+    world.query::<(&GlobalTransform, &ActiveCamera)>(|(global, active)| {
+        if found.is_none() {
+            found = Some(screen_ray_from_global(global, active, ndc, aspect));
+        }
+    });
+    let (origin, dir) = found?;
+    (dir != Vec3::ZERO).then_some((origin, dir))
 }
 
 /// 世界坐标（y = 0 平面附近的点）→ 屏幕像素（`None` = 点在相机后方）。
-/// 拾取的逆变换：headless 测试用「格子中心 → 像素 → 射线 → 格子」闭环
-/// 自检，也可用于场内目标的世界坐标 UI 标记。
+/// 拾取的逆变换：vp 取引擎
+/// [`view_proj_from_global`](iris_render::camera::view_proj_from_global)
+/// （视口来源同 [`screen_ray`]）。headless 测试用「格子中心 → 像素 →
+/// 射线 → 格子」闭环自检，也可用于场内目标的世界坐标 UI 标记。
 pub fn world_to_screen(world: &World, pos: Vec3) -> Option<(f64, f64)> {
-    let viewport = world.try_resource::<BastionViewport>()?;
-    let (w, h) = (viewport.width.max(1.0), viewport.height.max(1.0));
-    let vp = active_camera_vp(world, w / h).ok()?;
-    let clip = vp * pos.extend(1.0);
-    if clip.w.abs() < 1e-9 || clip.w <= 0.0 {
-        return None;
-    }
-    let ndc = clip.truncate() / clip.w;
+    let viewport = world.try_resource::<Viewport>()?;
+    let (w, h) = (viewport.width.max(1), viewport.height.max(1));
+    let aspect = w as f32 / h as f32;
+    let mut found: Option<Vec2> = None;
+    world.query::<(&GlobalTransform, &ActiveCamera)>(|(global, active)| {
+        if found.is_none() {
+            let clip = view_proj_from_global(global, active, aspect) * pos.extend(1.0);
+            if clip.w.abs() >= 1e-9 && clip.w > 0.0 {
+                found = Some(Vec2::new(clip.x, clip.y) / clip.w);
+            }
+        }
+    });
+    let ndc = found?;
     Some((
-        ((ndc.x + 1.0) * 0.5 * w) as f64,
-        ((1.0 - ndc.y) * 0.5 * h) as f64,
+        ((ndc.x + 1.0) * 0.5 * w as f32) as f64,
+        ((1.0 - ndc.y) * 0.5 * h as f32) as f64,
     ))
 }
 
@@ -420,7 +390,7 @@ impl BastionPlugin {
                     .read::<Input>()
                     .read::<Time>()
                     .read::<Audio>()
-                    .read::<BastionViewport>()
+                    .read::<Viewport>()
                     .read::<GlobalTransform>()
                     .read::<Transform>()
                     .read::<Collider>()
@@ -501,6 +471,12 @@ fn setup_resources(world: &mut World) {
         world.insert_resource(Audio::new());
     }
     world.insert_resource(BastionState::new());
+    // 视口尺寸：窗口路径由 DefaultPlugins 维护（缺席才插入不会覆盖），
+    // headless / 离屏路径由这里兜底（缺省 1280×720，与缺省窗口一致；
+    // 需要其他口径的调用方可预插入覆写）
+    if !world.contains_resource::<Viewport>() {
+        world.insert_resource(Viewport::default());
+    }
     // 空间音频场域尺度（见 BASTION_REFERENCE_DISTANCE 文档）：只调参数、
     // 不覆盖资源（设备句柄独占）
     if let Some(audio) = world.try_resource::<Audio>() {
@@ -516,7 +492,6 @@ fn setup_resources(world: &mut World) {
     });
     world.insert_resource(GhostKind::default());
     world.insert_resource(HoverCell::default());
-    world.insert_resource(BastionViewport::default());
 }
 
 /// 漏怪告警双音：392 Hz 短音 + 间隙 + 262 Hz 长音（下行 = 恶化告警）。
@@ -764,6 +739,9 @@ fn build_scene(world: &mut World) {
         },
         ring_mesh,
         ring_mat,
+        // 射程盘不挂 Visibility：ghost_root 隐藏时经**层级级联**一并隐藏
+        // （打磨 III 前的逐实体过滤语义下「组件缺席 = 恒渲染」——幽灵
+        // 待命时射程盘滞留在最后悬停格的缺陷由级联顺带修复）
     ));
     world.add_child(ghost_root, ghost_sentry_body);
     world.add_child(ghost_root, ghost_mortar_body);
@@ -774,20 +752,28 @@ fn build_scene(world: &mut World) {
         ring: ring_mat,
     });
 
-    // ---- 塔池：40 槽位，每槽双形态网格子实体（哨兵 / 臼炮），按塔种翻
-    // 可见性。网格子实体**直接挂在槽位根下**并以名字含段区分形态——
-    // `Visibility` 是逐实体过滤、不向子树级联（见 iris-render::visibility
-    // 模块文档），中间夹一层无网格的「形态 rig」再翻它对网格无效
-    // （dogfooding 实测踩坑：孙子网格恒渲染，待命槽位的身体全部堆在
-    // 世界原点入画）----
+    // ---- 塔池：40 槽位，每槽「根 → 形态 rig → 网格」三层。根可见性 =
+    // 塔在位与否；形态 rig 可见性 = 本塔当前形态；孙辈网格不挂
+    // Visibility（组件缺席 = 可见）。**层级级联**（打磨 III：渲染收集期
+    // 沿父链上行，任一祖先隐藏 ⇒ 子树全隐藏）保证根隐藏时待命塔的身管
+    // 不入画——dogfooding III 时级联缺失，夹层 rig 翻不动孙子网格
+    // （draw calls 139 事故），被迫拍平成「网格直接挂根 + 名字识别形态」；
+    // 现引擎闭合后还原夹层 rig，形态切换回到「翻两个 rig」，名字识别
+    // 与逐网格翻 Visibility 都不再需要 ----
     let mut tower_slots = Vec::new();
+    let mut tower_forms = Vec::new();
     for slot in 0..POOL_TOWERS {
         let root = world.spawn((
             Name(format!("bastion/tower-pool/{slot}")),
             Transform::IDENTITY,
             Visibility::HIDDEN,
         ));
-        // 哨兵形态：窄身高塔 + 前伸炮管
+        // 哨兵形态 rig：窄身高塔 + 前伸炮管
+        let sentry_rig = world.spawn((
+            Name(format!("bastion/tower-pool/{slot}/sentry-rig")),
+            Transform::IDENTITY,
+            Visibility::HIDDEN,
+        ));
         let sentry_mat = tower_sentry_material(world);
         let sentry_body = world.spawn((
             Name(format!("bastion/tower-pool/{slot}/sentry-body")),
@@ -798,9 +784,8 @@ fn build_scene(world: &mut World) {
             },
             ghost_mesh,
             sentry_mat,
-            Visibility::HIDDEN,
         ));
-        world.add_child(root, sentry_body);
+        world.add_child(sentry_rig, sentry_body);
         let barrel = world.spawn((
             Name(format!("bastion/tower-pool/{slot}/sentry-barrel")),
             Transform {
@@ -810,10 +795,14 @@ fn build_scene(world: &mut World) {
             },
             ghost_mesh,
             sentry_mat,
+        ));
+        world.add_child(sentry_rig, barrel);
+        // 臼炮形态 rig：宽矮底座 + 斜置炮筒
+        let mortar_rig = world.spawn((
+            Name(format!("bastion/tower-pool/{slot}/mortar-rig")),
+            Transform::IDENTITY,
             Visibility::HIDDEN,
         ));
-        world.add_child(root, barrel);
-        // 臼炮形态：宽矮底座 + 斜置炮筒
         let mortar_mat = tower_mortar_material(world);
         let base = world.spawn((
             Name(format!("bastion/tower-pool/{slot}/mortar-base")),
@@ -824,9 +813,8 @@ fn build_scene(world: &mut World) {
             },
             ghost_mesh,
             mortar_mat,
-            Visibility::HIDDEN,
         ));
-        world.add_child(root, base);
+        world.add_child(mortar_rig, base);
         let tube = world.spawn((
             Name(format!("bastion/tower-pool/{slot}/mortar-tube")),
             Transform {
@@ -836,19 +824,30 @@ fn build_scene(world: &mut World) {
             },
             ghost_mesh,
             mortar_mat,
-            Visibility::HIDDEN,
         ));
-        world.add_child(root, tube);
+        world.add_child(mortar_rig, tube);
+        world.add_child(root, sentry_rig);
+        world.add_child(root, mortar_rig);
         tower_slots.push(root);
+        tower_forms.push([sentry_rig, mortar_rig]);
     }
-    world.insert_resource(TowerPool { slots: tower_slots });
+    world.insert_resource(TowerPool {
+        slots: tower_slots,
+        forms: tower_forms,
+    });
 
-    // ---- 敌人池：24 槽位，每槽双形态网格子实体（疾行虫 / 重甲兽），
-    // 可见性切换同塔池的「直接挂根 + 名字含段」方案 ----
+    // ---- 敌人池：24 槽位，每槽「根 → 形态 rig → 网格」三层（与塔池
+    // 同款：rig 可见性 = 本敌人形态，孙辈网格不挂 Visibility）----
     let mut enemy_slots = Vec::new();
+    let mut enemy_forms = Vec::new();
     for slot in 0..POOL_ENEMIES {
         let root = world.spawn((
             Name(format!("bastion/enemy-pool/{slot}")),
+            Transform::IDENTITY,
+            Visibility::HIDDEN,
+        ));
+        let runner_rig = world.spawn((
+            Name(format!("bastion/enemy-pool/{slot}/runner-rig")),
             Transform::IDENTITY,
             Visibility::HIDDEN,
         ));
@@ -862,9 +861,13 @@ fn build_scene(world: &mut World) {
             },
             ghost_mesh,
             runner_mat,
+        ));
+        world.add_child(runner_rig, runner_body);
+        let brute_rig = world.spawn((
+            Name(format!("bastion/enemy-pool/{slot}/brute-rig")),
+            Transform::IDENTITY,
             Visibility::HIDDEN,
         ));
-        world.add_child(root, runner_body);
         let brute_mat = brute_material(world);
         let brute_body = world.spawn((
             Name(format!("bastion/enemy-pool/{slot}/brute-body")),
@@ -875,12 +878,17 @@ fn build_scene(world: &mut World) {
             },
             ghost_mesh,
             brute_mat,
-            Visibility::HIDDEN,
         ));
-        world.add_child(root, brute_body);
+        world.add_child(brute_rig, brute_body);
+        world.add_child(root, runner_rig);
+        world.add_child(root, brute_rig);
         enemy_slots.push(root);
+        enemy_forms.push([runner_rig, brute_rig]);
     }
-    world.insert_resource(EnemyPool(MappedPool::new(enemy_slots)));
+    world.insert_resource(EnemyPool {
+        slots: MappedPool::new(enemy_slots),
+        forms: enemy_forms,
+    });
 
     // ---- 哨兵弹池：自发光小球 × 32 ----
     let bullet_mesh = world
@@ -931,10 +939,10 @@ fn build_scene(world: &mut World) {
     world.insert_resource(ShellPool(MappedPool::new(shell_slots)));
 
     // ---- FX 池：12 个纯发射器槽位（无网格）。槽位**预挂一个禁用发射器**
-    // （零速率零 burst，永不产粒子）——Update 系统拿 &World，组件只能经
-    // get_mut 换值、不能 insert 新组件类型，故触发 = 整体覆写组件值
-    //（burst 一次性、v1 无重置 API，「换新发射器」即官方文档给出的复用
-    // 方式；摩擦清单在案）----
+    //（零速率零 burst，永不产粒子）作为组件载体——Update 系统拿 &World，
+    // 组件只能经 get_mut 换值、不能 insert 新组件类型，故待命态必须预挂；
+    // 触发 = 参数全字段覆写 + `reset()` 重新上膛（对象池槽位复用的正道，
+    // 打磨 III 起「换挂整只新组件」的绕行已删）----
     let mut fx_slots = Vec::new();
     for slot in 0..POOL_FX {
         let entity = world.spawn((
@@ -1202,7 +1210,8 @@ fn run_bastion(world: &World) {
 // ---------------------------------------------------------------------------
 
 /// 禁用发射器（FX 槽位的待命态）：零速率、零 burst、永久——永不产粒子，
-/// 仅占位让槽位组件齐备（触发时整体覆写）。
+/// 仅占位让槽位组件齐备（触发时经 [`configure_event_emitter`] + `reset`
+/// 就地复用）。
 fn disabled_emitter() -> ParticleEmitter {
     let mut e = ParticleEmitter::new(ParticleBlend::Additive);
     e.spawn_rate = 0.0;
@@ -1210,11 +1219,16 @@ fn disabled_emitter() -> ParticleEmitter {
     e
 }
 
+// 六类事件的 FX 参数（全字段写入函数，作用于槽位既有发射器组件）：
+// 槽位长期存活、字段会残留上一发配置，故每类**从默认基线逐字段全量
+// 覆写**——与「换挂新组件」逐位等价，但组件对象不再销毁重建。
+
 /// 枪口闪光：小型暖黄 burst（additive，触发泛光）。
-fn muzzle_flash() -> ParticleEmitter {
-    let mut e = ParticleEmitter::new(ParticleBlend::Additive);
+fn configure_muzzle_flash(e: &mut ParticleEmitter) {
+    e.blend = ParticleBlend::Additive;
     e.spawn_rate = 0.0;
     e.burst_count = 10;
+    e.emitter_lifetime = 0.0;
     e.particle_lifetime = 0.16;
     e.initial_speed = 3.5;
     e.velocity_jitter = 1.6;
@@ -1224,14 +1238,14 @@ fn muzzle_flash() -> ParticleEmitter {
     e.color_start = [3.0, 2.2, 0.6, 1.0];
     e.color_end = [1.5, 0.6, 0.1, 0.0];
     e.max_particles = 32;
-    e
 }
 
 /// 命中火花：冷白短 burst。
-fn spark_burst() -> ParticleEmitter {
-    let mut e = ParticleEmitter::new(ParticleBlend::Additive);
+fn configure_spark_burst(e: &mut ParticleEmitter) {
+    e.blend = ParticleBlend::Additive;
     e.spawn_rate = 0.0;
     e.burst_count = 8;
+    e.emitter_lifetime = 0.0;
     e.particle_lifetime = 0.22;
     e.initial_speed = 4.5;
     e.velocity_jitter = 2.0;
@@ -1241,14 +1255,14 @@ fn spark_burst() -> ParticleEmitter {
     e.color_start = [2.5, 2.8, 3.2, 1.0];
     e.color_end = [0.6, 0.9, 1.6, 0.0];
     e.max_particles = 32;
-    e
 }
 
 /// 臼炮发射烟尘：alpha 混合的灰烟（慢速上升）。
-fn mortar_smoke() -> ParticleEmitter {
-    let mut e = ParticleEmitter::new(ParticleBlend::Alpha);
+fn configure_mortar_smoke(e: &mut ParticleEmitter) {
+    e.blend = ParticleBlend::Alpha;
     e.spawn_rate = 0.0;
     e.burst_count = 14;
+    e.emitter_lifetime = 0.0;
     e.particle_lifetime = 0.7;
     e.initial_speed = 2.0;
     e.velocity_jitter = 1.2;
@@ -1258,30 +1272,48 @@ fn mortar_smoke() -> ParticleEmitter {
     e.color_start = [0.55, 0.5, 0.45, 0.7];
     e.color_end = [0.4, 0.38, 0.36, 0.0];
     e.max_particles = 64;
-    e
 }
 
 /// 落点爆炸：爆炸预设（explosion 预设）收紧到 AOE 尺度。
-fn explosion_small() -> ParticleEmitter {
-    let mut e = ParticleEmitter::explosion();
+fn configure_explosion_small(e: &mut ParticleEmitter) {
+    e.blend = ParticleBlend::Additive;
+    e.spawn_rate = 0.0;
     e.burst_count = 120;
+    e.emitter_lifetime = 0.0;
     e.particle_lifetime = 0.9;
     e.initial_speed = 5.5;
+    e.velocity_jitter = 2.6;
+    e.gravity_scale = 0.55;
     e.size_start = 0.24;
+    e.size_end = 0.02;
+    e.color_start = [3.2, 1.6, 0.5, 1.0];
+    e.color_end = [1.5, 0.12, 0.04, 0.0];
     e.max_particles = 256;
-    e
 }
 
 /// 敌人死亡：爆炸预设原样（全向 320 粒、HDR 暖色拖尾）。
-fn death_explosion() -> ParticleEmitter {
-    ParticleEmitter::explosion()
+fn configure_death_explosion(e: &mut ParticleEmitter) {
+    e.blend = ParticleBlend::Additive;
+    e.spawn_rate = 0.0;
+    e.burst_count = 320;
+    e.emitter_lifetime = 0.0;
+    e.particle_lifetime = 1.4;
+    e.initial_speed = 7.0;
+    e.velocity_jitter = 2.6;
+    e.gravity_scale = 0.55;
+    e.size_start = 0.30;
+    e.size_end = 0.02;
+    e.color_start = [3.2, 1.6, 0.5, 1.0];
+    e.color_end = [1.5, 0.12, 0.04, 0.0];
+    e.max_particles = 1024;
 }
 
 /// 漏怪核心告警：红色 burst 从核心迸出。
-fn core_breach() -> ParticleEmitter {
-    let mut e = ParticleEmitter::new(ParticleBlend::Additive);
+fn configure_core_breach(e: &mut ParticleEmitter) {
+    e.blend = ParticleBlend::Additive;
     e.spawn_rate = 0.0;
     e.burst_count = 64;
+    e.emitter_lifetime = 0.0;
     e.particle_lifetime = 0.8;
     e.initial_speed = 4.0;
     e.velocity_jitter = 2.2;
@@ -1291,14 +1323,40 @@ fn core_breach() -> ParticleEmitter {
     e.color_start = [3.0, 0.4, 0.25, 1.0];
     e.color_end = [1.2, 0.05, 0.02, 0.0];
     e.max_particles = 128;
-    e
+}
+
+/// 事件 → 粒子出生高度（世界 XZ 取事件坐标，各事件按视觉合适的高度
+/// 抬升）+ 参数写入函数（六类事件各一档）。
+fn event_origin(event: BastionEvent) -> (f32, f32, f32) {
+    match event {
+        BastionEvent::SentryShot { pos } => (pos.x, 0.7, pos.y),
+        BastionEvent::MortarShot { pos } => (pos.x, 0.5, pos.y),
+        BastionEvent::Hit { pos } => (pos.x, 0.5, pos.y),
+        BastionEvent::Boom { pos } => (pos.x, 0.25, pos.y),
+        BastionEvent::Death { pos } => (pos.x, 0.3, pos.y),
+        BastionEvent::Leak { pos } => (pos.x, 0.8, pos.y),
+    }
+}
+
+/// 按事件类型把 FX 参数全字段写入槽位发射器（六类事件各一档，见上方
+/// 各 configure_* 函数）。
+fn configure_event_emitter(emitter: &mut ParticleEmitter, event: BastionEvent) {
+    match event {
+        BastionEvent::SentryShot { .. } => configure_muzzle_flash(emitter),
+        BastionEvent::MortarShot { .. } => configure_mortar_smoke(emitter),
+        BastionEvent::Hit { .. } => configure_spark_burst(emitter),
+        BastionEvent::Boom { .. } => configure_explosion_small(emitter),
+        BastionEvent::Death { .. } => configure_death_explosion(emitter),
+        BastionEvent::Leak { .. } => configure_core_breach(emitter),
+    }
 }
 
 /// Update 2：事件 → 粒子。发射器挂 FX 池槽位实体按需触发：槽位 Transform
-/// 挪到事件坐标 + 换挂**新发射器组件**——`burst_count` 一次性、v1 无重置
-/// API（引擎限制在案），「重建组件」即官方文档给出的复用方式；同帧事件
-/// 多于槽位时环形覆盖（先前的 burst 已在飞的不受影响——粒子出生即世界
-/// 坐标，与发射器解耦）。
+/// 挪到事件坐标，发射器组件**就地复用**——参数全字段覆写
+///（[`configure_event_emitter`]）+ [`ParticleEmitter::reset`] 清上一发
+/// 模拟态并让 burst 重新上膛（打磨 III 的新 API；「换挂整只新组件」的
+/// 绕行已删）。同帧事件多于槽位时环形覆盖（先前 burst 已在飞的粒子
+/// 不受影响——粒子出生即世界坐标，与发射器解耦）。
 fn trigger_bastion_fx(world: &World) {
     let Some(state) = world.try_resource::<BastionState>() else {
         return;
@@ -1311,21 +1369,16 @@ fn trigger_bastion_fx(world: &World) {
     };
     for event in &state.frame_events {
         let entity = fx.next_slot();
-        let (position, emitter) = match *event {
-            BastionEvent::SentryShot { pos } => (Vec3::new(pos.x, 0.7, pos.y), muzzle_flash()),
-            BastionEvent::MortarShot { pos } => (Vec3::new(pos.x, 0.5, pos.y), mortar_smoke()),
-            BastionEvent::Hit { pos } => (Vec3::new(pos.x, 0.5, pos.y), spark_burst()),
-            BastionEvent::Boom { pos } => (Vec3::new(pos.x, 0.25, pos.y), explosion_small()),
-            BastionEvent::Death { pos } => (Vec3::new(pos.x, 0.3, pos.y), death_explosion()),
-            BastionEvent::Leak { pos } => (Vec3::new(pos.x, 0.8, pos.y), core_breach()),
-        };
+        let (x, y, z) = event_origin(*event);
         if let Some(mut transform) = world.get_mut::<Transform>(entity) {
-            transform.position = position;
+            transform.position = Vec3::new(x, y, z);
         }
-        // 覆写发射器组件 = burst 重新上膛（槽位预挂禁用发射器，见
-        // build_scene 的 FX 池注释；insert 新组件在 &World 下不可用）
-        if let Some(mut emitter_slot) = world.get_mut::<ParticleEmitter>(entity) {
-            *emitter_slot = emitter;
+        // 槽位发射器就地复用：参数覆写 + reset（burst 重新上膛——
+        // burst_fired 标记归位，下一帧 update_particles 射出整批）
+        if let Some(mut slot) = world.get_mut::<ParticleEmitter>(entity) {
+            let emitter = &mut *slot;
+            configure_event_emitter(emitter, *event);
+            emitter.reset();
         }
     }
 }
@@ -1397,37 +1450,33 @@ fn update_bastion_visuals(world: &World) {
         }
     }
 
-    // ---- 塔池：下标直映射（塔从不移除），双形态按塔种翻可见性 ----
+    // ---- 塔池：下标直映射（塔从不移除）。根可见性 = 塔在位；形态切换
+    // = 翻两个夹层 rig 的可见性（**层级级联**带动孙辈网格整组切换，
+    // 打磨 III 起无需逐网格翻 / 名字识别）----
     if let Some(pool) = world.try_resource::<TowerPool>() {
         for (index, tower) in state.towers.iter().enumerate() {
-            let Some(&entity) = pool.slots.get(index) else {
+            let Some(&root) = pool.slots.get(index) else {
                 break; // 池耗尽（逻辑封顶应先于此发生，防御性跳过）
             };
+            let Some(&[sentry_rig, mortar_rig]) = pool.forms.get(index) else {
+                break;
+            };
             let center = cell_center(tower.cell);
-            if let Some(mut transform) = world.get_mut::<Transform>(entity) {
+            if let Some(mut transform) = world.get_mut::<Transform>(root) {
                 transform.position = Vec3::new(center.x, 0.0, center.y);
             }
-            if let Some(mut visibility) = world.get_mut::<Visibility>(entity) {
+            if let Some(mut visibility) = world.get_mut::<Visibility>(root) {
                 *visibility = Visibility::VISIBLE;
             }
-            // 双形态网格子实体：只翻可见性、不换组件（池化零重挂的关键；
-            // 形态以名字含段识别：/sentry-* 或 /mortar-*）
-            let wanted_segment = match tower.kind {
-                TowerKind::Sentry => "/sentry",
-                TowerKind::Mortar => "/mortar",
+            let (active_rig, dormant_rig) = match tower.kind {
+                TowerKind::Sentry => (sentry_rig, mortar_rig),
+                TowerKind::Mortar => (mortar_rig, sentry_rig),
             };
-            for child in world.children(entity) {
-                let is_wanted = world
-                    .get::<Name>(child)
-                    .map(|name| name.0.contains(wanted_segment))
-                    .unwrap_or(false);
-                if let Some(mut visibility) = world.get_mut::<Visibility>(child) {
-                    *visibility = if is_wanted {
-                        Visibility::VISIBLE
-                    } else {
-                        Visibility::HIDDEN
-                    };
-                }
+            if let Some(mut visibility) = world.get_mut::<Visibility>(active_rig) {
+                *visibility = Visibility::VISIBLE;
+            }
+            if let Some(mut visibility) = world.get_mut::<Visibility>(dormant_rig) {
+                *visibility = Visibility::HIDDEN;
             }
         }
     }
@@ -1437,9 +1486,8 @@ fn update_bastion_visuals(world: &World) {
         Some(pool) => pool,
         None => return,
     };
-    let core_pool = &mut pool.0;
     let mut released: Vec<Entity> = Vec::new();
-    core_pool.active.retain(|(id, entity)| {
+    pool.slots.active.retain(|(id, entity)| {
         let alive = state.enemies.iter().any(|enemy| enemy.id == *id);
         if !alive {
             released.push(*entity);
@@ -1450,22 +1498,32 @@ fn update_bastion_visuals(world: &World) {
         if let Some(mut visibility) = world.get_mut::<Visibility>(entity) {
             *visibility = Visibility::HIDDEN;
         }
-        core_pool.free.push(entity);
+        pool.slots.free.push(entity);
     }
     for enemy in &state.enemies {
-        if core_pool.entity_of(enemy.id).is_none() {
-            core_pool.acquire(enemy.id);
+        if pool.slots.entity_of(enemy.id).is_none() {
+            pool.slots.acquire(enemy.id);
         }
     }
-    let mut enemy_jobs: Vec<(Entity, f32, EnemyKind)> = Vec::new();
+    let mut enemy_jobs: Vec<(Entity, [Entity; 2], f32, EnemyKind)> = Vec::new();
     for enemy in &state.enemies {
-        if let Some(entity) = core_pool.entity_of(enemy.id) {
-            enemy_jobs.push((entity, enemy.progress, enemy.kind));
+        if let Some(entity) = pool.slots.entity_of(enemy.id) {
+            // 槽位序号 = forms 下标（槽位表静态，线性查找 n ≤ 24 可忽略）
+            let forms = pool
+                .slots
+                .slots
+                .iter()
+                .position(|&s| s == entity)
+                .and_then(|index| pool.forms.get(index))
+                .copied();
+            if let Some(forms) = forms {
+                enemy_jobs.push((entity, forms, enemy.progress, enemy.kind));
+            }
         }
         // 池耗尽的敌人无槽位可写：静默跳过（逻辑封顶应先于此发生）
     }
     drop(pool);
-    for (entity, progress, kind) in enemy_jobs {
+    for (entity, [runner_rig, brute_rig], progress, kind) in enemy_jobs {
         if let Some(mut visibility) = world.get_mut::<Visibility>(entity) {
             *visibility = Visibility::VISIBLE;
         }
@@ -1478,23 +1536,16 @@ fn update_bastion_visuals(world: &World) {
         let dir = path_dir(progress);
         let yaw = (-dir.y).atan2(dir.x) + MODEL_YAW_OFFSET;
         transform.rotation = Quat::from_rotation_y(yaw);
-        // 双形态网格子实体按敌种翻可见性（名字含段：/runner-* 或 /brute-*）
-        let wanted_segment = match kind {
-            EnemyKind::Runner => "/runner",
-            EnemyKind::Brute => "/brute",
+        // 双形态 rig 按敌种翻可见性（**层级级联**带动孙辈网格整组切换）
+        let (active_rig, dormant_rig) = match kind {
+            EnemyKind::Runner => (runner_rig, brute_rig),
+            EnemyKind::Brute => (brute_rig, runner_rig),
         };
-        for child in world.children(entity) {
-            let is_wanted = world
-                .get::<Name>(child)
-                .map(|name| name.0.contains(wanted_segment))
-                .unwrap_or(false);
-            if let Some(mut visibility) = world.get_mut::<Visibility>(child) {
-                *visibility = if is_wanted {
-                    Visibility::VISIBLE
-                } else {
-                    Visibility::HIDDEN
-                };
-            }
+        if let Some(mut visibility) = world.get_mut::<Visibility>(active_rig) {
+            *visibility = Visibility::VISIBLE;
+        }
+        if let Some(mut visibility) = world.get_mut::<Visibility>(dormant_rig) {
+            *visibility = Visibility::HIDDEN;
         }
     }
 
@@ -1703,8 +1754,11 @@ mod tests {
     fn mapped_pool_acquire_release_never_oversubscribes() {
         let mut world = World::new();
         let slots: Vec<Entity> = (0..3).map(|_| world.spawn_empty()).collect();
-        let mut pool = EnemyPool(MappedPool::new(slots.clone()));
-        let pool = &mut pool.0;
+        let mut pool = EnemyPool {
+            slots: MappedPool::new(slots.clone()),
+            forms: Vec::new(),
+        };
+        let pool = &mut pool.slots;
         assert_eq!(pool.free_count(), 3);
 
         let a = pool.acquire(10).expect("空闲池应可取用");
@@ -1750,7 +1804,7 @@ mod tests {
     #[test]
     fn pick_roundtrip_world_to_screen_to_cell() {
         let mut world = World::new();
-        world.insert_resource(BastionViewport::default());
+        world.insert_resource(Viewport::default());
         // 俯视固定相机（与 build_scene 同位姿）+ 地面静态 collider
         world.spawn((
             Transform {

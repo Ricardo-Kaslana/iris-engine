@@ -56,8 +56,8 @@ pub use logic::{
 };
 pub use plugin::{
     BANNER_TEXT_NAME, BASTION_REFERENCE_DISTANCE, BUILD_TEXT_NAME, BastionAssets, BastionEntities,
-    BastionPickError, BastionPlugin, BastionViewport, BulletPool, CORE_TEXT_NAME,
-    CREDITS_TEXT_NAME, DEFAULT_VIEWPORT, EnemyPool, FxPool, GhostKind, GhostMaterials, HoverCell,
-    MappedPool, POOL_BULLETS, POOL_ENEMIES, POOL_FX, POOL_SHELLS, POOL_TOWERS, ShellPool,
-    TowerPool, WAVE_TEXT_NAME, active_camera_vp, pick_ground_cell, screen_ray, world_to_screen,
+    BastionPlugin, BulletPool, CORE_TEXT_NAME, CREDITS_TEXT_NAME, EnemyPool, FxPool, GhostKind,
+    GhostMaterials, HoverCell, MappedPool, POOL_BULLETS, POOL_ENEMIES, POOL_FX, POOL_SHELLS,
+    POOL_TOWERS, ShellPool, TowerPool, WAVE_TEXT_NAME, pick_ground_cell, screen_ray,
+    world_to_screen,
 };

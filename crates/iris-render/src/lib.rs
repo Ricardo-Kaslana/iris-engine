@@ -49,7 +49,9 @@ pub mod prelude {
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
         write_glb,
     };
-    pub use crate::camera::{ActiveCamera, Camera, view_from_global};
+    pub use crate::camera::{
+        ActiveCamera, Camera, screen_ray_from_global, view_from_global, view_proj_from_global,
+    };
     pub use crate::context::Gpu;
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::frustum::Frustum;

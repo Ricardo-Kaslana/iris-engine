@@ -58,14 +58,21 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
 - **iris-bastion**：与 iris-game / iris-arena 同层的第三作（示范游戏
   Iris Bastion，俯视塔防）——同一依赖纪律（iris-engine 门面 + glam），
   把 R21–R25 的五个新能力当载荷压榨：`raycast` 屏幕射线拾取（像素 →
-  NDC → vp 逆 → 世界射线打地面静态 Collider，刻意走引擎查询而非解析
-  平面）、`AlphaMode::Blend` 幽灵预览（红蓝着色 + 射程盘）、粒子 FX 池
-  （发射器挂槽位、按需覆写触发）、`play_spatial` 事件定位音效（逻辑侧
-  事件 `BastionEvent` 自带世界坐标）+ 听者跟随相机。纯逻辑核心（只 glam）
-  含放塔校验纯函数（界内 / 空格 / 积分三分支单独导出）、扫掠弹道命中、
-  路径进度索敌（打最靠前）、航点匀速推进与逐位确定性；塔 / 敌 / 双弹 /
-  FX 四池启动预热零运行期 spawn。headless 自动玩家经鼠标点击全链路放塔、
-  真实模拟 5 波全清获胜（经济 / 索敌闭环量化验证）。
+  NDC → 引擎 `screen_ray_from_global` 世界射线打地面静态 Collider，
+  刻意走引擎查询而非解析平面；拾取与 `world_to_screen` 共用
+  `view_proj_from_global`，视口宽高读引擎 `Viewport` 资源）、
+  `AlphaMode::Blend` 幽灵预览（红蓝着色 + 射程盘）、粒子 FX 池（发射器
+  挂槽位、参数全字段覆写 + `reset()` 就地复用触发）、`play_spatial`
+  事件定位音效（逻辑侧事件 `BastionEvent` 自带世界坐标）+ 听者跟随
+  相机。纯逻辑核心（只 glam）含放塔校验纯函数（界内 / 空格 / 积分三分
+  支单独导出）、扫掠弹道命中、路径进度索敌（打最靠前）、航点匀速推进
+  与逐位确定性；塔 / 敌 / 双弹 / FX 四池启动预热零运行期 spawn。
+  **同构池模式警示（dogfooding III 实测踩坑）**：资源按 `TypeId`
+  寻址——同型多实例资源（敌 / 弹 / 臼炮三个同构对象池）必须是三个
+  **distinct newtype**，`type alias` 只是同一类型的别名、共享 TypeId，
+  后插入的会把先插入的**整个覆盖**且编译期 / 运行期均不报错（见
+  `World::insert_resource` 文档的模式警示）。headless 自动玩家经鼠标
+  点击全链路放塔、真实模拟 5 波全清获胜（经济 / 索敌闭环量化验证）。
 
 ## 3. ECS 设计（iris-core）
 
@@ -334,6 +341,16 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   far 平面法线长度只有 ~0.001，比较结果毫无几何意义（单测实测抓出过该问题）。
 - 剔除对象为「变换后的包围球」：局部 AABB 的中心/半径经模型矩阵变换，
   半径按矩阵三列长度的最大值保守放大；不可见实体不进入批处理与实例缓冲。
+- **Visibility 过滤与层级级联（打磨 III）**：渲染收集查询带
+  `Option<&Visibility>`（**组件缺席 = 可见**），自身 `HIDDEN` 或
+  **任一祖先 `HIDDEN`** 的实体在全部收集路径跳过——级联实现为**收集期
+  沿 `ChildOf` 父链上行遍历**（每实体 O(父链深度)，典型 ≤ 4；不加新
+  组件、不动 `hierarchy` 数据），普通 / 蒙皮 / 透明（含透明蒙皮）三条
+  几何路径与 UI、粒子发射器同语义；可见性过滤不计入
+  `culled_instances`（口径见 §4.4.1）。GPU 回归测试
+  `culling_render.rs::hidden_ancestor_cascades_to_descendant_subtree`
+  守护「根 rig → 无网格夹层 → 孙子网格」三层结构（iris-bastion
+  draw calls 139 事故的引擎级回归锁）。
 - 渲染器通过 `FrameStats` 暴露剔除后的提交数，集成测试据此断言
   「相机背后 27 实体零提交、视锥内实体不误伤」。
 - **蒙皮保守剔除（R22）**：蒙皮实体此前「保守全收」（注释自认关节可把
@@ -357,7 +374,7 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
 |---|---|
 | `draw_calls` | 主几何（不透明主 pass + 透明 pass，§4.16 + 粒子 pass，§4.17）：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 + 透明蒙皮每实体 1 + 粒子（additive / alpha 段各至多 1）+ UI 顶点非空时 1；阴影 / 天空 / 后处理 pass 不计 |
 | `instances` | 主几何提交的**可见**实例数（普通 + 蒙皮 + 透明普通 + 透明蒙皮 + 粒子合计） |
-| `culled_instances` | 被视锥剔除的实例数（普通 + 蒙皮 + 透明合计；`Visibility::HIDDEN` 过滤不算剔除）。**粒子不进本口径**——剔除按发射器包围球整批裁决，被剔的发射器既不进 `instances` 也不进本字段（§4.17） |
+| `culled_instances` | 被视锥剔除的实例数（普通 + 蒙皮 + 透明合计；`Visibility` 过滤——自身 `HIDDEN` 与祖先级联——不算剔除）。**粒子不进本口径**——剔除按发射器包围球整批裁决，被剔的发射器既不进 `instances` 也不进本字段（§4.17） |
 | `triangles_drawn` | 主几何提交三角形总数：可见项索引数 / 3 累加（普通批 × 批实例数、蒙皮逐项、透明 run × 其实例数、粒子每粒 2 三角形；网格目录缺席按 0 不 panic）。不含 UI 与阴影 pass——阴影 pass 只复用不透明实例区间，透明项与粒子不投影 |
 | `instance_upload_bytes` | 几何实例缓冲实际 `write_buffer` 字节数（0 = 整帧跳过上传，见 §4.2）。粒子实例走独立缓冲、每帧全量上传，不计入本字段（§4.17） |
 | `particles_drawn` | 粒子 pass 提交的粒子实例数（发射器包围球剔除后；已并入 `instances` / `triangles_drawn`，其 draw call 已并入 `draw_calls`）。与发射器池状态对账：= 各可见发射器活粒子数之和（§4.17） |
@@ -385,6 +402,18 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   视图朝向取实体局部 **-Z 前方、+Y 上方**（`view_from_global`）；
   无挂载实体时回退到 `Camera` 资源，两条路径的投影参数（fov / near / far）语义一致。
 - 挂载相机会被视锥剔除与光照 uniform 复用（eye 位置同时供高光计算）。
+- **屏幕射线反投影（打磨 III）**：`Camera::screen_ray(ndc, aspect)` /
+  `screen_ray_from_global(gt, cam, ndc, aspect)` 把 NDC 点映射回世界
+  射线 `(origin, dir)`——inv(view_proj) 对近 / 远平面（DirectX 深度
+  z = 0 / 1）各取一点、两点连线即过眼点的针孔射线（透视除法奇异时
+  方向归零，由调用方兜底）。正向投影 `view_proj_from_global` 公开同一
+  份 vp 拼装（DirectX 深度约定与渲染器同款）——拾取、`world_to_screen`
+  与渲染器共用同一几何事实，引擎外不再手工拼矩阵。视口宽高比由调用方
+  给出：窗口程序读 iris-engine 的 **`Viewport` 资源**（物理像素，与
+  `Input::cursor_position` 同口径；`WindowPlugin` 以窗口初始尺寸首次
+  插入、主循环每次 `Resized` 自动同步，照 `Input` 资源模式；离屏 /
+  headless 程序无窗口事件，手动 `insert_resource` 写入实际渲染目标
+  尺寸，缺省 1280×720）。
 
 ### 4.6 glTF 2.0 资产管线（`asset` 模块）
 
@@ -909,6 +938,13 @@ glTF / HDR 错误经 `From` 映射保上下文）。
 - **发射器寿命**：`emitter_lifetime <= 0` 永久；> 0 时耗尽后停止持续
   发射（已出生粒子存活到各自终点）。burst 在首次 update 一次性触发，
   不受寿命门控、dt = 0 亦触发（粒子定格供渲染）。
+- **重置与命令式爆发（打磨 III）**：`reset()` 清空活粒子池、burst 重新
+  上膛、发射余量 / 发射器年龄 / 哈希流计数器归零——参数字段不动的前提
+  下与刚构造的同参数新实例逐位等价，`advance` 行为完全一致（对象池槽位
+  复用的正道：FX 槽位触发 = 覆写参数字段 + reset，无需销毁重建组件）；
+  `trigger_burst(count)` 把命令式爆发记账到下一次 `advance` 一次射出
+  （多次累加、消耗后不补发，不改 `burst_count` 配置语义），用于运行期
+  即时触发的特效。
 - **单遍系统**：`update_particles` 在一次查询内以 `&mut ParticleEmitter`
   直接推进——模拟只写发射器**自身内部**的粒子池，无跨组件借用（对照
   `update_animations` 的两阶段：它需要写**其他实体**的 Transform）。
@@ -948,15 +984,20 @@ glTF / HDR 错误经 `From` 映射保上下文）。
 - **剔除与统计**：剔除按**发射器包围球**（活粒子 AABB 包围球 + 最大
   尺寸边距，R22 同款保守界——只多画不漏画），被剔发射器整批不画且
   不计入 `culled_instances`（该字段口径为几何实例，粒子剔除口径独立，
-  见 §4.4.1）。可见粒子计入 `instances` / `draw_calls` / 
+  见 §4.4.1）。**收集查询带 `Option<&Visibility>`（打磨 III）**：挂
+  `HIDDEN` 的发射器（或任一祖先隐藏，层级级联 §4.4）整池跳过——组件
+  缺席 = 可见，与几何收集同语义；隐藏只是渲染过滤，`update_particles`
+  照常推进、粒子继续老化。可见粒子计入 `instances` / `draw_calls` / 
   `triangles_drawn`（每粒 2 三角形），并单列 `particles_drawn`
   （= 各可见发射器活粒子数之和，可与池状态对账）。**粒子不进阴影
   pass**（与透明同理由）。
-- **验收**：CPU 单测 7 项（逐位确定性、发射计数精确性 / 余量滚存、
+- **验收**：CPU 单测 9 项（逐位确定性、发射计数精确性 / 余量滚存、
   半隐式欧拉解析对照、寿命剔除 / 寿命耗尽 / 池满、burst 一次性、哈希流
-  健全性、渲染插值）；GPU 集成 `particles_render.rs` 3 项（喷泉可见性 +
+  健全性、渲染插值、reset 逐位还原 + burst 重新上膛、trigger_burst
+  确定性与累加）；GPU 集成 `particles_render.rs` 4 项（喷泉可见性 +
   `particles_drawn` 与池状态对账、additive 亮度显著高于 alpha 混合的
-  可区分断言、爆炸 one-shot 全灭后不补发）。验收图
+  可区分断言、爆炸 one-shot 全灭后不补发、隐藏发射器整池跳过 + 级联
+  隐藏 + 恢复重现）。验收图
   `docs/particles_fountain.png` / `docs/particles_explosion.png`
   （`particle_snapshot` 示例）。
 
@@ -1241,13 +1282,48 @@ glTF / HDR 错误经 `From` 映射保上下文）。
       → **陷阱原文保留**（资产管线守则）；「GLB 文件 → 关节矩阵」全链路
       的自动化守护已由 GPU 回归测试补上（`skinned_instance_follows_root_
       translation` 的像素级断言，见上上条）。
-13. **粒子系统为 v1**（§4.17）：场景序列化留白（JSON 场景无粒子段，
+14. **粒子系统为 v1**（§4.17）：场景序列化留白（JSON 场景无粒子段，
     发射器只能代码生成）；渲染实例每帧全量上传（粒子逐帧全变，无增量
     价值）；无碰撞 / 光照交互 / 软粒子深度淡出（贴地粒子可能穿插硬边）；
     剔除按发射器包围球保守整批裁决（单个巨池发射器跨视锥边界时会整批
     保留）；alpha 粒子排序粒度为逐粒子中心视深（与透明几何之间的先后
-    由 pass 顺序裁决，粒子恒在透明几何结果之上）；burst 一次性、无重置
-    API（重复爆炸需重建组件）。
+    由 pass 顺序裁决，粒子恒在透明几何结果之上）。（「burst 一次性、
+    无重置 API」的限制已由打磨 III 闭合：`reset()` / `trigger_burst()`
+    就地复用发射器，重复爆炸无需重建组件。）
+15. **dogfooding III 发现的引擎摩擦（iris-bastion 实践反馈）**——第三轮
+    以塔防压榨 raycast × 透明 × 粒子 × 空间音频时撞到的摩擦（原则同前
+    两轮：引擎侧零改动、记录 + 游戏内绕行；摩擦原文见 CHANGELOG R26
+    条目）。（更新：**五条已全部修复于「引擎 API 打磨 III」轮**，
+    iris-bastion 的绕行代码已同步删除并改用新 API 作闭合证明。）
+    - 无「屏幕 → 射线」辅助且实际窗口尺寸不作为资源暴露（插件手工拼
+      vp 逆 + `BastionViewport` 缺省 1280×720 绕行）
+      → **已修复**：`Camera::screen_ray` / `screen_ray_from_global` /
+      `view_proj_from_global`（§4.5）+ `Viewport` 资源（`WindowPlugin`
+      首插、`Resized` 自动同步）。游戏侧：`BastionViewport` /
+      `active_camera_vp` / `BastionPickError` 删除，拾取改走引擎 API。
+    - `ParticleEmitter` burst 一次性无重置 API（FX 池「覆写整只新组件」
+      绕行）
+      → **已修复**：`reset()` / `trigger_burst()`；游戏侧改「参数全字段
+      覆写 + reset 就地复用」。
+    - 粒子收集不查实体 `Visibility`（隐藏发射器的活粒子照画）
+      → **已修复**：收集查询带 `Option<&Visibility>`，隐藏发射器整池
+      跳过（GPU 测试守护，§4.17）。
+    - `Visibility` 不向子树级联且组件缺席 = 可见——池槽位「无网格 rig
+      夹层 + 孙子网格」结构下孙子恒渲染（待命池实体堆在原点入画，
+      draw calls 139 事故），游戏被迫拍平层级 + 名字识别形态绕行
+      → **已修复**：渲染收集期沿 `ChildOf` 父链上行的层级级联（§4.4），
+      GPU 回归测试复刻三层结构；游戏侧还原「根 → 形态 rig → 网格」池
+      结构，形态切换回到「翻两个 rig」。级联缺失期间「过滤逐实体」的
+      旧语义只存在于文档，代码语义由本条回归测试锁定。**快照实证**：
+      拍平结构下击杀归还的槽位只隐藏根、网格自带 `VISIBLE` 滞留死亡点
+      入画（bastion_snapshot 定格帧 `draw_calls = 18`——残块恰藏于 HUD
+      文字后，新旧帧逐像素差分定位）；级联闭合后 `draw_calls = 17`，
+      与「旧结构 + 手工逐子隐藏」帧逐字节一致。
+    - 同构池 type alias 共享 TypeId 互相覆盖（游戏侧设计陷阱，引擎无从
+      阻止）
+      → **改写为模式警示**（无引擎行为改动）：`World::insert_resource`
+      文档 + §2 iris-bastion 段记录——同型多实例资源必须 distinct
+      newtype。
 
 ## 9. 关键设计取舍记录
 

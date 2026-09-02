@@ -26,7 +26,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 
-use crate::plugin::Plugin;
+use crate::plugin::{Plugin, Viewport};
 
 /// 引擎应用：构建期收集插件与系统，运行期驱动主循环。
 pub struct App {
@@ -280,6 +280,13 @@ impl ApplicationHandler for Runner {
                 if is_main {
                     if let Some(surface) = &mut self.surface {
                         surface.resize(size.width, size.height);
+                    }
+                    // 视口资源同步（照 Input 资源的模式）：拾取等消费方
+                    // 读到的宽高比始终是当前帧的实际尺寸（缺席则跳过——
+                    // 未用 DefaultPlugins 的极简 App 自行负责）
+                    if let Some(mut viewport) = self.app.world.try_resource_mut::<Viewport>() {
+                        viewport.width = size.width;
+                        viewport.height = size.height;
                     }
                 }
             }

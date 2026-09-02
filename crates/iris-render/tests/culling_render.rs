@@ -1,6 +1,6 @@
 //! 集成测试：视锥剔除统计口径与蒙皮保守剔除（R22）。
 //!
-//! 两条主线：
+//! 三条主线：
 //! 1. **统计一致性**：N 个立方体、相机只朝向其中一部分——
 //!    `visible + culled == N`、`triangles_drawn == visible × 单网格三角形数`
 //!    （精确断言）、`draw_calls` 与批数一致；画面像素侧证「朝向的可见、
@@ -9,6 +9,9 @@
 //!    几何刚性移到 (10, 0, 0)——相机看向 (10, 0, 0) 时该蒙皮实例必须可见
 //!    （保守并集界生效；误用绑定姿势包围盒剔除就会误杀，本测试要能抓住），
 //!    背对时计入 `culled_instances`。
+//! 3. **层级可见性级联（打磨 III）**：根 rig（HIDDEN）→ 子夹层（无网格
+//!    无 Visibility）→ 孙子网格——任一祖先隐藏 ⇒ 子树全隐藏（iris-bastion
+//!    draw calls 139 事故的引擎级回归锁）。
 //!
 //! 环境无 GPU 适配器时优雅跳过（打印提示，测试仍算通过）。
 
@@ -207,4 +210,81 @@ fn skinned_culling_tracks_joint_transformed_geometry() {
     assert_eq!(stats.draw_calls, 0);
     let red_px = count_red(&renderer.read_pixels(), w, h);
     assert_eq!(red_px, 0, "背对时画面不应出现任何蒙皮几何像素");
+}
+
+/// 层级可见性级联（打磨 III 正确性核心，iris-bastion draw calls 139 事故
+/// 的引擎级回归锁）：**根 rig（HIDDEN）→ 子夹层（无网格无 Visibility）→
+/// 孙子网格** 的三层结构——任一祖先隐藏 ⇒ 子树全隐藏：
+/// - 根隐藏：孙子网格不得渲染（instances = 0、画面零其像素；隐藏过滤
+///   不计入 `culled_instances`，与自身 HIDDEN 同口径）；
+/// - 根恢复可见：夹层缺席 = 可见，孙子网格入画；
+/// - 夹层隐藏（根仍可见）：孙子网格再次全隐藏——级联对**每一层**祖先
+///   生效，而非只看根。
+///
+/// 事故背景：级联缺失时「夹层 rig 翻 HIDDEN、孙子网格组件缺席 = 恒
+/// 渲染」，待命池槽位的身体全部堆在世界原点入画（draw calls 139）。
+#[test]
+fn hidden_ancestor_cascades_to_descendant_subtree() {
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let (mut world, cube, red) = base_scene();
+
+    // 三层结构：根 rig → 夹层（无网格无 Visibility，组件缺席 = 可见）
+    // → 孙子网格（无 Visibility）
+    let rig = world.spawn((Transform::from_xyz(0.0, 0.5, -12.0), Visibility::HIDDEN));
+    let interlayer = world.spawn((Transform::IDENTITY,));
+    world.add_child(rig, interlayer);
+    let mesh = world.spawn((Transform::IDENTITY, cube, red));
+    world.add_child(interlayer, mesh);
+    propagate_transforms(&mut world);
+    {
+        let mut camera = world.resource_mut::<Camera>();
+        camera.eye = Vec3::new(0.0, 0.5, 0.0);
+        camera.target = Vec3::new(0.0, 0.5, -12.0);
+    }
+
+    // ---- 根 rig 隐藏：孙子网格整树隐藏 ----
+    renderer.render(&world);
+    let stats = renderer.renderer().stats();
+    assert_eq!(
+        stats.instances, 0,
+        "祖先隐藏 ⇒ 子树全隐藏：孙子网格不得进入收集"
+    );
+    assert_eq!(
+        stats.culled_instances, 0,
+        "可见性过滤不算剔除（与自身 HIDDEN 同口径）"
+    );
+    assert_eq!(stats.triangles_drawn, 0);
+    let (w, h) = renderer.size();
+    assert_eq!(
+        count_red(&renderer.read_pixels(), w, h),
+        0,
+        "画面应零红像素"
+    );
+
+    // ---- 根恢复可见：夹层缺席 = 可见，孙子网格入画 ----
+    world.insert(rig, Visibility::VISIBLE);
+    renderer.render(&world);
+    let stats = renderer.renderer().stats();
+    assert_eq!(stats.instances, 1, "根可见后孙子网格应入画");
+    assert_eq!(stats.draw_calls, 1);
+    assert_eq!(stats.triangles_drawn, CUBE_TRIANGLES);
+    let red_px = count_red(&renderer.read_pixels(), w, h);
+    assert!(
+        red_px > 200,
+        "恢复后的立方体应出现在画面中，红像素 {red_px}"
+    );
+
+    // ---- 夹层隐藏（根仍可见）：级联对每一层祖先生效 ----
+    world.insert(interlayer, Visibility::HIDDEN);
+    renderer.render(&world);
+    let stats = renderer.renderer().stats();
+    assert_eq!(stats.instances, 0, "中间夹层隐藏同样应隐藏整棵子树");
+    assert_eq!(
+        count_red(&renderer.read_pixels(), w, h),
+        0,
+        "夹层隐藏时画面应零红像素"
+    );
 }

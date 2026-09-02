@@ -13,7 +13,44 @@ pub trait Plugin {
     fn build(&self, app: &mut App);
 }
 
-/// 窗口配置插件。
+/// 视口尺寸（物理像素，与 [`Input::cursor_position`] 同口径）。
+///
+/// **窗口程序由框架维护，不要手动写**：[`DefaultPlugins`]（经
+/// [`WindowPlugin`]）以窗口初始尺寸首次插入，此后每次
+/// `WindowEvent::Resized` 由主循环自动同步（照 `Input` 资源的模式）——
+/// 用户系统只读即可（典型消费：屏幕射线拾取的宽高比输入，见
+/// `iris_render::camera::screen_ray_from_global`）。
+///
+/// **离屏 / headless 程序**没有窗口事件，可（也应）手动
+/// `insert_resource(Viewport::new(w, h))` 写入实际渲染目标尺寸；未插入
+/// 时的读取方兜底口径为 `Viewport::default()`（1280×720，与缺省窗口
+/// 一致）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Viewport {
+    /// 宽（物理像素）。
+    pub width: u32,
+    /// 高（物理像素）。
+    pub height: u32,
+}
+
+impl Viewport {
+    /// 以显式宽高构造（写入方保证 ≥ 1，消费方按宽高比使用）。
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self::new(1280, 720)
+    }
+}
+
+impl iris_core::resource::Resource for Viewport {}
+
+/// 窗口配置插件。同时以窗口初始尺寸**首次插入** [`Viewport`] 资源
+/// （此后 `Resized` 事件由主循环同步；预插入的同型资源会被本插件以
+/// 窗口配置覆写——窗口程序以窗口事实为准）。
 #[derive(Clone, Debug)]
 pub struct WindowPlugin {
     pub config: WindowConfig,
@@ -22,6 +59,8 @@ pub struct WindowPlugin {
 impl Plugin for WindowPlugin {
     fn build(&self, app: &mut App) {
         app.window_config = self.config.clone();
+        app.world
+            .insert_resource(Viewport::new(self.config.width, self.config.height));
     }
 }
 
@@ -250,5 +289,33 @@ impl Plugin for DefaultPlugins {
         // 空间音频与粒子同层（层级传播之后）：听者 / 声源读当帧全局位姿，
         // 当帧混音增益即跟随（访问集与粒子不相交，可同批并行）
         SpatialPlugin.build(app);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 视口资源：缺省 1280×720（与 `DefaultPlugins` 缺省窗口一致），
+    /// `WindowPlugin` 以窗口配置尺寸首次插入。
+    #[test]
+    fn viewport_defaults_and_follows_window_config() {
+        let viewport = Viewport::default();
+        assert_eq!(
+            (viewport.width, viewport.height),
+            (1280, 720),
+            "缺省视口应与缺省窗口尺寸一致"
+        );
+        let mut app = App::new();
+        WindowPlugin {
+            config: WindowConfig::new("视口测试", 800, 600),
+        }
+        .build(&mut app);
+        let viewport = app.world.try_resource::<Viewport>().expect("应已首次插入");
+        assert_eq!(
+            (viewport.width, viewport.height),
+            (800, 600),
+            "Viewport 应以窗口初始尺寸插入"
+        );
     }
 }

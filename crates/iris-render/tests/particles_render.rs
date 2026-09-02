@@ -228,3 +228,68 @@ fn explosion_burst_once_then_all_dead() {
     renderer.render(&world);
     assert_eq!(renderer.renderer().stats().particles_drawn, 0, "不得补发");
 }
+
+/// 用例 4（打磨 III）：隐藏发射器整池跳过——挂 `Visibility::HIDDEN` 后
+/// `particles_drawn = 0` 且画面失去全部粒子像素；恢复 `VISIBLE` 原样
+/// 重现；祖先隐藏（层级级联）同样整池跳过。与网格 / 透明收集同语义：
+/// 组件缺席 = 可见。
+#[test]
+fn hidden_emitter_skips_whole_pool_and_recovers() {
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let mut world = base_world();
+    let emitter = world.spawn((
+        Transform::from_xyz(0.0, 1.0, 0.0),
+        ParticleEmitter::explosion(),
+    ));
+    propagate_transforms(&mut world);
+    simulate(&world, 1);
+
+    // 可见基线：burst 320 颗在画
+    renderer.render(&world);
+    let stats = renderer.renderer().stats();
+    assert_eq!(stats.particles_drawn, 320, "可见发射器应整池在画");
+    let visible_frame = renderer.read_pixels();
+
+    // 隐藏发射器：整池跳过（模拟不受影响，只是渲染过滤）
+    world.insert(emitter, Visibility::HIDDEN);
+    renderer.render(&world);
+    let stats = renderer.renderer().stats();
+    assert_eq!(stats.particles_drawn, 0, "隐藏发射器的粒子不应绘制");
+    assert_eq!(stats.draw_calls, 0, "无任何可见几何时不应有 draw call");
+    let hidden_frame = renderer.read_pixels();
+    let diff = count_changed(&visible_frame, &hidden_frame, 12);
+    assert!(
+        diff > 200,
+        "隐藏发射器后画面应失去全部粒子像素，差分 {diff}"
+    );
+
+    // 恢复可见：原样重现（组件保留，切换开销为零的既有语义）
+    world.insert(emitter, Visibility::VISIBLE);
+    renderer.render(&world);
+    assert_eq!(
+        renderer.renderer().stats().particles_drawn,
+        320,
+        "恢复 VISIBLE 后应原样重现"
+    );
+
+    // 层级级联：发射器自身可见但祖先隐藏 → 同样整池跳过；祖先恢复后重现
+    let rig = world.spawn((Transform::IDENTITY, Visibility::HIDDEN));
+    world.add_child(rig, emitter);
+    propagate_transforms(&mut world);
+    renderer.render(&world);
+    assert_eq!(
+        renderer.renderer().stats().particles_drawn,
+        0,
+        "祖先隐藏应级联隐藏发射器整池"
+    );
+    world.insert(rig, Visibility::VISIBLE);
+    renderer.render(&world);
+    assert_eq!(
+        renderer.renderer().stats().particles_drawn,
+        320,
+        "祖先恢复可见后发射器整池应重现"
+    );
+}

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
-use iris_core::prelude::GlobalTransform;
+use iris_core::prelude::{Entity, GlobalTransform};
 
 use crate::SAMPLE_COUNT;
 use crate::camera::{ActiveCamera, Camera, view_from_global};
@@ -26,6 +26,30 @@ use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
 use crate::pipeline::create_pipeline;
 use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
+use crate::visibility::Visibility;
+
+/// 级联可见性的父链搜索深度上限：典型游戏层级 ≤ 4；上限只防御
+/// `add_child` 未检测的构造性环（a、b 互设父级——层级传播对环同样未
+/// 定义），渲染收集不得挂死，越界按可见处理（宁可多画的既有哲学）。
+const VISIBILITY_ANCESTOR_MAX_DEPTH: usize = 64;
+
+/// 层级可见性级联（打磨 III）：沿 `ChildOf` 父链上行，任一祖先挂
+/// [`Visibility::HIDDEN`] 即隐藏——语义即「任一祖先隐藏 ⇒ 子树全隐藏」。
+/// **渲染收集期上行遍历**实现：不加新组件、不动 `hierarchy` 数据；自身
+/// `HIDDEN` 的检查与旧语义一致（调用方完成），本函数只补祖先链。复杂度
+/// O(父链深度)，典型场景 ≤ 4。
+fn hidden_by_ancestor(world: &iris_core::world::World, mut entity: Entity) -> bool {
+    for _ in 0..VISIBILITY_ANCESTOR_MAX_DEPTH {
+        let Some(parent) = world.parent(entity) else {
+            return false;
+        };
+        if world.get::<Visibility>(parent).is_some_and(|v| !v.visible) {
+            return true;
+        }
+        entity = parent;
+    }
+    false
+}
 
 /// 与 WGSL `PointLight` 结构对齐（32 字节，POD）。
 #[repr(C)]
@@ -528,8 +552,10 @@ fn skin_world_aabb(
 /// 收集期分区天然排除透明项——半透明几何不应在地面上投出实心黑影
 /// （alpha 混合几何的阴影贡献需要分离投影，v1 不做）。
 ///
-/// [`crate::visibility::Visibility`] 过滤在全部收集路径生效；普通实体做
-/// 包围球视锥剔除；蒙皮实体做**保守并集 AABB 视锥剔除**（见
+/// [`crate::visibility::Visibility`] 过滤在全部收集路径生效（含层级
+/// 级联：任一祖先 `HIDDEN` ⇒ 子树全隐藏，见 `hidden_by_ancestor`——自身
+/// `HIDDEN` 也跳过，组件缺席 = 可见的旧语义不变）；普通实体做包围球视锥
+/// 剔除；蒙皮实体做**保守并集 AABB 视锥剔除**（见
 /// `skin_world_aabb`）。视锥剔除与剔除计数对透明同样生效。返回可见 /
 /// 被剔除的实例数（日志与 `FrameStats` 用）；排序由调用方完成。
 // 四个输出列表各自类型不同、语义独立（跨帧复用的 scratch 缓冲逐个传入），
@@ -547,7 +573,6 @@ fn collect_instances(
     transparent: &mut Vec<TransparentItem>,
     transparent_skinned: &mut Vec<TransparentSkinnedItem>,
 ) -> CollectCounts {
-    use crate::visibility::Visibility;
     items.clear();
     skinned.clear();
     transparent.clear();
@@ -571,7 +596,8 @@ fn collect_instances(
         &Skin,
         Option<&Visibility>,
     )>(|(e, gt, m, mat, skin, visibility)| {
-        if visibility.is_some_and(|v| !v.visible) {
+        // 自身 HIDDEN 跳过 + 祖先链级联（任一祖先隐藏 ⇒ 子树全隐藏）
+        if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
         }
         skinned_entities.insert(e.to_bits());
@@ -609,7 +635,8 @@ fn collect_instances(
         &MaterialHandle,
         Option<&Visibility>,
     )>(|(e, gt, m, mat, visibility)| {
-        if visibility.is_some_and(|v| !v.visible) {
+        // 自身 HIDDEN 跳过 + 祖先链级联（与蒙皮路径同语义）
+        if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
         }
         // 蒙皮实体走独立路径，避免同网格重复绘制
@@ -664,6 +691,10 @@ fn collect_instances(
 /// 数据准备；必须在 `update_particles` 之后调用——收集的是本帧模拟后的
 /// 活粒子，调用契约见 `particles.rs`）。
 ///
+/// - **Visibility 过滤**（打磨 III）：挂 `Visibility::HIDDEN` 的发射器
+///   整池跳过（组件缺席 = 可见，与网格 / 透明收集同语义）；任一祖先
+///   隐藏同样整池跳过（层级级联，见 `hidden_by_ancestor`）。注意隐藏
+///   只是渲染过滤——`update_particles` 照常推进，粒子继续老化。
 /// - **剔除按发射器包围球**（R22 同款保守界）：活粒子 AABB 的包围球 +
 ///   最大出生/终点尺寸边距（粒子为中心对称 quad，中心到 quad 最远点 =
 ///   尺寸，取 `size_start`/`size_end` 较大者保证不漏）。被剔发射器整批
@@ -688,7 +719,16 @@ fn collect_particles(
     let mut seq = 0u32;
     // 单发射器的实例组装暂存（跨发射器 clear 复用，池规模 ≤ 单发射器上限）
     let mut tmp: Vec<ParticleInstance> = Vec::new();
-    world.query::<(&GlobalTransform, &ParticleEmitter)>(|(_, emitter)| {
+    world.query::<(
+        Entity,
+        &GlobalTransform,
+        &ParticleEmitter,
+        Option<&Visibility>,
+    )>(|(e, _, emitter, visibility)| {
+        // 隐藏发射器整池跳过（自身 HIDDEN 或任一祖先 HIDDEN）
+        if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
+            return;
+        }
         let alive = emitter.particles();
         if alive.is_empty() {
             return;

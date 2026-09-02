@@ -163,6 +163,16 @@ impl World {
 
     // ---- 资源 ----
 
+    /// 插入资源（覆盖式：同型后插覆盖先插，返回旧值）。
+    ///
+    /// # 模式警示（dogfooding III 实测踩坑）
+    ///
+    /// 资源按 [`std::any::TypeId`] 寻址——**同构多实例资源（例如三个同构
+    /// 的对象池）必须是三个 distinct newtype**，`type alias` 只是同一类型
+    /// 的别名、共享 TypeId，后插入的会把先插入的**整个覆盖**：编译期与
+    /// 运行期都不会报错，症状是「其中一个池凭空消失 / 数据互相串味」。
+    /// 正确姿势见 iris-bastion 的 `EnemyPool` / `BulletPool` / `ShellPool`
+    /// 三兄弟（各自 `pub struct X(pub MappedPool)`）。
     pub fn insert_resource<R: Resource>(&mut self, resource: R) -> Option<R> {
         self.resources.insert(resource)
     }

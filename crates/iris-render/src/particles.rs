@@ -27,6 +27,11 @@
 //! 与层级传播同层——DefaultPlugins 的 ParticlePlugin 已保证；离屏快照 /
 //! 测试须手动按此顺序调用。
 //!
+//! **对象池复用**（打磨 III）：发射器是一次性 burst 特效的宿主组件——
+//! 槽位触发 = 覆写参数字段 + [`ParticleEmitter::reset`] 清模拟态并让
+//! burst 重新上膛（运行期即时触发亦可用
+//! [`ParticleEmitter::trigger_burst`]），无需销毁重建组件。
+//!
 //! v1 限制：不写场景序列化（JSON 场景无粒子段）；渲染实例缓冲每帧全量
 //! 上传（粒子逐帧全变，增量比对无价值）；无碰撞与光照交互。
 
@@ -101,8 +106,12 @@ pub struct ParticleEmitter {
     spawn_accumulator: f32,
     /// 发射器已存活秒数（`emitter_lifetime` 判据）。
     emitter_age: f32,
-    /// burst 是否已触发（一次性标记，v1 无重置 API）。
+    /// burst 是否已触发（一次性标记；[`ParticleEmitter::reset`] 重新上膛）。
     burst_fired: bool,
+    /// 命令式 burst 进账（[`ParticleEmitter::trigger_burst`] 累加，下一次
+    /// `advance` 一次射出后清零——出生位置与随机流种子取该次 advance 的
+    /// 入参；与配置式 `burst_count` 的一次性标记互不影响）。
+    pending_burst: u32,
     /// 伪随机流全局递增计数器（每尝试发射一颗 +1；哈希流的状态本体）。
     rng_counter: u64,
 }
@@ -139,6 +148,7 @@ impl ParticleEmitter {
             spawn_accumulator: 0.0,
             emitter_age: 0.0,
             burst_fired: false,
+            pending_burst: 0,
             rng_counter: 0,
         }
     }
@@ -194,6 +204,31 @@ impl ParticleEmitter {
         &self.particles
     }
 
+    /// 重置模拟状态（对象池槽位复用的正道）：清空活粒子池、burst 重新
+    /// 上膛（`burst_fired` = false）、发射余量 / 发射器年龄 / 伪随机计数
+    /// 器归零——**参数字段不变**的前提下（`spawn_rate` / `burst_count` /
+    /// 颜色等表现参数由调用方维护），调用后与「刚构造的同参数新实例」
+    /// 逐位等价，`advance` 行为完全一致。命令式进账（`pending_burst`）
+    /// 一并清零。典型用法：FX 对象池槽位触发前先覆写参数字段、再
+    /// `reset()` 上膛（见 iris-bastion 的 FX 池）。
+    pub fn reset(&mut self) {
+        self.particles.clear();
+        self.spawn_accumulator = 0.0;
+        self.emitter_age = 0.0;
+        self.burst_fired = false;
+        self.pending_burst = 0;
+        self.rng_counter = 0;
+    }
+
+    /// 命令式额外爆发 `count` 颗：进账在**下一次 `advance`** 一次射出
+    /// （dt = 0 亦触发，粒子定格出生态），出生位置 / 随机流种子取该次
+    /// advance 的入参，多次调用累加。**不改 `burst_count` 的语义**——
+    /// 它仍是「首次 advance 的一次性配置爆发」；本方法用于运行期触发的
+    /// 一次性特效（先挪发射器 / 换参数再触发，无需重建组件）。
+    pub fn trigger_burst(&mut self, count: u32) {
+        self.pending_burst = self.pending_burst.saturating_add(count);
+    }
+
     /// 收集当前活粒子的 GPU 渲染实例（中心 + 插值尺寸 + 插值颜色），
     /// 追加到 `out`——只读方法，供渲染器在 `update_particles` 之后调用。
     pub fn collect_render(&self, out: &mut Vec<ParticleInstance>) {
@@ -229,7 +264,8 @@ impl ParticleEmitter {
     ///    `pos += vel·dt`（先更新速度再积分位置）；
     /// 2. 剔除到寿粒子（`age >= particle_lifetime`）；
     /// 3. 发射器寿命计时（`emitter_lifetime > 0` 时才累计），耗尽停发；
-    /// 4. burst：首次调用一次性射出 `burst_count` 颗；
+    /// 4. burst：配置式 `burst_count` 首次调用一次性射出 +
+    ///    [`trigger_burst`](ParticleEmitter::trigger_burst) 的命令式进账；
     /// 5. 持续发射：累计分数法 `spawn_rate·dt` 取整、余量滚存。
     ///
     /// `origin` 为本帧发射原点（发射器 `GlobalTransform` 平移，世界坐标）；
@@ -255,10 +291,20 @@ impl ParticleEmitter {
         }
         let emitting = self.emitter_lifetime <= 0.0 || self.emitter_age < self.emitter_lifetime;
         let mut spawned = 0;
-        // 4. burst：只触发一次（与 dt 无关，dt = 0 亦触发——定格供渲染）
+        // 4. burst：配置式 burst_count 只触发一次（与 dt 无关，dt = 0 亦
+        //    触发——定格供渲染）；trigger_burst 的命令式进账每笔在本次
+        //    advance 一次射出。两路合并为一次批量发射（哈希流顺序消耗，
+        //    与拆成两批逐位等价）
+        let mut burst_total = 0u32;
         if self.burst_count > 0 && !self.burst_fired {
             self.burst_fired = true;
-            spawned += self.spawn_batch(self.burst_count, origin, seed);
+            burst_total += self.burst_count;
+        }
+        if self.pending_burst > 0 {
+            burst_total += std::mem::take(&mut self.pending_burst);
+        }
+        if burst_total > 0 {
+            spawned += self.spawn_batch(burst_total, origin, seed);
         }
         // 5. 持续发射：累计分数法——rate·dt 取整出生、小数余量滚存，
         //    任意 dt 序列下出生总数都收敛于 rate·总时长（确定性计数）
@@ -423,6 +469,7 @@ mod tests {
         v.push(e.spawn_accumulator.to_bits() as u64);
         v.push(e.emitter_age.to_bits() as u64);
         v.push(e.burst_fired as u64);
+        v.push(e.pending_burst as u64);
         v
     }
 
@@ -645,5 +692,96 @@ mod tests {
         assert!((out[0].color[0] - 0.5).abs() < 1e-4);
         assert!((out[0].color[1] - 0.5).abs() < 1e-4);
         assert!((out[0].color[3] - 0.5).abs() < 1e-4);
+    }
+
+    /// 用例 6（打磨 III）：`reset`——推进一段后重置，内部状态与刚构造的
+    /// 同参数新实例逐位一致，其后按相同序列推进完全等价（对象池槽位
+    /// 复用的正道）；burst 在 reset 后重新上膛。
+    #[test]
+    fn reset_restores_fresh_instance_behavior() {
+        let mut used = ParticleEmitter::fountain();
+        let mut fresh = ParticleEmitter::fountain();
+        for _ in 0..120 {
+            used.advance(DT, Vec3::new(1.0, 0.0, 2.0), SEED);
+        }
+        assert!(!used.is_empty(), "前置：已用发射器应有活粒子");
+        used.reset();
+        assert!(used.is_empty(), "重置应清空活粒子池");
+        assert_eq!(
+            bits(&used),
+            bits(&fresh),
+            "重置后内部状态应与刚构造的新实例逐位一致"
+        );
+        // 重置后按相同序列推进：与同参数新实例逐位等价
+        for i in 0..60 {
+            let origin = Vec3::new(2.0, 1.0, 0.0);
+            assert_eq!(
+                used.advance(DT, origin, SEED),
+                fresh.advance(DT, origin, SEED),
+                "第 {i} 步报告应一致"
+            );
+        }
+        assert_eq!(
+            bits(&used),
+            bits(&fresh),
+            "重置后的模拟序列应与新实例逐位一致"
+        );
+        // burst 重新上膛：已触发过的爆炸经 reset 后应能再次全量爆发
+        let mut e = ParticleEmitter::explosion();
+        e.advance(DT, Vec3::ZERO, SEED);
+        assert_eq!(e.live_count(), 320);
+        e.reset();
+        let report = e.advance(0.0, Vec3::ZERO, SEED);
+        assert_eq!(report.spawned, 320, "reset 后 burst 应重新上膛");
+    }
+
+    /// 用例 7（打磨 III）：`trigger_burst`——命令式进账在下一次 advance
+    /// 一次射出（dt = 0 亦触发），不改 burst_count 配置语义，多次进账
+    /// 累加、消耗后不补发，计数确定。
+    #[test]
+    fn trigger_burst_fires_on_next_advance_without_touching_config() {
+        let mut e = ParticleEmitter::new(ParticleBlend::Additive);
+        e.burst_count = 5; // 配置式 burst：首步照常触发
+        e.spawn_rate = 0.0;
+        e.particle_lifetime = 1000.0;
+        assert_eq!(
+            e.advance(DT, Vec3::ZERO, SEED).spawned,
+            5,
+            "配置式 burst 不受 trigger_burst 影响"
+        );
+        e.trigger_burst(7);
+        let report = e.advance(0.0, Vec3::new(1.0, 2.0, 3.0), SEED);
+        assert_eq!(
+            report.spawned, 7,
+            "命令式进账应在下一次 advance 一次射出（dt = 0 亦触发）"
+        );
+        assert_eq!(e.live_count(), 12);
+        assert_eq!(
+            e.particles()[5].pos,
+            Vec3::new(1.0, 2.0, 3.0),
+            "命令式 burst 的出生位置取当次 advance 的 origin"
+        );
+        assert_eq!(
+            e.advance(DT, Vec3::ZERO, SEED).spawned,
+            0,
+            "进账消耗后不得补发"
+        );
+        // 多次调用累加
+        let mut e = ParticleEmitter::new(ParticleBlend::Alpha);
+        e.spawn_rate = 0.0;
+        e.particle_lifetime = 1000.0;
+        e.max_particles = 10_000;
+        e.trigger_burst(3);
+        e.trigger_burst(4);
+        assert_eq!(e.advance(DT, Vec3::ZERO, SEED).spawned, 7, "多次进账应累加");
+        // 确定性：相同操作序列的两个发射器逐位一致
+        let mut a = ParticleEmitter::new(ParticleBlend::Alpha);
+        let mut b = ParticleEmitter::new(ParticleBlend::Alpha);
+        for emitter in [&mut a, &mut b] {
+            emitter.particle_lifetime = 1000.0;
+            emitter.trigger_burst(9);
+            emitter.advance(DT, Vec3::new(4.0, 5.0, 6.0), SEED);
+        }
+        assert_eq!(bits(&a), bits(&b), "trigger_burst 路径必须逐位确定");
     }
 }

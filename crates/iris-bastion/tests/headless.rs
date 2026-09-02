@@ -230,10 +230,10 @@ fn startup_prewarms_pools_and_shows_hud() {
     );
     {
         let pool = harness.enemy_pool();
-        assert_eq!(pool.0.slots.len(), POOL_ENEMIES);
-        assert_eq!(pool.0.free_count(), POOL_ENEMIES);
-        assert!(pool.0.active().is_empty());
-        for &slot in &pool.0.slots {
+        assert_eq!(pool.slots.slots.len(), POOL_ENEMIES);
+        assert_eq!(pool.slots.free_count(), POOL_ENEMIES);
+        assert!(pool.slots.active().is_empty());
+        for &slot in &pool.slots.slots {
             assert_eq!(
                 *harness
                     .app
@@ -713,9 +713,9 @@ fn auto_player_wins_all_five_waves_with_core_hp_ge_3() {
     // 敌池完全归还（胜负已分、场上清空）
     drop(game);
     let pool = harness.enemy_pool();
-    assert!(pool.0.active().is_empty(), "终局后敌人池应全部归还");
+    assert!(pool.slots.active().is_empty(), "终局后敌人池应全部归还");
     assert_eq!(
-        pool.0.active().len() + pool.0.free_count(),
+        pool.slots.active().len() + pool.slots.free_count(),
         POOL_ENEMIES,
         "池守恒：活跃 + 闲置 = 容量（不超发、不泄漏）"
     );
