@@ -10,7 +10,8 @@ pub const POINT_SHADOW_MAP_SIZE: u32 = 512;
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// 主管线、蒙皮管线、透明管线（常规 + 蒙皮变体）、阴影管线（常规 + 蒙皮
-/// 变体）、天空盒、泛光管线（提取 + 模糊）与色调映射管线，以及全部绑定组布局。
+/// 变体）、天空盒、后处理管线（泛光提取 + 模糊、暗角、色调映射 blit），
+/// 以及全部绑定组布局。
 pub(crate) struct PipelineBundle {
     pub pipeline: wgpu::RenderPipeline,
     /// 蒙皮变体：顶点多一路蒙皮缓冲，组 2 绑定关节矩阵 storage。
@@ -30,6 +31,8 @@ pub(crate) struct PipelineBundle {
     pub blit_pipeline: wgpu::RenderPipeline,
     pub bloom_threshold_pipeline: wgpu::RenderPipeline,
     pub bloom_blur_pipeline: wgpu::RenderPipeline,
+    /// 暗角 pass 管线（全分辨率 HDR → HDR，pass 串联框架的示范 pass）。
+    pub vignette_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 粒子 additive 管线（billboard 实例化，`SrcAlpha + One` 加法混合，
@@ -49,7 +52,10 @@ pub(crate) struct PipelineBundle {
     /// 关节矩阵只读 storage（蒙皮管线专用）。
     pub joints_layout: wgpu::BindGroupLayout,
     pub blit_layout: wgpu::BindGroupLayout,
-    pub bloom_layout: wgpu::BindGroupLayout,
+    /// 后处理全屏 pass 通用组布局：binding 0 = 参数 uniform、1 = 源纹理、
+    /// 2 = 采样器（泛光 / 暗角等全部链上中间 pass 同构，pass 串联框架
+    /// 据此用一个编码函数服务所有 pass）。
+    pub post_layout: wgpu::BindGroupLayout,
     /// UI 绑定组布局：binding 0 = 字形图集纹理、1 = 采样器、
     /// 2 = 屏幕尺寸 uniform（顶点阶段）。
     pub ui_layout: wgpu::BindGroupLayout,
@@ -688,14 +694,17 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
-    // 泛光：半分辨率亮度提取（软阈值）+ 可分离高斯模糊（水平/垂直共用一条管线，
-    // 方向由 uniform 决定）。两个 pass 输出到同规格的 Rgba16Float 中间缓冲。
+    // 后处理全屏 pass 族：泛光（半分辨率亮度提取 + 可分离高斯模糊）与
+    // 暗角（全分辨率逐像素压暗）。共用同一「参数 uniform + 源纹理 +
+    // 采样器」组布局（post_layout）与 HDR 颜色目标，只有着色器模块与
+    // 片段入口不同——pass 串联框架（post.rs）据此用单一编码函数服务
+    // 全部中间 pass。
     let bloom_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("iris.shader.bloom"),
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/bloom.wgsl").into()),
     });
-    let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("iris.layout.bloom"),
+    let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.post"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -725,31 +734,34 @@ pub(crate) fn create_pipeline(
             },
         ],
     });
-    let bloom_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("iris.bloom.pipeline.layout"),
-        bind_group_layouts: &[Some(&bloom_layout)],
+    let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.post.pipeline.layout"),
+        bind_group_layouts: &[Some(&post_layout)],
         immediate_size: 0,
     });
-    let bloom_target = &[Some(wgpu::ColorTargetState {
+    let post_target = &[Some(wgpu::ColorTargetState {
         format: HDR_FORMAT,
         blend: None,
         write_mask: wgpu::ColorWrites::ALL,
     })];
-    let make_bloom_pipeline = |label: &'static str, fs: &'static str| {
+    let make_post_pipeline = |label: &'static str,
+                              shader: &wgpu::ShaderModule,
+                              fs: &'static str|
+     -> wgpu::RenderPipeline {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
-            layout: Some(&bloom_pipeline_layout),
+            layout: Some(&post_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &bloom_shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &bloom_shader,
+                module: shader,
                 entry_point: Some(fs),
                 compilation_options: Default::default(),
-                targets: bloom_target,
+                targets: post_target,
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -761,9 +773,21 @@ pub(crate) fn create_pipeline(
             cache: None,
         })
     };
-    let bloom_threshold_pipeline =
-        make_bloom_pipeline("iris.pipeline.bloom_threshold", "fs_threshold");
-    let bloom_blur_pipeline = make_bloom_pipeline("iris.pipeline.bloom_blur", "fs_blur");
+    let bloom_threshold_pipeline = make_post_pipeline(
+        "iris.pipeline.bloom_threshold",
+        &bloom_shader,
+        "fs_threshold",
+    );
+    let bloom_blur_pipeline =
+        make_post_pipeline("iris.pipeline.bloom_blur", &bloom_shader, "fs_blur");
+    // 暗角：全分辨率 HDR → HDR 的逐像素四角压暗（pass 串联框架的示范
+    // pass——与泛光共用组布局与目标格式，仅换着色器模块）
+    let vignette_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.vignette"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/vignette.wgsl").into()),
+    });
+    let vignette_pipeline =
+        make_post_pipeline("iris.pipeline.vignette", &vignette_shader, "fs_main");
 
     // 2D UI 叠加层：像素坐标顶点 + 字形图集采样。写 blit 之后的 sRGB 目标：
     // 无深度附件（叠加而非遮挡）、cull None（UI 面向屏幕）、无 MSAA
@@ -947,6 +971,7 @@ pub(crate) fn create_pipeline(
         blit_pipeline,
         bloom_threshold_pipeline,
         bloom_blur_pipeline,
+        vignette_pipeline,
         ui_pipeline,
         particle_additive_pipeline,
         particle_alpha_pipeline,
@@ -956,7 +981,7 @@ pub(crate) fn create_pipeline(
         material_layout,
         joints_layout,
         blit_layout,
-        bloom_layout,
+        post_layout,
         ui_layout,
         particle_layout,
     }

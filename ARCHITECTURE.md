@@ -278,10 +278,12 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
     继续 alpha 混合，深度只测不写（见 §4.16）
   → 粒子 pass（可选，无活粒子零开销）：billboard 实例化绘制（additive /
     alpha 双管线），叠加在透明结果上、位于泛光之前（见 §4.17）
-  → 泛光（可选）：亮度提取 → 高斯模糊（半分辨率三轮分离迭代）
-  → blit pass：叠加泛光 + ACES 色调映射 → sRGB 目标
+  → 后处理链（见 §4.11）：
+    泛光（可选）：亮度提取 → 高斯模糊（半分辨率 ping-pong 三轮分离迭代）
+    → 暗角（可选，全分辨率 HDR → HDR 压暗四角，强度 0 整段跳过）
+    → blit pass：叠加泛光 + 曝光 + ACES 色调映射 → sRGB 目标（链的固定终点）
   → UI 叠加层（可选）：UiRect / UiText 顶点合批单 draw，LoadOp::Load
-    叠加于同一 sRGB 目标（不参与 HDR/泛光/色调映射，见 §4.13）
+    叠加于同一 sRGB 目标（不参与 HDR/后处理/色调映射，见 §4.13）
   → queue.submit（异步）→ present
 ```
 
@@ -327,7 +329,8 @@ World 查询 (Transform, MeshHandle, MaterialHandle)
   `window² / d²`（`window = 1 − (d/range)²`），在有效半径处平滑归零。
 - 法线矩阵在 CPU 端取模型矩阵的**逆转置 3×3**，保证非均匀缩放下光照方向正确。
 - **HDR 管线**：主 pass 渲染到线性 `Rgba16Float` 中间缓冲（MSAA 4x 解析），
-  全屏三角形 blit pass 做 ACES 色调映射（Narkowicz 解析近似）后输出 sRGB——
+  后处理链（§4.11）的 blit pass 叠加泛光、乘曝光后做 ACES 色调映射
+  （Narkowicz 解析近似）输出 sRGB——
   光照在线性 HDR 空间累加，高光滚降由 ACES 完成，不会出现死白截断。
 - WGSL 结构体对齐陷阱：`vec3<f32>` 在 WGSL 中对齐 16 字节，会把只含一个 vec3 的
   uniform 结构撑到 16 字节倍数；Iris 用 3 个独立 `f32` 填充保持与 CPU 侧 48 字节一致
@@ -605,21 +608,70 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
 `Renderer::draw` 的 CPU 耗时与读回路径解耦，见 §4.4.1）。
 GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可跳过而非失败。
 
-### 4.11 泛光（Bloom）后处理
+### 4.11 后处理链 v1（pass 串联框架：泛光 / 曝光 / 暗角）
 
-- **三段式**：亮度提取（smoothstep 软阈值，HDR 亮度超过 `BloomSettings.threshold`
-  才参与）→ 可分离高斯模糊（9 tap 线性采样，半分辨率，水平/垂直管线共用、
-  三轮迭代扩展半径）→ blit 合成（ACES 色调映射**之前**按 `strength` 叠加，
-  保证高光泛光同样被色调映射滚降，不会死白）。
-- **纯加法不变量**：泛光只增不减（加法 + 单调速映射），集成测试据此断言
-  「开/关差分：光晕成片变亮、零像素变暗、远场不变」。
-- **uniform 对齐陷阱**：三个 pass 的参数曾放在同一缓冲的 32B 插槽里，
-  触发 `min_uniform_buffer_offset_alignment`（典型 256）校验错误——
-  绑定偏移必须 256 对齐；改为三个独立小缓冲后消除。
-- **关闭路径**：`BloomSettings` 未注册 = 默认启用；`enabled = false` 时跳过
-  三个 pass、blit 强度 uniform 写 0（绑定组无需重建，纹理照常绑定）。
-- v1 不做降采样链（1/4、1/8 mip 链），三轮半分辨率迭代在质量与占用间取中；
-  泛光源来自自发光（`MaterialDef.emissive`，HDR 值可 > 1）。
+**pass 链顺序**（编译期有序；tonemap/blit 是链的固定终点，暗角在线性
+HDR 域作用）：
+
+```text
+主 HDR 解析缓冲（不透明 → 蒙皮 → 透明 → 粒子的混合结果 + 天空背景）
+  → 泛光（可选）：亮度提取 → 高斯模糊（半分辨率 ping-pong A/B，三轮分离迭代）
+  → 暗角（可选）：全分辨率 HDR → HDR，UV 距中心 smoothstep 压暗四角
+  → blit：叠加泛光（x）+ 曝光（y）+ ACES 色调映射 → sRGB 目标
+  → UI 叠加层（blit 之后，见 §4.13，不吃任何后处理）
+```
+
+- **pass 串联框架**（`post.rs`，防过度设计——编译期有序链，不做运行时
+  注册 / trait 对象注册表 / 拓扑排序）：全屏后处理 pass =
+  `PostPassDesc`（管线 + 组 0 布局 + 参数 uniform + 源 + 目标槽位），
+  编码统一走 `encode_post_pass` 单一函数——泛光三段循环与暗角的
+  begin_pass / set_bind_group / draw 样板只此一份。中间纹理由
+  `PostScratch` ping-pong 分配器按**分辨率等级**（泛光 = 半分辨率、
+  暗角 = 全分辨率按需）各缓存一对 Rgba16Float 纹理，命中同尺寸跨帧
+  复用、尺寸变化整体重建；泛光的槽位交替（读 A 写 B / 读 B 写 A）由
+  纯函数 `bloom_blur_slots` 单点定义（任意轮数输出恒回 A = blit 固定
+  采样槽），CPU 单测守护「不读写同槽、链连续、落点恒 A」。
+- **泛光三段式**：亮度提取（smoothstep 软阈值，HDR 亮度超过
+  `BloomSettings.threshold` 才参与）→ 可分离高斯模糊（9 tap 线性采样，
+  半分辨率，水平/垂直管线共用、三轮迭代扩展半径）→ blit 合成（ACES
+  色调映射**之前**按 `strength` 叠加，保证高光泛光同样被色调映射滚降，
+  不会死白）。**纯加法不变量**：泛光只增不减（加法 + 单调速映射），
+  集成测试据此断言「开/关差分：光晕成片变亮、零像素变暗、远场不变」。
+- **曝光**（`ExposureSettings { exposure }`）：传感器增益，线性 HDR 在
+  ACES **之前**乘 `exposure`（blit 的 `hdr * blit_params.y`）。ACES
+  （Narkowicz）在正半轴严格单调 → 0.5 / 1.0 / 2.0 三帧中心亮度严格
+  递增（GPU 测试守护）；`exposure = 0` 全黑（ACES(0)=0）；负值按 0
+  钳制。y = 1.0 的乘法逐位中性，是「默认零变化」的数学保证。
+- **暗角**（`VignetteSettings { strength }`，`shaders/vignette.wgsl`）：
+  镜头物理遮挡的近似——全分辨率单输入 pass 按 UV 到中心距离
+  `smoothstep(0.35, 0.75, d)` 压暗四角，中心 falloff 恒 0 逐位无损。
+  **链位与顺序理由**：暗角在泛光之后、blit 之前（线性 HDR 域作用）；
+  暗角（镜头遮挡）先于曝光（传感器增益）——光先被镜头边缘挡住、再
+  落到传感器上放大，blit 中的乘曝光因此排在暗角之后。开启时 blit 的
+  hdr 源切到全分辨率 A 槽（接入绑定组随纹理对惰性构建、跨帧复用）。
+- **资源缺席语义（零开销默认路径）**：`BloomSettings` 缺席 = 默认启用；
+  `ExposureSettings` 缺席 = 1.0 中性（画面与无曝光控制逐位一致）；
+  `VignetteSettings` 缺席或 `strength = 0` = 整段跳过暗角 pass、blit
+  直读主解析缓冲（与无暗角帧逐位一致）。三者都**不在 DefaultPlugins
+  强制注册**，需要时手动 `insert_resource`。GPU 测试逐位断言：
+  「曝光缺席 ≡ 显式 1.0」「暗角 0/缺席 ≡ 无 pass 帧」。
+- **uniform 对齐陷阱**：泛光三个 pass 的参数曾放在同一缓冲的 32B 插槽
+  里，触发 `min_uniform_buffer_offset_alignment`（典型 256）校验错误——
+  绑定偏移必须 256 对齐；改为三个独立小缓冲后消除。全链共享合成参数
+  `PostParamsRaw`（16B：x 泛光 / y 曝光 / z 暗角 / w 保留）为独立缓冲，
+  暗角 pass 复用同布局只消费 z。
+- **新增一个后处理 pass 的步骤清单**（暗角即模板）：
+  1. 写 WGSL：三顶点全屏三角形 + 片段入口，组 0 = uniform + 源纹理 +
+     采样器（照抄 `vignette.wgsl` 骨架）；
+  2. `pipeline.rs` 用 `make_post_pipeline` 建管线（目标 = HDR 格式，
+     与链上其他中间 pass 同构，仅换着色器模块与片段入口）；
+  3. `renderer.rs` 的 `draw` 后处理段按链序追加一个 `PostPassDesc` 并
+     调用 `encode_post_pass`；需要每帧可调参数就在 `PostParamsRaw`
+     占位分量或独立参数缓冲里携带；
+  4. 需要新分辨率等级就在 `PostScale` 加变体（分配器自动管理纹理对），
+     强度可关的 pass 记得「0 = 整段跳过」并补一条逐位等价测试。
+- v1 不做降采样链（1/4、1/8 mip 链），三轮半分辨率迭代在质量与占用间
+  取中；泛光源来自自发光（`MaterialDef.emissive`，HDR 值可 > 1）。
 
 ### 4.12 IBL 环境光照（分割求和）
 
@@ -679,7 +731,7 @@ GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可
 
 - **pass 顺序即语义**：UI pass 是一帧的最后一个 pass，位于色调映射
   blit 之后、同一 sRGB 目标上以 `LoadOp::Load` 叠加（不清屏、无深度
-  附件）。因此 HUD **不参与 HDR / 泛光 / ACES 色调映射**——HUD 是最终
+  附件）。因此 HUD **不参与 HDR / 后处理 / ACES 色调映射**——HUD 是最终
   界面而非被后期处理二次加工的场景辐射：白色文本就是纯白，不会被泛光
   染雾、不会被色调映射压灰（集成测试以「HUD 区域蓝主导不透 3D + HUD
   外区域与无 UI 渲染逐像素一致」守护该性质）。

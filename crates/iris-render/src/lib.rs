@@ -11,7 +11,8 @@
 //!   additive / alpha 双混合）；
 //! - 方向光阴影贴图（2048² 深度图 + PCF）与点光 cubemap 阴影
 //!   （首灯 6 面 × 512²，R32Float 存归一化线性距离）；
-//! - HDR 中间缓冲 + ACES 色调映射 + 泛光（Bloom）后处理；
+//! - HDR 中间缓冲 + ACES 色调映射 + 后处理链（泛光 / 曝光 / 暗角，
+//!   pass 串联框架：描述 → 编码 + ping-pong 中间纹理分配）；
 //! - 2D UI 叠加层（HUD）：屏幕空间彩色矩形 + 内嵌 font8x8 位图字体文本，
 //!   单管线单纹理单 draw，渲染在 3D 场景色调映射之后（不吃泛光）；
 //! - IBL 环境光照（程序化天空 + 分割求和，初始化时一次性烘焙）；
@@ -63,7 +64,7 @@ pub mod prelude {
     pub use crate::particles::{
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };
-    pub use crate::post::BloomSettings;
+    pub use crate::post::{BloomSettings, ExposureSettings, VignetteSettings};
     pub use crate::renderer::{FrameStats, Renderer};
     pub use crate::skin::{Skin, skin_vertex};
     pub use crate::surface::SurfaceKit;

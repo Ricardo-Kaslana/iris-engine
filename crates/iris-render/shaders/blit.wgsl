@@ -1,11 +1,13 @@
 // HDR → sRGB 色调映射 blit：全屏三角形，采样线性 HDR 中间缓冲，
-// 叠加泛光后做 ACES 近似色调映射，输出到 sRGB 目标（硬件完成最终 gamma 编码）。
+// 叠加泛光、乘曝光后做 ACES 近似色调映射，输出到 sRGB 目标（硬件完成
+// 最终 gamma 编码）。本 pass 是后处理链的固定终点（见 ARCHITECTURE §4.11）。
 
 @group(0) @binding(0) var hdr_texture: texture_2d<f32>;
 @group(0) @binding(1) var hdr_sampler: sampler;
-// 泛光（半分辨率模糊结果，HDR 线性空间）；关闭时 strength uniform 为 0
+// 泛光（半分辨率模糊结果，HDR 线性空间）；关闭时强度 uniform 为 0
 @group(0) @binding(2) var bloom_texture: texture_2d<f32>;
-// x: 泛光叠加强度
+// 全链共享合成参数（PostParamsRaw，16B）：
+// x: 泛光叠加强度, y: 曝光, z: 暗角强度（已在上游 vignette pass 作用）, w: 保留
 @group(0) @binding(3) var<uniform> blit_params: vec4<f32>;
 
 struct BlitVertexOutput {
@@ -48,6 +50,9 @@ fn fs_main(in: BlitVertexOutput) -> @location(0) vec4<f32> {
     var hdr = textureSample(hdr_texture, hdr_sampler, in.uv).rgb;
     // 泛光叠加（HDR 线性空间）后做 ACES 色调映射（输出线性色，sRGB 编码由目标格式完成）
     hdr = hdr + textureSample(bloom_texture, hdr_sampler, in.uv).rgb * blit_params.x;
-    let exposed = hdr * 1.0;
+    // 曝光 = 传感器增益。暗角（镜头物理遮挡）在链的上游 vignette pass、
+    // 即曝光**之前**作用——光先被镜头边缘挡住、再落到传感器上被增益
+    // 放大，顺序不可颠倒。y = 1.0（资源缺席）时与常数路径逐位一致。
+    let exposed = hdr * blit_params.y;
     return vec4<f32>(aces_tonemap(exposed), 1.0);
 }

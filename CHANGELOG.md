@@ -5,6 +5,48 @@
 
 ## [Unreleased]
 
+### Added（R27：后处理链 v1——曝光控制 + pass 串联框架 + 暗角示范 pass）
+
+- **曝光控制**：iris-render 新资源 `ExposureSettings { exposure }`
+  （Default 1.0；渲染器 `try_resource` 直读，与 `BloomSettings` 同款
+  模式）。线性 HDR 在 ACES 色调映射之前乘曝光（`blit.wgsl` 的
+  `hdr * blit_params.y`，替换原 `* 1.0` 占位）；**资源缺席 = 1.0 中性**，
+  `DefaultPlugins` 不强制注册，缺席画面与无曝光控制逐位一致
+  （1.0 乘法逐位中性的数学保证，GPU 测试逐位断言）。负值按 0 钳制；
+  曝光 0 全黑（ACES(0)=0）。GPU 测试：同场景（HDR 亮源）曝光
+  0.5 / 1.0 / 2.0 三帧中心亮度严格递增（ACES 正半轴严格单调）。
+- **pass 串联框架 v1**（`post.rs`，防过度设计——编译期有序链，不做
+  运行时注册 / trait 对象注册表 / 拓扑排序）：全屏后处理 pass =
+  `PostPassDesc`（管线 + 组 0 布局 + 参数 uniform + 源 + 目标槽位），
+  编码统一走 `encode_post_pass` 单一函数——泛光三段循环与暗角的
+  begin_pass / set_bind_group / draw 样板只此一份。中间纹理由
+  `PostScratch` ping-pong 分配器按**分辨率等级**各缓存一对 Rgba16Float
+  纹理（原泛光半分辨率 a/b 缓冲泛化；命中同尺寸跨帧复用、尺寸变化
+  整体重建，全分辨率对由暗角按需惰性分配），泛光槽位交替由纯函数
+  `bloom_blur_slots` 单点定义（任意轮数输出恒回 A = blit 固定采样槽）；
+  CPU 单测守护「半/全分辨率换算含 1×1 钳制」「缓存命中须尺寸精确
+  一致」「槽位不读写同槽、链连续、落点恒 A」。blit 全链共享参数
+  `PostParamsRaw`（16B：x 泛光 / y 曝光 / z 暗角 / w 保留，POD +
+  WGSL 对齐断言）。
+- **暗角示范 pass**（`shaders/vignette.wgsl` + 新资源
+  `VignetteSettings { strength }`，证明框架可扩展）：全分辨率
+  HDR → HDR 单输入 pass，UV 距中心 `smoothstep(0.35, 0.75, d)` 压暗
+  四角、中心逐位无损。链位 = 泛光之后、blit 之前（tonemap/blit 是链
+  的固定终点，暗角在线性 HDR 域作用）；**暗角先于曝光**——镜头物理
+  遮挡先于传感器增益（顺序理由写入 shader 与 ARCHITECTURE §4.11）。
+  强度 0 / 资源缺席时整段跳过、blit 直读主解析缓冲（绑定组与引入前
+  逐项一致），GPU 测试逐位断言「0/缺席 ≡ 无 pass 帧」与「角区线性
+  均值显著低于中心区」。
+- **默认像素零变化（提交门槛）**：offscreen / hdr / bloom / transparent /
+  particles / culling / skin / shadow / ui 全部既有 GPU 测试**未改动
+  一行**、直接全过。
+- **验收图**：新示例 `post_snapshot`（iris-engine，风格同
+  bloom_snapshot）——同一 HDR 场景 × {欠曝 0.4、标准 1.0、过曝 2.5 +
+  暗角 0.9 + 强泛光} 三帧，ffmpeg hstack 合成 `docs/post.png`。
+- 文档：ARCHITECTURE §4.11 改写为「后处理链 v1」（pass 链顺序图、
+  资源缺席语义、新增 pass 步骤清单以 vignette 为模板）；README 渲染
+  特性行与验收图补充。
+
 ### Added（打磨 III：引擎 API 打磨 III——闭合 Iris Bastion dogfooding 的五条引擎摩擦）
 
 延续「打磨 I / II」模式：**引擎侧修复 + Bastion 侧绕行删除验证**——每条

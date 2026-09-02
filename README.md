@@ -38,7 +38,7 @@ fn gameplay(world: &mut World) {
 | **音频** | 纯软件混音器（多声音线性叠加 + 线性插值重采样 + 软限幅，混音数学全纯函数、单测采样级断言）+ **3D 空间音频 v1**（距离软倒数衰减 + 恒功率立体声声像的纯函数增益模型，`play_spatial` / `set_listener` / `set_sound_position` 逐帧重算；`SpatialListener` / `SpatialSource` 组件 + PostUpdate 同步系统，组件移除帧间差分自动停止；身后不消音 v1 限制）+ cpal 设备层（实时回调 try_lock 不阻塞，无设备 / wasm32 优雅降级为纯混音器）+ WAV 加载（手写 RIFF 解析，16-bit PCM）+ 程序化音效（正弦 / 方波 / 噪声，确定性可复现） |
 | **物理与碰撞（Sphere/AABB 刚体，v1）** | 轻量刚体物理：重力（`gravity_scale`）/ 线性阻尼 / restitution 反弹（组合取双方 max）/ 近似库仑摩擦；`Collider`（静态/动态）+ `RigidBody` 组件模型（组件缺席语义：只有 Collider = 静态、只有 RigidBody = 仅受力积分）；求解管线「半隐式欧拉积分 → **均匀网格 broadphase 候选筛选**（BTreeMap 字典序 = 确定性；候选升序 + `j > i` 过滤使配对遍历序与 O(n²) 完全一致，bit 级确定性测试无需改动即守护等价性）→ 分离/反弹/摩擦响应 → 2 次迭代位置松弛」；检测与求解核心为**纯函数**（穿透/法线/反弹可脱离世界单测），`step_physics` 为 `&World` 并行系统（Update 内求解、PostUpdate 层级传播，天然正确编排），同输入两次模拟逐采样 bit 级一致；**静态推离查询**（`resolve_static_push` / `resolve_against_statics`，不写组件的纯查询）支撑运动学角色控制器——iris-game 只取水平分量即得「墙体阻挡 + 贴墙滑行」；**射线 / 线段查询**（`raycast` / `raycast_filtered` / `segment_hits_shape`——最近命中优先、`t` 并列取存储序先遍历者，线段扫掠判定防高速穿模）；**球扫掠 shapecast**（`sphere_sweep` / `sphere_sweep_statics`——保守推进二分求首次碰撞分数与阻挡法线，角色控制器地基） |
 | **场景序列化（JSON 双向）** | 关卡数据与游戏代码分离：手写 JSON 场景文件（环境段：方向光 + HDR 天空源；实体段：Name / Visibility / Transform / mesh / material / point_light / collider / rigidbody，缺省值 = 引擎默认）↔ 世界实体（`load_scene` / `save_scene`）；mesh 三态（图元 cube/plane/sphere/cylinder、glTF 整实例挂载为子实体、纯逻辑实体）；`SceneAssetRegistry` 登记表驱动资源来源往返（图元参数 / glTF 与贴图路径在 load 时登记、save 时还原），非场景来源句柄优雅降级 + 告警；`load(save(load(f)))` 语义等价且二次保存逐字节一致（21 项单测） |
-| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤，**层级级联**：任一祖先隐藏 ⇒ 子树全隐藏，组件缺席 = 可见）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机 + 屏幕射线反投影**（`screen_ray`：NDC 点 → 世界射线，拾取的基础操作；`Viewport` 视口尺寸资源随窗口缩放自动同步）；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + ACES 色调映射 + 泛光**（Rgba16Float 中间缓冲）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设，`reset()` / `trigger_burst()` 池槽位就地复用与命令式爆发）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
+| **现代化** | WGSL 着色器；ECS 架构 + 插件系统；**变换层级**（父子级联 + PostUpdate 阶段传播：Update 写变换当帧即全局生效）；**实体可见性开关**（`Visibility` 组件，全部渲染 pass 与 UI 统一过滤，**层级级联**：任一祖先隐藏 ⇒ 子树全隐藏，组件缺席 = 可见）；**实体命名查找**（`Name` + 按名定位）；**实体挂载相机 + 屏幕射线反投影**（`screen_ray`：NDC 点 → 世界射线，拾取的基础操作；`Viewport` 视口尺寸资源随窗口缩放自动同步）；**glTF 2.0 资产管线**（.gltf/.glb + **节点动画 + 骨骼蒙皮**）；**PBR 材质**（Cook-Torrance 金属度/粗糙度工作流）；**IBL 环境光照**（程序化天空 / **外部 HDR 环境贴图** + 分割求和，Radiance .hdr equirectangular 手写解析）；**HDR 渲染 + 后处理链**（Rgba16Float 中间缓冲 + ACES 色调映射；pass 串联框架 v1：泛光 / **曝光** / **暗角** 三 pass 有序链接，`ExposureSettings` / `VignetteSettings` 资源缺席 = 中性 / 关闭、默认画面零变化，ping-pong 中间纹理按半 / 全分辨率分配复用）；**方向光阴影贴图**（2048² 深度图 + 3×3 PCF 软阴影）；**多光源**（1 方向光 + 8 点光物理衰减，首灯 cubemap 阴影）；**透明渲染**（alpha 混合材质 + 按视深排序的独立透明 pass：远→近 back-to-front、深度只测不写、不投影，无透明实例零开销）；**粒子系统 v1**（Emitter 组件 + CPU 确定性模拟：splitmix64 哈希流方向抖动、累计分数发射计数、逐位可复现；billboard 实例化渲染 + additive / alpha 双混合，alpha 粒子按视深排序，喷泉 / 爆炸预设，`reset()` / `trigger_burst()` 池槽位就地复用与命令式爆发）；**2D UI 叠加层**（HUD：屏幕空间矩形 + 内嵌位图字体文本，单管线单纹理单 draw，色调映射后叠加）；derive 宏；4x MSAA；固定步长逻辑 |
 
 ## 快速开始
 
@@ -80,6 +80,11 @@ cargo run --example point_shadow_snapshot --release
 # 泛光验收场景（离屏渲染），输出 iris_bloom_preview.bmp：
 # 三颗自发光彩球的 HDR 光晕（阈值提取 + 半分辨率高斯模糊）
 cargo run --example bloom_snapshot --release
+
+# 后处理链验收场景（离屏渲染），输出 iris_post_*.bmp 三帧（→ docs/post.png）：
+# 同一 HDR 场景 × {欠曝 0.4，标准 1.0，过曝 2.5 + 暗角 0.9 + 强泛光}——
+# 曝光单调压暗 / 提亮，过曝帧亮源泛光扩散、暗角压暗四角而中心无损
+cargo run --example post_snapshot --release
 
 # 透明渲染验收场景（离屏渲染），输出 iris_transparent.bmp（→ docs/transparent.png）：
 # 玻璃罩住自发光内核 + 红绿蓝三块透明板纵深 back-to-front 混合（透明物不投影）
@@ -257,6 +262,14 @@ PBR + HDR + IBL 实测（`docs/pbr_preview.png`）：Cook-Torrance 金属度/粗
 暗部与地面保持干净；`BloomSettings` 资源可调强度 / 阈值或整帧关闭。
 
 ![泛光后处理](docs/bloom_preview.png)
+
+后处理链实测（`docs/post.png`，左→右：欠曝 0.4 / 标准 1.0 / 过曝 2.5 +
+暗角 0.9 + 强泛光）：曝光在 ACES 之前线性缩放画面（欠曝压暗但 HDR 亮源
+仍保细节，过曝提亮且亮源泛光扩散）；暗角压暗四角而中心无损（线性 HDR
+域、曝光之前作用）。`ExposureSettings` / `VignetteSettings` 资源缺席 =
+中性 / 关闭，默认画面与无曝光控制逐位一致。
+
+![后处理链](docs/post.png)
 
 glTF 动画实测（`docs/anim_preview.png`，左 t=0 / 右 t=1）：`anim_cube.glb`
 （GLB 容器）中的蓝色立方体按嵌入的自转 + 浮动剪辑运动——

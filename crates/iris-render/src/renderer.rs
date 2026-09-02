@@ -273,24 +273,88 @@ struct HdrTargets {
     #[allow(dead_code)]
     resolved: wgpu::Texture,
     resolved_view: wgpu::TextureView,
+    /// blit 合成绑定组：hdr_texture = 主解析缓冲（暗角关闭时的默认路径，
+    /// 与 pass 串联框架引入前的绑定逐项一致）。
     blit_bind_group: wgpu::BindGroup,
-    /// 泛光中间缓冲（半分辨率；a 为提取/垂直模糊输出并供 blit 采样，
-    /// b 为水平模糊中转）。
-    #[allow(dead_code)]
-    bloom_a: wgpu::Texture,
-    bloom_a_view: wgpu::TextureView,
-    #[allow(dead_code)]
-    bloom_b: wgpu::Texture,
-    bloom_b_view: wgpu::TextureView,
-    /// 三个 pass 的参数缓冲（提取 / 水平模糊 / 垂直模糊）。
+    /// blit 合成绑定组的暗角变体：hdr_texture = 全分辨率 A 槽（链尾为
+    /// 暗角时 blit 的源）。全分辨率对按需分配，故本组随之惰性构建、
+    /// 跨帧复用；HdrTargets 尺寸重建时随集合一起丢弃。
+    blit_vignetted_bg: Option<wgpu::BindGroup>,
+    /// 后处理中间纹理 ping-pong 分配器（post.rs 框架）：半分辨率对在
+    /// 建集合时即建好（泛光默认启用），全分辨率对由暗角按需分配。
+    post_scratch: crate::post::PostScratch,
+    /// 后处理链共享过滤采样器（各中间 pass 与 blit 同一采样行为）。
+    post_sampler: wgpu::Sampler,
+    /// 三个泛光 pass 的参数缓冲（提取 / 水平模糊 / 垂直模糊）。
     /// 独立三份而非一份缓冲的三个插槽：绑定偏移必须满足
     /// min_uniform_buffer_offset_alignment（典型 256），32B 插槽不合规。
     bloom_params: [wgpu::Buffer; 3],
-    /// blit 合成的泛光强度（16B，x 分量生效；关闭泛光时写 0）。
-    bloom_strength: wgpu::Buffer,
-    bloom_threshold_bg: wgpu::BindGroup,
-    bloom_blur_h_bg: wgpu::BindGroup,
-    bloom_blur_v_bg: wgpu::BindGroup,
+    /// 暗角参数缓冲（PostParamsRaw 布局，z 分量生效；pass 关闭时不写）。
+    vignette_params: wgpu::Buffer,
+    /// blit 合成参数（16B，PostParamsRaw：x 泛光强度 / y 曝光 / z 暗角 /
+    /// w 保留）。每帧整体覆写。
+    post_params: wgpu::Buffer,
+}
+
+impl HdrTargets {
+    /// 一帧后处理编码期的视图解析表（主解析缓冲 + 中间纹理分配器），
+    /// 供 post.rs 的统一编码函数把 pass 描述解析成实际视图。
+    fn post_views(&self) -> crate::post::PostViews<'_> {
+        crate::post::PostViews::new(&self.resolved_view, &self.post_scratch)
+    }
+}
+
+/// 与 WGSL `blit_params` 对齐（16 字节，POD）：后处理链共享合成参数。
+/// x = 泛光叠加强度（blit 消费）；y = 曝光（blit 在 ACES 之前乘）；
+/// z = 暗角强度（vignette pass 消费）；w = 保留（恒写 0.0）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PostParamsRaw {
+    bloom_strength: f32,
+    exposure: f32,
+    vignette_strength: f32,
+    _reserved: f32,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<PostParamsRaw>() == 16,
+    "PostParams 必须与 WGSL blit_params 布局一致"
+);
+
+/// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
+/// 与暗角变体惰性构建（`ensure_vignette_target`，源 = 全分辨率 A 槽）
+/// 共用条目清单，避免两处漂移；泛光纹理恒为半分辨率 A 槽（泛光链的
+/// 固定输出槽，见 post.rs `bloom_blur_slots`）。
+fn build_blit_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    hdr_view: &wgpu::TextureView,
+    bloom_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    params: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("iris.blit.bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(hdr_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(bloom_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 /// 与 WGSL `BlurParams` 对齐（32 字节，POD）。
@@ -1146,29 +1210,13 @@ impl Renderer {
         });
         let msaa_view = msaa.create_view(&wgpu::TextureViewDescriptor::default());
         let resolved_view = resolved.create_view(&wgpu::TextureViewDescriptor::default());
-        // 泛光目标：半分辨率，规格与 HDR 中间缓冲一致
-        let bloom_size = wgpu::Extent3d {
-            width: (width / 2).max(1),
-            height: (height / 2).max(1),
-            depth_or_array_layers: 1,
-        };
-        let make_bloom_tex = |label| {
-            self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: bloom_size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: crate::pipeline::HDR_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-        };
-        let bloom_a = make_bloom_tex("iris.bloom.a");
-        let bloom_b = make_bloom_tex("iris.bloom.b");
-        let bloom_a_view = bloom_a.create_view(&wgpu::TextureViewDescriptor::default());
-        let bloom_b_view = bloom_b.create_view(&wgpu::TextureViewDescriptor::default());
+        // 后处理中间纹理：半分辨率对（泛光链）即刻分配；全分辨率对由暗角
+        // 按需分配（PostScratch 账本与纹理同步，见 post.rs）
+        let mut post_scratch = crate::post::PostScratch::default();
+        post_scratch.ensure(&self.gpu, crate::post::PostScale::Half, width, height);
+        let (half_a_view, _) = post_scratch
+            .pair_views(crate::post::PostScale::Half)
+            .expect("半分辨率中间纹理对应已随集合创建");
         let make_bloom_params = || {
             self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("iris.bloom.params"),
@@ -1182,71 +1230,28 @@ impl Renderer {
             make_bloom_params(),
             make_bloom_params(),
         ];
-        let bloom_strength = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("iris.bloom.strength"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bloom_sampler = self
+        let make_post_params = |label: &'static str| {
+            self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<PostParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let post_params = make_post_params("iris.post.params");
+        let vignette_params = make_post_params("iris.vignette.params");
+        let post_sampler = self
             .gpu
             .device
             .create_sampler(&wgpu::SamplerDescriptor::default());
-        let bloom_bg = |view: &wgpu::TextureView, params: &wgpu::Buffer| {
-            self.gpu
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("iris.bloom.bg"),
-                    layout: &self.bundle.bloom_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&bloom_sampler),
-                        },
-                    ],
-                })
-        };
-        let bloom_threshold_bg = bloom_bg(&resolved_view, &bloom_params[0]);
-        let bloom_blur_h_bg = bloom_bg(&bloom_a_view, &bloom_params[1]);
-        let bloom_blur_v_bg = bloom_bg(&bloom_b_view, &bloom_params[2]);
-        let blit_bind_group = self
-            .gpu
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("iris.blit.bg"),
-                layout: &self.bundle.blit_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&resolved_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(
-                            &self
-                                .gpu
-                                .device
-                                .create_sampler(&wgpu::SamplerDescriptor::default()),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&bloom_a_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: bloom_strength.as_entire_binding(),
-                    },
-                ],
-            });
+        let blit_bind_group = build_blit_bind_group(
+            &self.gpu.device,
+            &self.bundle.blit_layout,
+            &resolved_view,
+            half_a_view,
+            &post_sampler,
+            &post_params,
+        );
         self.hdr_size = (width, height);
         self.hdr = Some(HdrTargets {
             msaa,
@@ -1254,16 +1259,44 @@ impl Renderer {
             resolved,
             resolved_view,
             blit_bind_group,
-            bloom_a,
-            bloom_a_view,
-            bloom_b,
-            bloom_b_view,
+            blit_vignetted_bg: None,
+            post_scratch,
+            post_sampler,
             bloom_params,
-            bloom_strength,
-            bloom_threshold_bg,
-            bloom_blur_h_bg,
-            bloom_blur_v_bg,
+            vignette_params,
+            post_params,
         });
+    }
+
+    /// 暗角开启时的按需资源：全分辨率中间纹理对（ping-pong 分配器惰性
+    /// 分配、跨帧复用）与「blit 读暗角输出」的接入绑定组。二者随
+    /// `HdrTargets` 尺寸重建一并失效（`blit_vignetted_bg` 归 `None`、
+    /// 纹理对重新按需分配）。仅在 `draw` 开头、`hdr` 不可变借用建立之前
+    /// 调用。
+    fn ensure_vignette_target(&mut self, width: u32, height: u32) {
+        let hdr = self
+            .hdr
+            .as_mut()
+            .expect("draw 开头已 ensure_hdr_targets，HDR 中间缓冲必就绪");
+        hdr.post_scratch
+            .ensure(&self.gpu, crate::post::PostScale::Full, width, height);
+        if hdr.blit_vignetted_bg.is_none() {
+            let (full_a_view, _) = hdr
+                .post_scratch
+                .pair_views(crate::post::PostScale::Full)
+                .expect("全分辨率中间纹理对应已按需创建");
+            hdr.blit_vignetted_bg = Some(build_blit_bind_group(
+                &self.gpu.device,
+                &self.bundle.blit_layout,
+                full_a_view,
+                hdr.post_scratch
+                    .pair_views(crate::post::PostScale::Half)
+                    .expect("半分辨率中间纹理对应已随集合创建")
+                    .0,
+                &hdr.post_sampler,
+                &hdr.post_params,
+            ));
+        }
     }
 
     pub fn set_clear_color(&mut self, color: wgpu::Color) {
@@ -1294,6 +1327,16 @@ impl Renderer {
         // 环境源失效检查在最前：重烘焙与绑定组重建必须发生在本帧编码之前
         self.ensure_environment(world);
         self.ensure_hdr_targets(width, height);
+        // 暗角按需资源（全分辨率中间对 + blit 接入绑定组）必须在贯穿全部
+        // pass 的 hdr 不可变借用建立之前惰性分配（强度 0 / 资源缺席零开销
+        // 跳过——与可见性、粒子同款「缺席零开销」哲学）
+        let vignette_strength = world
+            .try_resource::<crate::post::VignetteSettings>()
+            .map(|v| v.strength.max(0.0))
+            .unwrap_or(0.0);
+        if vignette_strength > 0.0 {
+            self.ensure_vignette_target(width, height);
+        }
         self.stats = FrameStats::default();
         // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），
         // 其次回退到全局 Camera 资源
@@ -2130,21 +2173,35 @@ impl Renderer {
             triangles_drawn += 2 * particle_total;
             particles_drawn = particle_total;
         }
-        // 泛光：提取 -> 水平模糊 -> 垂直模糊（半分辨率三个全屏 pass）。
-        // 强度经 uniform 进 blit：关闭时写 0，blit 绑定组无需重建。
+        // ---- 后处理链（ARCHITECTURE §4.11）：泛光（半分辨率，可选）→
+        // 暗角（全分辨率，强度 > 0 才入链）→ blit 色调映射（链的固定终
+        // 点）。pass 编码统一走 post.rs 的 encode_post_pass（描述 → 编码）。
+        // 资源缺席语义：BloomSettings 缺席 = 默认启用；ExposureSettings
+        // 缺席 = 1.0 中性；VignetteSettings 缺席 = 0.0 关闭。
         let bloom = world
             .try_resource::<crate::post::BloomSettings>()
             .map(|b| *b)
             .unwrap_or_default();
-        let strength = if bloom.enabled {
+        let exposure = world
+            .try_resource::<crate::post::ExposureSettings>()
+            .map(|e| e.exposure.max(0.0))
+            .unwrap_or(1.0);
+        let bloom_strength = if bloom.enabled {
             bloom.strength.max(0.0)
         } else {
             0.0
         };
+        // 全链共享合成参数：blit 消费 x（泛光）/ y（曝光），暗角 pass 消费
+        // z。曝光恒写——1.0 的乘法逐位中性（资源缺席画面不变的保证）。
         self.gpu.queue.write_buffer(
-            &hdr.bloom_strength,
+            &hdr.post_params,
             0,
-            bytemuck::bytes_of(&[strength, 0.0, 0.0, 0.0]),
+            bytemuck::bytes_of(&PostParamsRaw {
+                bloom_strength,
+                exposure,
+                vignette_strength,
+                _reserved: 0.0,
+            }),
         );
         if bloom.enabled {
             let bw = (width / 2).max(1) as f32;
@@ -2169,54 +2226,93 @@ impl Renderer {
                     .queue
                     .write_buffer(buffer, 0, bytemuck::bytes_of(&raw));
             }
-            let mut bloom_pass = |label,
-                                  pipeline: &wgpu::RenderPipeline,
-                                  bg: &wgpu::BindGroup,
-                                  view: &wgpu::TextureView| {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(label),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(0..3, 0..1);
-            };
-            bloom_pass(
-                "iris.pass.bloom_threshold",
-                &self.bundle.bloom_threshold_pipeline,
-                &hdr.bloom_threshold_bg,
-                &hdr.bloom_a_view,
+            let views = hdr.post_views();
+            // 提取：主解析缓冲 → 半分辨率 A 槽
+            crate::post::encode_post_pass(
+                &mut encoder,
+                &self.gpu.device,
+                &views,
+                &hdr.post_sampler,
+                crate::post::PostPassDesc {
+                    label: "iris.pass.bloom_threshold",
+                    pipeline: &self.bundle.bloom_threshold_pipeline,
+                    layout: &self.bundle.post_layout,
+                    params: &hdr.bloom_params[0],
+                    src: crate::post::PostInput::Scene,
+                    dst: crate::post::PostScratchRef::Half(crate::post::PingPongSlot::A),
+                },
             );
-            // 三轮水平/垂直迭代扩展模糊半径（绑定组固定：H 读 a 写 b，V 读 b 写 a）
-            for _ in 0..3 {
-                bloom_pass(
-                    "iris.pass.bloom_blur_h",
-                    &self.bundle.bloom_blur_pipeline,
-                    &hdr.bloom_blur_h_bg,
-                    &hdr.bloom_b_view,
-                );
-                bloom_pass(
-                    "iris.pass.bloom_blur_v",
-                    &self.bundle.bloom_blur_pipeline,
-                    &hdr.bloom_blur_v_bg,
-                    &hdr.bloom_a_view,
+            // 模糊：槽位交替由 bloom_blur_slots 单点定义（任意轮数输出恒回
+            // A 槽 = blit 固定采样）；源槽位决定绑定哪份方向参数与标签
+            // （读 A = 水平、读 B = 垂直）
+            for (src, dst) in crate::post::bloom_blur_slots(crate::post::BLOOM_BLUR_ROUNDS) {
+                let (label, params_buf) = match src {
+                    crate::post::PingPongSlot::A => {
+                        ("iris.pass.bloom_blur_h", &hdr.bloom_params[1])
+                    }
+                    crate::post::PingPongSlot::B => {
+                        ("iris.pass.bloom_blur_v", &hdr.bloom_params[2])
+                    }
+                };
+                crate::post::encode_post_pass(
+                    &mut encoder,
+                    &self.gpu.device,
+                    &views,
+                    &hdr.post_sampler,
+                    crate::post::PostPassDesc {
+                        label,
+                        pipeline: &self.bundle.bloom_blur_pipeline,
+                        layout: &self.bundle.post_layout,
+                        params: params_buf,
+                        src: crate::post::PostInput::Scratch(crate::post::PostScratchRef::Half(
+                            src,
+                        )),
+                        dst: crate::post::PostScratchRef::Half(dst),
+                    },
                 );
             }
         }
-        // 色调映射 blit：HDR -> sRGB 输出
+        // 暗角：全分辨率 HDR → HDR（镜头物理遮挡近似，线性域压暗四角），
+        // 位于泛光之后、blit 之前。强度 0（或缺席资源）整段跳过——blit
+        // 直读主解析缓冲，与无暗角帧逐位一致（零开销默认路径）。
+        if vignette_strength > 0.0 {
+            self.gpu.queue.write_buffer(
+                &hdr.vignette_params,
+                0,
+                bytemuck::bytes_of(&PostParamsRaw {
+                    bloom_strength: 0.0,
+                    exposure: 1.0,
+                    vignette_strength,
+                    _reserved: 0.0,
+                }),
+            );
+            let views = hdr.post_views();
+            crate::post::encode_post_pass(
+                &mut encoder,
+                &self.gpu.device,
+                &views,
+                &hdr.post_sampler,
+                crate::post::PostPassDesc {
+                    label: "iris.pass.vignette",
+                    pipeline: &self.bundle.vignette_pipeline,
+                    layout: &self.bundle.post_layout,
+                    params: &hdr.vignette_params,
+                    src: crate::post::PostInput::Scene,
+                    dst: crate::post::PostScratchRef::Full(crate::post::PingPongSlot::A),
+                },
+            );
+        }
+        // 色调映射 blit：链尾输出 -> sRGB 输出。暗角开启时 blit 的源切到
+        // 全分辨率 A 槽（绑定组在 ensure_vignette_target 惰性构建）；关闭
+        // 时直读主解析缓冲（默认绑定组，与引入暗角前逐项一致）。
         {
+            let blit_bg = if vignette_strength > 0.0 {
+                hdr.blit_vignetted_bg
+                    .as_ref()
+                    .expect("暗角开启时应已惰性构建 blit 接入绑定组")
+            } else {
+                &hdr.blit_bind_group
+            };
             let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2234,7 +2330,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             blit.set_pipeline(&self.bundle.blit_pipeline);
-            blit.set_bind_group(0, &hdr.blit_bind_group, &[]);
+            blit.set_bind_group(0, blit_bg, &[]);
             blit.draw(0..3, 0..1);
         }
         // UI 叠加层：blit 之后的最后一个 pass。同一 color_view、LoadOp::Load
