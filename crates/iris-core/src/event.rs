@@ -96,6 +96,41 @@ impl<E: Event> std::ops::Deref for EventRef<'_, E> {
     }
 }
 
+/// 事件缓冲可变守卫：解引用为 `&mut Events<E>`——`drain` 消费事件用
+/// （每帧取走全部，与帧尾 `clear_all_events` 的兜底清空同语义）。
+pub struct EventRefMut<'a, E> {
+    guard: std::sync::RwLockWriteGuard<'a, Box<dyn ErasedEvents>>,
+    _marker: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<'a, E: Event> EventRefMut<'a, E> {
+    pub(crate) fn new(guard: std::sync::RwLockWriteGuard<'a, Box<dyn ErasedEvents>>) -> Self {
+        Self {
+            guard,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<E: Event> std::ops::Deref for EventRefMut<'_, E> {
+    type Target = Events<E>;
+    fn deref(&self) -> &Events<E> {
+        self.guard
+            .as_any()
+            .downcast_ref::<Events<E>>()
+            .expect("事件存储类型与注册类型一致")
+    }
+}
+
+impl<E: Event> std::ops::DerefMut for EventRefMut<'_, E> {
+    fn deref_mut(&mut self) -> &mut Events<E> {
+        self.guard
+            .as_any_mut()
+            .downcast_mut::<Events<E>>()
+            .expect("事件存储类型与注册类型一致")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Event;

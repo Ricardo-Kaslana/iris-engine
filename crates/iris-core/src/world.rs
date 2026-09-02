@@ -11,7 +11,7 @@ use std::sync::RwLock;
 
 use crate::component::{Component, Components, Ref, RefMut};
 use crate::entity::{Entities, Entity};
-use crate::event::{ErasedEvents, Event, EventRef, Events};
+use crate::event::{ErasedEvents, Event, EventRef, EventRefMut, Events};
 use crate::query::QueryPart;
 use crate::resource::{Resource, ResourceRef, ResourceRefMut, Resources};
 use crate::sync::{read_lock, write_lock};
@@ -271,6 +271,22 @@ impl World {
     pub fn events<E: Event>(&self) -> EventRef<'_, E> {
         self.try_events()
             .unwrap_or_else(|| panic!("事件 {} 未注册", std::any::type_name::<E>()))
+    }
+
+    /// 可变访问事件缓冲；类型从未注册时 panic（同 [`World::events`]）。
+    ///
+    /// 典型消费：`world.events_mut::<E>().drain()`——每帧**恰好取走一
+    /// 次**全部事件（读到的是本帧产出，帧尾另有 [`World::clear_all_events`]
+    /// 兜底清空；消费契约见 `iris_core::physics` 模块文档「接触事件」）。
+    pub fn events_mut<E: Event>(&mut self) -> EventRefMut<'_, E> {
+        let cell = self
+            .events
+            .get(&TypeId::of::<E>())
+            .unwrap_or_else(|| panic!("事件 {} 未注册", std::any::type_name::<E>()));
+        EventRefMut::new(write_lock(
+            cell,
+            &format!("事件 {}", std::any::type_name::<E>()),
+        ))
     }
 
     /// 帧尾清空全部事件缓冲（由引擎主循环调用）。

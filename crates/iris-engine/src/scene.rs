@@ -771,6 +771,7 @@ fn spawn_section(
                 shape: collider.shape.to_shape(),
                 is_static: collider.is_static,
                 restitution: collider.restitution,
+                is_sensor: false,
             },
         );
     }
@@ -1101,7 +1102,8 @@ mod tests {
             Collider {
                 shape: ColliderShape::Sphere { radius: 0.5 },
                 is_static: false,
-                restitution: 0.0
+                restitution: 0.0,
+                is_sensor: false,
             },
             "collider 缺省 = 动态球、弹性 0（引擎动态构造器语义）"
         );

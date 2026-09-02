@@ -2,9 +2,10 @@
 //! 积分 → 检测 → 响应 → 迭代松弛。
 //!
 //! 与 [`crate::transform`] / [`crate::hierarchy`] 同款的「组件 + 单一系统」模型：
-//! - [`Collider`]：碰撞体（形状 + 是否静态 + 弹性）；
+//! - [`Collider`]：碰撞体（形状 + 是否静态 + 弹性 + 触发区域 sensor）；
 //! - [`RigidBody`]：刚体（速度 / 重力缩放 / 摩擦 / 线性阻尼）；
-//! - [`step_physics`]：每帧推进一步的物理系统（`&World` + 尝试型锁，可注册并行系统）。
+//! - [`step_physics`]：每帧推进一步的物理系统（`&World` + 尝试型锁，可注册并行系统），
+//!   帧末差分 [`ContactTracker`] 产出接触事件（见「接触事件与触发器」章节）。
 //!
 //! # 组件缺席语义
 //!
@@ -71,6 +72,68 @@
 //! （[`ColliderShape::Capsule`]）扫掠即由此获得；角色控制器的正式消费方
 //! 见 [`crate::character`]（`move_and_slide` 运动学控制器）。
 //!
+//! # 接触事件与触发器（begin/end + sensor）
+//!
+//! [`step_physics`] 帧末把本帧接触对与上一帧（[`ContactTracker`] 资源）
+//! 差分，产出 [`CollisionStarted`] / [`CollisionEnded`] 事件——压力板 /
+//! 警报区 / 着地回调从此**免逐帧轮询**。语义要点（实现与文档一一对应）：
+//!
+//! - **实体序归一化**：事件 a/b 恒满足 `a.index() ≤ b.index()`；检测
+//!   原始方向与索引序相反时 `normal` 随归一化翻转（保持「从 a 指向 b」
+//!   的 [`Contact`] 方向约定）；
+//! - **首求解轮采样**：接触对与 normal / penetration 取自
+//!   [`SOLVER_ITERATIONS`] 的**首轮**检测（位置分离前）——松弛轮的重复
+//!   检出对是同一配对的求解残影，无 begin/end 语义；
+//! - **静-静跳过**：静-静对互不动、配对永不变化，不进接触集合、不产
+//!   事件（与求解的静-静跳过同一条分支）；
+//! - **销毁成对性**：接触中的实体 despawn / 移除组件后，下一帧必然收
+//!   到携带已死实体 id 的 [`CollisionEnded`]（本帧集合只含存活实体的检
+//!   出对，差分必然筛出消失配对）——begin/end 严格成对，消费方的计数
+//!   / 状态不泄漏、世代安全；
+//! - **sensor 正交性**：[`Collider::is_sensor`]（触发区域）与 `is_static`
+//!   正交；sensor 对**照常进接触集合报事件**、但**跳过位置/速度求解**
+//!   （不推离不反弹，彼此穿过）——两动体 sensor 相撞只报事件；
+//! - **资源缺席语义**（照 `Time` 缺席静默跳过的风格）：`ContactTracker`
+//!   或事件资源未注册则静默跳过对应产出，不 panic、不强制注册
+//!   （`PhysicsPlugin` 已全部注册，游戏侧即得）；
+//! - **事件顺序**：先 Started 后 Ended，各自按对序（BTree 字典序）输出
+//!   ——同输入两次模拟的事件序列逐项一致（确定性守护）；
+//! - **消费契约**：事件在 `step_physics`（Update 阶段）帧末产出，当帧
+//!   其后注册的系统即可读（`world.events::<CollisionStarted>()`），帧尾
+//!   由主循环 `clear_all_events` 清空——每帧消费一次（读 `iter` 或经
+//!   `world.events_mut::<E>().drain()` 取走），读到的是本帧物理结果。
+//!
+//! 压力板用例（sensor 区域 + drain 事件 + 门开逻辑）：
+//!
+//! ```ignore
+//! use iris_core::prelude::*;
+//!
+//! struct Door { plate: Entity, open: bool, occupants: u32 }
+//!
+//! // 事件驱动：物理帧末差分产出，本系统每帧恰好消费一次
+//! fn update_pressure_plate(world: &World, door: &mut Door) {
+//!     for event in world.events_mut::<CollisionStarted>().drain() {
+//!         // 板是 sensor 区域：踏上即触发（实体序已归一化，双方都判）
+//!         if event.a == door.plate || event.b == door.plate {
+//!             door.occupants += 1;
+//!             door.open = true;
+//!         }
+//!     }
+//!     for event in world.events_mut::<CollisionEnded>().drain() {
+//!         if event.a == door.plate || event.b == door.plate {
+//!             door.occupants = door.occupants.saturating_sub(1);
+//!             door.open = door.occupants > 0; // 板上仍有实体不关门
+//!         }
+//!     }
+//! }
+//!
+//! // 板：sensor 盒（不阻挡不反弹，只报事件）；门逻辑自持计数
+//! let plate = world.spawn((
+//!     Transform::from_xyz(2.0, 0.05, 0.0),
+//!     Collider::sensor_box(Vec3::new(0.8, 0.05, 0.8)),
+//! ));
+//! ```
+//!
 //! # v1 限制（诚实清单）
 //!
 //! - **AABB 不随实体旋转**：[`ColliderShape::Box`] 是世界轴对齐包围盒，
@@ -114,6 +177,8 @@
 use glam::Vec3;
 
 use crate::Component;
+use crate::Event;
+use crate::Resource;
 use crate::broadphase::BroadphaseGrid;
 use crate::entity::Entity;
 use crate::time::Time;
@@ -153,7 +218,7 @@ pub enum ColliderShape {
     },
 }
 
-/// 碰撞体组件：形状 + 是否静态 + 弹性。
+/// 碰撞体组件：形状 + 是否静态 + 弹性 + 是否触发区域（sensor）。
 #[derive(Clone, Copy, Debug, PartialEq, Component)]
 pub struct Collider {
     pub shape: ColliderShape,
@@ -162,6 +227,12 @@ pub struct Collider {
     pub is_static: bool,
     /// 弹性系数（0..1）：碰撞后法向速度的保留比例；接触组合取双方最大。
     pub restitution: f32,
+    /// **触发区域**（sensor / trigger）：接触照常检出、照常产出
+    /// [`CollisionStarted`] / [`CollisionEnded`] 事件（压力板 / 警报区 /
+    /// 着地回调），但**跳过位置与速度求解**——不推离、不反弹、不摩擦，
+    /// 实体彼此穿过。与 `is_static` **正交**：sensor 也可以动（两动体
+    /// sensor 相撞只报事件、互不阻挡）。
+    pub is_sensor: bool,
 }
 
 impl Collider {
@@ -171,6 +242,7 @@ impl Collider {
             shape: ColliderShape::Box { half_extents },
             is_static: true,
             restitution: 0.0,
+            is_sensor: false,
         }
     }
 
@@ -180,6 +252,7 @@ impl Collider {
             shape: ColliderShape::Sphere { radius },
             is_static: true,
             restitution: 0.0,
+            is_sensor: false,
         }
     }
 
@@ -189,6 +262,7 @@ impl Collider {
             shape: ColliderShape::Sphere { radius },
             is_static: false,
             restitution,
+            is_sensor: false,
         }
     }
 
@@ -198,6 +272,7 @@ impl Collider {
             shape: ColliderShape::Box { half_extents },
             is_static: false,
             restitution,
+            is_sensor: false,
         }
     }
 
@@ -207,6 +282,7 @@ impl Collider {
             shape: ColliderShape::capsule(radius, half_height),
             is_static: true,
             restitution: 0.0,
+            is_sensor: false,
         }
     }
 
@@ -216,6 +292,30 @@ impl Collider {
             shape: ColliderShape::capsule(radius, half_height),
             is_static: false,
             restitution,
+            is_sensor: false,
+        }
+    }
+
+    /// **触发球**（sensor）：不阻挡不反弹，只产出接触事件（拾取圈 /
+    /// 爆炸伤害范围）。静态语义（无 `RigidBody` 时本就静态；要动态
+    /// sensor 请把结构体的 `is_static` 置 `false` 并挂 `RigidBody`）。
+    pub fn sensor_sphere(radius: f32) -> Self {
+        Self {
+            shape: ColliderShape::Sphere { radius },
+            is_static: true,
+            restitution: 0.0,
+            is_sensor: true,
+        }
+    }
+
+    /// **触发 AABB**（sensor）：不阻挡不反弹，只产出接触事件（压力板 /
+    /// 警报区 / 检查点）。静态语义（同 [`Collider::sensor_sphere`]）。
+    pub fn sensor_box(half_extents: Vec3) -> Self {
+        Self {
+            shape: ColliderShape::Box { half_extents },
+            is_static: true,
+            restitution: 0.0,
+            is_sensor: true,
         }
     }
 }
@@ -268,6 +368,65 @@ pub struct Contact {
     pub normal: Vec3,
     /// 穿透深度（正数）：两形状沿法线的重叠量。
     pub penetration: f32,
+}
+
+// ---------------------------------------------------------------------------
+// 接触事件与触发器（sensor，见模块文档「接触事件」章节）
+// ---------------------------------------------------------------------------
+
+/// 首次接触事件（begin）：上一帧不接触、本帧接触的一对碰撞体。由
+/// [`step_physics`] 帧末差分 [`ContactTracker`] 产出。
+///
+/// **实体序归一化**：`a.index() ≤ b.index()` 恒成立——配对以
+/// `Entity::to_bits` 按**索引序**存入追踪集合（检测顺序取决于组件存储
+/// 序，与索引序无关，删除可打乱两者相对次序）；若检测原始方向与索引序
+/// 相反，[`CollisionStarted::normal`] 随归一化**翻转**（保持「从 a 指向
+/// b」的 [`Contact`] 方向约定）。消费方不能假设 a 是「先 spawn 的一方」，
+/// 只能依赖索引序与法线方向的自洽。
+#[derive(Clone, Copy, Debug, PartialEq, Event)]
+pub struct CollisionStarted {
+    /// 归一化后的第一方（索引较小者）。
+    pub a: Entity,
+    /// 归一化后的第二方（索引较大者）。
+    pub b: Entity,
+    /// 接触法线（单位向量）：**从 a 指向 b**（归一化后方向，见类型文档）。
+    /// 采样自**首求解轮**（位置分离前）的 [`Contact::normal`]。
+    pub normal: Vec3,
+    /// 穿透深度（首求解轮采样，位置分离前的原始重叠量）。
+    pub penetration: f32,
+}
+
+/// 接触结束事件（end）：上一帧接触、本帧不再接触的一对碰撞体。由
+/// [`step_physics`] 帧末差分 [`ContactTracker`] 产出。
+///
+/// 与 [`CollisionStarted`] 严格成对：**销毁也成对**——接触中的实体被
+/// despawn（或组件移除）后，下一帧必然收到携带已死实体 id 的
+/// [`CollisionEnded`]（本帧接触集合只含存活实体的检出对，差分必然把它
+/// 从上一帧集合中筛出），消费方持有的计数 / 状态因此不会泄漏。实体序
+/// 归一化规则同 [`CollisionStarted`]。
+#[derive(Clone, Copy, Debug, PartialEq, Event)]
+pub struct CollisionEnded {
+    /// 归一化后的第一方（索引较小者；可能已销毁，见类型文档）。
+    pub a: Entity,
+    /// 归一化后的第二方（索引较大者；可能已销毁，见类型文档）。
+    pub b: Entity,
+}
+
+/// 接触对追踪资源：维护上一帧的接触对集合，供 [`step_physics`] 帧末
+/// 差分产出 [`CollisionStarted`] / [`CollisionEnded`]（begin/end 语义的
+/// 状态基线）。由 `PhysicsPlugin` 自动注册；自建 App（不用
+/// DefaultPlugins）时手动 `insert_resource(ContactTracker::default())`
+/// 即可开启事件产出，缺席则 [`step_physics`] 静默跳过（照 `Time` 缺席
+/// 语义，不强制注册）。
+///
+/// 集合选型 [`std::collections::BTreeSet`]（与 broadphase 的 BTreeMap
+/// 同款理由）：迭代序 = 字典序 = 跨平台确定——事件产出顺序由对序唯一
+/// 决定，同输入两次模拟的事件序列逐项一致（确定性测试守护）。
+#[derive(Default, Resource)]
+pub struct ContactTracker {
+    /// 上一帧的全部接触对（`to_bits` 按 `a.index() ≤ b.index()` 归一化，
+    /// 与 sensor 与否无关——sensor 对照常入集合报事件）。
+    prev: std::collections::BTreeSet<(u64, u64)>,
 }
 
 /// 参与接触求解的单方参数（从组件解包的纯数值，不依赖 ECS，便于单测）。
@@ -764,6 +923,9 @@ pub fn step_physics(world: &World) {
         }
     });
     if n == 0 && flyers.is_empty() {
+        // 全部碰撞体都没了：接触集合为空，上一帧的残留配对全部转 ended
+        //（销毁成对性：接触中的实体被销毁后，ended 不能因早退而丢失）
+        emit_contact_events(world, &std::collections::BTreeMap::new());
         return;
     }
 
@@ -772,6 +934,17 @@ pub fn step_physics(world: &World) {
         .iter()
         .map(|(_, collider, rigid)| collider.is_static || rigid.is_none())
         .collect();
+
+    // 触发区域标记（与 is_static 正交：sensor 也可以动，见 Collider 文档）
+    let is_sensor: Vec<bool> = collected
+        .iter()
+        .map(|(_, collider, _)| collider.is_sensor)
+        .collect();
+
+    // 本帧接触对（首求解轮采样，差分产出事件用）：位序归一化对 →
+    // (归一化方向法线, 穿透)。BTreeMap 字典序 = 事件产出顺序确定。
+    let mut current_contacts: std::collections::BTreeMap<(u64, u64), (Vec3, f32)> =
+        std::collections::BTreeMap::new();
 
     // ---- 积分（半隐式欧拉）----
     let mut velocities: Vec<Option<Vec3>> = collected
@@ -852,9 +1025,11 @@ pub fn step_physics(world: &World) {
         .map(|index| grid.candidates(aabbs[index].0, aabbs[index].1))
         .collect();
 
-    // 静-静对跳过（互不动，永不穿透）。位置分离即时生效（Gauss-Seidel
-    // 风格），共 SOLVER_ITERATIONS 轮；速度响应只在首轮施加（重复施加
-    // 会把摩擦/反弹多次结算，语义错误）。
+    // 静-静对跳过（互不动，永不穿透；也从不产出事件——静-静配对永不
+    // 变化，begin/end 无语义）。位置分离即时生效（Gauss-Seidel 风格），
+    // 共 SOLVER_ITERATIONS 轮；速度响应只在首轮施加（重复施加会把
+    // 摩擦/反弹多次结算，语义错误）。接触事件只在**首轮**采样：松弛轮
+    // 的重复检出对是同一配对的求解残影，无 begin/end 语义。
     for iteration in 0..SOLVER_ITERATIONS {
         for i in 0..n {
             for &j in &candidates[i] {
@@ -872,6 +1047,23 @@ pub fn step_physics(world: &World) {
                 ) else {
                     continue;
                 };
+                if iteration == 0 {
+                    // 实体序归一化（a.index() ≤ b.index()）：配对以索引序
+                    // 入集合；检测原始方向与索引序相反时法线随归一化翻转
+                    //（保持「从 a 指向 b」的方向约定，见 CollisionStarted）
+                    let (entity_a, entity_b) = (collected[i].0, collected[j].0);
+                    let (pair, normal) = if entity_a.index() <= entity_b.index() {
+                        ((entity_a.to_bits(), entity_b.to_bits()), contact.normal)
+                    } else {
+                        ((entity_b.to_bits(), entity_a.to_bits()), -contact.normal)
+                    };
+                    current_contacts.insert(pair, (normal, contact.penetration));
+                }
+                // sensor 对照常入接触集合（报事件），但跳过位置/速度求解
+                // ——不推离不反弹，实体彼此穿过（见 Collider::is_sensor）
+                if is_sensor[i] || is_sensor[j] {
+                    continue;
+                }
                 let response = solve_contact(contact, params[i], params[j]);
                 positions[i] += response.delta_pos_a;
                 positions[j] += response.delta_pos_b;
@@ -913,6 +1105,67 @@ pub fn step_physics(world: &World) {
         if let Some(mut rigid) = world.get_mut::<RigidBody>(entity) {
             rigid.velocity = velocity;
         }
+    }
+
+    // ---- 接触事件（帧末差分，见 emit_contact_events / 模块文档）----
+    emit_contact_events(world, &current_contacts);
+}
+
+/// 帧末差分产出接触事件：`started = 当前 − prev`、`ended = prev − 当前`，
+/// 按对序（BTree 字典序）先 Started 后 Ended 写入事件资源。
+///
+/// 资源缺席语义（照 `Time` 缺席静默跳过的风格，不强制注册）：
+/// - [`ContactTracker`] 缺席 → 完全跳过（无差分状态基线）；
+/// - [`Events<CollisionStarted>`](crate::event::Events) /
+///   [`Events<CollisionEnded>`](crate::event::Events) 单独缺席 → 跳过
+///   对应事件产出，但**照常推进 prev 基线**（否则后注册的一方会收到
+///   积压多帧的陈旧差分）。
+///
+/// **销毁成对性**：`current` 只含本帧实际检出的存活实体对——上一帧
+/// 配对若因 despawn / 组件移除消失，必然落入 `prev − current` 成为
+/// ended（携带已死实体 id），begin/end 严格成对、世代安全。
+fn emit_contact_events(
+    world: &World,
+    current: &std::collections::BTreeMap<(u64, u64), (Vec3, f32)>,
+) {
+    let Some(mut tracker) = world.try_resource_mut::<ContactTracker>() else {
+        return;
+    };
+    let started: Vec<CollisionStarted> = if world.try_events::<CollisionStarted>().is_some() {
+        current
+            .iter()
+            .filter(|(pair, _)| !tracker.prev.contains(pair))
+            .map(|(&(lo, hi), &(normal, penetration))| CollisionStarted {
+                a: Entity::from_bits(lo),
+                b: Entity::from_bits(hi),
+                normal,
+                penetration,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ended: Vec<CollisionEnded> = if world.try_events::<CollisionEnded>().is_some() {
+        tracker
+            .prev
+            .iter()
+            .filter(|pair| !current.contains_key(*pair))
+            .map(|&(lo, hi)| CollisionEnded {
+                a: Entity::from_bits(lo),
+                b: Entity::from_bits(hi),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // 基线先推进再发事件（发事件不读 tracker，顺序无语义；按对序输出）
+    tracker.prev = current.keys().copied().collect();
+    drop(tracker);
+    for event in started {
+        world.try_send_event(event);
+    }
+    for event in ended {
+        world.try_send_event(event);
     }
 }
 
@@ -1899,6 +2152,7 @@ mod tests {
                 shape: ColliderShape::Sphere { radius: 0.5 },
                 is_static: true,
                 restitution: 0.0,
+                is_sensor: false,
             },
             RigidBody {
                 velocity: Vec3::new(0.0, -3.0, 0.0),
@@ -2148,6 +2402,7 @@ mod tests {
                 },
                 is_static: true,
                 restitution: 0.0,
+                is_sensor: false,
             },
             RigidBody {
                 velocity: Vec3::new(1.0, 0.0, 0.0),
@@ -2771,6 +3026,375 @@ mod tests {
         assert!(
             ball_velocity(&world, capsule_entity).length() < 1e-4,
             "静止后速度应 ≈ 0"
+        );
+    }
+
+    // ---- 接触事件与触发器：CollisionStarted / CollisionEnded / sensor ----
+
+    /// 事件测试台：Time + 接触事件资源 + ContactTracker 全注册
+    /// （PhysicsPlugin 的注册等价物）。
+    fn make_event_world() -> World {
+        let mut world = make_world();
+        world.register_event::<CollisionStarted>();
+        world.register_event::<CollisionEnded>();
+        world.insert_resource(ContactTracker::default());
+        world
+    }
+
+    /// 推进一帧并取走本帧事件（drain 消费契约：每帧恰好一次）。
+    fn step_collect(world: &mut World, dt: f32) -> (Vec<CollisionStarted>, Vec<CollisionEnded>) {
+        world
+            .resource_mut::<Time>()
+            .advance(Duration::from_secs_f64(dt as f64));
+        step_physics(world);
+        let started = world.events_mut::<CollisionStarted>().drain().collect();
+        let ended = world.events_mut::<CollisionEnded>().drain().collect();
+        (started, ended)
+    }
+
+    /// begin/end 严格成对（弹跳三段时序）：首次触地恰 1 个 Started →
+    /// 弹起离地恰 1 个 Ended → 再次落地又恰 1 个 Started；接触持续期
+    /// 与滞空期不重复报事件。地面用物理静态盒（sensor 不反弹，弹起
+    /// 离地需要真实求解；sensor 配对的同款成对性由 sensor 穿越测试覆盖）。
+    #[test]
+    fn collision_events_pair_across_bounce_phases() {
+        const FINE: f32 = 1.0 / 240.0;
+        let mut world = make_event_world();
+        let floor = spawn_floor(&mut world);
+        let ball = spawn_ball(
+            &mut world,
+            Vec3::new(0.0, 2.5, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.8,
+            0.0,
+        );
+
+        let mut first_started: Option<usize> = None;
+        let mut first_ended: Option<usize> = None;
+        let mut second_started: Option<usize> = None;
+        // 预算：2.5 m 落地 ~155 帧、回弹滞空 ~140 帧（240Hz）——600 帧
+        // 覆盖三段时序绰绰有余（断言 expect 兜底，不达标即失败）
+        for frame in 0..600 {
+            let (started, ended) = step_collect(&mut world, FINE);
+            if second_started.is_some() {
+                continue; // 后续弹跳的同款循环不再关心
+            }
+            if first_started.is_none() {
+                assert!(ended.is_empty(), "首次接触前不应有 ended");
+                if !started.is_empty() {
+                    assert_eq!(started.len(), 1, "首次接触帧应恰有 1 个 Started");
+                    let event = started[0];
+                    assert_eq!(event.a, floor, "a = 索引较小的地面（先 spawn）");
+                    assert_eq!(event.b, ball, "b = 索引较大的球");
+                    assert!(
+                        (event.normal - Vec3::Y).length() < 1e-5,
+                        "法线应从地面指向球（+Y），实际 {:?}",
+                        event.normal
+                    );
+                    assert!(event.penetration > 0.0, "穿透深度应为正");
+                    first_started = Some(frame);
+                }
+            } else if first_ended.is_none() {
+                assert!(started.is_empty(), "接触持续期不应重复 Started");
+                if !ended.is_empty() {
+                    assert_eq!(ended.len(), 1, "离地帧应恰有 1 个 Ended");
+                    assert_eq!(ended[0].a, floor);
+                    assert_eq!(ended[0].b, ball);
+                    first_ended = Some(frame);
+                }
+            } else {
+                assert!(ended.is_empty(), "再次落地前不应有 ended");
+                if !started.is_empty() {
+                    assert_eq!(started.len(), 1, "再次落地应恰有 1 个 Started");
+                    second_started = Some(frame);
+                }
+            }
+        }
+        let (s1, e1, s2) = (
+            first_started.expect("应发生首次触地"),
+            first_ended.expect("应弹起离地"),
+            second_started.expect("应再次落地"),
+        );
+        assert!(s1 < e1 && e1 < s2, "时序应为 Started → Ended → Started");
+    }
+
+    /// 销毁成对性：接触中的球 despawn → 下一帧恰 1 个 Ended（携带已死
+    /// 实体 id），再下一帧无新事件——begin/end 严格成对、不重复。
+    #[test]
+    fn despawn_mid_contact_emits_ended_with_dead_entity() {
+        const FINE: f32 = 1.0 / 120.0;
+        let mut world = make_event_world();
+        let floor = spawn_floor(&mut world);
+        let ball = spawn_ball(
+            &mut world,
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+        );
+        // 2 秒充分沉降：落地帧的 Started 已逐帧取走
+        for _ in 0..240 {
+            step_collect(&mut world, FINE);
+        }
+        let (started, ended) = step_collect(&mut world, FINE);
+        assert!(
+            started.is_empty() && ended.is_empty(),
+            "沉降后的持续接触不应有事件"
+        );
+
+        // 接触中销毁球：消失配对转 ended（id 已死但保留，世代安全）
+        assert!(world.despawn(ball), "球应仍在场");
+        let (started, ended) = step_collect(&mut world, FINE);
+        assert!(started.is_empty());
+        assert_eq!(ended.len(), 1, "销毁应把消失配对转 ended");
+        assert_eq!(ended[0].a, floor);
+        assert_eq!(ended[0].b, ball, "ended 应携带已销毁实体的 id");
+        assert!(
+            !world.contains(ball),
+            "球确已销毁（ended 中的 id 不再匹配）"
+        );
+
+        // 差分只报一次：下一帧无新事件
+        let (started, ended) = step_collect(&mut world, FINE);
+        assert!(started.is_empty() && ended.is_empty(), "不应重复报 ended");
+    }
+
+    /// sensor 语义：事件报了、球穿过去了——Started → 逐帧单调下降
+    /// （无位置推离）→ 速度持续向下（无反弹）→ 从下方穿出报 Ended。
+    #[test]
+    fn sensor_region_reports_events_without_solving() {
+        const FINE: f32 = 1.0 / 240.0;
+        let mut world = make_event_world();
+        // sensor 盒：中心 y = 2、半高 0.5（占据 y ∈ [1.5, 2.5]）；球 r = 0.5
+        let sensor = world.spawn((
+            Transform::from_xyz(0.0, 2.0, 0.0),
+            Collider::sensor_box(Vec3::new(1.0, 0.5, 1.0)),
+        ));
+        let ball = spawn_ball(
+            &mut world,
+            Vec3::new(0.0, 6.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.9,
+            0.0,
+        );
+
+        let mut started_frame: Option<usize> = None;
+        let mut ended_frame: Option<usize> = None;
+        let mut y_at_started = 0.0f32;
+        let mut vy_at_started = 0.0f32;
+        let mut prev_y = 6.0f32;
+        for frame in 0..1200 {
+            let (started, ended) = step_collect(&mut world, FINE);
+            let y = ball_position(&world, ball).y;
+            if !started.is_empty() {
+                assert_eq!(started.len(), 1, "穿越 sensor 应恰报 1 次 Started");
+                assert!(started_frame.is_none(), "全程应只报一次 Started");
+                let event = started[0];
+                assert_eq!(event.a, sensor, "a = 索引较小的 sensor（先 spawn）");
+                assert_eq!(event.b, ball);
+                assert!(
+                    (event.normal - Vec3::Y).length() < 1e-5,
+                    "法线应从 sensor（下方）指向球（上方），实际 {:?}",
+                    event.normal
+                );
+                started_frame = Some(frame);
+                y_at_started = y;
+                vy_at_started = ball_velocity(&world, ball).y;
+            }
+            if !ended.is_empty() {
+                assert_eq!(ended.len(), 1, "穿出 sensor 应恰报 1 次 Ended");
+                assert!(ended_frame.is_none(), "全程应只报一次 Ended");
+                assert_eq!(ended[0].a, sensor);
+                assert_eq!(ended[0].b, ball);
+                ended_frame = Some(frame);
+            }
+            if started_frame.is_some() && ended_frame.is_none() {
+                // 穿越期：位置逐帧下降（无推离）、速度向下（无反弹支撑）
+                assert!(
+                    y <= prev_y + 1e-6,
+                    "sensor 不应把球推离，y 应持续下降：{y} vs {prev_y}"
+                );
+                assert!(ball_velocity(&world, ball).y < 0.0, "穿越期不应反弹");
+            }
+            prev_y = y;
+        }
+        assert!(started_frame.is_some(), "球应进入 sensor 区域");
+        assert!(ended_frame.is_some(), "球应从下方穿出 sensor 区域");
+        assert!(
+            (2.5..3.0).contains(&y_at_started),
+            "首次接触帧球底应刚越过盒顶（y ≈ 3.0 减当帧位移），实际 {y_at_started}"
+        );
+        assert!(
+            vy_at_started < -1.0,
+            "接触帧球仍在自由下落（sensor 不提供支撑），实际 {vy_at_started}"
+        );
+        assert!(
+            ball_position(&world, ball).y < 0.0,
+            "球应完全穿过 sensor 区域（最终远在盒下方），实际 {}",
+            ball_position(&world, ball).y
+        );
+    }
+
+    /// 归一化与方向：检测原始方向与实体索引序相反（销毁 swap_remove 打乱
+    /// 存储序）时，事件 a/b 按索引序归一化、法线随归一化翻转（a → b）。
+    #[test]
+    fn events_normalize_entity_order_and_flip_normal() {
+        const FINE: f32 = 1.0 / 120.0;
+        let mut world = make_event_world();
+        // 失重漂移球（隔离重力，水平相向运动）
+        let spawn_drifter = |world: &mut World, pos: Vec3, vel: Vec3| {
+            world.spawn((
+                Transform::from_translation(pos),
+                Collider::dynamic_sphere(0.5, 0.0),
+                RigidBody {
+                    velocity: vel,
+                    gravity_scale: 0.0,
+                    ..RigidBody::default()
+                },
+            ))
+        };
+        // 占位者（index 0，spawn 后立即销毁）
+        let filler = spawn_drifter(&mut world, Vec3::new(0.0, 100.0, 0.0), Vec3::ZERO);
+        let left = spawn_drifter(&mut world, Vec3::new(-1.0, 100.0, 0.0), Vec3::X);
+        let right = spawn_drifter(&mut world, Vec3::new(1.0, 100.0, 0.0), -Vec3::X);
+        assert!(left.index() < right.index(), "spawn 序即索引序的前提");
+        // 销毁占位者：swap_remove 把最后 spawn 的 right 挪到存储首位 →
+        // 检测原始方向为 right → left，与索引序（left < right）相反
+        assert!(world.despawn(filler));
+
+        let mut event = None;
+        for _ in 0..240 {
+            let (started, _ended) = step_collect(&mut world, FINE);
+            if let Some(first) = started.first().copied() {
+                event = Some(first);
+                break;
+            }
+        }
+        let event = event.expect("相向运动的两球应接触");
+        assert_eq!(event.a, left, "事件 a 应为索引较小者（归一化）");
+        assert_eq!(event.b, right, "事件 b 应为索引较大者（归一化）");
+        assert!(
+            (event.normal - Vec3::X).length() < 1e-5,
+            "归一化后法线应从 a（左）指向 b（右）——检测原始方向（右 → 左，-X）已被翻转，实际 {:?}",
+            event.normal
+        );
+    }
+
+    /// 确定性：同场景跑两遍（物理地面 + sensor 盒 + 两颗异质弹球），
+    /// 逐帧事件序列（内容与顺序）完全相等。
+    #[test]
+    fn contact_events_are_deterministic_across_runs() {
+        fn build() -> World {
+            let mut world = make_event_world();
+            spawn_floor(&mut world);
+            world.spawn((
+                Transform::from_xyz(4.0, 1.0, 0.0),
+                Collider::sensor_box(Vec3::new(1.0, 1.0, 1.0)),
+            ));
+            spawn_ball(
+                &mut world,
+                Vec3::new(0.0, 5.0, 0.0),
+                Vec3::new(0.5, 0.0, 0.0),
+                0.5,
+                0.7,
+                0.0,
+            );
+            spawn_ball(
+                &mut world,
+                Vec3::new(4.0, 8.0, 0.0),
+                Vec3::ZERO,
+                0.4,
+                0.2,
+                0.1,
+            );
+            world
+        }
+        let mut world_a = build();
+        let mut world_b = build();
+        let mut log_a: Vec<(Vec<CollisionStarted>, Vec<CollisionEnded>)> = Vec::new();
+        let mut log_b: Vec<(Vec<CollisionStarted>, Vec<CollisionEnded>)> = Vec::new();
+        for _ in 0..240 {
+            let (sa, ea) = step_collect(&mut world_a, DT);
+            let (sb, eb) = step_collect(&mut world_b, DT);
+            log_a.push((sa, ea));
+            log_b.push((sb, eb));
+        }
+        assert!(
+            log_a.iter().any(|(s, e)| !s.is_empty() || !e.is_empty()),
+            "场景应产出事件（测试非空转的佐证）"
+        );
+        assert_eq!(log_a, log_b, "同输入两次模拟的事件序列应逐项相等（含顺序）");
+    }
+
+    /// 静-静对不报事件：两静态盒刻意重叠（求解与事件同分支跳过——
+    /// 静-静配对永不变化，begin/end 无语义）。
+    #[test]
+    fn static_static_pairs_never_report_events() {
+        let mut world = make_event_world();
+        world.spawn((
+            Transform::from_xyz(0.0, 0.0, 0.0),
+            Collider::static_box(Vec3::ONE),
+        ));
+        world.spawn((
+            Transform::from_xyz(0.5, 0.5, 0.0),
+            Collider::static_box(Vec3::ONE),
+        ));
+        for _ in 0..10 {
+            let (started, ended) = step_collect(&mut world, DT);
+            assert!(
+                started.is_empty() && ended.is_empty(),
+                "静-静对永不变化，不应有事件"
+            );
+        }
+    }
+
+    /// 资源缺席不 panic：完全不注册（照 Time 缺席语义静默跳过）；以及只
+    /// 有 ContactTracker 无事件资源——基线照常逐帧推进，后注册事件资源
+    /// 不收到积压差分，物理行为不受影响。
+    #[test]
+    fn missing_event_resources_does_not_panic() {
+        // 情形一：什么都不注册
+        let mut world = make_world();
+        spawn_floor(&mut world);
+        spawn_ball(
+            &mut world,
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+        );
+        step(&world, DT); // 不 panic 即通过
+
+        // 情形二：只有 ContactTracker、没有事件资源
+        let mut world = make_world();
+        world.insert_resource(ContactTracker::default());
+        spawn_floor(&mut world);
+        let ball = spawn_ball(
+            &mut world,
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+        );
+        for _ in 0..60 {
+            step(&world, DT); // 落地 + 持续接触，基线静默推进
+        }
+        assert!(
+            ball_position(&world, ball).y < 0.6,
+            "球应已落地（物理行为不受事件资源缺席影响）"
+        );
+        // 后补注册：不收到积压的陈旧差分
+        world.register_event::<CollisionStarted>();
+        world.register_event::<CollisionEnded>();
+        let (started, ended) = step_collect(&mut world, DT);
+        assert!(
+            started.is_empty() && ended.is_empty(),
+            "补注册不应收到积压差分（持续接触配对无变化）"
         );
     }
 }

@@ -155,7 +155,9 @@ impl Plugin for AnimationPlugin {
 }
 
 /// 物理插件：在 Update 阶段推进刚体物理（积分 → 检测 → 响应 → 迭代松弛，
-/// 见 `iris_core::physics::step_physics`）。
+/// 见 `iris_core::physics::step_physics`），并注册接触事件资源
+/// （`Events<CollisionStarted>` / `Events<CollisionEnded>` /
+/// `ContactTracker`——帧末差分产出 begin/end，游戏侧不注册即得）。
 ///
 /// 已包含在 [`DefaultPlugins`] 中。编排语义与动画一致：物理在 Update 写
 /// 局部 `Transform`，随后的 PostUpdate（[`HierarchyPlugin`]）当帧完成全局
@@ -170,8 +172,13 @@ pub struct PhysicsPlugin;
 
 impl Plugin for PhysicsPlugin {
     fn build(&self, app: &mut App) {
-        use iris_core::physics::{Collider, RigidBody, step_physics};
-        use iris_core::prelude::{Access, Stage, Transform};
+        use iris_core::physics::{Collider, ContactTracker, RigidBody, step_physics};
+        use iris_core::prelude::{Access, CollisionEnded, CollisionStarted, Stage, Transform};
+        // 接触事件资源 + 差分基线：游戏侧不注册即得（事件资源缺席时
+        // step_physics 静默跳过产出，自建 App 也可按需手动注册）
+        app.world.register_event::<CollisionStarted>();
+        app.world.register_event::<CollisionEnded>();
+        app.world.insert_resource(ContactTracker::default());
         app.schedule.add_parallel_system(
             Stage::Update,
             Access::new()

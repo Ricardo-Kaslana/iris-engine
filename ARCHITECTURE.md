@@ -268,6 +268,27 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   收集封装，缺席语义同 `resolve_against_statics`）。任意形状泛化
   `shape_sweep`（R31）同款算法供胶囊扫掠。检出范围的诚实边界（起点与
   终点都自由的完全贯穿返回 `None`，调用方按需分步）写在函数文档。
+- **接触事件与触发器（R34）**：`step_physics` 帧末把本帧接触对与
+  `ContactTracker` 资源的上一帧集合差分，产出 `CollisionStarted` /
+  `CollisionEnded` 事件（压力板 / 警报区 / 着地回调免逐帧轮询）。语义
+  要点：**实体序归一化**（事件 a/b 恒 `a.index() ≤ b.index()`，检测原始
+  方向与索引序相反时 normal 随归一化翻转，保持「从 a 指向 b」的方向
+  约定）；**首求解轮采样**（接触对与 normal/penetration 取自
+  `SOLVER_ITERATIONS` 首轮检测、位置分离前——松弛轮的重复检出对是同一
+  配对的求解残影，无 begin/end 语义）；**静-静跳过**（静-静配对永不
+  变化，不进接触集合不产事件，与求解同分支）；**销毁成对性**（接触中
+  实体 despawn / 移除组件 → 下一帧必收到携带已死实体 id 的 Ended——
+  本帧集合只含存活实体的检出对，差分必然筛出消失配对，begin/end 严格
+  成对、世代安全）；**sensor 正交性**（`Collider::is_sensor` 触发区域与
+  `is_static` 正交：sensor 对照常进接触集合报事件、但跳过位置/速度求解
+  ——不推离不反弹，两动体 sensor 相撞只报事件）；**确定性**（追踪集合
+  用 BTreeSet 与 broadphase 同款选型理由，事件先 Started 后 Ended 按对序
+  输出，同输入两次模拟事件序列逐项相等——单测守护）；**资源缺席语义**
+  （`ContactTracker` / 事件资源未注册则静默跳过，照 `Time` 缺席风格，
+  `PhysicsPlugin` 已全部注册游戏侧即得）。消费契约：事件在 `step_physics`
+  帧末产出、当帧其后注册的系统即可读（`world.events::<E>()` / 
+  `world.events_mut::<E>().drain()` 每帧恰好消费一次），帧尾
+  `clear_all_events` 兜底清空。
 - **运动学角色控制器（iris-core/character，R31）**：`move_and_slide` /
   `move_and_slide_statics`（纯函数核心，静态体列表入参可脱离世界单测）——
   竖直胶囊 + 五步管线：① 重力（`v.y += g·gravity_scale·dt`）；② 水平

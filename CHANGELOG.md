@@ -5,6 +5,45 @@
 
 ## [Unreleased]
 
+### Added（R34：接触事件与触发器——物理产出 begin/end 事件 + sensor 触发区域）
+
+物理系统从此**主动广播**接触生命周期，压力板 / 警报区 / 着地回调免逐帧
+轮询（第 34 轮迭代；文档用例见 `iris-core::physics` 模块文档「接触事件
+与触发器」章节）：
+
+- **接触事件**：`step_physics` 帧末把本帧接触对与上一帧
+  （`ContactTracker` 资源）差分，产出 `CollisionStarted`（a / b /
+  normal / penetration）与 `CollisionEnded`（a / b）事件。语义决策：
+  **实体序归一化**（事件 a/b 恒 `a.index() ≤ b.index()`；检测原始方向与
+  索引序相反——despawn 的 swap_remove 会打乱存储序——时 normal 随归一化
+  翻转，保持「从 a 指向 b」的方向约定）；**首求解轮采样**（接触对与
+  normal/penetration 取自 `SOLVER_ITERATIONS` 首轮、位置分离前——松弛轮
+  的重复检出对是同一配对的求解残影，无 begin/end 语义）；**静-静跳过**
+  （静-静配对永不变化，与求解同分支跳过，不产事件）；**销毁成对性**
+  （接触中的实体 despawn / 移除组件 → 下一帧必收到携带已死实体 id 的
+  Ended——本帧集合只含存活实体的检出对，差分必然筛出消失配对，
+  begin/end 严格成对、世代安全；含「全部碰撞体销毁后的早退帧」）；**确
+  定性**（追踪集合 BTreeSet 与 broadphase 同款选型理由，事件先 Started
+  后 Ended 按对序输出，同输入两次模拟事件序列逐项相等——单测守护）；
+  **资源缺席语义**（`ContactTracker` / 事件资源未注册则静默跳过，照
+  `Time` 缺席风格不强制注册；基线照常推进，后注册不收积压差分）。
+  `PhysicsPlugin` 注册全部三类资源（`Events<CollisionStarted>` /
+  `Events<CollisionEnded>` / `ContactTracker`），游戏侧不注册即得。
+- **Sensor 触发区域**：`Collider` 新增 `is_sensor`（默认 false，既有
+  构造函数与结构字面量零破坏）——sensor 对**照常进接触集合报事件**、但
+  **跳过位置/速度求解**（不推离不反弹不摩擦，实体彼此穿过）；与
+  `is_static` **正交**（sensor 也可以动，两动体 sensor 相撞只报事件）。
+  构造辅助 `Collider::sensor_sphere` / `sensor_box`（静态触发区域）。
+- **事件消费入口**：`World::events_mut::<E>()`（`EventRefMut` 可变守卫，
+  与既有只读 `events` / `EventRef` 对称）——`drain()` 每帧恰好消费一次；
+  事件在 `step_physics` 帧末产出、当帧其后注册的系统即可读，帧尾
+  `clear_all_events` 兜底清空（消费契约写入 physics.rs 模块文档）。
+  prelude 导出 `CollisionStarted` / `CollisionEnded` / `ContactTracker`。
+- **测试**：physics.rs 新增 7 项（弹跳三段时序 begin/end 成对、接触中
+  despawn 的销毁成对、sensor 穿越报事件不推离不反弹、归一化与法线翻转、
+  事件序列跨运行确定性、静-静不报 + 资源缺席不 panic），既有全部物理 /
+  游戏测试零改动全过。
+
 ### Added（打磨 IV：引擎 API 打磨 IV——闭合 Iris Ascent dogfooding 的六条引擎摩擦）
 
 延续「打磨 I / II / III」模式：**引擎侧修复 + iris-ascent 侧绕行删除
