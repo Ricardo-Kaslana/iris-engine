@@ -7,6 +7,8 @@
 //! - 自动实例化批处理：共享网格与材质的实体合并为一个 draw call；
 //! - 4x MSAA、深度测试、Cook-Torrance PBR（方向光 + 点光 + 环境光 + 自发光）；
 //! - 透明渲染（alpha 混合材质 + 按视深排序的透明 pass，不写深度、不投影）；
+//! - 盒投影贴花（`Decal` 组件：弹孔 / 血迹 / 地面标记，端盖代理几何 +
+//!   逐实例世界盒矩阵 / 逆矩阵，按纹理分批，蒙皮后透明前叠加，v1 无光照）；
 //! - 粒子系统 v1（Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染，
 //!   additive / alpha 双混合）；
 //! - 方向光级联阴影 CSM v2（2048² × 3 层 2D 数组深度图 + PFS 分割 +
@@ -28,6 +30,7 @@ pub mod animation;
 pub mod asset;
 pub mod camera;
 pub mod context;
+pub mod decal;
 pub mod environment;
 pub mod foot_ik;
 pub mod frustum;
@@ -61,6 +64,7 @@ pub mod prelude {
         ActiveCamera, Camera, screen_ray_from_global, view_from_global, view_proj_from_global,
     };
     pub use crate::context::Gpu;
+    pub use crate::decal::{Decal, DecalInstanceRaw};
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::foot_ik::{FootIk, solve_two_bone_ik, update_foot_ik};
     pub use crate::frustum::Frustum;

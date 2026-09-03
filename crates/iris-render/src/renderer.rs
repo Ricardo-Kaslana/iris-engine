@@ -8,6 +8,8 @@
 //!     -> 查询 (Transform, MaterialHandle, MeshHandle|LodMesh) 收集实例
 //!        （LodMesh 按实体-相机距离选 high/low，见 mesh.rs）
 //!     -> 按 (网格, 材质) 排序合并为批次 -> 一个批次一个 draw call
+//!     -> 另查 (GlobalTransform, Decal) 收集贴花实例，按纹理分批在独立
+//!        pass 绘制（蒙皮之后、透明之前，见 decal.rs）
 //! ```
 
 use std::collections::HashMap;
@@ -15,10 +17,12 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 use iris_core::prelude::{Entity, GlobalTransform};
+use wgpu::util::DeviceExt;
 
 use crate::SAMPLE_COUNT;
 use crate::camera::{ActiveCamera, Camera, view_from_global};
 use crate::context::Gpu;
+use crate::decal::{Decal, DecalInstanceRaw, PROXY_INDEX_COUNT, PROXY_INDICES, PROXY_POSITIONS};
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
 use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight, cascade_fit, cascade_splits};
@@ -198,6 +202,17 @@ struct TransparentSkinnedItem {
     depth: f32,
 }
 
+/// 一帧内收集到的贴花绘制项：按纹理排序分组，同纹理连续区间为一个批
+///（1 draw）；批内按实体 bits 并列序（确定性，与收集顺序无关，见
+/// `decal.rs` 模块文档的分批策略）。
+struct DecalItem {
+    /// 贴花纹理句柄值（分批键）。
+    texture: u32,
+    /// 实体位标识（同批内次序的确定性并列键）。
+    entity: u64,
+    instance: DecalInstanceRaw,
+}
+
 struct GpuTexture {
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
@@ -301,6 +316,25 @@ pub struct Renderer {
     particle_camera_buf: wgpu::Buffer,
     /// 粒子相机绑定组（粒子管线的组 1）。
     particle_camera_bg: wgpu::BindGroup,
+    /// 贴花代理几何顶点缓冲（单位盒 ±Z 端盖，初始化时一次性上传；
+    /// 字段保持缓冲存活）。
+    #[allow(dead_code)]
+    decal_vertex_buf: wgpu::Buffer,
+    /// 贴花代理几何索引缓冲（12 索引，初始化时一次性上传）。
+    #[allow(dead_code)]
+    decal_index_buf: wgpu::Buffer,
+    /// 贴花实例缓冲（`DecalInstanceRaw` 144B/实例，独立于几何实例缓冲；
+    /// 贴花实例少且常静止，每帧全量上传、无帧级比对——增量价值近零，
+    /// 与粒子同款决策）。
+    decal_instance_buf: Option<wgpu::Buffer>,
+    /// 贴花实例缓冲可容纳的实例数。
+    decal_capacity: usize,
+    /// 贴花纹理绑定组缓存（纹理句柄值 → 组 1 绑定组；跨帧复用）。
+    decal_bind_groups: HashMap<u32, wgpu::BindGroup>,
+    /// 贴花收集暂存（跨帧复用）。
+    decal_scratch: Vec<DecalItem>,
+    /// 贴花实例组装暂存（跨帧复用）。
+    decal_instance_scratch: Vec<DecalInstanceRaw>,
     scratch: Vec<DrawItem>,
     instance_scratch: Vec<InstanceRaw>,
     skinned_scratch: Vec<SkinnedItem>,
@@ -451,32 +485,33 @@ const _: () = assert!(
     "ParticleCamera 必须与 WGSL 布局一致"
 );
 
-/// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、透明 pass
-/// 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17）：UI pass 只计入
-/// `draw_calls` 的单批，阴影 pass（3 级联各一遍，复用不透明实例区间，
-/// 透明项与粒子不进阴影）与天空 / 后处理 pass 全部不计。
+/// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、贴花 pass、
+/// 透明 pass 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17 / §4.20）：UI pass
+/// 只计入 `draw_calls` 的单批，阴影 pass（3 级联各一遍，复用不透明实例
+/// 区间，贴花 / 透明项与粒子不进阴影）与天空 / 后处理 pass 全部不计。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
-    /// 主几何 draw call 数：普通批每批 1 + 蒙皮每实体 1 + 透明 run 批每批 1 +
-    /// 透明蒙皮每实体 1 + 粒子（additive / alpha 段各至多 1）+ UI 顶点非空
-    /// 时 1。
+    /// 主几何 draw call 数：普通批每批 1 + 蒙皮每实体 1 + 贴花每纹理批 1 +
+    /// 透明 run 批每批 1 + 透明蒙皮每实体 1 + 粒子（additive / alpha 段各至
+    /// 多 1）+ UI 顶点非空时 1。
     pub draw_calls: u32,
-    /// 主几何提交的实例数（可见实例，普通 + 蒙皮 + 透明普通 + 透明蒙皮 +
-    /// 粒子合计）。
+    /// 主几何提交的实例数（可见实例，普通 + 蒙皮 + 贴花 + 透明普通 +
+    /// 透明蒙皮 + 粒子合计）。
     pub instances: u32,
     /// 本帧实例缓冲实际 `write_buffer` 的字节数。0 = 与上一帧逐实例比对
-    /// 完全一致、整帧跳过实例上传（静态场景零上传）。粒子实例走独立
-    /// 缓冲、每帧全量上传，**不计入**本字段（见 `particles_drawn`）。
+    /// 完全一致、整帧跳过实例上传（静态场景零上传）。粒子与贴花实例走
+    /// 独立缓冲、每帧全量上传，**不计入**本字段（见 `particles_drawn`）。
     pub instance_upload_bytes: u64,
-    /// 本帧被视锥剔除的实例数（普通 + 蒙皮 + 透明合计）。`Visibility::HIDDEN`
-    /// 的过滤不算剔除（不进入 `instances` 也不进入本字段）。**粒子不进本
-    /// 口径**：剔除按发射器包围球整批裁决，被剔的发射器既不进 `instances`
-    /// 也不进本字段（口径为几何实例，避免混淆，见 ARCHITECTURE §4.17）。
+    /// 本帧被视锥剔除的实例数（普通 + 蒙皮 + 透明 + 贴花合计）。
+    /// `Visibility::HIDDEN` 的过滤不算剔除（不进入 `instances` 也不进入本
+    /// 字段）。**粒子不进本口径**：剔除按发射器包围球整批裁决，被剔的
+    /// 发射器既不进 `instances` 也不进本字段（口径为几何实例，避免混淆，
+    /// 见 ARCHITECTURE §4.17）。
     pub culled_instances: u32,
     /// 主几何实际提交的三角形总数：可见项的网格索引数 / 3 累加（普通批
-    /// × 批实例数，蒙皮逐项；透明同口径计入；粒子每粒 2 三角形）。
-    /// **主几何口径**——不含 UI pass 与阴影 pass（阴影 pass 只复用不透明
-    /// 实例区间，透明项与粒子不投影）。
+    /// × 批实例数，蒙皮逐项，贴花每实例 4 三角形 = ±Z 两端盖；透明同口径
+    /// 计入；粒子每粒 2 三角形）。**主几何口径**——不含 UI pass 与阴影
+    /// pass（阴影 pass 只复用不透明实例区间，贴花 / 透明项与粒子不投影）。
     pub triangles_drawn: u32,
     /// 本帧粒子 pass 提交的粒子实例数（发射器包围球剔除后；已并入
     /// `instances` / `triangles_drawn`，其 draw call 已并入 `draw_calls`）。
@@ -995,6 +1030,66 @@ fn collect_particles(
     total
 }
 
+/// 收集全部 [`Decal`] 贴花实例（`draw` 的贴花 pass 数据准备）。
+///
+/// - **Visibility 过滤与层级级联**：与普通 / 蒙皮 / 透明 / 粒子收集同
+///   语义（组件缺席 = 可见；自身 `HIDDEN` 或任一祖先 `HIDDEN` 跳过，见
+///   `hidden_by_ancestor`）。
+/// - **视锥剔除按变换后 AABB**（R22 同款保守界）：单位盒 8 角点经世界盒
+///   矩阵变换后取包围盒与视锥 `intersects_aabb`——薄盒旋转后包围球半径
+///   （对角线 / 2）远大于实际覆盖，AABB 界明显更贴合。被剔实例不计入
+///   `instances`、计入 `culled_instances`（与其他几何同口径）。
+/// - **世界盒矩阵** = 实体全局矩阵 × `size` 缩放（size 在实体局部轴上，
+///   跟随层级缩放语义）；`inv_model` 由 CPU 求逆传入（着色器零求逆）。
+///   size 任一分量 ≤ 0 时矩阵不可逆（NaN），debug 断言拦截。
+///
+/// 返回被视锥剔除的实例数；收集次序即查询顺序，分批排序由调用方完成
+/// （按纹理句柄排序，同批内实体 bits 并列序——见 `decal.rs` 分批策略）。
+fn collect_decals(
+    world: &iris_core::world::World,
+    frustum: &Frustum,
+    out: &mut Vec<DecalItem>,
+) -> u32 {
+    out.clear();
+    let mut culled = 0u32;
+    world.query::<(Entity, &GlobalTransform, &Decal, Option<&Visibility>)>(
+        |(e, gt, decal, visibility)| {
+            // 自身 HIDDEN 跳过 + 祖先链级联（与其他收集路径同语义）
+            if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
+                return;
+            }
+            debug_assert!(
+                decal.size.x > 0.0 && decal.size.y > 0.0 && decal.size.z > 0.0,
+                "贴花 size 三轴必须为正（零/负分量使盒矩阵不可逆，inv_model 将为 NaN）"
+            );
+            let model = gt.matrix() * Mat4::from_scale(decal.size);
+            // 单位盒 8 角点 → 世界 AABB → 视锥相交测试（保守界：只多画不漏画）
+            let mut min = Vec3::splat(f32::INFINITY);
+            let mut max = Vec3::splat(f32::NEG_INFINITY);
+            for corner in 0..8u32 {
+                let local = Vec3::new(
+                    if corner & 1 != 0 { 0.5 } else { -0.5 },
+                    if corner & 2 != 0 { 0.5 } else { -0.5 },
+                    if corner & 4 != 0 { 0.5 } else { -0.5 },
+                );
+                let world = model.transform_point3(local);
+                min = min.min(world);
+                max = max.max(world);
+            }
+            if !frustum.intersects_aabb(min, max) {
+                culled += 1;
+                return;
+            }
+            out.push(DecalItem {
+                texture: decal.texture.0,
+                entity: e.to_bits(),
+                instance: DecalInstanceRaw::from_model(model, decal.tint),
+            });
+        },
+    );
+    culled
+}
+
 impl Renderer {
     pub fn new(gpu: Arc<Gpu>, color_format: wgpu::TextureFormat) -> Self {
         let bundle = create_pipeline(&gpu, color_format, SAMPLE_COUNT);
@@ -1305,6 +1400,22 @@ impl Renderer {
                 resource: particle_camera_buf.as_entire_binding(),
             }],
         });
+        // 贴花代理几何（单位盒 ±Z 端盖）：静态小缓冲，初始化时一次性上传，
+        // 全部贴花实例共享（实例数据在 decal_instance_buf 逐帧携带）
+        let decal_vertex_buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.decal.proxy_vertices"),
+                contents: bytemuck::cast_slice(&PROXY_POSITIONS),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let decal_index_buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.decal.proxy_indices"),
+                contents: bytemuck::cast_slice(&PROXY_INDICES),
+                usage: wgpu::BufferUsages::INDEX,
+            });
         Self {
             gpu,
             bundle,
@@ -1345,6 +1456,13 @@ impl Renderer {
             particle_capacity: 0,
             particle_camera_buf,
             particle_camera_bg,
+            decal_vertex_buf,
+            decal_index_buf,
+            decal_instance_buf: None,
+            decal_capacity: 0,
+            decal_bind_groups: HashMap::new(),
+            decal_scratch: Vec::new(),
+            decal_instance_scratch: Vec::new(),
             scratch: Vec::new(),
             instance_scratch: Vec::new(),
             skinned_scratch: Vec::new(),
@@ -1526,9 +1644,11 @@ impl Renderer {
         self.stats
     }
 
-    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），透明 pass 与
-    /// 粒子 pass 依次叠加（粒子位于透明之后、泛光之前——粒子叠加在玻璃
-    /// 等透明结果之上，且高亮 additive 粒子参与泛光），随后 ACES 色调映射
+    /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），贴花 pass、
+    /// 透明 pass 与粒子 pass 依次叠加——贴花位于蒙皮之后、透明之前（不
+    /// 透明表面的装饰，玻璃等透明物盖在其混合结果上，见 `decal.rs`），
+    /// 粒子位于透明之后、泛光之前（粒子叠加在玻璃等透明结果之上，且
+    /// 高亮 additive 粒子参与泛光），随后 ACES 色调映射
     /// blit 到 `color_view`（通常为 sRGB 目标）；最后如有 UI 组件
     /// （`UiRect` / `UiText` / `UiColor`），在同一 `color_view` 上
     /// 以 `LoadOp::Load` 叠加 HUD pass——**位于 blit 之后**，因此 HUD
@@ -1773,11 +1893,19 @@ impl Renderer {
         particle_alpha.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let particle_additive_len = particle_instances.len();
         particle_instances.extend(particle_alpha.iter().map(|(_, _, inst)| *inst));
+        // 2d. 贴花收集（R39）：Visibility 过滤 + 祖先级联 + 变换后 AABB
+        //     视锥剔除，随后按纹理句柄排序分批（同纹理连续区间 = 1 draw；
+        //     批内实体 bits 并列序——确定性，与收集顺序无关）。无贴花时
+        //     整个 pass 跳过（零开销默认路径）。
+        let mut decal_items = std::mem::take(&mut self.decal_scratch);
+        let decal_culled = collect_decals(world, &frustum, &mut decal_items);
+        decal_items.sort_by(|a, b| a.texture.cmp(&b.texture).then(a.entity.cmp(&b.entity)));
+        let decal_total = decal_items.len();
         let total = items.len();
         let skinned_total = skinned.len();
         let transparent_total = transparent.len();
         let instance_total = total + skinned_total + transparent_total + transparent_skinned.len();
-        self.stats.culled_instances = counts.culled;
+        self.stats.culled_instances = counts.culled + decal_culled;
         if counts.culled > 0 {
             log::trace!(
                 "视锥剔除 {} / {} 实例（普通 + 蒙皮，含透明）",
@@ -1935,9 +2063,60 @@ impl Renderer {
                 MaterialHandle(item.key as u32),
             );
         }
+        // 4d. 贴花资源（R39）：纹理懒上传 + 组 1 绑定组按纹理缓存构建 +
+        //     实例缓冲容量复用与全量上传。放在 HDR 目标借用（hdr）建立
+        //     之前：容量不足的缓冲重建需要 &mut self，会与贯穿后续全部
+        //     pass 的 hdr 借用冲突（同粒子 4c 的理由）。贴花实例少且常
+        //     静止，但静态场景同批也无从比对（独立缓冲、144B/实例），v1
+        //     每帧全量上传——增量比对留待实测出现热点再做。
+        for item in &decal_items {
+            let handle = crate::texture::TextureHandle(item.texture);
+            self.ensure_texture(texture_store.as_deref(), handle);
+            if !self.decal_bind_groups.contains_key(&item.texture) {
+                // 句柄不存在时 ensure_texture 只告警不上传——回退 0 号
+                // 内置白色兜底纹理的绑定（与材质缺纹理告警同哲学）
+                let texture = self
+                    .texture_gpu
+                    .get(&item.texture)
+                    .unwrap_or_else(|| &self.texture_gpu[&0]);
+                let bind_group = self
+                    .gpu
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("iris.decal.bg"),
+                        layout: &self.bundle.decal_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&texture.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                            },
+                        ],
+                    });
+                self.decal_bind_groups.insert(item.texture, bind_group);
+            }
+        }
+        if decal_total > 0 {
+            self.ensure_decal_capacity(decal_total);
+            let mut decal_raws = std::mem::take(&mut self.decal_instance_scratch);
+            decal_raws.clear();
+            decal_raws.extend(decal_items.iter().map(|item| item.instance));
+            let decal_buf = self
+                .decal_instance_buf
+                .as_ref()
+                .expect("贴花实例缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(decal_buf, 0, bytemuck::cast_slice(&decal_raws));
+            self.decal_instance_scratch = decal_raws;
+        }
 
         // 5. 编码渲染通道：先阴影 pass（光源视角，深度写入颜色附件；
-        //     只画不透明实例区间——透明项不投影），后主 pass 与透明 pass
+        //     只画不透明实例区间——透明项不投影），后主 pass、贴花 pass
+        //     （蒙皮之后、透明之前，见下）与透明 pass
         let mut encoder = self
             .gpu
             .device
@@ -2268,8 +2447,78 @@ impl Renderer {
                 }
             }
         }
-        // 透明 pass：主 pass（天空 + 不透明 + 蒙皮）之后、泛光 / 后处理之前，
-        // 写同一 HDR MSAA 颜色目标——LoadOp::Load 载入主 pass 结果继续混合，
+        // 贴花 pass（R39）：主 pass（天空 + 不透明 + 蒙皮）之后、透明 pass
+        // 之前——贴花是**不透明表面的装饰**，属于场景「实体」的一部分；
+        // 玻璃等透明物应盖在贴花的**混合结果**之上（透过玻璃看到的墙面
+        // 弹孔带玻璃色），「后画者在上」由 pass 顺序统一裁决（与 R23 透明、
+        // R24 粒子同构；透明 / 粒子在贴花之后依次叠加）。
+        // - 颜色：同一 HDR MSAA 目标 LoadOp::Load 继续混合，pass 结束再
+        //   resolve（= 主 pass 结果 + 贴花混合，透明 pass 将在此基础上继续）。
+        // - 深度附件 Load + **Store**（非透明 / 粒子 pass 的 Discard）：贴花
+        //   管线深度只测不写、本 pass 不改深度，但其后的透明 pass 仍要 Load
+        //   同一深度附件做遮挡测试——Discard 会把附件内容置为未定义（R23
+        //   的 DX12 教训），Store 未变更内容是严格定义的零成本透传。
+        // - 管线：alpha 混合 + LessEqual 只测不写（端盖与被贴表面共面，
+        //   见 pipeline.rs 贴花管线注释）。
+        // - 按纹理分批：排序后同纹理实例区间连续，每批 1 draw（组 1 切纹理
+        //   绑定组）。无贴花实例时整个 pass 跳过（零开销）。
+        if decal_total > 0 {
+            let decal_buf = self
+                .decal_instance_buf
+                .as_ref()
+                .expect("贴花实例缓冲已就绪");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.decal"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &hdr.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&hdr.resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.bundle.decal_pipeline);
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_vertex_buffer(0, self.decal_vertex_buf.slice(..));
+            pass.set_index_buffer(self.decal_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(1, decal_buf.slice(..));
+            let mut d = 0usize;
+            while d < decal_total {
+                let texture = decal_items[d].texture;
+                let mut count = 1;
+                while d + count < decal_total && decal_items[d + count].texture == texture {
+                    count += 1;
+                }
+                let bind_group = self
+                    .decal_bind_groups
+                    .get(&texture)
+                    .expect("贴花纹理绑定组应在 4d 阶段构建");
+                pass.set_bind_group(1, bind_group, &[]);
+                pass.draw_indexed(0..PROXY_INDEX_COUNT as u32, 0, d as u32..(d + count) as u32);
+                draw_calls += 1;
+                instances += count as u32;
+                // 每实例 4 三角形（±Z 两块端盖）
+                triangles_drawn += 4 * count as u32;
+                d += count;
+            }
+        }
+        // 透明 pass：主 pass（天空 + 不透明 + 蒙皮）与贴花 pass 之后、
+        // 泛光 / 后处理之前，
+        // 写同一 HDR MSAA 颜色目标——LoadOp::Load 载入主 pass（含贴花
+        // 混合）结果继续混合，
         // pass 结束的 resolve 与主 pass 同一目标（MSAA 内容保留完整，再次
         // resolve 的结果 = 主 pass 结果 + 透明混合）。深度附件同样 Load：
         // 保留不透明几何的深度做遮挡测试（透明被墙挡住仍不可见），
@@ -2633,6 +2882,7 @@ impl Renderer {
         self.skinned_scratch = skinned;
         self.transparent_scratch = transparent;
         self.transparent_skinned_scratch = transparent_skinned;
+        self.decal_scratch = decal_items;
         self.particle_scratch = particle_instances;
         self.particle_alpha_scratch = particle_alpha;
     }
@@ -2687,6 +2937,23 @@ impl Renderer {
         }));
         self.particle_capacity = capacity;
         log::debug!("粒子实例缓冲扩容至 {capacity} 实例");
+    }
+
+    /// 贴花实例缓冲容量复用（同款模式）：容量足够则零开销，不足时按
+    /// 2 倍扩容整体重建。贴花每帧全量上传，重建后无须特殊处理。
+    fn ensure_decal_capacity(&mut self, needed: usize) {
+        if self.decal_capacity >= needed {
+            return;
+        }
+        let capacity = (needed * 2).max(256);
+        self.decal_instance_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.decals"),
+            size: (capacity * std::mem::size_of::<DecalInstanceRaw>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.decal_capacity = capacity;
+        log::debug!("贴花实例缓冲扩容至 {capacity} 实例");
     }
 
     fn ensure_mesh(&mut self, store: &MeshStore, handle: MeshHandle) {

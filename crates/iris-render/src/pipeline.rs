@@ -54,6 +54,11 @@ pub(crate) struct PipelineBundle {
     /// 粒子 alpha 管线（标准 alpha 混合 + 深度只测不写，与透明管线参数
     /// 一致；实例按视深降序绘制）。
     pub particle_alpha_pipeline: wgpu::RenderPipeline,
+    /// 贴花管线（R39）：盒投影代理几何（单位盒 ±Z 端盖）× 逐实例世界盒
+    /// 矩阵 + 逆矩阵 + tint（144B）。alpha 混合 + 深度 LessEqual 只测不写
+    /// （端盖与被贴表面共面，等深必须通过；不污染后续 pass 读取的深度），
+    /// 位于蒙皮之后、透明之前（绘制序理由见 decal.rs 模块文档）。
+    pub decal_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
     /// 级联阴影 pass 的每级联精简布局：binding 0 = 64B 级联视图投影矩阵
     /// uniform（顶点算裁剪位置；一缓冲一级联，同 pass 内不读写阴影贴图）。
@@ -75,6 +80,9 @@ pub(crate) struct PipelineBundle {
     /// 粒子相机布局：binding 0 = billboard 基向量小 uniform
     ///（相机 right / up，视图矩阵第 0 / 1 行，每帧 write_buffer）。
     pub particle_layout: wgpu::BindGroupLayout,
+    /// 贴花纹理布局：binding 0 = 贴花纹理、1 = 采样器（组 1 按纹理分批
+    /// 绑定；tint 在实例数据里逐实例携带，不占绑定组）。
+    pub decal_layout: wgpu::BindGroupLayout,
 }
 
 pub(crate) fn create_pipeline(
@@ -989,6 +997,89 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
     );
 
+    // 贴花（R39）：盒投影代理几何（单位盒 ±Z 端盖，位置顶点）× 逐实例
+    // 世界盒矩阵 + 逆矩阵 + tint（144B，DecalInstanceRaw::LAYOUT location
+    // 1..=9）。组 0 复用全局布局（着色器只声明 view_proj，精简 Globals，
+    // skybox.wgsl 同款做法）；组 1 = 贴花纹理 + 采样器（按纹理分批绑定）。
+    // alpha 混合（src α, 1 − src α）；深度 **LessEqual** 只测不写——端盖
+    // 与被贴表面共面（推荐摆放见 decal.rs），等深必须通过（Less 浮点抖动
+    // 会闪烁），不写则透明 / 粒子照常按不透明深度裁决；cull Back + CCW
+    // （端盖正面朝盒外，相机在哪侧只见哪侧端盖）。
+    let decal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.decal"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/decal.wgsl").into()),
+    });
+    let decal_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.decal"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let decal_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.decal.pipeline.layout"),
+        bind_group_layouts: &[Some(&globals_layout), Some(&decal_layout)],
+        immediate_size: 0,
+    });
+    let decal_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.decal"),
+        layout: Some(&decal_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &decal_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(crate::decal::PROXY_VERTEX_LAYOUT),
+                Some(crate::decal::DecalInstanceRaw::LAYOUT),
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &decal_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            // 写线性 HDR 中间缓冲（与主 / 透明 pass 同目标，泛光与色调
+            // 映射照常作用于贴花）
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
     PipelineBundle {
         pipeline,
         skinned_pipeline,
@@ -1006,6 +1097,7 @@ pub(crate) fn create_pipeline(
         ui_pipeline,
         particle_additive_pipeline,
         particle_alpha_pipeline,
+        decal_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,
@@ -1015,5 +1107,6 @@ pub(crate) fn create_pipeline(
         post_layout,
         ui_layout,
         particle_layout,
+        decal_layout,
     }
 }
