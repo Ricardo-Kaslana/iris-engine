@@ -1,0 +1,5 @@
+# 仓库级构建配置：sccache 编译缓存（见 ARCHITECTURE §7.2）。
+# 前提：sccache 在 PATH（`cargo install sccache`，一次即可）——
+# 未安装时任何 cargo 命令都会失败，新机器需先装。
+[build]
+rustc-wrapper = "sccache"

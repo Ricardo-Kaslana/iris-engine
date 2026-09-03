@@ -1651,6 +1651,31 @@ release 构建，2026-09-03；**仅供量级参考**——CI 虚拟机数字不�
 互补。debug 构建自动跳过（数值无参照意义）。四个代表：ECS 遍历
 （300 µs）、物理步进（25 ms）、帧收集（1.5 ms）、混音块（500 µs）。
 
+### 7.2 构建与门禁约定（2026-09 工程化）
+
+**门禁命令序**（子智能体收尾与独立验收共用；顺序有讲究）：
+
+```sh
+cargo fmt --all --check
+cargo build --release --workspace --all-targets   # 一次编译全部产物（含 examples/benches/tests）
+cargo test  --workspace           --quiet          # debug 测试（编译全命中缓存，纯运行）
+cargo test  --workspace --release --quiet          # release 测试 + 预算断言（同上）
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
+```
+
+要点：`build --all-targets` 必须在两个 `test` **之前**——`cargo test`
+不构建 examples/benches（20+ 个），分开跑会让 release 编译两轮；先
+build 后 test 则 test 的全部编译单元命中缓存，只剩纯运行时间。clippy
+放最后（自有 check-profile 缓存，与前后互不干扰）。
+
+**sccache 编译缓存**（`.cargo/config.toml` 的 `rustc-wrapper`，仓库级
+自动生效）：新机器先 `cargo install sccache`（否则一切 cargo 命令失败，
+见 config 注释）。诚实预期：**workspace 内部源码变更的重编无法避免**
+（源码变 → 哈希变 → 必重编），sccache 的收益在依赖树——`cargo clean`、
+target 目录丢失、profile 切换时依赖工件直接命中缓存；构建脚本与
+proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
+
 ## 8. 已知限制（诚实清单）
 
 1. **并行调度为批次粒度**：无驻留线程池，每帧按批创建线程（批内系统少时
