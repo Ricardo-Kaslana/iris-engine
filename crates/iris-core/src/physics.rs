@@ -34,7 +34,8 @@
 //!    仅当朝向穿透，e 取双方最大）；切向分量乘 `max(0, 1 - friction)`
 //!    （friction 取参与响应的动体的均值）；
 //! 5. **松弛**：位置分离重复求解 [`SOLVER_ITERATIONS`] 次（速度响应只在
-//!    首轮施加），减弱堆叠抖动；
+//!    首轮施加），减弱堆叠抖动；每轮接触之后追加**约束求解轮**（距离 /
+//!    目标点关节，见「约束与关节」章节）；
 //! 6. **写回**：动体的 `Transform.position` / `RigidBody.velocity`
 //!    （静态体不写；两阶段处理保证迭代期间不持任何组件借用）。
 //!
@@ -134,6 +135,81 @@
 //! ));
 //! ```
 //!
+//! # 约束与关节（v1 位置约束集）
+//!
+//! 机关门 / 吊灯 / 弹簧板的地基（R36）。v1 物理是**纯位置物理**
+//! （[`RigidBody`] 只有线速度，无角速度 / 旋转积分），语义完整的旋转
+//! 铰链（限制转轴的 hinge 等）在此模型下无法诚实实现——**旋转约束需
+//! 角速度支持，见路线图**（R37 的 ragdoll 关节同属此类，本轮不做）。
+//! v1 只做位置物理下语义清晰的两个关节组件、三种约束行为：
+//!
+//! - [`DistanceJoint`]：距离约束——`stiffness = 1` 硬约束（双向刚杆）、
+//!   `(0, 1)` 弹簧（部分修正投影）+ 轴向相对速度 `damping`；
+//! - [`TargetJoint`]：目标点约束——把实体拉向世界固定点，`rest_distance`
+//!   给出「停在距目标多近」的到达半径（0 = 精确到达）。
+//!
+//! ## 求解在管线中的位置
+//!
+//! [`step_physics`] 的松弛大循环（[`SOLVER_ITERATIONS`] 轮）内，每轮
+//! **先接触后约束**：全部接触对求解完毕后追加一轮约束求解。顺序理由：
+//! **约束优先级高于接触**——机关门被挤进墙体时，先把门投影回关节语义
+//! 位置（结构完整性），再让下一轮接触分离穿透（外观修正）；反过来会
+//! 让接触推离持续对抗约束、结构撕裂。位置修正即时生效（Gauss-Seidel
+//! 风格，与接触分离同款）；**速度响应只在首轮**施加（与接触速度响应
+//! 同轮同理由——重复结算会放大阻尼）。修正后的 `positions` 快照照常
+//! 走既有写回阶段——约束**零额外写回代码**。
+//!
+//! - **距离约束**：当前距离 d 与 `rest_length` 偏差 `err = d − rest`，
+//!   沿连线按动体数均分修正（静态端 share = 0 不动）；弹簧
+//!   `stiffness < 1` 即部分修正——**迭代性质**：每轮部分修正 ×
+//!   [`SOLVER_ITERATIONS`] 轮 × 多帧 ≈ 收敛到平衡，非一步到位；
+//! - **目标点约束**：单端向 target 修正，进入 `rest_distance` 半径即
+//!   不修（到达语义）；速度响应把「沿目标轴」分量按 `1 − stiffness`
+//!   缩放、切向分量按 `1 − damping` 缩放——到达时速度归零的临界阻尼
+//!   **近似**（精确临界解需要力模型与质量，v1 用速度缩放代替，诚实
+//!   声明，见 [`solve_target_joint`]）；
+//! - **确定性**：约束收集序 = 组件存储序（query 遍历序）、两端位置取自
+//!   同一 `positions` 快照、求解顺序固定（先收集的先解、距离后目标点）、
+//!   无随机源——既有逐位确定性测试不受影响，关节场景同样 bit 级可复现
+//!   （单测守护）。
+//!
+//! ## 诚实边界（v1 约束）
+//!
+//! - **无能量守恒**：位置松弛投影不是力积分——弹簧不存储势能、无共振
+//!   频率，「弹性」是每轮部分修正的视觉弹跳语义；需要精确能量行为的
+//!   场景请由游戏逻辑自管；
+//! - **双向刚杆**：距离约束靠近与远离都修正（非「只拉不推」的绳）；
+//! - **挂载体须为碰撞体动体**：关节挂在无 [`Collider`] 或静态的实体上
+//!   被跳过（静态体不写回，约束无从生效）；`target` 端可以是静态体、
+//!   动态体或**无碰撞体的锚点实体**（只有 [`Transform`](crate::transform::Transform)
+//!   也行——关节不要求碰撞）；此类锚点按本帧 Transform 快照视为固定
+//!   点，若锚点本身是仅 [`RigidBody`] 的飞行体，关节视角下等效固定于
+//!   帧初位置；
+//! - **退化 / 无效跳过**：两端重合（约束轴不定）、`target` 实体 despawn
+//!   / 从未存在 → 约束跳过不 panic——与实体世代语义一致（不做悬垂
+//!   panic）。
+//!
+//! 吊灯用例（静态锚点 + 动态球 + 硬距离关节，悬挂验证场景）：
+//!
+//! ```ignore
+//! use iris_core::prelude::*;
+//!
+//! // 锚点：只有 Transform 也行（关节不要求碰撞）
+//! let anchor = world.spawn((Transform::from_xyz(0.0, 6.0, 0.0),));
+//! // 吊灯球：被 rest = 2 的硬距离关节拉住，悬在锚点下方 2 m 处稳定
+//! world.spawn((
+//!     Transform::from_xyz(0.0, 5.0, 0.0),
+//!     Collider::dynamic_sphere(0.3, 0.0),
+//!     RigidBody { linear_damping: 0.2, ..RigidBody::default() },
+//!     DistanceJoint {
+//!         target: anchor,
+//!         rest_length: 2.0,
+//!         stiffness: 1.0, // 硬约束；改 0.1 即弹簧（吊灯摇晃缓冲）
+//!         damping: 0.5,   // 轴向阻尼：抑制持续弹跳
+//!     },
+//! ));
+//! ```
+//!
 //! # v1 限制（诚实清单）
 //!
 //! - **AABB 不随实体旋转**：[`ColliderShape::Box`] 是世界轴对齐包围盒，
@@ -146,6 +222,9 @@
 //!   坐标读写——与变换层级并用时请自行保证物理体没有父级（或父级变换恒等）；
 //! - **非迭代完整求解器**：等质量冲量 + 2 次位置松弛，重堆叠场景松弛不
 //!   彻底（残余穿透 / 缓慢滑移），不是完整 LCP 求解器；
+//! - **约束 v1 是位置松弛投影**：无能量守恒（弹簧无势能 / 共振）、双向
+//!   刚杆语义、旋转约束（铰链 / ragdoll）需角速度支持、见路线图——完整
+//!   清单见「约束与关节」章节的诚实边界；
 //! - **粗检测为 AABB 网格快照**：均匀网格按「积分后、求解前」的 AABB
 //!   一次构建，求解期位置修正（穿透量级）不重建——常规场景修正量远小于
 //!   cell 尺寸、候选为保守超集；极端穿透（接近 cell 尺寸）理论上可能漏对。
@@ -360,6 +439,62 @@ impl Default for RigidBody {
     }
 }
 
+/// 距离关节：把挂载实体与 `target` 实体的**间距**约束到 `rest_length`
+/// （v1 位置约束集，语义规范 = 模块文档「约束与关节」章节）。
+///
+/// - `stiffness ∈ (0, 1]`：`1` 为**硬约束**（每轮松弛把间距全额投影回
+///   `rest_length`——双向「刚杆」语义，靠近与远离都修正，非只拉不推的
+///   绳）；`(0, 1)` 为**弹簧**（按比例部分修正——位置物理的弹簧是**松弛
+///   投影**而非力积分：无能量守恒、无共振频率，是「视觉弹跳」语义的
+///   诚实近似；每轮部分修正 × [`SOLVER_ITERATIONS`] 轮 × 多帧 ≈ 指数
+///   收敛到 `rest_length`）。越界值在求解时钳制到 [0, 1]；
+/// - `damping ∈ [0, 1)`：轴向**相对**速度的每帧衰减（`v_rel_axis ×=
+///   (1 − damping)`，按动体数均分写回——阻尼器语义，抑制弹簧的持续
+///   弹跳；只在求解首轮施加，与接触速度响应同轮同理由）。
+///
+/// **无效目标**：`target` 实体已 despawn / 从未存在 / 无
+/// [`Transform`](crate::transform::Transform) → 本帧约束整体跳过（不
+/// panic、不悬垂——与实体世代语义一致）。**挂载体**须为参与物理的动体
+/// （有 [`Collider`] 且非静态），否则组件同样被跳过。
+#[derive(Clone, Copy, Debug, PartialEq, Component)]
+pub struct DistanceJoint {
+    /// 另一端实体；无效实体 = 约束跳过（见类型文档）。
+    pub target: Entity,
+    /// 两端保持的距离（米）。
+    pub rest_length: f32,
+    /// 松弛强度 `(0, 1]`：1 = 硬约束（全额投影），`(0, 1)` = 弹簧。
+    pub stiffness: f32,
+    /// 轴向相对速度每帧衰减 `[0, 1)`。
+    pub damping: f32,
+}
+
+/// 目标点关节：把挂载实体拉向**世界固定点**（机关门开合 / 移动平台的
+/// 物理形态；v1 位置约束集，语义规范 = 模块文档「约束与关节」章节）。
+///
+/// - `rest_distance`：停在距目标多近（**到达语义**——实体进入该半径后
+///   不再修正，停在球壳上；`0` = 精确到达目标点）；
+/// - `stiffness ∈ (0, 1]`：每轮松弛向目标的部分修正比例（1 = 全额
+///   投影到球壳），越界值钳制到 [0, 1]；
+/// - `damping ∈ [0, 1)`：**切向**速度的每帧衰减（与 [`DistanceJoint`]
+///   的「轴向」阻尼正交互补——目标点约束的速度响应把「沿目标轴」分量
+///   按 `1 − stiffness` 缩放（临界阻尼的工程近似，见纯函数
+///   [`solve_target_joint`] 文档），切向分量按 `1 − damping` 衰减，
+///   两者合力把实体阻尼到静止在球壳上）。
+///
+/// 目标是世界坐标（非实体），无无效目标语义；挂载体限制同
+/// [`DistanceJoint`]（须为碰撞体动体，否则跳过）。
+#[derive(Clone, Copy, Debug, PartialEq, Component)]
+pub struct TargetJoint {
+    /// 世界固定点（米）。
+    pub target: Vec3,
+    /// 停在距目标多近（米）；`0` = 精确到达。
+    pub rest_distance: f32,
+    /// 松弛强度 `(0, 1]`。
+    pub stiffness: f32,
+    /// 切向速度每帧衰减 `[0, 1)`。
+    pub damping: f32,
+}
+
 /// 一次接触（纯数据）：法线 + 穿透深度。由 [`detect_pair`] 产出。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Contact {
@@ -459,8 +594,11 @@ impl BodyParams {
     }
 }
 
-/// 单个接触的求解输出：双方的位置修正与速度修正（叠加到各自当前值上；
-/// 静态方恒为零）。
+/// 单个接触 / 关节的求解输出：双方的位置修正与速度修正（叠加到各自
+/// 当前值上；静态方恒为零）。接触求解（[`solve_contact`]）与关节求解
+/// （[`solve_distance_joint`] / [`solve_target_joint`]）共用此四通道
+/// 形状——关节语境下 a = 挂载体、b = 目标端（[`TargetJoint`] 的 b 通道
+/// 恒为零；目标端为静态体 / 锚点时 b 通道亦为零）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContactResponse {
     pub delta_pos_a: Vec3,
@@ -618,6 +756,139 @@ pub fn solve_contact(contact: Contact, a: BodyParams, b: BodyParams) -> ContactR
         delta_pos_b,
         delta_vel_a,
         delta_vel_b,
+    }
+}
+
+/// 关节求解的目标端（`step_physics` 收集阶段的内部纯数据，脱离 ECS）：
+/// 碰撞体快照索引（静态或动态，位置随求解演进、速度参与阻尼）或无碰撞
+/// 体锚点（本帧 [`Transform`](crate::transform::Transform) 快照视为固定
+/// 点——关节不要求碰撞，吊灯锚点只有 Transform 也行；若锚点本身是仅
+/// [`RigidBody`] 的飞行体，关节视角下等效固定于帧初位置，见模块文档
+/// 诚实边界）。
+#[derive(Clone, Copy, Debug)]
+enum JointEnd {
+    Body(usize),
+    Anchor(Vec3),
+}
+
+/// 距离关节求解（纯函数）：位置投影 + 轴向相对速度阻尼，可脱离世界单测。
+///
+/// - **位置投影**：当前距离 `d` 与 `rest_length` 偏差 `err = d − rest`，
+///   沿连线（a → b 单位轴）修正 `axis·err·stiffness`，按动体数均分
+///   （双动各半、静态端 / 锚点 share = 0 不动、动端全吃）；stiffness
+///   钳制到 [0, 1]（弹簧 = 每轮部分修正，× 多轮 × 多帧 ≈ 收敛，见
+///   [`DistanceJoint`] 的迭代性质声明）；
+/// - **速度响应**（`apply_velocity` = 首轮才传 true，与接触速度响应
+///   同轮）：轴向**相对**速度（a 相对 b 沿轴分量）×`(1 − damping)`
+///   衰减到零（切向分量保留），修正量按动体数均分写回——阻尼器语义，
+///   双向耗散（靠近与远离的相对速度都衰减）；
+/// - **退化**：两端重合（约束轴不定）→ 全零响应（确定性跳过，无凭空
+///   选轴）；挂载体速度缺席（不应出现，收集阶段已过滤）按零处理。
+pub fn solve_distance_joint(
+    pos_a: Vec3,
+    vel_a: Option<Vec3>,
+    pos_b: Vec3,
+    vel_b: Option<Vec3>,
+    joint: DistanceJoint,
+    apply_velocity: bool,
+) -> ContactResponse {
+    let zero = ContactResponse {
+        delta_pos_a: Vec3::ZERO,
+        delta_pos_b: Vec3::ZERO,
+        delta_vel_a: Vec3::ZERO,
+        delta_vel_b: Vec3::ZERO,
+    };
+    let delta = pos_b - pos_a;
+    let dist_sq = delta.length_squared();
+    if dist_sq <= SEGMENT_EPSILON_SQ {
+        // 两端重合：约束轴退化，任意方向都需凭空选轴——跳过本轮（确定性）
+        return zero;
+    }
+    let dist = dist_sq.sqrt();
+    let axis = delta / dist;
+    let stiffness = joint.stiffness.clamp(0.0, 1.0);
+    let correction = axis * ((dist - joint.rest_length) * stiffness);
+    // 动体数均分（等质量近似，与 solve_contact 的分离同款规则）
+    let (share_a, share_b) = match (vel_a.is_some(), vel_b.is_some()) {
+        (true, true) => (0.5, 0.5),
+        (true, false) => (1.0, 0.0),
+        // a 静态不应出现（收集阶段已过滤），确定性兜底：修正全给 b 端
+        _ => (0.0, 1.0),
+    };
+    let delta_pos_a = correction * share_a;
+    let delta_pos_b = -correction * share_b;
+
+    let (delta_vel_a, delta_vel_b) = if apply_velocity {
+        let rel = vel_a.unwrap_or(Vec3::ZERO) - vel_b.unwrap_or(Vec3::ZERO);
+        let v_axial = rel.dot(axis);
+        let tangent = rel - axis * v_axial;
+        let damp = (1.0 - joint.damping).clamp(0.0, 1.0);
+        let delta_rel = axis * (v_axial * damp) + tangent - rel;
+        (delta_rel * share_a, -delta_rel * share_b)
+    } else {
+        (Vec3::ZERO, Vec3::ZERO)
+    };
+
+    ContactResponse {
+        delta_pos_a,
+        delta_pos_b,
+        delta_vel_a,
+        delta_vel_b,
+    }
+}
+
+/// 目标点关节求解（纯函数）：位置投影 + 朝目标的速度阻尼，可脱离世界单测。
+///
+/// - **位置投影**：进入 `rest_distance` 半径即不修（**到达语义**——停在
+///   球壳上），否则沿「实体 → 目标」轴修正 `err·stiffness`（单端修正，
+///   目标是世界固定点）；stiffness 钳制到 [0, 1]；
+/// - **速度响应**（`apply_velocity` = 首轮才传 true）：**近似**临界阻尼
+///   ——把实体速度分解为「沿目标轴」与「切向」两个分量：轴向分量 ×
+///   `(1 − stiffness)`（stiffness = 1 即每帧清零轴向速度，到达时速度
+///   归零的临界行为），切向分量 ×`(1 − damping)`（消解侧向漂移，把
+///   实体阻尼到静止在球壳上）。这是速度缩放的工程近似，**非**精确
+///   临界阻尼解（精确解需要力模型与质量，位置物理 v1 不具备）——诚实
+///   声明见模块文档；
+/// - **退化**：已在目标点上（轴不定）→ 全零响应（确定性跳过）。
+pub fn solve_target_joint(
+    pos: Vec3,
+    vel: Option<Vec3>,
+    joint: TargetJoint,
+    apply_velocity: bool,
+) -> ContactResponse {
+    let zero = ContactResponse {
+        delta_pos_a: Vec3::ZERO,
+        delta_pos_b: Vec3::ZERO,
+        delta_vel_a: Vec3::ZERO,
+        delta_vel_b: Vec3::ZERO,
+    };
+    let delta = joint.target - pos;
+    let dist_sq = delta.length_squared();
+    if dist_sq <= SEGMENT_EPSILON_SQ {
+        return zero; // 已在目标点上：轴退化，确定性跳过
+    }
+    let dist = dist_sq.sqrt();
+    let axis = delta / dist;
+    let stiffness = joint.stiffness.clamp(0.0, 1.0);
+    let err = (dist - joint.rest_distance).max(0.0);
+    let delta_pos_a = axis * (err * stiffness);
+
+    let delta_vel_a = if apply_velocity {
+        let v = vel.unwrap_or(Vec3::ZERO);
+        let axial = v.dot(axis);
+        let tangent = v - axis * axial;
+        let axial_scale = (1.0 - joint.stiffness).clamp(0.0, 1.0);
+        let tangent_scale = (1.0 - joint.damping).clamp(0.0, 1.0);
+        axis * (axial * axial_scale) + tangent * tangent_scale - v
+    } else {
+        Vec3::ZERO
+    };
+
+    ContactResponse {
+        delta_pos_a,
+        delta_pos_b: Vec3::ZERO,
+        delta_vel_a,
+        delta_vel_b: Vec3::ZERO,
     }
 }
 
@@ -941,6 +1212,49 @@ pub fn step_physics(world: &World) {
         .map(|(_, collider, _)| collider.is_sensor)
         .collect();
 
+    // ---- 约束收集（两阶段模式追加，见模块文档「约束与关节」章节）----
+    // 挂载体实体 → 碰撞体快照索引。HashMap 只做点查、从不迭代（求解序 =
+    // 下面 query 的组件存储收集序），确定性不受哈希序影响。
+    let mut body_index: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for (index, (entity, _, _)) in collected.iter().enumerate() {
+        body_index.insert(entity.to_bits(), index);
+    }
+
+    // 距离关节：挂载体须为碰撞体动体（无 Collider 或 is_static → 跳过，
+    // 静态体本就不写回）；目标端是碰撞体（静态 / 动态皆可，位置随求解
+    // 演进）或无碰撞体锚点（Transform 快照视为固定点）；目标无效
+    //（despawn / 从未存在 / 无 Transform）→ 约束跳过（世代语义一致，
+    // 不 panic）。收集序 = 组件存储序 = 求解序（确定性）。
+    let mut distance_joints: Vec<(usize, DistanceJoint, JointEnd)> = Vec::new();
+    world.query::<(Entity, &DistanceJoint)>(|(entity, joint)| {
+        let Some(&owner) = body_index.get(&entity.to_bits()) else {
+            return; // 挂载体不是碰撞体：v1 关节跳过（模块文档诚实边界）
+        };
+        if is_static[owner] {
+            return;
+        }
+        let end = match body_index.get(&joint.target.to_bits()) {
+            Some(&index) => JointEnd::Body(index),
+            // 目标不是碰撞体：仍存活且有 Transform → 固定锚点快照；
+            // 否则无效，整体跳过
+            None => match world.get::<Transform>(joint.target) {
+                Some(transform) => JointEnd::Anchor(transform.position),
+                None => return,
+            },
+        };
+        distance_joints.push((owner, *joint, end));
+    });
+
+    // 目标点关节：目标是世界坐标，无实体存在性语义；挂载体限制同上。
+    let mut target_joints: Vec<(usize, TargetJoint)> = Vec::new();
+    world.query::<(Entity, &TargetJoint)>(|(entity, joint)| {
+        if let Some(&owner) = body_index.get(&entity.to_bits()) {
+            if !is_static[owner] {
+                target_joints.push((owner, *joint));
+            }
+        }
+    });
+
     // 本帧接触对（首求解轮采样，差分产出事件用）：位序归一化对 →
     // (归一化方向法线, 穿透)。BTreeMap 字典序 = 事件产出顺序确定。
     let mut current_contacts: std::collections::BTreeMap<(u64, u64), (Vec3, f32)> =
@@ -1076,6 +1390,54 @@ pub fn step_physics(world: &World) {
                         *v += response.delta_vel_b;
                         params[j].velocity = Some(*v);
                     }
+                }
+            }
+        }
+
+        // ---- 约束轮（每轮接触求解之后追加，见模块文档「约束与关节」）----
+        // 顺序理由：约束优先级高于接触——先把实体投影回关节语义位置
+        //（结构完整性），再让下一轮接触分离穿透（外观修正）；反过来
+        // 会让接触推离持续对抗约束、结构撕裂。位置修正即时生效
+        //（Gauss-Seidel）；速度响应只在首轮（与接触速度响应同轮同
+        // 理由——重复结算会放大阻尼/反弹）。求解序 = 收集序（距离
+        // 关节先、目标点关节后），固定无随机。
+        for &(owner, joint, end) in &distance_joints {
+            let (pos_b, vel_b) = match end {
+                JointEnd::Body(index) => (positions[index], velocities[index]),
+                JointEnd::Anchor(pos) => (pos, None),
+            };
+            let response = solve_distance_joint(
+                positions[owner],
+                velocities[owner],
+                pos_b,
+                vel_b,
+                joint,
+                iteration == 0,
+            );
+            positions[owner] += response.delta_pos_a;
+            if let JointEnd::Body(index) = end {
+                positions[index] += response.delta_pos_b;
+            }
+            if iteration == 0 {
+                // 速度写回；params 快照无需同步——其速度只在首轮的接触
+                // 速度响应中被消费，且接触先于约束轮
+                if let Some(v) = velocities[owner].as_mut() {
+                    *v += response.delta_vel_a;
+                }
+                if let JointEnd::Body(index) = end {
+                    if let Some(v) = velocities[index].as_mut() {
+                        *v += response.delta_vel_b;
+                    }
+                }
+            }
+        }
+        for &(owner, joint) in &target_joints {
+            let response =
+                solve_target_joint(positions[owner], velocities[owner], joint, iteration == 0);
+            positions[owner] += response.delta_pos_a;
+            if iteration == 0 {
+                if let Some(v) = velocities[owner].as_mut() {
+                    *v += response.delta_vel_a;
                 }
             }
         }
@@ -3395,6 +3757,616 @@ mod tests {
         assert!(
             started.is_empty() && ended.is_empty(),
             "补注册不应收到积压差分（持续接触配对无变化）"
+        );
+    }
+
+    // ---- 约束与关节 v1：DistanceJoint / TargetJoint（见模块文档章节）----
+
+    /// 失重动体球（隔离重力，纯看约束语义；半径 0.5、无弹性无摩擦）。
+    fn spawn_weightless(world: &mut World, pos: Vec3, vel: Vec3) -> Entity {
+        world.spawn((
+            Transform::from_translation(pos),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                velocity: vel,
+                gravity_scale: 0.0,
+                ..RigidBody::default()
+            },
+        ))
+    }
+
+    /// 纯函数语义：距离关节的均分 / 静态端全吃 / 重合退化 / 轴向阻尼只动
+    /// 轴向分量；目标点关节的球壳投影 / 到达不修 / 轴向按 (1−stiffness)
+    /// 缩放、切向按 (1−damping) 缩放。
+    #[test]
+    fn joint_solver_pure_functions_semantics() {
+        // 双动体：err = 1 沿轴各修一半
+        let both = solve_distance_joint(
+            Vec3::ZERO,
+            Some(Vec3::ZERO),
+            Vec3::new(3.0, 0.0, 0.0),
+            Some(Vec3::ZERO),
+            DistanceJoint {
+                target: Entity::from_bits(u64::MAX),
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+            false,
+        );
+        assert_eq!(both.delta_pos_a, Vec3::new(0.5, 0.0, 0.0), "a 朝 b 修一半");
+        assert_eq!(both.delta_pos_b, Vec3::new(-0.5, 0.0, 0.0), "b 朝 a 修一半");
+
+        // 静态端（速度缺席）：share 0 不动，动端全吃（拉回 rest_length）
+        let anchored = solve_distance_joint(
+            Vec3::ZERO,
+            Some(Vec3::ZERO),
+            Vec3::new(3.0, 0.0, 0.0),
+            None,
+            DistanceJoint {
+                target: Entity::from_bits(u64::MAX),
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+            false,
+        );
+        assert_eq!(anchored.delta_pos_a, Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(anchored.delta_pos_b, Vec3::ZERO, "静态端不移动");
+
+        // 速度阻尼：只衰减轴向相对速度（均分写回），切向分量保留
+        let damped = solve_distance_joint(
+            Vec3::ZERO,
+            Some(Vec3::new(3.0, 4.0, 0.0)),
+            Vec3::new(3.0, 0.0, 0.0),
+            Some(Vec3::new(1.0, 4.0, 0.0)),
+            DistanceJoint {
+                target: Entity::from_bits(u64::MAX),
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.5,
+            },
+            true,
+        );
+        // rel = (2, 0, 0) 沿 +X 轴 → ×0.5 → Δv_a = (−0.5, 0, 0)，切向 4 已在
+        // rel 中抵消（两端同速），不应产生任何修正
+        assert_eq!(damped.delta_vel_a, Vec3::new(-0.5, 0.0, 0.0));
+        assert_eq!(damped.delta_vel_b, Vec3::new(0.5, 0.0, 0.0));
+
+        // apply_velocity = false：位置照常、速度零修正（松弛第 2 轮语义）
+        let pos_only = solve_distance_joint(
+            Vec3::ZERO,
+            Some(Vec3::new(3.0, 4.0, 0.0)),
+            Vec3::new(3.0, 0.0, 0.0),
+            None,
+            DistanceJoint {
+                target: Entity::from_bits(u64::MAX),
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.5,
+            },
+            false,
+        );
+        assert_eq!(pos_only.delta_vel_a, Vec3::ZERO);
+        assert_eq!(pos_only.delta_pos_a, Vec3::new(1.0, 0.0, 0.0));
+
+        // 两端重合：约束轴退化，确定性全零跳过
+        let degenerate = solve_distance_joint(
+            Vec3::ONE,
+            Some(Vec3::X),
+            Vec3::ONE,
+            Some(Vec3::ZERO),
+            DistanceJoint {
+                target: Entity::from_bits(u64::MAX),
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.5,
+            },
+            true,
+        );
+        assert_eq!(degenerate, zero_response());
+
+        // 目标点关节：投影到球壳（rest 0.5），b 通道恒零
+        let pulled = solve_target_joint(
+            Vec3::new(3.0, 0.0, 0.0),
+            Some(Vec3::new(-4.0, 2.0, 0.0)),
+            TargetJoint {
+                target: Vec3::ZERO,
+                rest_distance: 0.5,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+            true,
+        );
+        assert_eq!(pulled.delta_pos_a, Vec3::new(-2.5, 0.0, 0.0), "投影到球壳");
+        assert_eq!(pulled.delta_pos_b, Vec3::ZERO);
+        // 轴向（朝目标）分量 ×(1 − 1) = 0 清零，切向 (0, 2, 0) 保留
+        assert_eq!(pulled.delta_vel_a, Vec3::new(4.0, 0.0, 0.0));
+
+        // 已在球壳内：到达语义，不再修正
+        let arrived = solve_target_joint(
+            Vec3::new(0.3, 0.0, 0.0),
+            Some(Vec3::ZERO),
+            TargetJoint {
+                target: Vec3::ZERO,
+                rest_distance: 0.5,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+            true,
+        );
+        assert_eq!(arrived.delta_pos_a, Vec3::ZERO);
+
+        // 恰在目标点上：轴退化，全零
+        let at_target = solve_target_joint(
+            Vec3::ZERO,
+            Some(Vec3::X),
+            TargetJoint {
+                target: Vec3::ZERO,
+                rest_distance: 0.0,
+                stiffness: 1.0,
+                damping: 0.5,
+            },
+            true,
+        );
+        assert_eq!(at_target, zero_response());
+    }
+
+    /// 零响应便捷构造（纯函数测试用）。
+    fn zero_response() -> ContactResponse {
+        ContactResponse {
+            delta_pos_a: Vec3::ZERO,
+            delta_pos_b: Vec3::ZERO,
+            delta_vel_a: Vec3::ZERO,
+            delta_vel_b: Vec3::ZERO,
+        }
+    }
+
+    /// 硬距离约束（stiffness = 1）：拉开 3 m 的双动球对一帧内被拉回
+    /// rest = 2，两端各修正一半（中点保持不动），此后稳定。
+    #[test]
+    fn hard_distance_joint_pulls_pair_to_rest_length() {
+        let mut world = make_world();
+        let b = spawn_weightless(&mut world, Vec3::new(1.5, 20.0, 0.0), Vec3::ZERO);
+        let a = world.spawn((
+            Transform::from_translation(Vec3::new(-1.5, 20.0, 0.0)),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                gravity_scale: 0.0,
+                ..RigidBody::default()
+            },
+            DistanceJoint {
+                target: b,
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+        ));
+
+        step(&world, DT);
+        let pa = ball_position(&world, a);
+        let pb = ball_position(&world, b);
+        // 全程无速度（重力隔离、初速为零）：f32 运算 bit 级精确
+        assert_eq!(pa, Vec3::new(-1.0, 20.0, 0.0), "a 朝 b 全额修正一半");
+        assert_eq!(pb, Vec3::new(1.0, 20.0, 0.0), "b 朝 a 全额修正一半");
+        assert_eq!(
+            (pa + pb) * 0.5,
+            Vec3::new(0.0, 20.0, 0.0),
+            "等质量均分 ⇒ 质心中点不动"
+        );
+
+        for _ in 0..10 {
+            step(&world, DT);
+        }
+        assert!(
+            (pa.distance(ball_position(&world, a)) < 1e-6)
+                && (pb.distance(ball_position(&world, b)) < 1e-6),
+            "到达 rest 后应稳定不动"
+        );
+        assert!(
+            (ball_position(&world, a).distance(ball_position(&world, b)) - 2.0).abs() < 1e-3,
+            "数步后距离应收敛到 rest = 2"
+        );
+    }
+
+    /// 静态端距离约束：锚点（is_static 静态体）不动（bit 级），动球全额
+    /// 修正、悬在 rest 处。
+    #[test]
+    fn distance_joint_static_end_anchors_and_stays_bit_identical() {
+        let mut world = make_world();
+        let anchor_pos = Vec3::new(5.0, 5.0, 0.0);
+        let anchor = world.spawn((
+            Transform::from_translation(anchor_pos),
+            Collider::static_sphere(0.5),
+        ));
+        let ball = spawn_weightless(&mut world, Vec3::new(2.0, 5.0, 0.0), Vec3::ZERO);
+        world.insert(
+            ball,
+            DistanceJoint {
+                target: anchor,
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+        );
+
+        for _ in 0..5 {
+            step(&world, DT);
+        }
+        assert_eq!(
+            ball_position(&world, ball),
+            Vec3::new(3.0, 5.0, 0.0),
+            "静态端 share = 0，动球沿轴全额修正 1 m 到 rest 处"
+        );
+        assert_eq!(
+            ball_position(&world, anchor),
+            anchor_pos,
+            "静态锚点位置应 bit 级不变"
+        );
+        assert!(
+            (ball_position(&world, ball).distance(anchor_pos) - 2.0).abs() < 1e-6,
+            "球应悬在锚点 rest = 2 处"
+        );
+    }
+
+    /// 弹簧（stiffness = 0.1）：多帧渐进收敛到 rest（对比硬约束一帧到位）、
+    /// 过程单调无过冲（每轮部分修正 × 多轮 ≈ 收敛的迭代性质）。
+    #[test]
+    fn spring_stiffness_converges_monotonically_without_overshoot() {
+        let mut world = make_world();
+        let b = spawn_weightless(&mut world, Vec3::new(1.5, 20.0, 0.0), Vec3::ZERO);
+        let a = world.spawn((
+            Transform::from_translation(Vec3::new(-1.5, 20.0, 0.0)),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                gravity_scale: 0.0,
+                ..RigidBody::default()
+            },
+            DistanceJoint {
+                target: b,
+                rest_length: 2.0,
+                stiffness: 0.1,
+                damping: 0.0,
+            },
+        ));
+
+        let mut previous = 3.0f32; // 初始间距
+        for frame in 0..90 {
+            step(&world, DT);
+            let dist = ball_position(&world, a).distance(ball_position(&world, b));
+            assert!(
+                dist <= previous + 1e-6,
+                "弹簧修正应朝 rest 单调（帧 {frame}：{dist} > {previous}）"
+            );
+            assert!(
+                dist >= 2.0 - 1e-5,
+                "无过冲：间距不应越过 rest 往回弹（帧 {frame}：{dist}）"
+            );
+            if frame == 0 {
+                assert!(
+                    (2.5..2.9).contains(&dist),
+                    "弹簧第一帧只部分修正（≈ 0.81 收敛因子），应仍明显大于 rest，实际 {dist}"
+                );
+            }
+            previous = dist;
+        }
+        assert!(
+            (previous - 2.0).abs() < 1e-2,
+            "90 帧后应收敛到 rest 附近，实际间距 {previous}"
+        );
+    }
+
+    /// 距离关节 damping：拉开方向运动的球对的轴向相对速度逐帧精确减半
+    ///（×(1 − damping)，均分写回），单调衰减。
+    #[test]
+    fn joint_damping_decays_axial_relative_velocity() {
+        let mut world = make_world();
+        let b = spawn_weightless(
+            &mut world,
+            Vec3::new(1.5, 20.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+        );
+        let a = world.spawn((
+            Transform::from_translation(Vec3::new(-1.5, 20.0, 0.0)),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                velocity: Vec3::new(-1.0, 0.0, 0.0),
+                gravity_scale: 0.0,
+                ..RigidBody::default()
+            },
+            DistanceJoint {
+                target: b,
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.5,
+            },
+        ));
+
+        let mut previous = 2.0f32; // 初始轴向相对速度 |v_a − v_b| = 2
+        for frame in 0..20 {
+            step(&world, DT);
+            let rel = (ball_velocity(&world, a) - ball_velocity(&world, b)).x;
+            assert!(
+                rel < 0.0 && -rel <= previous + 1e-6,
+                "轴向相对速度应单调衰减（帧 {frame}）"
+            );
+            assert!(
+                (-rel - previous * 0.5).abs() < 1e-5,
+                "damping = 0.5 ⇒ 轴向相对速度每帧精确减半（帧 {frame}：{} vs {}）",
+                -rel,
+                previous * 0.5
+            );
+            previous = -rel;
+        }
+    }
+
+    /// 目标点关节：偏移球被拉到 rest_distance 球壳上、速度归零；球壳内
+    /// 到达语义不修正（位置 bit 级不动）；rest_distance = 0 精确到达。
+    #[test]
+    fn target_joint_pulls_to_shell_and_reaches_rest_distance() {
+        let mut world = make_world();
+        // 三个子情形各自独立的目标点（垂直间隔 60 m），避免球体互撞干扰
+        let target_a = Vec3::new(0.0, 20.0, 0.0);
+        // 偏移 3 m 且带背离初速：一帧内被拉回球壳、轴向速度清零
+        let seeker = spawn_weightless(
+            &mut world,
+            Vec3::new(3.0, 20.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        );
+        world.insert(
+            seeker,
+            TargetJoint {
+                target: target_a,
+                rest_distance: 0.5,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+        );
+        // 球壳内（0.3 < rest 0.5）：到达语义，应纹丝不动
+        let target_b = Vec3::new(0.0, 80.0, 0.0);
+        let insider = spawn_weightless(&mut world, Vec3::new(0.3, 80.0, 0.0), Vec3::ZERO);
+        world.insert(
+            insider,
+            TargetJoint {
+                target: target_b,
+                rest_distance: 0.5,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+        );
+        // rest_distance = 0：精确到达目标点
+        let target_c = Vec3::new(0.0, 140.0, 0.0);
+        let exact = spawn_weightless(&mut world, Vec3::new(3.0, 140.0, 0.0), Vec3::ZERO);
+        world.insert(
+            exact,
+            TargetJoint {
+                target: target_c,
+                rest_distance: 0.0,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+        );
+
+        for _ in 0..60 {
+            step(&world, DT);
+        }
+        let d = ball_position(&world, seeker).distance(target_a);
+        assert!(
+            (d - 0.5).abs() < 1e-3,
+            "应停在 rest_distance = 0.5 球壳上，实际距目标 {d}"
+        );
+        assert!(
+            ball_velocity(&world, seeker).length() < 1e-6,
+            "到达后速度应归零（轴向 ×(1 − stiffness) 清零）"
+        );
+        assert_eq!(
+            ball_position(&world, insider),
+            Vec3::new(0.3, 80.0, 0.0),
+            "球壳内到达语义：位置应 bit 级不动"
+        );
+        assert!(
+            ball_position(&world, exact).distance(target_c) < 1e-3,
+            "rest_distance = 0 应精确到达目标点"
+        );
+    }
+
+    /// 无效目标：despawn 的 target 实体 → 约束整体跳过（不 panic），挂载
+    /// 体自由落体与无关节对照球 bit 级一致。
+    #[test]
+    fn joint_with_despawned_target_is_skipped() {
+        let mut world = make_world();
+        let dead = world.spawn((Transform::from_xyz(100.0, 100.0, 0.0),));
+        assert!(world.despawn(dead), "占位实体应成功销毁");
+
+        let linked = spawn_ball(
+            &mut world,
+            Vec3::new(-5.0, 20.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+        );
+        world.insert(
+            linked,
+            DistanceJoint {
+                target: dead,
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.0,
+            },
+        );
+        let linked_control = spawn_ball(
+            &mut world,
+            Vec3::new(5.0, 20.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+        );
+
+        for _ in 0..60 {
+            step(&world, DT);
+        }
+        assert!(
+            ball_position(&world, linked).y < 20.0,
+            "无效目标的挂载体应照常自由落体"
+        );
+        assert_eq!(
+            ball_position(&world, linked).y,
+            ball_position(&world, linked_control).y,
+            "距离关节跳过 ⇒ 与无关节对照球 bit 级一致"
+        );
+    }
+
+    /// 悬挂验证场景（语义锚）：静态锚点实体（无 Collider——关节不要求
+    /// 碰撞）+ 动态吊灯球 + 硬距离关节（rest = 2）：重力下被拉住悬在锚点
+    /// 下方 2 m 处稳定，速度被阻尼压到近零、不发散，锚点 bit 级不动。
+    #[test]
+    fn chandelier_hangs_stable_under_gravity() {
+        let mut world = make_world();
+        let anchor_pos = Vec3::new(0.0, 6.0, 0.0);
+        let anchor = world.spawn((Transform::from_translation(anchor_pos),));
+        let lamp = world.spawn((
+            Transform::from_xyz(0.0, 4.5, 0.0),
+            Collider::dynamic_sphere(0.3, 0.0),
+            RigidBody {
+                linear_damping: 0.2,
+                ..RigidBody::default()
+            },
+            DistanceJoint {
+                target: anchor,
+                rest_length: 2.0,
+                stiffness: 1.0,
+                damping: 0.9,
+            },
+        ));
+
+        let mut tail_velocity: Vec<f32> = Vec::new();
+        for frame in 0..300 {
+            step(&world, DT);
+            let dist = ball_position(&world, lamp).distance(anchor_pos);
+            assert!(
+                (dist - 2.0).abs() < 1e-3,
+                "吊灯应被拉住悬在 rest = 2 处（帧 {frame}：距锚点 {dist}）"
+            );
+            if frame >= 240 {
+                tail_velocity.push(ball_velocity(&world, lamp).length());
+            }
+        }
+        let max_tail = tail_velocity.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            max_tail < 0.05,
+            "末段速度应被关节阻尼压到近零（平衡 ≈ g·dt·(1−d)/d ≈ 0.018），实际峰值 {max_tail}"
+        );
+        assert!(
+            ball_position(&world, lamp).y < anchor_pos.y,
+            "吊灯应悬在锚点下方"
+        );
+        assert_eq!(
+            world
+                .get::<Transform>(anchor)
+                .expect("锚点应有 Transform")
+                .position,
+            anchor_pos,
+            "无 Collider 的锚点实体位置应 bit 级不变"
+        );
+    }
+
+    /// 确定性：吊灯 + 地面 + 多约束场景（距离硬约束 / 目标点约束 / 双动
+    /// 刚杆对 / 接触与约束交互）跑两遍，逐帧位置 bit 级一致。
+    #[test]
+    fn joint_simulation_is_deterministic_across_runs() {
+        fn build() -> (World, Vec<Entity>) {
+            let mut world = make_world();
+            spawn_floor(&mut world);
+            // 吊灯：无 Collider 锚点 + 硬距离关节（重力下悬挂）
+            let anchor = world.spawn((Transform::from_xyz(0.0, 6.0, 0.0),));
+            let lamp = world.spawn((
+                Transform::from_xyz(0.5, 4.5, 0.0),
+                Collider::dynamic_sphere(0.3, 0.2),
+                RigidBody {
+                    linear_damping: 0.1,
+                    ..RigidBody::default()
+                },
+                DistanceJoint {
+                    target: anchor,
+                    rest_length: 2.0,
+                    stiffness: 1.0,
+                    damping: 0.9,
+                },
+            ));
+            // 目标点约束球：拉向 (3, 0.8, 0) 的球壳——球壳底恰触地面，
+            // 接触推离与约束投影长期交互（管线顺序的确定性压力场景）
+            let seeker = world.spawn((
+                Transform::from_xyz(3.0, 5.0, 0.0),
+                Collider::dynamic_sphere(0.3, 0.0),
+                RigidBody::default(),
+                TargetJoint {
+                    target: Vec3::new(3.0, 0.8, 0.0),
+                    rest_distance: 0.5,
+                    stiffness: 1.0,
+                    damping: 0.5,
+                },
+            ));
+            // 双动刚杆对：先后落到地面，落地震荡由关节与接触共同求解
+            let lower = spawn_ball(
+                &mut world,
+                Vec3::new(-3.0, 3.8, 0.0),
+                Vec3::ZERO,
+                0.5,
+                0.05,
+                0.4,
+            );
+            let upper = world.spawn((
+                Transform::from_xyz(-3.0, 5.0, 0.0),
+                Collider::dynamic_sphere(0.5, 0.05),
+                RigidBody {
+                    friction: 0.4,
+                    ..RigidBody::default()
+                },
+                DistanceJoint {
+                    target: lower,
+                    rest_length: 1.2,
+                    stiffness: 1.0,
+                    damping: 0.3,
+                },
+            ));
+            (world, vec![lamp, seeker, lower, upper])
+        }
+
+        let (world_a, entities_a) = build();
+        let (world_b, entities_b) = build();
+        let mut trace_a: Vec<Vec3> = Vec::new();
+        let mut trace_b: Vec<Vec3> = Vec::new();
+        for _ in 0..240 {
+            step(&world_a, DT);
+            step(&world_b, DT);
+            for (a, b) in entities_a.iter().zip(&entities_b) {
+                trace_a.push(ball_position(&world_a, *a));
+                trace_b.push(ball_position(&world_b, *b));
+            }
+        }
+        assert_eq!(trace_a, trace_b, "同输入两次模拟应逐采样 bit 级一致");
+
+        // 场景非空转佐证：约束语义各自兑现（悬挂 / 球壳 / 刚杆间距）
+        let (lamp, seeker, lower, upper) =
+            (entities_a[0], entities_a[1], entities_a[2], entities_a[3]);
+        assert!(
+            (ball_position(&world_a, lamp).distance(Vec3::new(0.0, 6.0, 0.0)) - 2.0).abs() < 1e-2,
+            "吊灯应悬在锚点 rest 处"
+        );
+        assert!(
+            ball_position(&world_a, seeker).distance(Vec3::new(3.0, 0.8, 0.0)) <= 0.5 + 1e-2,
+            "目标点约束球应停在球壳上"
+        );
+        assert!(
+            (ball_position(&world_a, lower).distance(ball_position(&world_a, upper)) - 1.2).abs()
+                < 1e-2,
+            "刚杆对应保持 rest 间距"
+        );
+        assert!(
+            ball_position(&world_a, lower).y > 0.0 && ball_position(&world_a, lower).y < 2.0,
+            "刚杆对应落在地面上而非穿出"
         );
     }
 }

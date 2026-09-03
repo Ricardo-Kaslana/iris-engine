@@ -51,8 +51,8 @@ pub mod prelude {
     pub use crate::name::Name;
     pub use crate::nav::{NavGrid, NavGridParams};
     pub use crate::physics::{
-        Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker, PHYSICS_GRAVITY,
-        RigidBody, step_physics,
+        Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker, DistanceJoint,
+        PHYSICS_GRAVITY, RigidBody, TargetJoint, step_physics,
     };
     pub use crate::query::QueryPart;
     pub use crate::resource::Resource;
