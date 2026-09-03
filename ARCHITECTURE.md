@@ -700,6 +700,57 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   不消费会跨帧累积）。crossfade 期间只有目标剪辑（active）产事件——
   源已冻结不再推进。典型联动（音频脚步声，玩法侧每帧）：
   `for name in player.take_events() { if name == "footstep" { audio.play(...) } }`。
+- **BlendSpace2D 混合空间（v3）**：`BlendSpace { samples: Vec<(Vec2, usize)> }`
+  ——任意分布的参数点集 → 剪辑索引（idle / walk / run / strafe 按
+  「速度 × 转向」连续混合的标准载体）。**采样 = 逐轴线性分解**：先按
+  x 把样本分列（x 精确相等同列）、找括住参数点的左右两列，列内再按 y
+  找前后两行，权重 = 各轴插值系数乘积（轴对齐双线性）——点集任意分布
+  时单样本列自动钳制、全同 y / 全同 x 自然退化为 1D 链式 lerp，无需特判；
+  最多 4 路非零权重，**非负、和恒为 1**（确定性：轴扫描序固定、并列取
+  下标小者、参数点精确命中某样本 → 权重 1；单测随机参数网格遍历守护）。
+  `AnimationPlayer::play_blendspace()` 激活混合空间模式：**与 crossfade /
+  状态机互斥**（`transition` 清位、`play_blendspace` 丢 `blend`），激活时
+  `active` 剪辑的通道采样停用（事件轨道不停——共享时间轴仍按 active
+  推进），`update_animations` 每帧按 `blend_param` 采样出 ≤ 4 路
+  「剪辑 + 权重」走 **N 路姿势混合**（`blend_pose`）：把 v2 的两路混合
+  泛化为任意路数，所有混合剪辑共享播放器时间轴；平移 / 缩放 = 加权
+  线性和，旋转 = **N 路 nlerp**（首个四元数为基准、点积 < 0 翻转后加权
+  求和再归一）——slerp 是两算子不具结合性，N 路结果依赖配对顺序且误差
+  链式累积；混合空间相邻剪辑夹角小，nlerp 的非线性不可感知（两路
+  crossfade 仍 slerp 语义不变）。
+- **两骨足部 IK（v3，`foot_ik` 模块）**：动画之后的落地修正层。
+  `update_foot_ik`（DefaultPlugins 注册在 `update_animations` **之后**
+  ——修正对象是动画刚写出的本帧局部关节姿势；层级传播**之前**——写回
+  的也是局部 `Transform`，当帧传播全局生效）按 `FootIk` 组件开关：对
+  「hip ← knee ← foot」直连链，从脚踝世界位上抬 `ray_up_offset` 竖直
+  向下射线（**静态体 only**，收集语义同 `resolve_against_statics`——
+  动态体不参与 IK 落地，脚踩的支撑面必须稳定），命中点即踝目标；**平地
+  门**（高差 ≤ 1 mm）内不写任何变换——平地姿势 bit 级不动。解算为
+  **完整两骨旋转解**：骨长取当前世界姿势实际距离，纯函数
+  `solve_two_bone_ik` 余弦定理解膝角（`a = (d² + u² − l²)/2d`）、pole
+  向量投影定弯曲方向（不可达拉伸至全长、过近钳到 |u − l|，确定性退化
+  兜底），旋转回写 = 骨方向旧 → 新的最小旋转弧
+  （`Quat::from_rotation_arc`）除以父级旋转反推 hip / knee 局部旋转，
+  foot 局部旋转不动、按膝新世界矩阵逆回写局部位置把踝精确放到目标；
+  骨长严格保持（hip / knee 局部位置不动）。验收：大球面斜坡脚踝贴面
+  ±2 cm、平地 bit 级不变（单测守护）。诚实边界：三节点须 `ChildOf`
+  直连成链（debug_assert）、链上均匀缩放假设（非均匀缩放位置仍精确、
+  旋转可能偏差）、hip 旋转带动其全部子级（腿部链挂独立节点）。
+- **根运动（v3）**：`AnimationPlayer::root_motion_clip`（哪个剪辑带根
+  位移）+ `root_motion_node`（哪个节点，None = 完全关闭）。启用中该
+  节点的 Translation 通道**不再覆写 Transform**（从覆写列表剔除，含
+  混合结果），改为按纯函数 `root_motion_delta` 累积**本帧位移增量**进
+  `pending_root_motion`——循环回绕三段精确累积：「旧圈余段 v(dur) −
+  v(prev)」+「(k−1) 个整圈位移 v(dur) − v(0)」+「新圈已走 v(raw mod
+  dur) − v(0)」（一帧跨 k 圈 multi-lap，同 `collect_events` 的跨越计数
+  语义）；非循环停在末端后 prev == new → 零增量不重复计步。
+  **消费契约**：增量是剪辑空间（根节点局部平移）的帧位移，游戏侧每帧
+  `take_root_motion()`（take 语义同 `take_events`）→ 旋转到角色 yaw 系
+  → 交给 `move_and_slide` 位移——根运动只出「每帧走多远」，不直接写
+  角色 Transform。crossfade 期间 delta 仅取目标剪辑（冻结源的根位移
+  丢弃）。与原规范的偏离：root_motion 标志放播放器侧而非
+  `AnimationClip`（新增剪辑字段会给既有测试的结构体字面量引入编译
+  破坏，硬约束「既有动画测试零改动」优先）。
 
 ### 4.6.2 骨骼蒙皮（GPU LBS）
 

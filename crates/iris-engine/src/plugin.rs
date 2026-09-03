@@ -129,20 +129,27 @@ impl Plugin for HierarchyPlugin {
     }
 }
 
-/// 动画插件：在 Update 阶段推进所有 [`iris_render::animation::AnimationPlayer`]。
+/// 动画插件：在 Update 阶段推进所有 [`iris_render::animation::AnimationPlayer`]，
+/// 并在同一阶段执行足部 IK（v3，按 `FootIk` 组件开关）。
 ///
 /// 已包含在 [`DefaultPlugins`] 中。动画在 Update 写局部变换，随后的
 /// PostUpdate（[`HierarchyPlugin`]）当帧即完成全局传播——「动画写入的
 /// 变换当帧可见」的语义不变。
-/// 注册为**并行系统**：只读世界 + 组件写访问走尝试型锁，
-/// 调度器据其访问集（写 AnimationPlayer / Transform，读 Time）分批。
+///
+/// **足部 IK 的注册序（[`iris_render::foot_ik::update_foot_ik`]，紧跟
+/// `update_animations`）**：IK 修正的对象是动画刚写出的本帧局部关节姿势
+/// （晚于动画才能读到本帧姿势），写回的也是局部 `Transform`（早于层级
+/// 传播才能让修正当帧全局生效）。两个系统的访问集在写 Transform /
+/// 读写 AnimationPlayer 上重叠 ⇒ 调度器按注册序分批（动画先、IK 后）；
+/// 按 `FootIk` 组件开关，未挂组件的世界空转一次查询即过。
+/// 均注册为**并行系统**（只读世界 + 组件写访问走尝试型锁）。
 #[derive(Default)]
 pub struct AnimationPlugin;
 
 impl Plugin for AnimationPlugin {
     fn build(&self, app: &mut App) {
-        use iris_core::prelude::{Access, Stage, Transform};
-        use iris_render::prelude::AnimationPlayer;
+        use iris_core::prelude::{Access, ChildOf, Collider, RigidBody, Stage, Transform};
+        use iris_render::prelude::{AnimationPlayer, FootIk};
         app.schedule.add_parallel_system(
             Stage::Update,
             Access::new()
@@ -150,6 +157,19 @@ impl Plugin for AnimationPlugin {
                 .write::<Transform>()
                 .read::<Time>(),
             iris_render::animation::update_animations,
+        );
+        // 足部 IK（v3）：动画之后、层级传播之前（顺序理由见插件文档与
+        // foot_ik 模块文档「编排」）
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<Transform>()
+                .read::<AnimationPlayer>()
+                .read::<FootIk>()
+                .read::<ChildOf>()
+                .read::<Collider>()
+                .read::<RigidBody>(),
+            iris_render::foot_ik::update_foot_ik,
         );
     }
 }

@@ -5,6 +5,58 @@
 
 ## [Unreleased]
 
+### Added（R38：动画 v3——BlendSpace2D 混合空间 + 两骨足部 IK + 根运动，第三人称动作动画门面）
+
+动画运行时第三轮扩展（第 38 轮迭代；`iris-render` 新模块 `foot_ik` +
+`animation` 扩展，语义规范 = `iris_render::animation` /
+`iris_render::foot_ik` 模块文档，架构记录见 ARCHITECTURE §4.6.1）。v3
+新字段全部带中性默认值——`blend_space` / 根运动默认关闭，不启用时行为
+与 v2 完全一致（既有动画测试零改动全过）：
+
+- **BlendSpace2D 混合空间**：`BlendSpace { samples: Vec<(Vec2, usize)> }`
+  任意分布参数点集 → 剪辑索引；采样 = **逐轴线性分解**（先按 x 分列找
+  左右列、列内按 y 找前后行，权重 = 各轴插值系数乘积的轴对齐双线性；
+  单样本列自动钳制、全同 y / 全同 x 退化为 1D 链式 lerp 无需特判），
+  ≤ 4 路非零权重、**非负和恒 1**（轴扫描序固定、并列取下标小者、参数
+  精确命中样本 → 权重 1；测试覆盖精确命中 / 轴中点 0.5·0.5 / 1D 链式
+  与范围外钳制 / 满网格双线性精确值 / 确定性参数网格遍历和恒 1）。
+  `AnimationPlayer::play_blendspace()` 激活：**与 crossfade / 状态机互斥**
+  （`transition` 清位、激活时进行中过渡丢弃），激活时 active 剪辑采样
+  停用（事件轨道照常——共享时间轴仍按 active 推进）。
+- **N 路姿势混合（`blend_pose`）**：把两路 crossfade 泛化为任意路数
+  （每帧按 `blend_param` 采样出 ≤ 4 路「剪辑 + 权重」加权）；平移 /
+  缩放 = 加权线性和，旋转 = **N 路 nlerp**（首个四元数为基准、点积 < 0
+  翻转后加权求和再归一）——slerp 不具结合性、N 路链式配对误差累积，
+  混合空间相邻夹角小 nlerp 非线性不可感知（两路 crossfade 仍 slerp）；
+  三点等权 yaw 0/45/90 → 中间值 45°（纯函数 + 世界级双测）。
+- **两骨足部 IK（`foot_ik` 模块）**：`update_foot_ik` 注册在
+  `update_animations` 之后、层级传播之前（修正对象 = 动画刚写出的本帧
+  局部姿势，写回局部 Transform 当帧传播生效；按 `FootIk` 组件开关）。
+  落地查询 = 脚踝世界位上抬后竖直向下射线、**静态体 only**（收集语义
+  同 `resolve_against_statics`，动态体不参与 IK 落地）；**平地门**
+  （高差 ≤ 1 mm）不写任何变换。解算 = **完整两骨旋转解**：纯函数
+  `solve_two_bone_ik` 余弦定理解膝角 + pole 向量定弯曲方向（不可达
+  拉伸全长 / 过近钳 |u−l| / pole 并列确定性兜底），旋转回写用骨方向
+  最小旋转弧反推 hip / knee 局部旋转、foot 按膝新世界矩阵逆回写位置，
+  骨长严格保持。测试：纯函数精确解 / 不可达拉伸 / 最小距离钳制 /
+  pole 镜像不翻转 / 零长骨断言；世界级**大球面斜坡脚踝贴面 ±2 cm**、
+  平地 bit 级不变、无地面 / 动态体不写、**逐位确定性**、断链 debug
+  断言。
+- **根运动**：`root_motion_clip` + `root_motion_node`（None = 关闭）
+  声明带根位移的剪辑节点——该节点 Translation 通道不再覆写 Transform，
+  帧位移增量经纯函数 `root_motion_delta` 累积进 `pending_root_motion`，
+  消费方每帧 `take_root_motion()` 取走（旋转到角色 yaw 系后交
+  `move_and_slide`，用例入文档）。**循环回绕三段精确累积**（旧圈余段 +
+  (k−1) 整圈 + 新圈已走，一帧跨多圈不跳变不漏记）、非循环末端零增量
+  不重复计步；crossfade 期间仅取目标剪辑。与规范的偏离：root_motion
+  标志放播放器侧而非 `AnimationClip`——新增剪辑字段会给既有测试的
+  结构体字面量引入编译破坏（「既有动画测试零改动」硬约束优先，语义
+  等价）。测试：全程增量累计 = 总位移、回绕帧无跳变 + 整圈累计恰一
+  周期、一帧跨两圈 2.05 m 纯函数精确值、关闭时零影响。
+
+新增 26 个测试（animation 14 + foot_ik 12），既有动画 / 物理测试零改动
+全过。
+
 ### Added（R37：布娃娃与死亡混合 v1——球肢链 + 运动学窗口，附碰撞过滤掩码）
 
 死亡系统地基落地（第 37 轮迭代；iris-core 新模块 `ragdoll` + `physics`

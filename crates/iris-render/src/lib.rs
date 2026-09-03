@@ -29,6 +29,7 @@ pub mod asset;
 pub mod camera;
 pub mod context;
 pub mod environment;
+pub mod foot_ik;
 pub mod frustum;
 pub mod instance;
 pub mod light;
@@ -50,7 +51,7 @@ pub mod prelude {
     pub use crate::animation::{
         AnimatedField, AnimationBlend, AnimationChannel, AnimationClip, AnimationEdge,
         AnimationEvent, AnimationInterpolation, AnimationPath, AnimationPlayer, AnimationState,
-        collect_events, update_animations,
+        BlendSpace, blend_pose, collect_events, root_motion_delta, update_animations,
     };
     pub use crate::asset::{
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
@@ -61,6 +62,7 @@ pub mod prelude {
     };
     pub use crate::context::Gpu;
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
+    pub use crate::foot_ik::{FootIk, solve_two_bone_ik, update_foot_ik};
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;
     pub use crate::light::{

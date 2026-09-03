@@ -33,8 +33,27 @@
 //!     }
 //! }
 //! ```
+//!
+//! v3 扩展（新字段全部带中性默认值，不启用时行为与 v2 完全一致）：
+//! - **BlendSpace2D 混合空间**：[`BlendSpace`]（任意分布的参数点集 →
+//!   剪辑）+ [`AnimationPlayer::blend_param`]，[`AnimationPlayer::play_blendspace`]
+//!   激活后 `update_animations` 每帧按参数点采样出 ≤ 4 路
+//!   「剪辑 + 权重」，经 [`blend_pose`] 做 N 路姿势混合——把 v2 的两路
+//!   crossfade 泛化为任意路数；采样算法为**逐轴线性分解**（先按 x 找
+//!   左右列、列内再按 y 找前后行，权重 = 各轴插值系数乘积），权重非负、
+//!   和恒为 1（单测守护）；
+//! - **N 路旋转加权**：混合期旋转用「首个四元数为基准、点积 < 0 翻转后
+//!   加权求和再归一」的 **nlerp**（[`blend_fields_nway`]），不用 slerp
+//!   链式两两插值——slerp 不具结合性，N 路结果依赖配对顺序且误差链式
+//!   累积；混合空间相邻剪辑夹角小，nlerp 的非线性不可感知（取舍见其文档）；
+//! - **根运动**：[`AnimationPlayer::root_motion_clip`] + [`AnimationPlayer::root_motion_node`]
+//!   声明「哪个剪辑的哪个节点带根位移」——该节点的 Translation 通道不再
+//!   覆写 `Transform`，改为把本帧采样位移差（含循环回绕的三段精确累积，
+//!   见 [`root_motion_delta`]）累积进 [`AnimationPlayer::pending_root_motion`]，
+//!   消费方每帧 [`AnimationPlayer::take_root_motion`] 取走、旋转到角色
+//!   yaw 系后交给角色控制器（消费契约见 [`root_motion_delta`] 文档）。
 
-use glam::Quat;
+use glam::{Quat, Vec2, Vec3};
 use iris_core::prelude::{Entity, Time, Transform};
 
 /// 动画通道作用的节点属性。
@@ -174,6 +193,130 @@ pub struct AnimationClip {
     pub events: Vec<AnimationEvent>,
 }
 
+/// 2D 混合空间（v3）：任意分布的参数点集 → 剪辑索引的映射，第三人称
+/// 移动循环（idle / walk / run / strafe …）按「速度 × 转向」连续混合的
+/// 标准载体。
+///
+/// # 采样算法（[`BlendSpace::sample`]，确定性）
+///
+/// **逐轴线性分解**——先按 x 把样本点分列（x 精确相等的样本同列），找出
+/// 括住参数点的左右两列；再在每列内按 y 找括住参数点的前后两行。参数点
+/// 的 x 插值系数决定两列的列权重（单列 = 全权重落该列），列权重再按列内
+/// y 插值系数分给前后两行——权重 = 各轴插值系数乘积，恰为轴对齐双线性
+/// 插值，最多 4 个样本获得非零权重。点集任意分布时列退化（单样本列）自动
+/// 退化为「沿该列钳制」，所有样本同 y 时即 1D 链式 lerp、所有样本同 x 时
+/// 为 1D 纵向 lerp，无需特判。确定性保证：轴扫描方向固定（x 先、y 后；
+/// 括号取「≤ 参数一侧的最大者 / ≥ 参数一侧的最小者」）、并列取下标小者、
+/// 输出按「左列前行 → 左列后行 → 右列前行 → 右列后行」固定顺序、恰为零
+/// 的权重项不输出。参数点恰好等于某样本点 → 该点权重 1（精确相等）。
+///
+/// 权重不变量：非空点集下权重全部非负、和恒为 1（单测随机参数遍历守护）；
+/// 剪辑索引可重复（同一剪辑可出现在多个参数点），输出按样本逐项给出。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlendSpace {
+    /// 样本点集：`(参数点, 剪辑索引)`；点集任意分布，空集采样返回空表。
+    pub samples: Vec<(Vec2, usize)>,
+}
+
+/// 列内 y 括号：把列权重 `column_weight` 按 `param_y` 分给列内前后两行
+/// 样本（[`BlendSpace::sample`] 的内层步骤，见其算法文档）。
+fn column_y_weights(
+    samples: &[(Vec2, usize)],
+    column: &[usize],
+    param_y: f32,
+    column_weight: f32,
+    out: &mut Vec<(usize, f32)>,
+) {
+    // 前行 = y ≤ param_y 的最大者；后行 = y ≥ param_y 的最小者；
+    // 严格比较才替换 ⇒ 并列保留先扫描者（下标小者，确定性）。
+    // 非有限 param_y 已在入口拒绝 ⇒ 每个 y 至少满足一侧比较，
+    // down / up 不会同时为 None；参数落在列外时缺侧 ⇒ 钳到存在侧
+    let mut down: Option<usize> = None;
+    let mut up: Option<usize> = None;
+    for &i in column {
+        let y = samples[i].0.y;
+        if y <= param_y && down.is_none_or(|d| y > samples[d].0.y) {
+            down = Some(i);
+        }
+        if y >= param_y && up.is_none_or(|u| y < samples[u].0.y) {
+            up = Some(i);
+        }
+    }
+    match (down, up) {
+        (Some(d), Some(u)) => {
+            if d == u {
+                // 单行命中（参数 y 恰在该行上 / 列内只有一行）：全权重
+                out.push((samples[d].1, column_weight));
+                return;
+            }
+            let ty =
+                ((param_y - samples[d].0.y) / (samples[u].0.y - samples[d].0.y)).clamp(0.0, 1.0);
+            if 1.0 - ty > 0.0 {
+                out.push((samples[d].1, column_weight * (1.0 - ty)));
+            }
+            if ty > 0.0 {
+                out.push((samples[u].1, column_weight * ty));
+            }
+        }
+        // 参数 y 在列 y 范围外：钳到唯一存在的一侧（全权重）
+        (Some(d), None) => out.push((samples[d].1, column_weight)),
+        (None, Some(u)) => out.push((samples[u].1, column_weight)),
+        (None, None) => unreachable!("非空列至少有一侧括住有限参数"),
+    }
+}
+
+impl BlendSpace {
+    /// 采样：返回 ≤ 4 个 `(剪辑索引, 权重)`——权重非负、和恒为 1
+    /// （空点集或非有限参数返回空表）；算法与确定性见 [`BlendSpace`]。
+    pub fn sample(&self, param: Vec2) -> Vec<(usize, f32)> {
+        if self.samples.is_empty() || !param.x.is_finite() || !param.y.is_finite() {
+            return Vec::new();
+        }
+        // 精确命中：参数点等于某样本点 → 该点权重 1
+        if let Some(&(_, clip)) = self.samples.iter().find(|(p, _)| *p == param) {
+            return vec![(clip, 1.0)];
+        }
+        // 按 x 精确值分列（保持首遇顺序；列 x 互不相同）
+        let mut columns: Vec<(f32, Vec<usize>)> = Vec::new();
+        for (i, (point, _)) in self.samples.iter().enumerate() {
+            match columns.iter_mut().find(|(x, _)| *x == point.x) {
+                Some((_, list)) => list.push(i),
+                None => columns.push((point.x, vec![i])),
+            }
+        }
+        // x 括号：左列 = x ≤ param.x 的最大者；右列 = x ≥ param.x 的
+        // 最小者；严格比较 ⇒ 并列（不可能，列 x 唯一）天然无歧义
+        let mut left: Option<(f32, &Vec<usize>)> = None;
+        let mut right: Option<(f32, &Vec<usize>)> = None;
+        for (x, list) in &columns {
+            if *x <= param.x && left.is_none_or(|(lx, _)| *x > lx) {
+                left = Some((*x, list));
+            }
+            if *x >= param.x && right.is_none_or(|(rx, _)| *x < rx) {
+                right = Some((*x, list));
+            }
+        }
+        let mut out = Vec::with_capacity(4);
+        match (left, right) {
+            (Some((lx, l)), Some((rx, r))) if lx < rx => {
+                // 两列括住：列权重 = 各轴插值系数乘积的 x 因子
+                let tx = ((param.x - lx) / (rx - lx)).clamp(0.0, 1.0);
+                if 1.0 - tx > 0.0 {
+                    column_y_weights(&self.samples, l, param.y, 1.0 - tx, &mut out);
+                }
+                if tx > 0.0 {
+                    column_y_weights(&self.samples, r, param.y, tx, &mut out);
+                }
+            }
+            // 单列命中（参数 x 落在唯一列上 / 点集单列）：全权重落该列
+            (Some((_, l)), _) => column_y_weights(&self.samples, l, param.y, 1.0, &mut out),
+            (None, Some((_, r))) => column_y_weights(&self.samples, r, param.y, 1.0, &mut out),
+            (None, None) => unreachable!("非空列集至少有一侧括住有限参数"),
+        }
+        out
+    }
+}
+
 /// 一次 crossfade 过渡的状态：目标剪辑为 `player.active`（正常推进），
 /// 源姿势在过渡开始时**冻结快照**为 `(from_clip, from_time)`。
 ///
@@ -257,11 +400,44 @@ pub struct AnimationPlayer {
     /// 「仅源有」通道保持 v2 定格语义；捕获后混合期平滑淡回基姿势
     /// （语义见 [`AnimationBlend`]）。默认空，兼容性承诺与 v1/v2 一致。
     pub rest: Vec<(Entity, AnimatedField)>,
+    /// 混合空间（v3）：与 [`AnimationPlayer::blend_param`] 配合，
+    /// [`AnimationPlayer::play_blendspace`] 激活后 `update_animations`
+    /// 每帧按参数点采样出 ≤ 4 路混合输入（所有混合剪辑**共享播放器
+    /// 时间轴**——步态循环同长的常规用法；相位偏移需求直接给不同
+    /// 剪辑做首帧偏移，v1 不做逐剪辑时间）。默认 None = 不使用。
+    pub blend_space: Option<BlendSpace>,
+    /// 混合空间当前参数点（游戏侧每帧写入，如「水平速度 × 转向」）；
+    /// 激活模式下每帧采样一次。默认原点。
+    pub blend_param: Vec2,
+    /// 混合空间激活标志：[`AnimationPlayer::play_blendspace`] 置位，
+    /// [`AnimationPlayer::transition`]（含状态机路径）清位——**与
+    /// crossfade / 状态机互斥**：激活时 `active` 剪辑的通道采样停用
+    /// （不再覆写任何 Transform，姿势完全来自混合空间采样）。标志为真
+    /// 而 `blend_space` 为 None 的无效组合按「无姿势来源」处理（不写）。
+    pub blend_space_active: bool,
+    /// 根运动源剪辑（v3，Some = 声明该剪辑带根位移）：与 `active` 相同
+    /// 且 [`AnimationPlayer::root_motion_node`] 有效时，该节点的
+    /// Translation 通道不再覆写 Transform，改累积帧增量到
+    /// [`AnimationPlayer::pending_root_motion`]。
+    ///
+    /// 与规范的偏离说明：规范原文把 root_motion 标志放在 `AnimationClip`
+    /// 上，但新增剪辑字段会给既有测试的全部 `AnimationClip` 结构体字面量
+    /// 引入编译破坏（硬约束「既有动画测试零改动」），故把激活开关移到
+    /// 播放器侧按索引声明——语义等价（同一播放器的剪辑集合固定）。
+    pub root_motion_clip: Option<usize>,
+    /// 根运动作用节点（`node_entities` 下标）；None = 根运动完全关闭
+    /// （任何剪辑的平移照常覆写）。默认 None。
+    pub root_motion_node: Option<usize>,
+    /// 本帧根运动位移增量（剪辑空间，米）；每帧由 `update_animations`
+    /// 累积写入，**消费方 [`AnimationPlayer::take_root_motion`] take**
+    /// ——不消费会跨帧累积（照 `pending_events` 的帧内消息模式）。
+    pub pending_root_motion: Option<Vec3>,
 }
 
 impl Default for AnimationPlayer {
     /// 全字段的默认值（兼容性承诺：新增字段一律给中性默认——
-    /// blend/states/edges/pending_events 默认空/None，行为与 v1 一致）。
+    /// blend/states/edges/pending_events/根运动/混合空间默认空/None/未激活，
+    /// 行为与 v1 一致）。
     fn default() -> Self {
         Self {
             clips: Vec::new(),
@@ -277,6 +453,12 @@ impl Default for AnimationPlayer {
             current_state: 0,
             pending_events: Vec::new(),
             rest: Vec::new(),
+            blend_space: None,
+            blend_param: Vec2::ZERO,
+            blend_space_active: false,
+            root_motion_clip: None,
+            root_motion_node: None,
+            pending_root_motion: None,
         }
     }
 }
@@ -370,6 +552,9 @@ impl AnimationPlayer {
             );
             return;
         }
+        // 与混合空间互斥：任何 transition（含状态机经此的路径）都退出
+        // 混合空间模式——同一时刻只有一种姿势来源
+        self.blend_space_active = false;
         if clip == self.active {
             return;
         }
@@ -439,6 +624,42 @@ impl AnimationPlayer {
     /// 事件是帧内消息，不调用会跨帧累积。
     pub fn take_events(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    /// 激活混合空间模式（v3）：此后 `update_animations` 每帧按
+    /// [`AnimationPlayer::blend_param`] 采样 [`AnimationPlayer::blend_space`]
+    /// 做 N 路姿势混合，`active` 剪辑的通道采样停用（语义与互斥边界见
+    /// [`AnimationPlayer::blend_space_active`]）。进行中的 crossfade 立即
+    /// 丢弃（姿势直接切换到混合空间，无过渡——混合空间内部的权重连续性
+    /// 由参数点连续变化保证，游戏侧移动 `blend_param` 即天然的淡入淡出）。
+    ///
+    /// # Panics / 边界
+    /// 未设置 `blend_space` 字段时 `debug_assert!`（API 误用），release 下
+    /// 静默忽略（标志不置位）。
+    pub fn play_blendspace(&mut self) {
+        if self.blend_space.is_none() {
+            debug_assert!(false, "play_blendspace 需先设置 blend_space 字段");
+            return;
+        }
+        self.blend_space_active = true;
+        self.blend = None;
+    }
+
+    /// 取走本帧根运动位移增量（v3，drain 语义）。返回 `None` = 本帧（及
+    /// 累积以来）无根运动——根运动未启用、或暂停 / 停在末端的零增量帧
+    /// 也会产 `Some(零向量)`，消费方按向量用即可。典型消费（游戏侧每帧）：
+    ///
+    /// ```ignore
+    /// // 剪辑空间增量 → 旋转到角色 yaw 系 → 交给角色控制器位移
+    /// if let Some(delta) = world.get_mut::<AnimationPlayer>(root).unwrap().take_root_motion() {
+    ///     let yaw = Quat::from_rotation_y(character_yaw);
+    ///     let world_delta = yaw * delta;
+    ///     let out = move_and_slide(&world, pos, world_delta / dt, dt, &params);
+    ///     world.get_mut::<Transform>(root).unwrap().position = out.position;
+    /// }
+    /// ```
+    pub fn take_root_motion(&mut self) -> Option<Vec3> {
+        self.pending_root_motion.take()
     }
 
     /// 推进后的时间与播放状态（不修改自身，供系统两阶段处理）。
@@ -571,14 +792,192 @@ fn animated_path(field: &AnimatedField) -> AnimationPath {
     }
 }
 
+/// N 路旋转加权（v3）：**首个四元数为基准，点积 < 0 翻转后加权求和再
+/// 归一（nlerp）**。
+///
+/// 为什么 N 路不用 slerp：slerp 是两算子、不具结合性——`slerp(slerp(a,b,
+/// w₁), c, w₂)` 的结果依赖配对顺序，三路以上混合会出现「权重对称但结果
+/// 不对称」且误差随链式插值累积；nlerp 退化为一次加权求和 + 单次归一，
+/// 对权重完全对称、与输入顺序无关（求和顺序固定即可复现）。代价是角度
+/// 大时角速度非线性——混合空间的相邻剪辑夹角小（步态族），非线性不可
+/// 感知；两路 crossfade 可能拉到 180°，仍走 [`blend_fields`] 的 slerp
+/// （两路语义不变）。求和后长度趋零（对跖四元数互抵）按基准四元数兜底
+/// （确定性，不产 NaN）。
+fn blend_rotation_nway(inputs: &[(Quat, f32)]) -> Quat {
+    let base = inputs[0].0;
+    let mut sum = base * inputs[0].1;
+    for &(q, w) in &inputs[1..] {
+        let mut q = q;
+        if base.dot(q) < 0.0 {
+            q = -q;
+        }
+        sum += q * w;
+    }
+    if sum.length_squared() < 1e-10 {
+        base
+    } else {
+        sum.normalize()
+    }
+}
+
+/// 「目标实体 + 路径」分组（[`blend_pose`] 内部）：该组的全部采样值与
+/// 各自权重（保持首遇顺序，确定性）。
+type PoseGroup = (Entity, AnimationPath, Vec<(AnimatedField, f32)>);
+
+/// N 路姿势混合（v3，纯函数）：对每个 `(剪辑索引, 权重, 时间)` 三元组
+/// 采样剪辑，按「目标实体 + 路径」并集逐通道加权——平移 / 缩放为加权
+/// 线性和（权重和 1 时即逐分量 lerp 的 N 路推广），旋转走
+/// [`blend_rotation_nway`]。权重 ≤ 0 的输入跳过（不采样）；剪辑越界
+/// `debug_assert!` 后跳过（release 静默，坏索引不应报废整帧姿势）。
+///
+/// 空输入 / 全零权重返回空表（调用方 = 无姿势来源，不写任何 Transform）。
+pub fn blend_pose(
+    clips: &[AnimationClip],
+    node_entities: &[Option<Entity>],
+    inputs: &[(usize, f32, f32)],
+) -> Vec<(Entity, AnimatedField)> {
+    // 「目标实体 + 路径」并集分组（保持首遇顺序，确定性）
+    let mut groups: Vec<PoseGroup> = Vec::new();
+    for &(clip_index, weight, time) in inputs {
+        if weight <= 0.0 {
+            continue;
+        }
+        let Some(clip) = clips.get(clip_index) else {
+            debug_assert!(false, "blend_pose 剪辑越界：{clip_index} / {}", clips.len());
+            continue;
+        };
+        for channel in &clip.channels {
+            let Some(target) = node_entities.get(channel.node).copied().flatten() else {
+                continue;
+            };
+            match groups
+                .iter_mut()
+                .find(|(e, p, _)| *e == target && *p == channel.path)
+            {
+                Some((_, _, list)) => list.push((channel.sample(time), weight)),
+                None => groups.push((target, channel.path, vec![(channel.sample(time), weight)])),
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(target, _, list)| {
+            let first = list[0].0;
+            let field = match first {
+                AnimatedField::Rotation(_) => {
+                    let quats: Vec<(Quat, f32)> = list
+                        .iter()
+                        .filter_map(|(field, w)| match field {
+                            AnimatedField::Rotation(q) => Some((*q, *w)),
+                            _ => None,
+                        })
+                        .collect();
+                    AnimatedField::Rotation(blend_rotation_nway(&quats))
+                }
+                AnimatedField::Translation(v) => {
+                    AnimatedField::Translation(weighted_sum3(&v, &list))
+                }
+                AnimatedField::Scale(v) => AnimatedField::Scale(weighted_sum3(&v, &list)),
+            };
+            (target, field)
+        })
+        .collect()
+}
+
+/// `[f32; 3]` 的 N 路加权和：首项权重 × 首值 + 其余各项加权和。
+fn weighted_sum3(first: &[f32; 3], rest: &[(AnimatedField, f32)]) -> [f32; 3] {
+    let mut acc = [
+        first[0] * rest[0].1,
+        first[1] * rest[0].1,
+        first[2] * rest[0].1,
+    ];
+    for (field, w) in rest.iter().skip(1) {
+        let v = match field {
+            AnimatedField::Translation(v) | AnimatedField::Scale(v) => v,
+            _ => continue,
+        };
+        acc[0] += v[0] * w;
+        acc[1] += v[1] * w;
+        acc[2] += v[2] * w;
+    }
+    acc
+}
+
+/// 根运动帧增量（v3，纯函数）：平移通道在 `prev_time → raw_time` 间的
+/// 采样位移差。**循环回绕的三段精确累积**——一帧跨 k 次回绕时，
+/// 增量 = 「旧圈余段：v(dur) − v(prev)」+「(k−1) 个整圈位移：v(dur) − v(0)」
+/// +「新圈已走：v(raw mod dur) − v(0)」，其中 `k = ⌊raw/dur⌋ − ⌊prev/dur⌋`；
+/// 方向语义：增量是**剪辑空间**（根节点局部平移）的前向位移，单圈不回绕
+/// 时退化为 `v(raw) − v(prev)`。非循环按钳制后的时间差（停在末端后
+/// prev == new → 零增量，不重复计步）。`duration <= 0` 恒为零。
+///
+/// # 消费契约
+///
+/// 增量累积在 [`AnimationPlayer::pending_root_motion`]（剪辑空间），
+/// 消费方每帧 [`AnimationPlayer::take_root_motion`] 取走后**旋转到角色
+/// yaw 系**（剪辑以 +Z 或引擎约定前方为前进向，角色朝向由玩法控制）
+/// 再交给 `move_and_slide` 做位移——根运动只出「每帧走多远」，不直接
+/// 写角色 Transform（见 [`AnimationPlayer::take_root_motion`] 用例）。
+pub fn root_motion_delta(
+    channel: &AnimationChannel,
+    prev_time: f32,
+    raw_time: f32,
+    duration: f32,
+    looping: bool,
+) -> Vec3 {
+    if duration <= 0.0 {
+        return Vec3::ZERO;
+    }
+    let value_at = |t: f32| match channel.sample(t) {
+        AnimatedField::Translation(v) => Vec3::new(v[0], v[1], v[2]),
+        _ => Vec3::ZERO,
+    };
+    if !looping {
+        // 非循环：两端钳制（末端 prev == new → 零增量）
+        return value_at(raw_time.min(duration)) - value_at(prev_time.clamp(0.0, duration));
+    }
+    let laps = (raw_time / duration).floor() as i64 - (prev_time / duration).floor() as i64;
+    if laps <= 0 {
+        // 单圈内（未回绕）
+        return value_at(raw_time) - value_at(prev_time);
+    }
+    // 回绕：旧圈余段 + (laps − 1) 个整圈 + 新圈已走（multi-lap 语义与
+    // collect_events 的跨越计数同源）
+    let full_lap = value_at(duration) - value_at(0.0);
+    let wrapped = value_at(raw_time % duration) - value_at(0.0);
+    (value_at(duration) - value_at(prev_time)) + full_lap * (laps - 1) as f32 + wrapped
+}
+
 /// 单个动画根实体的采样任务包（`update_animations` 阶段一产出、阶段二
 /// 消费）：根实体 + 推进后的时间 + 循环标记 + 「目标实体 → 覆写字段」
-/// 列表（crossfade 时已混合完毕）+ 本帧命中的事件名。
-type AnimationJob = (Entity, f32, bool, Vec<(Entity, AnimatedField)>, Vec<String>);
+/// 列表（crossfade / 混合空间时已混合完毕）+ 本帧命中的事件名 +
+/// 本帧根运动增量（未启用 / 无效时为 None）。
+type AnimationJob = (
+    Entity,
+    f32,
+    bool,
+    Vec<(Entity, AnimatedField)>,
+    Vec<String>,
+    Option<Vec3>,
+);
 
 /// 每帧动画系统：推进所有 [`AnimationPlayer`]，把采样结果覆写到目标实体的
 /// `Transform`。必须在 `propagate_transforms` 之前执行（DefaultPlugins 已保证）；
 /// `Time` 资源缺席时 dt 视为 0（可手动设置 `player.time` 后调用以定位到指定时刻）。
+///
+/// 姿势来源三选一（优先级即列出顺序，见各字段文档）：
+/// 1. **混合空间模式**（`blend_space_active` 置位）：按 `blend_param` 采样
+///    `blend_space` 做 N 路混合（[`blend_pose`]）——`active` 剪辑采样停用；
+/// 2. **crossfade**（`blend` 非空）：目标剪辑 + 冻结源快照两路混合（v2 语义）；
+/// 3. **纯 active 剪辑**（v1 语义）。
+///
+/// 根运动（`root_motion_clip == Some(active)` 且 `root_motion_node` 有效）
+/// 独立于姿势来源生效：根节点的 Translation 通道从覆写列表中剔除（含
+/// crossfade / 混合空间产出的混合结果），改为按 [`root_motion_delta`]
+/// 累积帧增量进 `pending_root_motion`——**crossfade 期间 delta 仅取目标
+/// 剪辑**（冻结源快照的根位移被丢弃，v1 简化：根位移是游戏玩法量、
+/// 不应随表现层过渡回放）。事件轨道不随混合空间停用：共享时间轴仍按
+/// active 剪辑推进，事件照常检测（脚步声等玩法事件与姿势来源正交）。
 ///
 /// 只读世界签名（`&World`）：组件写访问走世界内部的尝试型锁，
 /// 因此可注册为**并行系统**（访问集：写 AnimationPlayer / Transform，读 Time）。
@@ -616,17 +1015,34 @@ pub fn update_animations(world: &iris_core::world::World) {
             })
             .unwrap_or_default();
         let Some(clip) = player.clips.get(player.active) else {
-            jobs.push((entity, time, playing, Vec::new(), fired));
+            jobs.push((entity, time, playing, Vec::new(), fired, None));
             return;
         };
-        let mut fields = Vec::with_capacity(clip.channels.len());
-        for channel in &clip.channels {
-            let target = player.node_entities.get(channel.node).copied().flatten();
-            let Some(target) = target else {
-                continue;
-            };
-            fields.push((target, channel.sample(time)));
-        }
+        // 姿势来源：混合空间激活时按参数点 N 路采样，否则纯 active 剪辑
+        let mut fields = if player.blend_space_active {
+            let inputs: Vec<(usize, f32, f32)> = player
+                .blend_space
+                .as_ref()
+                .map(|space| {
+                    space
+                        .sample(player.blend_param)
+                        .into_iter()
+                        .map(|(index, weight)| (index, weight, time))
+                        .collect()
+                })
+                .unwrap_or_default();
+            blend_pose(&player.clips, &player.node_entities, &inputs)
+        } else {
+            let mut fields = Vec::with_capacity(clip.channels.len());
+            for channel in &clip.channels {
+                let target = player.node_entities.get(channel.node).copied().flatten();
+                let Some(target) = target else {
+                    continue;
+                };
+                fields.push((target, channel.sample(time)));
+            }
+            fields
+        };
         // crossfade 混合：对「目标实体 + 路径」并集逐项混入冻结的源快照。
         // 混合用的 elapsed 加上 dt（与 time 的推进对称，两阶段只读），
         // 保证姿势只由过渡总时长决定、与分帧方式无关
@@ -667,17 +1083,42 @@ pub fn update_animations(world: &iris_core::world::World) {
                 }
             }
         }
-        jobs.push((entity, time, playing, fields, fired));
+        // 根运动（v3）：启用中的根节点平移从覆写列表剔除（含混合结果），
+        // 改为累积本帧位移增量（剪辑空间；crossfade 期间仅取目标剪辑）
+        let mut root_delta = None;
+        if player.root_motion_clip == Some(player.active) {
+            if let Some(node) = player.root_motion_node {
+                if let Some(root_target) = player.node_entities.get(node).copied().flatten() {
+                    fields.retain(|(target, field)| {
+                        !(*target == root_target && matches!(field, AnimatedField::Translation(_)))
+                    });
+                    let delta: Vec3 = clip
+                        .channels
+                        .iter()
+                        .filter(|c| c.node == node && c.path == AnimationPath::Translation)
+                        .map(|c| root_motion_delta(c, prev_time, raw_time, clip.duration, looping))
+                        .fold(Vec3::ZERO, |acc, d| acc + d);
+                    root_delta = Some(delta);
+                }
+            }
+        }
+        jobs.push((entity, time, playing, fields, fired, root_delta));
     });
 
     // 阶段二（写入）：更新播放状态，覆写目标实体的局部变换
-    for (player_entity, time, playing, fields, events) in jobs {
+    for (player_entity, time, playing, fields, events, root_delta) in jobs {
         if let Some(mut player) = world.get_mut::<AnimationPlayer>(player_entity) {
             // 读到的是推进前的 playing：暂停时混合计时同步冻结
             let was_playing = player.playing;
             player.time = time;
             player.playing = playing;
             player.pending_events.extend(events);
+            // 根运动增量累积（消费方 take_root_motion 取走；一帧一增量，
+            // 已有累积时叠加——多系统同帧写同一播放器的防御性合并）
+            if let Some(delta) = root_delta {
+                player.pending_root_motion =
+                    Some(player.pending_root_motion.unwrap_or_default() + delta);
+            }
             // 推进 crossfade 计时；完成后清除，回到纯目标姿势
             if was_playing {
                 if let Some(blend) = player.blend.as_mut() {
@@ -1499,5 +1940,381 @@ mod tests {
                 "同配置两个播放器应逐位一致"
             );
         }
+    }
+
+    // ---- BlendSpace2D（v3）----
+
+    /// 循环直线走位剪辑：node 0 平移 0 → 1 → 2 米 over 2 秒（复用既有
+    /// 测试构造器，速度 1 m/s）。
+    fn walk_clip() -> AnimationClip {
+        clip(
+            "walk",
+            vec![translation_channel(AnimationInterpolation::Linear)],
+            2.0,
+        )
+    }
+
+    #[test]
+    fn blendspace_exact_hit_gives_full_weight() {
+        let space = BlendSpace {
+            samples: vec![(Vec2::new(0.0, 0.0), 0), (Vec2::new(1.0, 0.0), 1)],
+        };
+        assert_eq!(
+            space.sample(Vec2::new(1.0, 0.0)),
+            vec![(1, 1.0)],
+            "参数点恰等于样本点 → 该点权重 1"
+        );
+        assert_eq!(space.sample(Vec2::new(0.0, 0.0)), vec![(0, 1.0)]);
+        // 空点集：空表
+        let empty = BlendSpace { samples: vec![] };
+        assert!(empty.sample(Vec2::ZERO).is_empty());
+    }
+
+    #[test]
+    fn blendspace_axis_midpoint_halves() {
+        let space = BlendSpace {
+            samples: vec![(Vec2::ZERO, 0), (Vec2::new(1.0, 0.0), 1)],
+        };
+        assert_eq!(
+            space.sample(Vec2::new(0.5, 0.0)),
+            vec![(0, 0.5), (1, 0.5)],
+            "轴中点两邻各 0.5"
+        );
+    }
+
+    #[test]
+    fn blendspace_1d_chain_lerp_and_clamp() {
+        // 所有样本同 y → 1D 链式 lerp（无需特判的退化路径）
+        let space = BlendSpace {
+            samples: vec![
+                (Vec2::new(0.0, 0.0), 0),
+                (Vec2::new(1.0, 0.0), 1),
+                (Vec2::new(2.0, 0.0), 2),
+            ],
+        };
+        assert_eq!(
+            space.sample(Vec2::new(0.25, 0.0)),
+            vec![(0, 0.75), (1, 0.25)],
+            "链式 lerp：两侧邻按 x 距离分权"
+        );
+        assert_eq!(
+            space.sample(Vec2::new(1.5, 0.0)),
+            vec![(1, 0.5), (2, 0.5)],
+            "中点两邻各 0.5"
+        );
+        // 范围外钳到最近端（权重 1）
+        assert_eq!(space.sample(Vec2::new(-1.0, 0.0)), vec![(0, 1.0)]);
+        assert_eq!(space.sample(Vec2::new(5.0, 0.0)), vec![(2, 1.0)]);
+    }
+
+    #[test]
+    fn blendspace_grid_bilinear_exact() {
+        let space = BlendSpace {
+            samples: vec![
+                (Vec2::new(0.0, 0.0), 0),
+                (Vec2::new(1.0, 0.0), 1),
+                (Vec2::new(0.0, 1.0), 2),
+                (Vec2::new(1.0, 1.0), 3),
+            ],
+        };
+        // 参数 (0.25, 0.75)：x 列权重 (0.75, 0.25)、y 行权重 (0.25, 0.75)
+        // → 权重 = 各轴插值系数乘积（轴对齐双线性），输出按「左列前行 →
+        // 左列后行 → 右列前行 → 右列后行」固定顺序
+        assert_eq!(
+            space.sample(Vec2::new(0.25, 0.75)),
+            vec![
+                (0, 0.75 * 0.25),
+                (2, 0.75 * 0.75),
+                (1, 0.25 * 0.25),
+                (3, 0.25 * 0.75),
+            ],
+            "满网格应为标准双线性"
+        );
+    }
+
+    /// 权重不变量：非负、和恒为 1、至多 4 路——确定性「随机」参数网格
+    /// 遍历（坐标写死，无随机源）。
+    #[test]
+    fn blendspace_weights_nonnegative_and_sum_to_one() {
+        let space = BlendSpace {
+            samples: vec![
+                (Vec2::new(0.0, 0.0), 0),
+                (Vec2::new(1.0, 0.0), 1),
+                (Vec2::new(0.0, 1.0), 2),
+                (Vec2::new(1.0, 1.0), 1),
+                (Vec2::new(2.0, 0.5), 0),
+            ],
+        };
+        for i in 0..64u32 {
+            let param = Vec2::new((i % 8) as f32 * 0.313 - 1.0, (i / 8) as f32 * 0.271 - 1.0);
+            let out = space.sample(param);
+            assert!(
+                out.len() <= 4,
+                "至多 4 路非零权重：参数 {param:?} 得 {out:?}"
+            );
+            let mut sum = 0.0f32;
+            for &(clip_index, weight) in &out {
+                assert!(
+                    (0.0..=1.0).contains(&weight),
+                    "权重应在 [0,1]：参数 {param:?} 的 ({clip_index}, {weight})"
+                );
+                sum += weight;
+            }
+            assert!(
+                (sum - 1.0).abs() < 1e-4,
+                "权重和应恒为 1：参数 {param:?} 和 {sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn nway_rotation_blend_yaw_midpoint() {
+        // yaw 0/45/90 等权 → nlerp 中间值 45°
+        let inputs = [
+            (Quat::from_rotation_y(0.0), 1.0 / 3.0),
+            (Quat::from_rotation_y(45f32.to_radians()), 1.0 / 3.0),
+            (Quat::from_rotation_y(90f32.to_radians()), 1.0 / 3.0),
+        ];
+        let q = blend_rotation_nway(&inputs);
+        let expected = Quat::from_rotation_y(45f32.to_radians());
+        let angle = 2.0 * q.dot(expected).abs().clamp(0.0, 1.0).acos();
+        assert!(angle < 1e-4, "三路等权应得中间值 45°，角距 {angle} rad");
+    }
+
+    #[test]
+    fn play_blendspace_excludes_crossfade_and_vice_versa() {
+        let mut player =
+            AnimationPlayer::new(vec![clip("a", vec![], 1.0), clip("b", vec![], 1.0)], vec![]);
+        player.blend_space = Some(BlendSpace {
+            samples: vec![(Vec2::ZERO, 0)],
+        });
+        player.transition(1, 0.5);
+        assert!(player.blend.is_some(), "前置：crossfade 进行中");
+        player.play_blendspace();
+        assert!(player.blend_space_active, "应激活混合空间模式");
+        assert!(player.blend.is_none(), "激活时进行中的 crossfade 应丢弃");
+        // 反向：transition（含状态机路径）退出混合空间模式
+        player.transition(0, 0.5);
+        assert!(
+            !player.blend_space_active,
+            "transition 应退出混合空间模式（互斥）"
+        );
+        assert!(player.blend.is_some(), "transition 正常启动过渡");
+    }
+
+    /// 仅 debug 构建：断言走 `debug_assert!`（release 下静默忽略是
+    /// `play_blendspace` 的文档语义），release 编译掉断言后不应再测 panic。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "blend_space")]
+    fn play_blendspace_without_space_panics() {
+        let mut bare = AnimationPlayer::new(vec![], vec![]);
+        bare.play_blendspace();
+    }
+
+    /// 混合空间模式经 update_animations：active 剪辑采样停用，姿势来自
+    /// N 路加权（参数 0.25 → x = 0·0.75 + 2·0.25 = 0.5，而非 active 剪辑
+    /// 的原值 2）。
+    #[test]
+    fn blendspace_mode_blends_in_update_animations() {
+        let a = clip("a", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let b = clip("b", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![a, b], vec![Some(root)]);
+        player.blend_space = Some(BlendSpace {
+            samples: vec![(Vec2::new(0.0, 0.0), 0), (Vec2::new(1.0, 0.0), 1)],
+        });
+        player.blend_param = Vec2::new(0.25, 0.0);
+        player.play_blendspace();
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().position.x,
+            0.5,
+            "混合空间参数 0.25 应得加权 x = 0.5（active 剪辑的 x=2 不覆写）"
+        );
+    }
+
+    /// 三路旋转 N 路 nlerp 经系统：2 列混合空间在参数 (0.25, 0.25) 给出
+    /// 权重 0.5625 / 0.25 / 0.1875（yaw 0/45/90），结果应等于显式加权和
+    /// 的归一化。
+    #[test]
+    fn blendspace_three_way_rotation_nlerp() {
+        let yaw = |deg: f32| constant_rotation(0, Quat::from_rotation_y(deg.to_radians()));
+        let clips = vec![
+            clip("yaw0", vec![yaw(0.0)], 1.0),
+            clip("yaw45", vec![yaw(45.0)], 1.0),
+            clip("yaw90", vec![yaw(90.0)], 1.0),
+        ];
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(clips, vec![Some(root)]);
+        player.blend_space = Some(BlendSpace {
+            samples: vec![
+                (Vec2::new(0.0, 0.0), 0),
+                (Vec2::new(1.0, 0.0), 1),
+                (Vec2::new(0.0, 1.0), 2),
+            ],
+        });
+        player.blend_param = Vec2::new(0.25, 0.25);
+        player.play_blendspace();
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        let expected = (Quat::from_rotation_y(0.0) * 0.5625
+            + Quat::from_rotation_y(45f32.to_radians()) * 0.25
+            + Quat::from_rotation_y(90f32.to_radians()) * 0.1875)
+            .normalize();
+        let actual = world.get::<Transform>(root).unwrap().rotation;
+        let angle = 2.0 * actual.dot(expected).abs().clamp(0.0, 1.0).acos();
+        assert!(
+            angle < 1e-5,
+            "三路旋转应等于显式 nlerp 加权和，角距 {angle} rad，实际 {actual:?}"
+        );
+    }
+
+    // ---- 根运动（v3）----
+
+    /// 直线走位剪辑全程：增量累计 = 总位移 2 m，根节点平移不被覆写。
+    #[test]
+    fn root_motion_accumulates_full_clip() {
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![walk_clip()], vec![Some(root)]);
+        player.looping = false;
+        player.root_motion_clip = Some(0);
+        player.root_motion_node = Some(0);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        let mut total = Vec3::ZERO;
+        for _ in 0..9 {
+            step(&world, 0.25);
+            let delta = world
+                .get_mut::<AnimationPlayer>(root)
+                .unwrap()
+                .take_root_motion();
+            if let Some(delta) = delta {
+                total += delta;
+            }
+        }
+        assert!(
+            (total.x - 2.0).abs() < 1e-5,
+            "8 帧增量应累计总位移 2 m，实际 {total:?}"
+        );
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().position,
+            Vec3::ZERO,
+            "根运动开启时根节点平移不应被覆写"
+        );
+        assert!(
+            world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .pending_root_motion
+                .is_none(),
+            "take 后应无剩余增量"
+        );
+    }
+
+    /// 循环回绕帧：0.9 → 原始 1.1 的增量 = (1 − 0.9) + (0.1 − 0) = 0.2，
+    /// 无跳变；整圈累计恰为一个周期位移。
+    #[test]
+    fn root_motion_loop_wrap_has_no_jump() {
+        let wrap_clip = clip(
+            "walk",
+            vec![AnimationChannel {
+                node: 0,
+                path: AnimationPath::Translation,
+                interpolation: AnimationInterpolation::Linear,
+                times: vec![0.0, 1.0],
+                values: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            }],
+            1.0,
+        );
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![wrap_clip], vec![Some(root)]);
+        player.root_motion_clip = Some(0);
+        player.root_motion_node = Some(0);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        // 回绕帧：0.9 + 0.2 = 1.1（显示 0.1）
+        world.get_mut::<AnimationPlayer>(root).unwrap().time = 0.9;
+        step(&world, 0.2);
+        let delta = world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .take_root_motion()
+            .expect("回绕帧应产增量");
+        assert!(
+            (delta.x - 0.2).abs() < 1e-5,
+            "回绕增量应 = 旧圈余段 0.1 + 新圈 0.1 = 0.2（无跳变），实际 {delta:?}"
+        );
+        // 整圈累计：从 0 起 4 × 0.25 s 恰走完 1 m
+        let mut total = 0.0f32;
+        for _ in 0..4 {
+            step(&world, 0.25);
+            total += world
+                .get_mut::<AnimationPlayer>(root)
+                .unwrap()
+                .take_root_motion()
+                .map(|d| d.x)
+                .unwrap_or(0.0);
+        }
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "整圈增量累计应为一个周期位移 1 m，实际 {total}"
+        );
+    }
+
+    /// 纯函数多圈语义：一帧跨两圈 = 旧圈余段 + 1 个整圈 + 新圈已走。
+    #[test]
+    fn root_motion_delta_multilap_and_nonlooping_end() {
+        let channel = AnimationChannel {
+            node: 0,
+            path: AnimationPath::Translation,
+            interpolation: AnimationInterpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+        // prev 0.1 → raw 2.15：跨两圈，0.9 + 1.0 + 0.15 = 2.05
+        let delta = root_motion_delta(&channel, 0.1, 2.15, 1.0, true);
+        assert!(
+            (delta.x - 2.05).abs() < 1e-5,
+            "一帧跨两圈应三段精确累积 2.05 m，实际 {delta:?}"
+        );
+        // 非循环停在末端：prev == new → 零增量（不重复计步）
+        assert_eq!(
+            root_motion_delta(&channel, 1.0, 1.0, 1.0, false),
+            Vec3::ZERO,
+            "非循环末端应为零增量"
+        );
+    }
+
+    /// 关闭根运动（默认字段）：平移照常覆写 Transform、不产增量——
+    /// 既有行为零影响。
+    #[test]
+    fn root_motion_disabled_writes_transform_normally() {
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let player = AnimationPlayer::new(vec![walk_clip()], vec![Some(root)]);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().position.x,
+            0.25,
+            "关闭根运动：平移照常覆写"
+        );
+        assert!(
+            world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .pending_root_motion
+                .is_none(),
+            "关闭根运动：不应产增量"
+        );
     }
 }
