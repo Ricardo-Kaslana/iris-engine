@@ -772,6 +772,8 @@ fn spawn_section(
                 is_static: collider.is_static,
                 restitution: collider.restitution,
                 is_sensor: false,
+                groups: u32::MAX,
+                mask: u32::MAX,
             },
         );
     }
@@ -1104,6 +1106,8 @@ mod tests {
                 is_static: false,
                 restitution: 0.0,
                 is_sensor: false,
+                groups: u32::MAX,
+                mask: u32::MAX,
             },
             "collider 缺省 = 动态球、弹性 0（引擎动态构造器语义）"
         );

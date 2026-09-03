@@ -25,6 +25,7 @@ pub mod name;
 pub mod nav;
 pub mod physics;
 pub mod query;
+pub mod ragdoll;
 pub mod resource;
 pub mod schedule;
 pub(crate) mod sync;
@@ -55,6 +56,9 @@ pub mod prelude {
         PHYSICS_GRAVITY, RigidBody, TargetJoint, step_physics,
     };
     pub use crate::query::QueryPart;
+    pub use crate::ragdoll::{
+        RAGDOLL_GROUP, RagdollDesc, RagdollLimbDef, release_ragdoll, spawn_ragdoll_kinematic,
+    };
     pub use crate::resource::Resource;
     pub use crate::schedule::{Access, Schedule, Stage, System};
     pub use crate::time::Time;

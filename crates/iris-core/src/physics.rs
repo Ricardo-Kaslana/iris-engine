@@ -26,7 +26,8 @@
 //! 2. **积分**（半隐式欧拉，仅动体）：`v += 重力 × gravity_scale × dt`；
 //!    `v ×= exp(-linear_damping × dt)`；`pos += v × dt`；
 //! 3. **检测**：均匀网格 broadphase（[`crate::broadphase::BroadphaseGrid`]）
-//!    先按 AABB 快照筛出候选对，再逐对 [`detect_pair`] 精检（跳过静-静对）。
+//!    先按 AABB 快照筛出候选对，再逐对 [`detect_pair`] 精检（跳过静-静对
+//!    与被 `groups`/`mask` 过滤的配对，见「碰撞过滤掩码」章节）。
 //!    候选升序 + `j > i` 过滤 ⇒ 配对遍历序与朴素 O(n²) 双层循环**完全一致**
 //!    （既有 bit 级确定性测试无需改动即守护等价性，见 [`step_physics`]）；
 //! 4. **响应**：穿透深度沿法线分离（静态体不动，动体按动体数均分——
@@ -87,6 +88,9 @@
 //!   检出对是同一配对的求解残影，无 begin/end 语义；
 //! - **静-静跳过**：静-静对互不动、配对永不变化，不进接触集合、不产
 //!   事件（与求解的静-静跳过同一条分支）；
+//! - **过滤配对同待遇**：被 `groups`/`mask` 过滤的配对同样不进接触
+//!   集合、不产事件（掩码固定的「永不碰撞」与静-静的「永不变化」
+//!   语义一致，见「碰撞过滤掩码」章节）；
 //! - **销毁成对性**：接触中的实体 despawn / 移除组件后，下一帧必然收
 //!   到携带已死实体 id 的 [`CollisionEnded`]（本帧集合只含存活实体的检
 //!   出对，差分必然筛出消失配对）——begin/end 严格成对，消费方的计数
@@ -135,13 +139,63 @@
 //! ));
 //! ```
 //!
+//! # 碰撞过滤掩码（groups / mask，R37）
+//!
+//! [`Collider::groups`]（所属位组）与 [`Collider::mask`]（碰撞白名单）
+//! 是按语义层开关碰撞的通用能力（ragdoll 自碰撞免抖的前置：全部肢体同
+//! 组位、mask 排除该位，肢体互不碰撞，见 [`crate::ragdoll`]）。语义要点
+//! （实现与文档一一对应）：
+//!
+//! - **配对判定对称**：`(a.groups & b.mask) != 0 && (b.groups & a.mask)
+//!   != 0` 才进入检测与求解——两个方向都认可才碰撞，任一方向为 0 即
+//!   过滤（「a 想碰 b」但「b 不想碰 a」同样不碰：碰撞是配对的对称属性
+//!   而非单方意愿）；
+//! - **被过滤对与静-静对同待遇**：不检测、不求解、**不进接触事件集合**
+//!   ——掩码固定的「永不碰撞」配对与静-静配对一样永不变化，begin/end
+//!   无语义（sensor 正交性不受影响：过滤在 sensor 判定之前）；
+//! - **broadphase 照旧**：过滤只作用于配对白名单、不做粗筛——网格候选
+//!   的构建与遍历序完全不变（候选序 = 既有确定性遍历序，掩码判定是逐
+//!   配对的一次位与，成本可忽略）；被过滤对的 `j ≤ i` / 静-静等既有
+//!   跳过分支照常先行，**没有任何遍历顺序被改变** ⇒ bit 级确定性保持
+//!   （既有确定性测试零改动守护）；
+//! - **默认全 1**：全部构造辅助（[`Collider::static_box`] 等）产出的
+//!   碰撞体 `groups` / `mask` 均为全 1——与引入过滤前的行为逐位一致，
+//!   既有场景零迁移成本；需要过滤时字段直改（无辅助构造，示例见下）；
+//! - **正交性**：过滤与 `is_static` / `is_sensor` / 关节均正交——关节
+//!   不看掩码（约束是显式拓扑，[crate::ragdoll] 的肢体链靠它连通），
+//!   sensor 照常报事件的前提是配对未被过滤。
+//!
+//! 分层碰撞用例（敌人子弹打玩家、敌我子弹互穿、装饰物不挡弹道）：
+//!
+//! ```ignore
+//! use iris_core::prelude::*;
+//!
+//! const PLAYER: u32 = 1 << 1; // 位 0 已被 RAGDOLL_GROUP 占用，层位从 1 起
+//! const ENEMY: u32 = 1 << 2;
+//!
+//! // 玩家：被一切打（mask 全开）；敌人子弹：只打玩家（mask 仅 PLAYER）
+//! world.spawn((
+//!     Transform::from_xyz(0.0, 0.9, 0.0),
+//!     Collider::static_capsule(0.4, 0.9),
+//! ));
+//! let mut bullet = Collider::dynamic_sphere(0.08, 0.0);
+//! bullet.groups = ENEMY;
+//! bullet.mask = PLAYER; // 敌方子弹不与场景 / 敌人自身碰撞，只命中玩家
+//! world.spawn((
+//!     Transform::from_xyz(3.0, 1.0, 0.0),
+//!     bullet,
+//!     RigidBody { velocity: Vec3::new(-6.0, 0.0, 0.0), ..RigidBody::default() },
+//! ));
+//! ```
+//!
 //! # 约束与关节（v1 位置约束集）
 //!
 //! 机关门 / 吊灯 / 弹簧板的地基（R36）。v1 物理是**纯位置物理**
 //! （[`RigidBody`] 只有线速度，无角速度 / 旋转积分），语义完整的旋转
 //! 铰链（限制转轴的 hinge 等）在此模型下无法诚实实现——**旋转约束需
-//! 角速度支持，见路线图**（R37 的 ragdoll 关节同属此类，本轮不做）。
-//! v1 只做位置物理下语义清晰的两个关节组件、三种约束行为：
+//! 角速度支持，见路线图**（R37 的 ragdoll 以「球肢近似 + 距离关节」
+//! 绕开旋转语义落地，见 [`crate::ragdoll`]；旋转肢体重建仍待角速度
+//! 扩展）。v1 只做位置物理下语义清晰的两个关节组件、三种约束行为：
 //!
 //! - [`DistanceJoint`]：距离约束——`stiffness = 1` 硬约束（双向刚杆）、
 //!   `(0, 1)` 弹簧（部分修正投影）+ 轴向相对速度 `damping`；
@@ -297,7 +351,8 @@ pub enum ColliderShape {
     },
 }
 
-/// 碰撞体组件：形状 + 是否静态 + 弹性 + 是否触发区域（sensor）。
+/// 碰撞体组件：形状 + 是否静态 + 弹性 + 是否触发区域（sensor）+
+/// 碰撞过滤掩码（`groups` / `mask`，见模块文档「碰撞过滤掩码」章节）。
 #[derive(Clone, Copy, Debug, PartialEq, Component)]
 pub struct Collider {
     pub shape: ColliderShape,
@@ -312,6 +367,17 @@ pub struct Collider {
     /// 实体彼此穿过。与 `is_static` **正交**：sensor 也可以动（两动体
     /// sensor 相撞只报事件、互不阻挡）。
     pub is_sensor: bool,
+    /// **所属位组**（R37）：本实体归属哪些碰撞组（按位多选）。默认全 1
+    /// ——一切位组都在场，与引入过滤前的行为逐位一致。典型用法：一个
+    /// 语义层一个位（层「玩家」「敌人」「布娃娃」），见 [`crate::ragdoll`]
+    /// 的 `RAGDOLL_GROUP`。
+    pub groups: u32,
+    /// **碰撞白名单**（R37）：本实体愿意与哪些位组碰撞（按位多选）。
+    /// 配对判定**对称**：`(a.groups & b.mask) != 0 && (b.groups & a.mask)
+    /// != 0` 才检测求解；被过滤的配对**不进接触事件集合**（与静-静对同
+    /// 待遇）。默认全 1 = 与一切碰撞（既有行为零变化）；过滤用字段直改
+    /// （构造辅助保持全开，见模块文档「碰撞过滤掩码」）。
+    pub mask: u32,
 }
 
 impl Collider {
@@ -322,6 +388,8 @@ impl Collider {
             is_static: true,
             restitution: 0.0,
             is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -332,6 +400,8 @@ impl Collider {
             is_static: true,
             restitution: 0.0,
             is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -342,6 +412,8 @@ impl Collider {
             is_static: false,
             restitution,
             is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -352,6 +424,8 @@ impl Collider {
             is_static: false,
             restitution,
             is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -362,6 +436,8 @@ impl Collider {
             is_static: true,
             restitution: 0.0,
             is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -372,6 +448,8 @@ impl Collider {
             is_static: false,
             restitution,
             is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -384,6 +462,8 @@ impl Collider {
             is_static: true,
             restitution: 0.0,
             is_sensor: true,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 
@@ -395,6 +475,8 @@ impl Collider {
             is_static: true,
             restitution: 0.0,
             is_sensor: true,
+            groups: u32::MAX,
+            mask: u32::MAX,
         }
     }
 }
@@ -1351,6 +1433,17 @@ pub fn step_physics(world: &World) {
                     continue; // 只保留下三角（j > i），与原 (i+1)..n 内层一致
                 }
                 if is_static[i] && is_static[j] {
+                    continue;
+                }
+                // 碰撞过滤（groups/mask 位掩码，见模块文档「碰撞过滤掩码」）：
+                // 双向白名单都认可的配对才检测求解；被过滤对与静-静对同
+                // 待遇——不检测、不求解、不进接触集合（下方分支共享）。
+                // 放在 broadphase 之后：过滤只影响配对白名单、不粗筛——
+                // 网格候选构建与遍历序完全不变（确定性保持），逐配对一次
+                // 位与的成本可忽略。
+                if collected[i].1.groups & collected[j].1.mask == 0
+                    || collected[j].1.groups & collected[i].1.mask == 0
+                {
                     continue;
                 }
                 let Some(contact) = detect_pair(
@@ -2515,6 +2608,8 @@ mod tests {
                 is_static: true,
                 restitution: 0.0,
                 is_sensor: false,
+                groups: u32::MAX,
+                mask: u32::MAX,
             },
             RigidBody {
                 velocity: Vec3::new(0.0, -3.0, 0.0),
@@ -2765,6 +2860,8 @@ mod tests {
                 is_static: true,
                 restitution: 0.0,
                 is_sensor: false,
+                groups: u32::MAX,
+                mask: u32::MAX,
             },
             RigidBody {
                 velocity: Vec3::new(1.0, 0.0, 0.0),
@@ -3711,6 +3808,164 @@ mod tests {
                 "静-静对永不变化，不应有事件"
             );
         }
+    }
+
+    // ---- 碰撞过滤掩码：groups / mask（见模块文档「碰撞过滤掩码」章节）----
+
+    /// 全部构造辅助产出全 1 的 groups / mask（默认 = 与一切碰撞，引入
+    /// 过滤前的行为逐位不变——既有测试全量守护该等价性，这里是字段级
+    /// 直接断言）。
+    #[test]
+    fn collider_helpers_default_to_all_one_groups_and_mask() {
+        let helpers = [
+            Collider::static_box(Vec3::ONE),
+            Collider::static_sphere(0.5),
+            Collider::dynamic_sphere(0.5, 0.3),
+            Collider::dynamic_box(Vec3::ONE, 0.3),
+            Collider::static_capsule(0.4, 0.9),
+            Collider::dynamic_capsule(0.4, 0.9, 0.3),
+            Collider::sensor_sphere(0.5),
+            Collider::sensor_box(Vec3::ONE),
+        ];
+        for collider in &helpers {
+            assert_eq!(collider.groups, u32::MAX, "groups 默认应全 1");
+            assert_eq!(collider.mask, u32::MAX, "mask 默认应全 1");
+        }
+    }
+
+    /// 失重对撞体的过滤辅助（restitution 0.9：若未被过滤必然剧烈反弹）。
+    fn spawn_grouped_drifter(
+        world: &mut World,
+        pos: Vec3,
+        vel: Vec3,
+        groups: u32,
+        mask: u32,
+    ) -> Entity {
+        world.spawn((
+            Transform::from_translation(pos),
+            Collider {
+                shape: ColliderShape::Sphere { radius: 0.5 },
+                is_static: false,
+                restitution: 0.9,
+                is_sensor: false,
+                groups,
+                mask,
+            },
+            RigidBody {
+                velocity: vel,
+                gravity_scale: 0.0,
+                ..RigidBody::default()
+            },
+        ))
+    }
+
+    /// 组 A vs 组 B 互不匹配（各自 mask 只含自己的组）：相互穿过——
+    /// 位置 = 自由飞航迹（bit 级，无任何推离）、速度 bit 级不变（无反弹
+    /// 无摩擦）、全程零事件；同几何的默认掩码对照组则反弹 + 报事件
+    /// （证明行为差异来自过滤本身，测试非空转）。
+    #[test]
+    fn group_filter_mismatched_pair_passes_through_without_events() {
+        const GROUP_A: u32 = 0b01;
+        const GROUP_B: u32 = 0b10;
+        let start_a = Vec3::new(-2.0, 100.0, 0.0);
+        let start_b = Vec3::new(2.0, 100.0, 0.0);
+        let vel_a = Vec3::X;
+        let vel_b = -Vec3::X;
+
+        // ---- 被过滤场景 ----
+        let mut world = make_event_world();
+        let a = spawn_grouped_drifter(&mut world, start_a, vel_a, GROUP_A, GROUP_A);
+        let b = spawn_grouped_drifter(&mut world, start_b, vel_b, GROUP_B, GROUP_B);
+
+        let mut events_seen = 0usize;
+        for _ in 0..120 {
+            let (started, ended) = step_collect(&mut world, DT);
+            events_seen += started.len() + ended.len();
+        }
+        assert_eq!(events_seen, 0, "被过滤配对不应产出任何接触事件");
+
+        // 速度 bit 级不变（求解从未触碰）
+        assert_eq!(ball_velocity(&world, a), vel_a, "过滤对的 a 速度不应被改写");
+        assert_eq!(ball_velocity(&world, b), vel_b, "过滤对的 b 速度不应被改写");
+        // 位置 = 自由飞航迹：同款逐帧累加复算，bit 级一致（无推离）
+        let mut expect_a = start_a;
+        let mut expect_b = start_b;
+        for _ in 0..120 {
+            expect_a += vel_a * DT;
+            expect_b += vel_b * DT;
+        }
+        assert_eq!(ball_position(&world, a), expect_a, "a 应严格沿自由飞航迹");
+        assert_eq!(ball_position(&world, b), expect_b, "b 应严格沿自由飞航迹");
+        // 非空转佐证：两球末态深度重叠（对心穿越已发生）却无任何求解
+        let gap = ball_position(&world, a).distance(ball_position(&world, b));
+        assert!(gap < 1.0, "相向 2 s 应已对心穿越重叠，实际间距 {gap}");
+
+        // ---- 对照组：同几何 + 默认全 1 掩码 → 反弹 + 报事件 ----
+        let mut control = make_event_world();
+        let ca = spawn_grouped_drifter(&mut control, start_a, vel_a, u32::MAX, u32::MAX);
+        let cb = spawn_grouped_drifter(&mut control, start_b, vel_b, u32::MAX, u32::MAX);
+        let mut control_events = 0usize;
+        for _ in 0..120 {
+            let (started, ended) = step_collect(&mut control, DT);
+            control_events += started.len() + ended.len();
+        }
+        assert!(control_events > 0, "默认掩码的对照组应报接触事件");
+        assert!(
+            ball_velocity(&control, ca).x < 0.9,
+            "对照组 a 应发生反弹（速度被改写），实际 {:?}",
+            ball_velocity(&control, ca)
+        );
+        assert!(ball_velocity(&control, cb).x > -0.9, "对照组 b 应发生反弹");
+        assert!(
+            ball_position(&control, ca).distance(ball_position(&control, cb)) >= 1.0,
+            "对照组两球应被弹开而非重叠"
+        );
+    }
+
+    /// 单向 mask（a 的白名单含 b 的组、b 的不含 a 的组）同样不碰——
+    /// 配对判定对称：两个方向都认可才碰撞；镜像配置（b 认 a、a 不认 b）
+    /// 结果一致。
+    #[test]
+    fn group_filter_one_sided_mask_is_still_filtered() {
+        const GROUP_A: u32 = 0b01;
+        const GROUP_B: u32 = 0b10;
+        let start_a = Vec3::new(-2.0, 100.0, 0.0);
+        let start_b = Vec3::new(2.0, 100.0, 0.0);
+        let vel_a = Vec3::X;
+        let vel_b = -Vec3::X;
+
+        // 正向单向：a（组 A）的白名单含组 B，b（组 B）只认组 B
+        let mut world = make_event_world();
+        let a = spawn_grouped_drifter(&mut world, start_a, vel_a, GROUP_A, GROUP_A | GROUP_B);
+        let b = spawn_grouped_drifter(&mut world, start_b, vel_b, GROUP_B, GROUP_B);
+        let mut events_seen = 0usize;
+        for _ in 0..120 {
+            let (started, ended) = step_collect(&mut world, DT);
+            events_seen += started.len() + ended.len();
+        }
+        assert_eq!(events_seen, 0, "单向认可的配对同样应被过滤");
+        assert_eq!(ball_velocity(&world, a), vel_a, "a 速度不应被改写");
+        assert_eq!(ball_velocity(&world, b), vel_b, "b 速度不应被改写");
+        let gap = ball_position(&world, a).distance(ball_position(&world, b));
+        assert!(gap < 1.0, "两球应已穿越重叠（无求解），实际间距 {gap}");
+
+        // 镜像单向：b 认 a、a 不认 b → 同样过滤（对称语义）
+        let mut mirrored = make_event_world();
+        let ma = spawn_grouped_drifter(&mut mirrored, start_a, vel_a, GROUP_A, GROUP_A);
+        let mb = spawn_grouped_drifter(&mut mirrored, start_b, vel_b, GROUP_B, GROUP_A | GROUP_B);
+        let mut mirrored_events = 0usize;
+        for _ in 0..120 {
+            let (started, ended) = step_collect(&mut mirrored, DT);
+            mirrored_events += started.len() + ended.len();
+        }
+        assert_eq!(mirrored_events, 0, "镜像单向配置同样应被过滤");
+        assert_eq!(ball_velocity(&mirrored, ma), vel_a);
+        assert_eq!(ball_velocity(&mirrored, mb), vel_b);
+        let mirrored_gap = ball_position(&mirrored, ma).distance(ball_position(&mirrored, mb));
+        assert!(
+            (mirrored_gap - gap).abs() < 1e-6,
+            "镜像配置的穿越轨迹应与正向逐位一致：{mirrored_gap} vs {gap}"
+        );
     }
 
     /// 资源缺席不 panic：完全不注册（照 Time 缺席语义静默跳过）；以及只

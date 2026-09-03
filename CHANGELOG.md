@@ -5,6 +5,56 @@
 
 ## [Unreleased]
 
+### Added（R37：布娃娃与死亡混合 v1——球肢链 + 运动学窗口，附碰撞过滤掩码）
+
+死亡系统地基落地（第 37 轮迭代；iris-core 新模块 `ragdoll` + `physics`
+扩展，语义规范 = `iris-core::ragdoll` / `iris-core::physics` 模块文档，
+架构记录见 ARCHITECTURE §3.8，视觉验收 `examples/ragdoll_snapshot.rs` →
+`docs/ragdoll.png`）。v1 物理是纯位置物理（`RigidBody` 只有线速度、
+无角速度 / 旋转积分），语义完整的旋转铰链无法诚实实现——ragdoll 刻意
+用**球肢近似**绕开旋转语义（肢体 = 半径各异的球 + 既有 `DistanceJoint`
+硬约束；球各向同性，翻滚 / 拖拽 / 堆叠语义正确且不需要旋转；旋转肢体
+重建仍待角速度扩展，见路线图）：
+
+- **碰撞过滤掩码（`Collider.groups` / `mask`）**：所属位组 + 碰撞白名单
+  两个 `u32` 位字段，**默认全 1**——全部构造辅助零变化，引入前行为
+  逐位一致。配对判定**对称**：`(a.groups & b.mask) != 0 &&
+  (b.groups & a.mask) != 0` 才检测求解（单向认可同样过滤）；被过滤对
+  与静-静对同待遇——不检测、不求解、**不进接触事件集合**；broadphase
+  照旧（过滤只在配对白名单层做一次位与，候选构建与遍历序完全不变）
+  ⇒ 既有 bit 级确定性测试零改动全过。测试：互不匹配组穿透（位置 /
+  速度 / 事件三重断言 + 默认掩码对照组）、单向 mask（含镜像配置）、
+  默认全 1 字段级断言。
+- **`spawn_ragdoll_kinematic`（动画接管期）**：按 `RagdollDesc`
+  （`limbs: Vec<RagdollLimbDef { offset, radius, restitution }>` +
+  `links: Vec<(usize, usize)>`）生成**静态**肢体——`is_static = true`
+  挡玩家 / 弹道，游戏侧照常驱动 `Transform` 定格死亡姿势；相邻对挂
+  `DistanceJoint`（`stiffness = 1` 硬约束，rest = 生成时两端实际距离）；
+  肢体全部挂 `RAGDOLL_GROUP`（bit 0）组位、`mask` 排除该位 →
+  **自碰撞免抖**（生成时相邻球相切 / 微重叠，互相求解会被挤开炸裂；
+  与场景照常碰）。确定性：生成序 = 定义序、同 pos 同 desc 逐位一致；
+  断言半径 > 0、链接在界内且非自链接（中文断言消息）。
+- **`release_ragdoll`（物理接管期）**：把全部肢体翻转动体
+  （`is_static = false`）+ 写入继承速度 + 可选冲量 `(方向, 强度)`
+  踢飞（`normalize_or_zero`，零方向确定性跳过）；只需 `&World`
+  （组件写锁翻转，生成时已带齐组件；实体失效静默跳过不 panic）；
+  释放后关节自动生效（挂载体已为动体），重力 / 碰撞 / 接触事件照常。
+- **诚实限制**（模块文档「前提与边界」一一对应）：肢体间无挤压——
+  **堆叠靠地面 / 场景**；全部 ragdoll 共用组位，两具 ragdoll 的肢体
+  也互不碰撞（位组按语义层细分留游戏侧）；速度无钳制（v1 无 CCD，
+  冲量过大可穿墙，调用方自控强度）；生成需 `&mut World`（实体分配是
+  结构性修改），释放只需 `&World`。
+- **测试**：拓扑（limb / link 数量、rest = 生成距离 bit 级、组位 /
+  mask / 静态初值）、断言守护（越界 / 自链接 / 非正半径 panic）、
+  kinematic 期纹丝不动 + 静态肢体挡弹道（对照球直达地面）、release
+  翻转 / 速度继承 / 冲量增量 / 下坠 / despawn 静默跳过、**倒地链
+  不散架**（240 步相邻肢体距离保持 rest ± 3e-2、终态 ± 1e-2、质心
+  塌地收敛、全程速度有界无爆炸）、确定性（同 desc 两次全流程 240 步
+  逐采样 bit 级一致）。
+
+新增 11 个测试（physics 过滤 3 + ragdoll 8），既有物理 / 场景测试
+零改动全过。
+
 ### Added（R36：物理约束与关节 v1——距离/弹簧/目标点约束进 step_physics 管线）
 
 位置物理约束集落地，机关门 / 吊灯 / 弹簧板的地基（第 36 轮迭代；iris-core
