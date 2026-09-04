@@ -5,6 +5,47 @@
 
 ## [Unreleased]
 
+### Added（R40：多视口与渲染到纹理——小地图 / 监控屏玩法基础 + UI 图片控件）
+
+多视口与渲染到纹理落地（第 40 轮迭代；iris-render 新模块 `rendertarget` +
+RT pass + 两条 UI 图片控件管线，语义规范 = `iris_render::rendertarget` /
+`ui` 模块文档，架构记录见 ARCHITECTURE §4.21，限制见 §8.20，视觉验收
+`examples/rendertarget_snapshot.rs` → `docs/rendertarget.png`）：
+
+- **`RendersTo { target: RenderTargetHandle }` 组件**（挂在相机实体上，须
+  同步挂 `ActiveCamera`）：渲染器收集全部 `(ActiveCamera + RendersTo)`
+  实体，每台 RT 相机渲一次到对应离屏纹理；**主视图 = 无 `RendersTo` 的
+  相机**（选择逻辑零变化——默认场景无 RT 实体时行为与 R39 逐位一致，集成
+  测试 `main_view_pixels_unchanged_with_rt_camera` / `no_rt_store_keeps_baseline`
+  逐像素锁定「主视图零变化」）；只有 RT 相机时主视图回退 `Camera` 资源。
+- **`RenderTargetStore`（World 资源，CPU 侧尺寸描述 + 句柄，GPU 纹理由
+  渲染器惰性创建并跨帧持有）**：**不进 `DefaultPlugins`**——游戏侧按需
+  `insert_resource`，缺席 = 无 RT 相机 = 主路径零变化。无 `resize`（v1）。
+- **RT pass**：不透明 + 蒙皮 + 透明（复用 `collect_instances` 视锥参数化、
+  主 pass 同款排序——确定性），用 RT 相机自己的视锥剔除；**复用主阴影图 /
+  CSM**（RT 相机朝向不同时拟合仍按主相机）；**天空盒 / 贴花 / 粒子 v1 不画**；
+  输出 = 几何渲到 RT 线性 HDR 中间缓冲 → **ACES 色调映射**（泛光 0 / 曝光 1 /
+  暗角 0——无后处理链）到 `Rgba8UnormSrgb` 颜色纹理；**无 UI**。
+  FrameStats 口径 = 主几何（RT 辅助视口不计）。数量上限 2，超出 warn 跳过。
+- **UI 图片控件**：`UiImage { texture }` / `UiImageRtt { target }` 把普通
+  纹理或 RT 颜色纹理贴到屏幕（复用于 `UiRect` 定位 + `UiColor` 乘色），UV
+  全屏 0..1 直角采样（Nearest）；**图片之下、文本之上**（图片先于 atlas
+  矩形 / 文本绘制，小地图底图垫在 HUD 文字之下）。挂图片的实体其 `UiRect`
+  仅作定位 / 尺寸载体、不绘制矩形（与 `UiText` 同语义——否则缺省白矩形
+  盖住图片，集成测试实测抓出）。
+- **RT 渲染实现形态**：RT 几何走单采样几何管线（`rt_*`，无 MSAA），渲到
+  每 RT 专用线性 HDR 缓冲，`rt_blit_pipeline`（Rgba8UnormSrgb 输出）ACES
+  色调映射到 RT 颜色纹理；每 RT 独立全局 uniform / 实例缓冲 / 深度缓冲。
+
+与规范的偏离：无（按设计决策实现；tonemap 选 ACES-through-blit 而非直接
+clamp——复用既有 blit 着色器，几何管线同为 HDR 线性输出、alpha 混合在线
+性域正确；RT 无 MSAA 为「像素化小地图天然契合」）。
+
+新增 5 个 CPU 单测（rendertarget 3 + ui 2 图片收集/定位）与 6 个 GPU 集成
+测试（RT 内容正确 + UiImageRtt 呈现、主视图零变化回归锁、RT 相机不改
+FrameStats、UiImage 贴纹理像素、UiImageRtt 区域差分、无 RT / 空 store
+主路径零变化），既有 IRIS 测试零改动全过（默认场景主渲染像素零变化）。
+
 ### Added（R39：盒投影贴花——弹孔 / 血迹 / 地面标记，正向前向管线的 decal cube projection）
 
 贴花渲染落地（第 39 轮迭代；iris-render 新模块 `decal` + 贴花管线 +

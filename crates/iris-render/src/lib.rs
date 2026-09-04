@@ -43,6 +43,7 @@ pub mod particles;
 pub mod pipeline;
 pub mod post;
 pub mod renderer;
+pub mod rendertarget;
 pub mod skin;
 pub mod surface;
 pub mod texture;
@@ -85,13 +86,16 @@ pub mod prelude {
     pub use crate::renderer::{
         CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,
     };
+    pub use crate::rendertarget::{
+        RenderTargetHandle, RenderTargetSpec, RenderTargetStore, RendersTo,
+    };
     pub use crate::skin::{Skin, skin_vertex};
     pub use crate::surface::SurfaceKit;
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
     pub use crate::texture_bcn::{
         BC1_BLOCK_BYTES, bc1_eligible, encode_bc1, encoded_len, padded_extent,
     };
-    pub use crate::ui::{UiColor, UiRect, UiText, glyph_bits, text_width};
+    pub use crate::ui::{UiColor, UiImage, UiImageRtt, UiRect, UiText, glyph_bits, text_width};
     pub use crate::visibility::Visibility;
 }
 

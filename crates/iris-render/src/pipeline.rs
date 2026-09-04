@@ -48,6 +48,22 @@ pub(crate) struct PipelineBundle {
     pub vignette_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
+    /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
+    /// 透明变体），仅 `multisample.count = 1`、片段目标仍为线性 HDR——
+    /// RT 场景先渲到离屏线性 HDR 中间缓冲，再经 [`Self::rt_blit_pipeline`]
+    /// ACES 色调映射到 RT 颜色纹理。**不画天空盒**（v1 限制，见
+    /// `rendertarget.rs` 与 ARCHITECTURE §4.21）。
+    pub rt_pipeline: wgpu::RenderPipeline,
+    /// RT 蒙皮变体（组 2 绑定关节矩阵）。
+    pub rt_skinned_pipeline: wgpu::RenderPipeline,
+    /// RT 透明变体（alpha 混合 + 深度只测不写）。
+    pub rt_transparent_pipeline: wgpu::RenderPipeline,
+    /// RT 透明蒙皮变体。
+    pub rt_transparent_skinned_pipeline: wgpu::RenderPipeline,
+    /// RT 色调映射管线（Rgba8UnormSrgb 输出）：复用 blit 着色器做 ACES +
+    /// 曝光、泛光强度恒 0（RT 无 bloom），把 RT 线性 HDR 中间缓冲 map 到
+    /// RT 颜色纹理。
+    pub rt_blit_pipeline: wgpu::RenderPipeline,
     /// 粒子 additive 管线（billboard 实例化，`SrcAlpha + One` 加法混合，
     /// 深度只测不写——火焰 / 火花类高亮粒子，叠加顺序无关）。
     pub particle_additive_pipeline: wgpu::RenderPipeline,
@@ -278,7 +294,8 @@ pub(crate) fn create_pipeline(
                               layout: &wgpu::PipelineLayout,
                               skinned: bool,
                               blend: wgpu::BlendState,
-                              depth_write: bool|
+                              depth_write: bool,
+                              msaa: u32|
      -> wgpu::RenderPipeline {
         let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
             &[
@@ -326,7 +343,7 @@ pub(crate) fn create_pipeline(
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: sample_count,
+                count: msaa,
                 ..Default::default()
             },
             multiview_mask: None,
@@ -341,6 +358,7 @@ pub(crate) fn create_pipeline(
         false,
         wgpu::BlendState::REPLACE,
         true,
+        sample_count,
     );
     // 蒙皮主管线：顶点输入 = [常规顶点, 蒙皮属性, 实例]，
     // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
@@ -351,6 +369,7 @@ pub(crate) fn create_pipeline(
         true,
         wgpu::BlendState::REPLACE,
         true,
+        sample_count,
     );
     // 透明变体（普通 + 蒙皮）：alpha 混合 + 深度只测不写，
     // 绘制在不透明主 pass 之后、按视深降序（见 renderer.rs 透明 pass）。
@@ -361,6 +380,7 @@ pub(crate) fn create_pipeline(
         false,
         wgpu::BlendState::ALPHA_BLENDING,
         false,
+        sample_count,
     );
     let transparent_skinned_pipeline = make_mesh_pipeline(
         "iris.pipeline.transparent_skinned",
@@ -369,6 +389,45 @@ pub(crate) fn create_pipeline(
         true,
         wgpu::BlendState::ALPHA_BLENDING,
         false,
+        sample_count,
+    );
+    // RT（R40）几何管线族：单采样变体（RT 无 MSAA——像素化小地图天然契合，
+    // 见 rendertarget.rs），复用同源着色器 / 布局，仅 multisample.count = 1。
+    let rt_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::REPLACE,
+        true,
+        1,
+    );
+    let rt_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::REPLACE,
+        true,
+        1,
+    );
+    let rt_transparent_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_transparent",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+        1,
+    );
+    let rt_transparent_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_transparent_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+        1,
     );
 
     // 天空盒：全屏三角形按像素射线采样预滤波环境贴图 0 级 mip（= 原始天空）。
@@ -719,6 +778,40 @@ pub(crate) fn create_pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // RT 色调映射管线（R40）：复用 blit 着色器（ACES + 曝光 + 泛光叠加），
+    // 但输出固定为 RT 颜色格式 Rgba8UnormSrgb（与视图表面格式解耦——
+    // RT 颜色纹理恒为 sRGB 8 位，不依赖 window 的 surface 格式）。
+    // 单采样无 MSAA；泛光强度恒 0（rt_blit_bind_group 的 bloom 槽位绑定
+    // 白色兜底纹理、强度参数 0，见 renderer.rs 的 build_rt_bind_group）。
+    let rt_blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.rt_blit"),
+        layout: Some(&blit_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &blit_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &blit_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1095,6 +1188,11 @@ pub(crate) fn create_pipeline(
         bloom_blur_pipeline,
         vignette_pipeline,
         ui_pipeline,
+        rt_pipeline,
+        rt_skinned_pipeline,
+        rt_transparent_pipeline,
+        rt_transparent_skinned_pipeline,
+        rt_blit_pipeline,
         particle_additive_pipeline,
         particle_alpha_pipeline,
         decal_pipeline,

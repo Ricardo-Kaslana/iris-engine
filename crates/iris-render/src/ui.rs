@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use iris_core::Component;
 use iris_core::prelude::Entity;
 
+use crate::rendertarget::RenderTargetHandle;
+use crate::texture::TextureHandle;
+
 /// UI 矩形：屏幕像素坐标（原点左上、y 向下）。
 ///
 /// 挂在任意实体上，与 [`UiColor`] 配对渲染；无层级 / 无锚点（v1）。
@@ -48,6 +51,35 @@ impl Default for UiColor {
     fn default() -> Self {
         Self([1.0, 1.0, 1.0, 1.0])
     }
+}
+
+/// UI 图片：把一张普通纹理（[`crate::texture::TextureHandle`]）以
+/// [`UiRect`]（position / size，像素）定位绘制到屏幕。
+///
+/// 与 [`UiText`] 同款：**定位复用同实体 `UiRect`**（缺省画在 (0,0)，
+/// 尺寸 0×0），`UiColor` 乘色（缺省白 = 原样显示）。绘制顺序 = 图片之下、
+/// 文本之上：图片先于 UI 文本绘制（小地图底图应垫在 HUD 文字下方，
+/// 「后画者在上」由收集顺序统一裁决，见模块头）。UV 恒为全屏 0..1
+/// 直角采样（无抗锯齿 v1——小地图 / 像素化内容天然契合，Nearest 采样
+/// 由渲染器统一使用）。图片纹理同样可能走 BC1 上传（照
+/// [`crate::texture_bcn`] 决策树，见 `renderer.rs::ensure_texture`）。
+#[derive(Component, Clone, Debug)]
+pub struct UiImage {
+    /// 要显示的普通纹理。
+    pub texture: crate::texture::TextureHandle,
+}
+
+/// UI 图片（渲染目标版）：把 [`crate::rendertarget::RenderTargetHandle`]
+/// 对应 RT 的颜色纹理以 [`UiRect`] 定位绘制到屏幕——小地图 / 监控屏的直接
+/// 呈现。
+///
+/// 定位 / 乘色 / 顺序语义与 [`UiImage`] 完全一致（图片之下、文本之上）。
+/// RT 的 GPU 颜色纹理由渲染器跨帧持有（`renderer.rs::GpuRenderTarget`），
+/// UI pass 直接采样该纹理（Rgba8UnormSrgb）。
+#[derive(Component, Clone, Debug)]
+pub struct UiImageRtt {
+    /// 要显示的渲染目标。
+    pub target: crate::rendertarget::RenderTargetHandle,
 }
 
 /// 公有领域 font8x8 位图字体（Daniel Hepper 整理 / Marcel Sondaar 起源，
@@ -485,13 +517,16 @@ pub(crate) fn collect_ui_vertices(world: &iris_core::world::World, out: &mut Vec
     use crate::visibility::Visibility;
     world.query::<(Entity, &UiRect, &UiColor, Option<&Visibility>)>(
         |(entity, rect, color, visibility)| {
-            // 挂有 UiText 的实体上，UiRect 仅充当文本排版原点（定位载体），
-            // 不绘制矩形——否则缺省白矩形会盖住文字；需要面板背景时单独
-            // 生成一个矩形实体（与文本实体解耦）。
+            // 挂有 UiText / UiImage / UiImageRtt 的实体上，UiRect 仅充当定位
+            // / 尺寸载体（文本排版原点、图片像素盒），不绘制矩形——否则缺省
+            // 白矩形会盖住文字 / 图片；需要面板背景时单独生成一个矩形实体。
             if visibility.is_some_and(|v| !v.visible) {
                 return;
             }
-            if world.get::<UiText>(entity).is_none() {
+            if world.get::<UiText>(entity).is_none()
+                && world.get::<UiImage>(entity).is_none()
+                && world.get::<UiImageRtt>(entity).is_none()
+            {
                 push_rect_vertices(out, rect, *color);
             }
         },
@@ -506,6 +541,72 @@ pub(crate) fn collect_ui_vertices(world: &iris_core::world::World, out: &mut Vec
                 .map(|rect| rect.position)
                 .unwrap_or([0.0, 0.0]);
             push_text_vertices(out, text, origin, *color);
+        },
+    );
+}
+
+/// 图片 quad 的 6 顶点：UV 全屏 0..1（把整张图片纹理映射到
+/// [`UiRect`] 像素盒），颜色 = 乘色。
+pub fn push_image_vertices(out: &mut Vec<UiVertex>, rect: &UiRect, color: UiColor) {
+    let min = rect.position;
+    let max = [
+        rect.position[0] + rect.size[0],
+        rect.position[1] + rect.size[1],
+    ];
+    push_quad(out, min, max, [0.0, 0.0], [1.0, 1.0], color.0);
+}
+
+/// 渲染器收集到的单张 UI 图片：绘制源（普通纹理 / 渲染目标）+ 固定
+/// 6 顶点（图片恒为单位 quad，见 [`push_image_vertices`]）。
+pub(crate) struct UiImageItem {
+    /// 绘制源的纹理（普通纹理）——`None` 则 `rtt` 出参。
+    pub texture: Option<TextureHandle>,
+    /// 绘制源的渲染目标——`None` 则 `texture` 出参。
+    pub rtt: Option<RenderTargetHandle>,
+    /// 该图片的 6 顶点（独立于 atlas 顶点缓冲，避免混批绑定冲突）。
+    pub vertices: [UiVertex; 6],
+}
+
+/// 从 World 只读收集全部 UI 图片顶点（渲染器每帧调用；图片在下、文本在
+/// 上的顺序由「先收集图片、再收集矩形/文本」的调用序保证——收集顺序即
+/// 绘制顺序，后画者在上）。
+///
+/// [`crate::visibility::Visibility`] 过滤：挂 `HIDDEN` 的实体不产生顶点；
+/// 组件缺席视为可见（默认行为零变化）。定位复用同实体 [`UiRect`]（缺省
+/// 画在 (0,0)），乘色 = [`UiColor`]（缺省白）。
+pub(crate) fn collect_ui_image_vertices(
+    world: &iris_core::world::World,
+    out: &mut Vec<UiImageItem>,
+) {
+    use crate::visibility::Visibility;
+    world.query::<(Entity, &UiImage, &UiRect, &UiColor, Option<&Visibility>)>(
+        |(entity, image, rect, color, visibility)| {
+            if visibility.is_some_and(|v| !v.visible) {
+                return;
+            }
+            let _ = entity;
+            let mut tmp = Vec::with_capacity(6);
+            push_image_vertices(&mut tmp, rect, *color);
+            out.push(UiImageItem {
+                texture: Some(image.texture),
+                rtt: None,
+                vertices: tmp.try_into().expect("图片 quad 恒 6 顶点"),
+            });
+        },
+    );
+    world.query::<(Entity, &UiImageRtt, &UiRect, &UiColor, Option<&Visibility>)>(
+        |(entity, image, rect, color, visibility)| {
+            if visibility.is_some_and(|v| !v.visible) {
+                return;
+            }
+            let _ = entity;
+            let mut tmp = Vec::with_capacity(6);
+            push_image_vertices(&mut tmp, rect, *color);
+            out.push(UiImageItem {
+                texture: None,
+                rtt: Some(image.target),
+                vertices: tmp.try_into().expect("图片 quad 恒 6 顶点"),
+            });
         },
     );
 }
@@ -873,5 +974,75 @@ mod tests {
             UiColor::default(),
         );
         assert!(empty.is_empty());
+    }
+
+    /// 图片 quad：6 顶点、全屏 UV（0..1 跨整个纹理）、像素盒 = position+size、
+    /// 乘色恒为顶点色。
+    #[test]
+    fn image_vertices_use_fullscreen_uv() {
+        let mut out = Vec::new();
+        push_image_vertices(
+            &mut out,
+            &UiRect {
+                position: [10.0, 20.0],
+                size: [30.0, 40.0],
+            },
+            UiColor([1.0, 0.0, 0.0, 1.0]),
+        );
+        assert_eq!(out.len(), 6, "图片 quad = 2 三角形 6 顶点");
+        let max_x = out.iter().map(|v| v.pos[0]).fold(f32::MIN, f32::max);
+        let max_y = out.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+        assert_eq!((max_x, max_y), (40.0, 60.0), "图片盒 = position + size");
+        // UV 恒为全屏 0..1（整个纹理映射到图片盒）
+        assert!(out.iter().any(|v| v.uv == [0.0, 0.0]));
+        assert!(out.iter().any(|v| v.uv == [1.0, 1.0]));
+        assert!(
+            out.iter()
+                .all(|v| (0.0..=1.0).contains(&v.uv[0]) && (0.0..=1.0).contains(&v.uv[1])),
+            "图片 UV 应全部落在 0..1"
+        );
+        assert!(out.iter().all(|v| v.color == [1.0, 0.0, 0.0, 1.0]));
+    }
+
+    /// 图片收集：UiImage / UiImageRtt 实体各产生一个带源标记的 6 顶点项；
+    /// 挂 `Visibility::HIDDEN` 的实体不产生顶点；挂图片的实体其 `UiRect`
+    /// 不再被矩形收集路径当作普通矩形绘制（否则缺省白矩形盖住图片）。
+    #[test]
+    fn collect_image_vertices_groups_by_source_and_honors_visibility() {
+        use crate::rendertarget::RenderTargetHandle;
+        use crate::visibility::Visibility;
+        let mut world = iris_core::world::World::new();
+        let tex = TextureHandle(3);
+        world.spawn((
+            UiRect {
+                position: [0.0, 0.0],
+                size: [8.0, 8.0],
+            },
+            UiImage { texture: tex },
+            UiColor::default(),
+        ));
+        world.spawn((
+            UiRect {
+                position: [20.0, 0.0],
+                size: [8.0, 8.0],
+            },
+            UiImageRtt {
+                target: RenderTargetHandle(5),
+            },
+            UiColor::default(),
+            Visibility::HIDDEN,
+        ));
+        let mut out = Vec::new();
+        collect_ui_image_vertices(&world, &mut out);
+        assert_eq!(out.len(), 1, "HIDDEN 的图片实体不应产生顶点");
+        assert_eq!(out[0].texture, Some(tex));
+        assert_eq!(out[0].rtt, None);
+        // 图片实体的 UiRect 不被矩形收集路径当作普通矩形（否则白矩形盖图）
+        let mut rects = Vec::new();
+        collect_ui_vertices(&world, &mut rects);
+        assert!(
+            rects.is_empty(),
+            "挂图片的实体其 UiRect 只作定位载体，不应产生矩形顶点"
+        );
     }
 }

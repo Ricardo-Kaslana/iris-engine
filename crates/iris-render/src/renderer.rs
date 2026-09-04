@@ -30,6 +30,7 @@ use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
 use crate::mesh::{LodMesh, MeshHandle, MeshStore, upload_mesh};
 use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
 use crate::pipeline::{SHADOW_CASCADES, create_pipeline};
+use crate::rendertarget::{RenderTargetHandle, RenderTargetStore, RendersTo};
 use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
 use crate::visibility::Visibility;
@@ -225,6 +226,43 @@ struct GpuMaterial {
     bind_group: wgpu::BindGroup,
 }
 
+/// 单张渲染目标（R40）的 GPU 侧资源：颜色纹理（UI 可采样）+ 深度 +
+/// 线性 HDR 中间缓冲（几何渲到此处）+ ACES 色调映射绑定组 + RT 相机专用
+/// 全局 uniform / 绑定组 + RT 实例缓冲。全部按句柄惰性创建、跨帧持有。
+struct GpuRenderTarget {
+    /// RT 颜色纹理（Rgba8UnormSrgb）：`UiImageRtt` 采样目标。
+    #[allow(dead_code)]
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    /// RT 深度缓冲（Depth32Float，单采样）。
+    #[allow(dead_code)]
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    /// RT 线性 HDR 中间缓冲（Rgba16Float，单采样）——几何管线输出格式。
+    #[allow(dead_code)]
+    hdr: wgpu::Texture,
+    hdr_view: wgpu::TextureView,
+    /// ACES 色调映射绑定组（hdr_view → color_view，泛光恒 0）。
+    blit_bg: wgpu::BindGroup,
+    /// RT 相机专用全局 uniform（view_proj / eye 与主相机不同）。
+    globals_buf: wgpu::Buffer,
+    globals_bg: wgpu::BindGroup,
+    /// RT 实例缓冲（独立于主实例缓冲——RT 相机视锥剔除结果不同）。
+    instance_buf: Option<wgpu::Buffer>,
+    instance_capacity: usize,
+}
+
+/// 单台 RT 相机的帧内解析结果（R40）：世界查询派生的相机参数 + 目标
+/// 句柄/尺寸。收集阶段与渲染阶段解耦（渲染在阴影 pass 之后执行）。
+struct RtCameraPrep {
+    handle: RenderTargetHandle,
+    view: glam::Mat4,
+    eye: Vec3,
+    vp: glam::Mat4,
+    width: u32,
+    height: u32,
+}
+
 /// 排序键 + 实例数据一体存储，可直接整体上传 GPU。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -254,6 +292,13 @@ pub struct Renderer {
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
     material_gpu: HashMap<u32, GpuMaterial>,
+    /// 渲染目标（R40）GPU 缓存：句柄 → 颜色 / 深度 / HDR / 绑定组 /
+    /// 专用全局与实例缓冲。按句柄惰性创建、跨帧持有（尺寸不变时零重建）。
+    render_target_gpu: HashMap<u32, GpuRenderTarget>,
+    /// RT 色调映射共享采样器 + 合成参数（泛光 0 / 曝光 1 / 暗角 0——RT
+    /// 无后处理链，恒中性）。两者所有 RT 共用。
+    rt_blit_sampler: wgpu::Sampler,
+    rt_post_params_buf: wgpu::Buffer,
     /// 蒙皮实体位标识 → 关节矩阵缓冲。
     skin_gpu: HashMap<u64, GpuSkin>,
     /// 方向光级联阴影贴图：R32Float 2D 数组（2048² × SHADOW_CASCADES 层，
@@ -301,6 +346,8 @@ pub struct Renderer {
     ui_atlas: wgpu::Texture,
     /// UI 绑定组：图集纹理 + Nearest 采样器 + 屏幕尺寸 uniform。
     ui_bind_group: wgpu::BindGroup,
+    /// UI Nearest 采样器（图集 / 图片共用：位图锐利、像素化小地图）。
+    ui_sampler: wgpu::Sampler,
     /// 屏幕尺寸 uniform（每帧 write_buffer，供像素 → NDC 映射）。
     ui_screen_buf: wgpu::Buffer,
     /// UI 顶点缓冲（容量不足时整体重建，照抄实例缓冲的容量复用模式）。
@@ -343,6 +390,19 @@ pub struct Renderer {
     transparent_skinned_scratch: Vec<TransparentSkinnedItem>,
     /// UI 顶点组装暂存（跨帧复用，避免每帧堆分配）。
     ui_scratch: Vec<crate::ui::UiVertex>,
+    /// UI 图片暂存（跨帧复用）——图片独立于 atlas 顶点缓冲（按源绑定组
+    /// 分别绘制于 atlas UI 之下/之上，见 draw 的 UI pass）。
+    ui_image_scratch: Vec<crate::ui::UiImageItem>,
+    /// UI 图片顶点缓冲（容量不足时整体重建，跨帧复用）。
+    ui_image_buf: Option<wgpu::Buffer>,
+    ui_image_capacity: usize,
+    /// RT 收集暂存（跨帧复用；最多 RENDER_TARGET_MAX 个 RT 相机，逐相机
+    /// 顺序完成后清空复用）。
+    rt_items: Vec<DrawItem>,
+    rt_skinned: Vec<SkinnedItem>,
+    rt_transparent: Vec<TransparentItem>,
+    rt_transparent_skinned: Vec<TransparentSkinnedItem>,
+    rt_instance_scratch: Vec<InstanceRaw>,
     /// 粒子收集暂存：additive 段（后接排好序的 alpha 段，一次全量上传）。
     particle_scratch: Vec<ParticleInstance>,
     /// alpha 粒子收集暂存：(视深, 收集序号, 实例)——排序键与数据一体。
@@ -522,6 +582,10 @@ pub struct FrameStats {
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
 /// 大量碎段 `write_buffer` 的驱动提交开销会超过省下的拷贝字节数。
 const INSTANCE_DIFF_FULL_FALLBACK_RATIO: f32 = 0.5;
+
+/// RT（R40）相机数量上限（v1）：小地图 + 监控屏两个典型用例。超出部分
+/// `log::warn` 跳过（多视口编排是后续路线图，见 ARCHITECTURE §8.20）。
+const RENDER_TARGET_MAX: usize = 2;
 
 /// 计算两帧实例数组之间的连续变化段（实例索引区间，升序且互不相邻）。
 ///
@@ -1375,6 +1439,28 @@ impl Renderer {
                 },
             ],
         });
+        // RT（R40）色调映射共享资源：采样器（线性 Clamp，与后处理采样器
+        // 同行为）+ 恒中性合成参数（泛光 0 / 曝光 1 / 暗角 0——RT 无后处理
+        // 链，ACES 前不叠泛光、不放大、不压角）。所有 RT 共用一份。
+        let rt_blit_sampler = gpu
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor::default());
+        let rt_post_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.rt.blit_params"),
+            size: std::mem::size_of::<PostParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(
+            &rt_post_params_buf,
+            0,
+            bytemuck::bytes_of(&PostParamsRaw {
+                bloom_strength: 0.0,
+                exposure: 1.0,
+                vignette_strength: 0.0,
+                _reserved: 0.0,
+            }),
+        );
         // 全局绑定组（env 视图相关的构建逻辑与重烘焙共用，见 build_globals_bind_group）
         let globals_bg = build_globals_bind_group(
             &gpu,
@@ -1430,6 +1516,9 @@ impl Renderer {
             mesh_gpu: HashMap::new(),
             texture_gpu,
             material_gpu: HashMap::new(),
+            render_target_gpu: HashMap::new(),
+            rt_blit_sampler,
+            rt_post_params_buf,
             skin_gpu: HashMap::new(),
             shadow_map,
             shadow_map_view,
@@ -1449,6 +1538,7 @@ impl Renderer {
             hdr_size: (0, 0),
             ui_atlas,
             ui_bind_group,
+            ui_sampler,
             ui_screen_buf,
             ui_vertex_buf: None,
             ui_capacity: 0,
@@ -1469,6 +1559,14 @@ impl Renderer {
             transparent_scratch: Vec::new(),
             transparent_skinned_scratch: Vec::new(),
             ui_scratch: Vec::new(),
+            ui_image_scratch: Vec::new(),
+            ui_image_buf: None,
+            ui_image_capacity: 0,
+            rt_items: Vec::new(),
+            rt_skinned: Vec::new(),
+            rt_transparent: Vec::new(),
+            rt_transparent_skinned: Vec::new(),
+            rt_instance_scratch: Vec::new(),
             particle_scratch: Vec::new(),
             particle_alpha_scratch: Vec::new(),
             clear_color: wgpu::Color {
@@ -1678,10 +1776,12 @@ impl Renderer {
         }
         self.stats = FrameStats::default();
         // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），
-        // 其次回退到全局 Camera 资源
+        // 其次回退到全局 Camera 资源。`RendersTo`（R40）标记的相机不复用
+        // 主视图选择——主视图 = 无 `RendersTo` 的相机；只有 RT 相机时
+        // 回退 Camera 资源（原语义，见 rendertarget.rs）。
         let mut mounted: Option<(glam::Mat4, ActiveCamera, Vec3)> = None;
-        world.query::<(&GlobalTransform, &ActiveCamera)>(|(gt, ac)| {
-            if mounted.is_none() {
+        world.query::<(&GlobalTransform, &ActiveCamera, Option<&RendersTo>)>(|(gt, ac, rt)| {
+            if mounted.is_none() && rt.is_none() {
                 mounted = Some((view_from_global(gt), *ac, gt.position()));
             }
         });
@@ -1727,6 +1827,52 @@ impl Renderer {
             return;
         };
         let texture_store = world.try_resource::<TextureStore>();
+
+        // RT（R40）相机收集：全部 (ActiveCamera + RendersTo) 实体，数量上限
+        // RENDER_TARGET_MAX（小地图 / 监控屏两个典型用例，超出 warn 跳过）。
+        // 缺席 RenderTargetStore 资源 = 无 RT 相机（主路径零变化）。
+        let rt_cameras: Vec<RtCameraPrep> = match world.try_resource::<RenderTargetStore>() {
+            Some(store) => {
+                let mut list = Vec::new();
+                let mut total = 0usize;
+                world.query::<(&GlobalTransform, &ActiveCamera, &RendersTo)>(|(gt, ac, rt)| {
+                    total += 1;
+                    if total > RENDER_TARGET_MAX {
+                        return;
+                    }
+                    let Some(spec) = store.get(rt.target) else {
+                        log::warn!(
+                            "渲染目标 {:?} 未在 RenderTargetStore 中注册，跳过该 RT 相机",
+                            rt.target
+                        );
+                        return;
+                    };
+                    let view = view_from_global(gt);
+                    let aspect = spec.width as f32 / spec.height.max(1) as f32;
+                    let vp = glam::camera::rh::proj::directx::perspective(
+                        ac.fov_y_radians,
+                        aspect,
+                        ac.z_near,
+                        ac.z_far,
+                    ) * view;
+                    list.push(RtCameraPrep {
+                        handle: rt.target,
+                        view,
+                        eye: gt.position(),
+                        vp,
+                        width: spec.width,
+                        height: spec.height,
+                    });
+                });
+                if total > RENDER_TARGET_MAX {
+                    log::warn!(
+                        "检测到 {total} 个 RT 相机，v1 仅渲染前 {RENDER_TARGET_MAX} 个（超出已跳过）"
+                    );
+                }
+                list
+            }
+            None => Vec::new(),
+        };
 
         // 1. 全局 uniform：相机 + 方向光 + 点光
         let light_dir = (-light.direction).normalize_or_zero();
@@ -2326,6 +2472,21 @@ impl Renderer {
                 }
             }
         }
+        // RT（R40）渲染目标 pass：每台 RT 相机渲一次到其纹理（几何 pass +
+        // ACES blit）。位于阴影 pass 之后（复用刚写出的阴影贴图 / CSM）、
+        // 主 pass 的 hdr 借用建立之前（RT 资源惰性创建需 &mut self）。
+        // FrameStats 口径 = 主几何，RT 辅助视口不计入。
+        for prep in &rt_cameras {
+            self.render_to_rt_target(
+                world,
+                &mut encoder,
+                &mesh_store,
+                &material_store,
+                texture_store.as_deref(),
+                &globals,
+                prep,
+            );
+        }
         // 4c. 粒子实例上传（独立缓冲，每帧全量——粒子逐帧全变，帧级比对
         // 无增量价值）与相机基向量写入。放在 HDR 目标借用（hdr）建立之前：
         // 容量不足时的缓冲重建需要 &mut self，会与贯穿后续全部 pass 的
@@ -2833,10 +2994,19 @@ impl Renderer {
         // （不清屏，直接叠加在色调映射结果上）、无深度附件。顶点非空才开
         // pass——空 UI 场景零额外开销。屏幕尺寸 uniform 每帧写入（write_buffer
         // 与本帧 submit 同队列，执行顺序保证在 pass 之前生效）。
+        //
+        // 绘制顺序（R40 含图片）：**图片先（在下）、atlas 文本/矩形后（在上）**
+        // ——小地图底图应垫在 HUD 文字下方，「后画者在上」由 pass 内顺序统一
+        // 裁决（同模块里矩形先、文本后再收集的既有语义）。图片按源（普通
+        // 纹理 / 渲染目标）各持独立绑定组，逐个 draw；atlas 内容合并为单
+        // draw call（与 UI 图片并存时 UI 总 draw call = 图片数 + 1）。
         let mut ui_vertices = std::mem::take(&mut self.ui_scratch);
         ui_vertices.clear();
         crate::ui::collect_ui_vertices(world, &mut ui_vertices);
-        if !ui_vertices.is_empty() {
+        let mut ui_images = std::mem::take(&mut self.ui_image_scratch);
+        ui_images.clear();
+        crate::ui::collect_ui_image_vertices(world, &mut ui_images);
+        if !ui_vertices.is_empty() || !ui_images.is_empty() {
             let screen = UiGlobalsRaw {
                 screen: [width as f32, height as f32],
                 _pad: [0.0; 2],
@@ -2844,11 +3014,74 @@ impl Renderer {
             self.gpu
                 .queue
                 .write_buffer(&self.ui_screen_buf, 0, bytemuck::bytes_of(&screen));
-            self.ensure_ui_vertex_capacity(ui_vertices.len());
-            let ui_buf = self.ui_vertex_buf.as_ref().expect("UI 顶点缓冲已就绪");
-            self.gpu
-                .queue
-                .write_buffer(ui_buf, 0, bytemuck::cast_slice(&ui_vertices));
+            // 图片绑定组：每源一个（纹理 / RT 颜色视图 + UI 采样器 + 屏幕
+            // uniform）。本帧重建（逐帧构建，RT 颜色视图跨帧稳定但懒建的
+            // RT 可能在上一帧未渲染，逐帧重建保证拿到最新视图；图片为数
+            // 个，重建成本可忽略）。
+            let mut img_bgs: Vec<wgpu::BindGroup> = Vec::with_capacity(ui_images.len());
+            for img in &ui_images {
+                let view: &wgpu::TextureView = match (img.texture, img.rtt) {
+                    (Some(h), None) => {
+                        self.ensure_texture(texture_store.as_deref(), h);
+                        self.texture_gpu
+                            .get(&h.0)
+                            .map(|t| &t.view)
+                            .unwrap_or(&self.texture_gpu[&0].view)
+                    }
+                    (None, Some(t)) => match self.render_target_gpu.get(&t.0) {
+                        Some(rt) => &rt.color_view,
+                        None => {
+                            log::warn!(
+                                "渲染目标 {t:?} 未被渲染（无对应 RT 相机），UiImageRtt 回退白色兜底"
+                            );
+                            &self.texture_gpu[&0].view
+                        }
+                    },
+                    _ => &self.texture_gpu[&0].view, // 两源皆无：防御回退白色
+                };
+                let bg = self
+                    .gpu
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("iris.ui.image.bg"),
+                        layout: &self.bundle.ui_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.ui_screen_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                img_bgs.push(bg);
+            }
+            // 图片顶点缓冲：合批后整段上传（每图 6 顶点，图序 = 顶点序）。
+            if !ui_images.is_empty() {
+                self.ensure_ui_image_capacity(ui_images.len() * 6);
+                let mut image_vertices = Vec::with_capacity(ui_images.len() * 6);
+                for img in &ui_images {
+                    image_vertices.extend_from_slice(&img.vertices);
+                }
+                let image_buf = self.ui_image_buf.as_ref().expect("UI 图片顶点缓冲已就绪");
+                self.gpu
+                    .queue
+                    .write_buffer(image_buf, 0, bytemuck::cast_slice(&image_vertices));
+            }
+            // atlas 顶点缓冲（矩形 + 文本合并）。
+            if !ui_vertices.is_empty() {
+                self.ensure_ui_vertex_capacity(ui_vertices.len());
+                let ui_buf = self.ui_vertex_buf.as_ref().expect("UI 顶点缓冲已就绪");
+                self.gpu
+                    .queue
+                    .write_buffer(ui_buf, 0, bytemuck::cast_slice(&ui_vertices));
+            }
             let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.ui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2865,14 +3098,30 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            ui_pass.set_pipeline(&self.bundle.ui_pipeline);
-            ui_pass.set_bind_group(0, &self.ui_bind_group, &[]);
-            ui_pass.set_vertex_buffer(0, ui_buf.slice(..));
-            ui_pass.draw(0..ui_vertices.len() as u32, 0..1);
-            // HUD 全部顶点合批为单 draw call
-            draw_calls += 1;
+            // 图片（在下）：各源独立绑定组，逐图 draw。
+            if !ui_images.is_empty() {
+                let image_buf = self.ui_image_buf.as_ref().expect("UI 图片顶点缓冲已就绪");
+                ui_pass.set_pipeline(&self.bundle.ui_pipeline);
+                ui_pass.set_vertex_buffer(0, image_buf.slice(..));
+                for (i, bg) in img_bgs.iter().enumerate() {
+                    ui_pass.set_bind_group(0, bg, &[]);
+                    let first = (i * 6) as u32;
+                    ui_pass.draw(first..first + 6, 0..1);
+                    draw_calls += 1;
+                }
+            }
+            // atlas 内容（矩形 + 文本，在上）：单批单 draw。
+            if !ui_vertices.is_empty() {
+                let ui_buf = self.ui_vertex_buf.as_ref().expect("UI 顶点缓冲已就绪");
+                ui_pass.set_pipeline(&self.bundle.ui_pipeline);
+                ui_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+                ui_pass.set_vertex_buffer(0, ui_buf.slice(..));
+                ui_pass.draw(0..ui_vertices.len() as u32, 0..1);
+                draw_calls += 1;
+            }
         }
         self.ui_scratch = ui_vertices;
+        self.ui_image_scratch = ui_images;
         self.gpu.queue.submit([encoder.finish()]);
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
@@ -2922,6 +3171,24 @@ impl Renderer {
         log::debug!("UI 顶点缓冲扩容至 {capacity} 顶点");
     }
 
+    /// UI 图片顶点缓冲容量复用（照 UI atlas 顶点缓冲模式：容量不足时 2 倍
+    /// 扩容整体重建）。图片顶点独立于 atlas 顶点缓冲——图片按源绑定组分别
+    /// 绘制（与 atlas 单批单 draw 解耦，见 draw 的 UI pass）。
+    fn ensure_ui_image_capacity(&mut self, needed: usize) {
+        if self.ui_image_capacity >= needed {
+            return;
+        }
+        let capacity = (needed * 2).max(64);
+        self.ui_image_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.ui.image_vertices"),
+            size: (capacity * std::mem::size_of::<crate::ui::UiVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.ui_image_capacity = capacity;
+        log::debug!("UI 图片顶点缓冲扩容至 {capacity} 顶点");
+    }
+
     /// 粒子实例缓冲容量复用（同款模式）：容量足够则零开销，不足时按
     /// 2 倍扩容整体重建。粒子每帧全量上传，重建后无须特殊处理。
     fn ensure_particle_capacity(&mut self, needed: usize) {
@@ -2954,6 +3221,423 @@ impl Renderer {
         }));
         self.decal_capacity = capacity;
         log::debug!("贴花实例缓冲扩容至 {capacity} 实例");
+    }
+
+    /// 构建单张渲染目标的 GPU 资源（惰性创建后被 `ensure_render_target`
+    /// 缓存，尺寸不变则跨帧复用）。颜色纹理挂 `TEXTURE_BINDING` 供
+    /// [`crate::ui::UiImageRtt`] 采样；几何渲到线性 HDR 中间缓冲
+    /// （几何管线均为 HDR_FORMAT 输出），再经 `blit_bg` ACES 色调映射到
+    /// 颜色纹理。
+    fn build_render_target(&self, width: u32, height: u32) -> GpuRenderTarget {
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let color = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.rt.color"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.rt.depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let hdr = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.rt.hdr"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let hdr_view = hdr.create_view(&wgpu::TextureViewDescriptor::default());
+        let globals_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.rt.globals"),
+            size: std::mem::size_of::<GlobalsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // RT 相机专用全局绑定组：与主全局组共享级联参数（CSM 仍按主相机
+        // 拟合——RT 相机朝向不同时的 CSM 拟合是 v1 限制，见 rendertarget.rs
+        // 与 ARCHITECTURE §8.20）、阴影贴图、IBL，仅视图投影 / 眼点不同。
+        let globals_bg = build_globals_bind_group(
+            &self.gpu,
+            &self.bundle,
+            &globals_buf,
+            &self.csm_params_buf,
+            &self.shadow_map_view,
+            &self.point_shadow_cube_view,
+            &self.env,
+        );
+        // ACES 色调映射绑定组：hdr_view → color_view；bloom 槽绑定白色
+        // 兜底纹素（泛光强度恒 0，着色器不采样）、采样器 / 参数为 RT 常值。
+        let blit_bg = build_blit_bind_group(
+            &self.gpu.device,
+            &self.bundle.blit_layout,
+            &hdr_view,
+            &self.texture_gpu[&0].view,
+            &self.rt_blit_sampler,
+            &self.rt_post_params_buf,
+        );
+        GpuRenderTarget {
+            color,
+            color_view,
+            depth,
+            depth_view,
+            hdr,
+            hdr_view,
+            blit_bg,
+            globals_buf,
+            globals_bg,
+            instance_buf: None,
+            instance_capacity: 0,
+        }
+    }
+
+    /// 若句柄尚无 GPU 资源则构建并缓存；尺寸变化时**不重建**（v1 无
+    /// resize，见 [`RenderTargetStore`] 文档——尺寸由 store 创建时决定）。
+    fn ensure_render_target(&mut self, handle: RenderTargetHandle, width: u32, height: u32) {
+        if !self.render_target_gpu.contains_key(&handle.0) {
+            let rt = self.build_render_target(width, height);
+            self.render_target_gpu.insert(handle.0, rt);
+            log::debug!("渲染目标 {handle:?} GPU 资源已构建（{width}×{height}）");
+        }
+    }
+
+    /// RT 实例缓冲容量复用（与主实例缓冲同款——容量不足时 2 倍扩容整体
+    /// 重建，返回 `true` 时调用方须全量上传）。RT 每帧全量上传（实例少、
+    /// 视锥剔除结果常变，帧级比对无增量价值）。
+    fn ensure_rt_instance_capacity(&mut self, handle: RenderTargetHandle, needed: usize) -> bool {
+        let rt = self
+            .render_target_gpu
+            .get_mut(&handle.0)
+            .expect("RT 已就绪");
+        if rt.instance_capacity >= needed {
+            return false;
+        }
+        let capacity = (needed * 2).max(256);
+        rt.instance_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.rt.instances"),
+            size: (capacity * std::mem::size_of::<InstanceRaw>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        rt.instance_capacity = capacity;
+        log::debug!("RT 实例缓冲扩容至 {capacity} 实例");
+        true
+    }
+
+    /// 渲染一台 RT 相机到其渲染目标（R40）。
+    ///
+    /// 语义（v1，见 rendertarget.rs / ARCHITECTURE §4.21）：
+    /// - **几何**：不透明 + 蒙皮 + 透明（实例区间与主 pass 同布局），用 RT
+    ///   相机自己的视锥做剔除（复用 [`collect_instances`] 的视锥参数化）；
+    ///   天空盒 / 贴花 / 粒子 v1 不画（限制）；
+    /// - **阴影**：复用主阴影图 / CSM（csm_params 仍按主相机拟合——RT 相机
+    ///   朝向不同时是 v1 限制，见 §8.20）；
+    /// - **输出**：几何渲到 RT 线性 HDR 中间缓冲 → `rt_blit_pipeline` ACES
+    ///   色调映射到 RT 颜色纹理（Rgba8UnormSrgb）。无后处理链（无泛光 /
+    ///   曝光 / 暗角）无 UI（UI 由主 pass 的 HUD 在 blit 之后叠加）；
+    /// - **确定性 / 帧统计**：收集排序与主 pass 同款（`total_cmp` 全序 + 并列
+    ///   次序断言）；FrameStats 口径 = **主几何**——RT 辅助视口不计入
+    ///   `draw_calls` / `instances`（见 §4.21 与 §4.4.1 口径说明）。
+    ///
+    /// 调用时机：阴影 pass 之后（复用刚写出的阴影贴图）、`hdr` 借用建立之前
+    ///（RT 资源惰性创建需要 &mut self，与贯穿主 pass 的 hdr 借用冲突）。
+    #[allow(clippy::too_many_arguments)]
+    fn render_to_rt_target(
+        &mut self,
+        world: &iris_core::world::World,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh_store: &MeshStore,
+        material_store: &MaterialStore,
+        texture_store: Option<&TextureStore>,
+        globals: &GlobalsRaw,
+        prep: &RtCameraPrep,
+    ) {
+        self.ensure_render_target(prep.handle, prep.width, prep.height);
+        let mut items = std::mem::take(&mut self.rt_items);
+        let mut skinned = std::mem::take(&mut self.rt_skinned);
+        let mut transparent = std::mem::take(&mut self.rt_transparent);
+        let mut transparent_skinned = std::mem::take(&mut self.rt_transparent_skinned);
+        items.clear();
+        skinned.clear();
+        transparent.clear();
+        transparent_skinned.clear();
+        // RT 相机自己的视锥剔除（复用主 pass 的收集逻辑与排序）。
+        let frustum = Frustum::from_view_proj(&prep.vp);
+        let _counts = collect_instances(
+            world,
+            mesh_store,
+            material_store,
+            &prep.view,
+            prep.eye,
+            &frustum,
+            &mut items,
+            &mut skinned,
+            &mut transparent,
+            &mut transparent_skinned,
+        );
+        items.sort_unstable_by_key(|item| item.key);
+        transparent.sort_unstable_by(|a, b| {
+            b.depth
+                .total_cmp(&a.depth)
+                .then_with(|| a.entity.cmp(&b.entity))
+        });
+        transparent_skinned.sort_unstable_by(|a, b| {
+            b.depth
+                .total_cmp(&a.depth)
+                .then_with(|| a.skinned.skin_entity.cmp(&b.skinned.skin_entity))
+        });
+        let total = items.len();
+        let opaque_total = total + skinned.len();
+        let instance_total = opaque_total + transparent.len() + transparent_skinned.len();
+
+        // GPU 资源预上传：网格 / 材质 / 蒙皮关节缓冲（与主 pass 懒上传同款；
+        // 同一网格/材质/蒙皮实体若主 pass 已上传则缓存命中零开销）。
+        let mut idx = 0;
+        while idx < total {
+            let key = items[idx].key;
+            let mut count = 1;
+            while idx + count < total && items[idx + count].key == key {
+                count += 1;
+            }
+            self.ensure_mesh(mesh_store, MeshHandle((key >> 32) as u32));
+            self.ensure_material(material_store, texture_store, MaterialHandle(key as u32));
+            idx += count;
+        }
+        for item in skinned
+            .iter()
+            .chain(transparent_skinned.iter().map(|t| &t.skinned))
+        {
+            self.ensure_mesh(mesh_store, MeshHandle(item.mesh));
+            self.ensure_material(material_store, texture_store, MaterialHandle(item.material));
+            self.ensure_skin(item.skin_entity, item.joint_matrices.len());
+        }
+        for item in &transparent {
+            self.ensure_mesh(mesh_store, MeshHandle((item.key >> 32) as u32));
+            self.ensure_material(
+                material_store,
+                texture_store,
+                MaterialHandle(item.key as u32),
+            );
+        }
+
+        // 全部需要 &mut self 的资源预上传完成后再取 rt（&self 借用），避免
+        // 与 ensure_* 的 &mut self 冲突。
+        self.ensure_rt_instance_capacity(prep.handle, instance_total);
+        let rt = &self.render_target_gpu[&prep.handle.0];
+
+        // RT 专用全局（复用主全局的光 / 点光 / 阴影参数，仅换视图投影与眼点）。
+        let mut rglobals = *globals;
+        rglobals.view_proj = prep.vp.to_cols_array_2d();
+        rglobals.eye_pos = [prep.eye.x, prep.eye.y, prep.eye.z, 1.0];
+        rglobals.inv_view_proj = prep.vp.inverse().to_cols_array_2d();
+        self.gpu
+            .queue
+            .write_buffer(&rt.globals_buf, 0, bytemuck::bytes_of(&rglobals));
+
+        // RT 实例：每帧全量上传（实例少、RT 视锥剔除结果常变，帧级比对无
+        // 增量价值）。蒙皮关节矩阵同样全量覆写（同实体与主 pass 并列时末次
+        // 写同值，不破坏确定性）。缓冲已在 ensure_rt_instance_capacity 就绪。
+        if instance_total > 0 {
+            let mut instances = std::mem::take(&mut self.rt_instance_scratch);
+            instances.clear();
+            instances.extend(items.iter().map(|i| i.instance));
+            instances.extend(skinned.iter().map(|i| i.instance));
+            instances.extend(transparent.iter().map(|i| i.instance));
+            instances.extend(transparent_skinned.iter().map(|t| t.skinned.instance));
+            let instance_buf = rt.instance_buf.as_ref().expect("RT 实例缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(instance_buf, 0, bytemuck::cast_slice(&instances));
+            // 蒙皮关节矩阵（RT 视锥内的蒙皮实体全量覆写，与主 pass 同路径）。
+            let mut joint_bytes: Vec<u8> = Vec::new();
+            for item in skinned
+                .iter()
+                .chain(transparent_skinned.iter().map(|t| &t.skinned))
+            {
+                joint_bytes.clear();
+                for m in &item.joint_matrices {
+                    joint_bytes.extend_from_slice(bytemuck::bytes_of(&m.to_cols_array_2d()));
+                }
+                let skin = self
+                    .skin_gpu
+                    .get(&item.skin_entity)
+                    .expect("蒙皮缓冲已就绪");
+                self.gpu
+                    .queue
+                    .write_buffer(&skin.joint_buf, 0, &joint_bytes);
+            }
+            self.rt_instance_scratch = instances;
+        }
+
+        // 几何 pass：单 pass 依次画不透明 + 蒙皮 + 透明（同一 HDR 中间缓冲，
+        // 深度清一次、不透明写入、透明只测不写）——RT 无贴花 / 粒子 / 天空盒。
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.rt_geometry"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &rt.hdr_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &rt.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        // 深度 Store：透明 pass 在同一 pass 内（Load 同附件）做遮挡
+                        // 测试——与主 pass 的透明语义一致（主 pass 的 DX12 教训）。
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if instance_total > 0 {
+                let instance_buf = rt.instance_buf.as_ref().expect("RT 实例缓冲已就绪");
+                pass.set_pipeline(&self.bundle.rt_pipeline);
+                pass.set_bind_group(0, &rt.globals_bg, &[]);
+                pass.set_vertex_buffer(1, instance_buf.slice(..));
+                idx = 0;
+                while idx < total {
+                    let key = items[idx].key;
+                    let mut count = 1;
+                    while idx + count < total && items[idx + count].key == key {
+                        count += 1;
+                    }
+                    let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                    let material = &self.material_gpu[&(key as u32)];
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.num_indices, 0, idx as u32..(idx + count) as u32);
+                    idx += count;
+                }
+                if !skinned.is_empty() {
+                    pass.set_pipeline(&self.bundle.rt_skinned_pipeline);
+                    pass.set_bind_group(0, &rt.globals_bg, &[]);
+                    pass.set_vertex_buffer(2, instance_buf.slice(..));
+                    for (i, item) in skinned.iter().enumerate() {
+                        let mesh = &self.mesh_gpu[&item.mesh];
+                        let material = &self.material_gpu[&item.material];
+                        let skin = &self.skin_gpu[&item.skin_entity];
+                        pass.set_bind_group(1, &material.bind_group, &[]);
+                        pass.set_bind_group(2, &skin.bind_group, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_vertex_buffer(
+                            1,
+                            mesh.skin_buf
+                                .as_ref()
+                                .expect("蒙皮网格应有蒙皮属性缓冲")
+                                .slice(..),
+                        );
+                        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        let base = (total + i) as u32;
+                        pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                    }
+                }
+                if !transparent.is_empty() || !transparent_skinned.is_empty() {
+                    pass.set_pipeline(&self.bundle.rt_transparent_pipeline);
+                    pass.set_bind_group(0, &rt.globals_bg, &[]);
+                    pass.set_vertex_buffer(1, instance_buf.slice(..));
+                    let base = opaque_total as u32;
+                    let mut t = 0usize;
+                    while t < transparent.len() {
+                        let key = transparent[t].key;
+                        let mut count = 1;
+                        while t + count < transparent.len() && transparent[t + count].key == key {
+                            count += 1;
+                        }
+                        let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                        let material = &self.material_gpu[&(key as u32)];
+                        pass.set_bind_group(1, &material.bind_group, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(
+                            0..mesh.num_indices,
+                            0,
+                            base + t as u32..base + (t + count) as u32,
+                        );
+                        t += count;
+                    }
+                    if !transparent_skinned.is_empty() {
+                        pass.set_pipeline(&self.bundle.rt_transparent_skinned_pipeline);
+                        pass.set_bind_group(0, &rt.globals_bg, &[]);
+                        pass.set_vertex_buffer(2, instance_buf.slice(..));
+                        for (i, t) in transparent_skinned.iter().enumerate() {
+                            let item = &t.skinned;
+                            let mesh = &self.mesh_gpu[&item.mesh];
+                            let material = &self.material_gpu[&item.material];
+                            let skin = &self.skin_gpu[&item.skin_entity];
+                            pass.set_bind_group(1, &material.bind_group, &[]);
+                            pass.set_bind_group(2, &skin.bind_group, &[]);
+                            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                            pass.set_vertex_buffer(
+                                1,
+                                mesh.skin_buf
+                                    .as_ref()
+                                    .expect("蒙皮网格应有蒙皮属性缓冲")
+                                    .slice(..),
+                            );
+                            pass.set_index_buffer(
+                                mesh.index_buf.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            let start = (opaque_total + transparent.len() + i) as u32;
+                            pass.draw_indexed(0..mesh.num_indices, 0, start..start + 1);
+                        }
+                    }
+                }
+            }
+        }
+        // ACES blit：RT 线性 HDR 中间缓冲 → RT 颜色纹理（sRGB）。
+        let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("iris.pass.rt_blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &rt.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        blit.set_pipeline(&self.bundle.rt_blit_pipeline);
+        blit.set_bind_group(0, &rt.blit_bg, &[]);
+        blit.draw(0..3, 0..1);
+
+        self.rt_items = items;
+        self.rt_skinned = skinned;
+        self.rt_transparent = transparent;
+        self.rt_transparent_skinned = transparent_skinned;
     }
 
     fn ensure_mesh(&mut self, store: &MeshStore, handle: MeshHandle) {

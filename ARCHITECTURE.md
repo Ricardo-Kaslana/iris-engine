@@ -439,6 +439,9 @@ World 查询 (Transform, MaterialHandle, MeshHandle | LodMesh)
     只画不透明实例区间（透明不投影，见 §4.16）
   → 点光阴影（可选）：首盏 shadows 点光的 cubemap，6 面 × 512² 各一个
     render pass，R32Float 颜色附件存归一化线性距离（见 §4.7.1）
+  → RT pass（可选，R40：有 ActiveCamera+RendersTo 时才执行，零开销默认路径）：
+    每台 RT 相机渲一次到其离屏纹理（不透明+蒙皮+透明，复用主阴影图/CSM、
+    无天空盒/贴花/粒子）→ ACES blit 到 RT 颜色纹理（无后处理链，见 §4.21）
   → 主 pass：天空盒背景（inv_view_proj 射线采样预滤波环境 0 级 mip，深度只读）
     → 不透明几何渲染到线性 HDR 中间缓冲（Rgba16Float + 4x MSAA → resolve），
     环境光采样初始化时烘焙好的 IBL 贴图（辐照度 / 预滤波 / BRDF LUT），
@@ -1113,6 +1116,11 @@ HDR 域作用）：
   `UiRect.position`；该 `UiRect` 此时**仅作定位载体、不绘制矩形**
   （缺省白矩形会盖住文字的实测教训），面板背景用独立矩形实体表达
   （验收示例的血条即「深底矩形 + 红色前景矩形」两实体）。
+- **图片控件（R40，见 §4.21）**：`UiImage { texture }` / `UiImageRtt
+  { target }` 把普通纹理或 RT 颜色纹理贴到屏幕（`UiRect` 定位 + `UiColor`
+  乘色），UV 全屏 0..1 直角采样（Nearest）；**图片之下、文本之上**（图
+  片先于 atlas 矩形/文本绘制）。挂图片的实体其 `UiRect` **仅作定位/尺寸
+  载体、不绘制矩形**（与 `UiText` 同语义——否则缺省白矩形会盖住图片）。
 
 ### 4.14 音频子系统（iris-audio）
 
@@ -1545,6 +1553,52 @@ glTF / HDR 错误经 `From` 映射保上下文）。
   R38 基线一致（零开销路径）。CPU 单测覆盖 144B 布局 / 代理几何环绕方
   向 / CPU 求逆往返。验收图 `docs/decal.png`（`decal_snapshot` 示例：灰
   墙 3 弹孔 + 地面血迹 + 斜面旋转盒贴花）。
+
+### 4.21 多视口与渲染到纹理（R40）
+
+**组件与存储**（iris-render `rendertarget.rs` + `ui.rs`）：`RendersTo`
+组件挂在相机实体上（须同时挂 `ActiveCamera`），把该相机输出到一张离屏
+RT；`RenderTargetStore`（World 资源，**不进 DefaultPlugins**——游戏侧按需
+`insert_resource`，缺席 = 无 RT 相机 = 主路径零变化）保存 CPU 侧尺寸描述
++ `RenderTargetHandle`，GPU 纹理由 [`crate::renderer::Renderer`] 按句柄
+惰性创建并跨帧持有（`GpuRenderTarget`：颜色 + 深度 + 线性 HDR 中间缓冲 +
+ACES blit 绑定组 + RT 相机专用全局 / 实例缓冲）。
+
+**RT pass 语义（v1，小地图 / 监控屏）**：
+- **相机收集**：渲染器收集全部 `(ActiveCamera + RendersTo)` 实体，每台
+  RT 相机渲一次到对应纹理；**主视图 = 无 `RendersTo` 的相机**（选择逻辑
+  在既有基础上加 `Option<&RendersTo>` 过滤——无 RT 实体时行为与 R39
+  逐位一致，见下）；只有 RT 相机时主视图回退 `Camera` 资源（原语义）。
+  数量上限 [`RENDER_TARGET_MAX`] = 2，超出 `log::warn` 跳过。
+- **几何**：不透明 + 蒙皮 + 透明（实例区间与主 pass 同布局），用 RT 相机
+  **自己的视锥做剔除**（复用 `collect_instances` 的视锥参数化，收集 /
+  排序与主 pass 同款 `total_cmp` 全序 + 并列断言——确定性）。**天空盒 /
+  贴花 / 粒子 v1 不画**（诚实限制，见 §8.20）。
+- **阴影**：复用主阴影图 / CSM 与点光 cubemap（`csm_params` 仍按主相机
+  拟合——RT 相机朝向不同时是 v1 限制，见 §8.20）。
+- **输出**：几何渲到 RT 专用**线性 HDR 中间缓冲**（`Rgba16Float`、单采样
+  无 MSAA——像素化小地图天然契合），再经 `rt_blit_pipeline` **ACES 色调
+  映射**（泛光强度恒 0 / 曝光 1 / 暗角 0——无后处理链）到 `Rgba8UnormSrgb`
+  颜色纹理。**无 UI**（UI 只叠在主视图 blit 之后）。
+- **FrameStats 口径 = 主几何**：RT 辅助视口不计入 `draw_calls` /
+  `instances` / `triangles_drawn` / `culled_instances`（见 §4.4.1）。
+- **主视图零变化保证**：默认场景（无 RT store = 无 RT 相机）时 RT 相机
+  收集为空、整段 RT 逻辑零执行——主 pass 像素与 R39 逐位一致；有 RT 相机
+  但无 UI 时主 pass 像素亦不受影响（集成测试
+  `main_view_pixels_unchanged_with_rt_camera` / `no_rt_store_keeps_baseline`
+  逐像素锁定）。
+
+**UI 图片控件**（ui.rs + ui.wgsl）：`UiImage { texture }`（普通纹理）与
+`UiImageRtt { target }`（RT 颜色纹理）组件，定位复用同实体 `UiRect`
+（position / size 像素，`UiColor` 乘色、缺省白）。UV 恒为全屏 0..1 直角
+采样（Nearest，无抗锯齿 v1——像素化小地图天然契合）。**绘制顺序 = 图片
+之下、文本之上**：图片先于 atlas（矩形 + 文本）绘制于同一 `LoadOp::Load`
+pass，「后画者在上」由 pass 内顺序统一裁决（小地图底图应垫在 HUD 文字
+下方）。图片按源各持独立组 0 绑定组（复用 `ui_layout`：纹理 + `ui_sampler`
++ 屏幕 uniform），逐图 draw；atlas 内容仍合为单 draw。**`UiRect` 仅作定位
+/ 尺寸载体**：挂 `UiImage` / `UiImageRtt` 的实体与 `UiText` 同语义，不再
+绘制缺省白矩形（否则盖住图片，集成测试 `ui_image_draws_texture_pixels`
+实测抓出）。
 
 ## 5. 内存安全策略总表
 
@@ -2010,6 +2064,16 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
     `size.z/2`，基于深度缓冲重投影的屏幕空间 decals 在路线图）；不进
     阴影 pass；同批重叠贴花无视深排序（实体 bits 并列序）；场景序列化
     留白（JSON 场景无贴花段）；实例每帧全量上传（无帧级增量比对）。
+20. **多视口与渲染到纹理为 v1**（§4.21）：RT pass 数量上限 2（小地图 +
+    监控屏两个典型用例，超出 warn 跳过）；**无 `RenderTargetStore::resize`**
+    （RT 尺寸创建后固定，尺寸变化需重建 store 条目——监控屏分辨率一般
+    固定，读回 / 重分配留待后续）；**RT 相机朝向不同时 CSM 仍按主相机
+    拟合**（级联覆盖范围可能不匹配 RT 视锥，俯视 / 平视角下阴影精度
+    退化）；**天空盒 / 贴花 / 粒子 v1 不画**（RT 视锥内这些元素缺席）；
+    **无后处理链**（RT 直渲后仅 ACES（泛光 0 / 曝光 1 / 暗角 0）——
+    无 bloom / 曝光 / 暗角）；RT 无读写回（v1 不做 RT 像素 map，UI 直接
+    采样 GPU 纹理）；UI 图片无抗锯齿（Nearest 直角采样，像素化小地图
+    天然契合）且绘制顺序固定（图片之下、文本之上）。
 
 ## 9. 关键设计取舍记录
 
