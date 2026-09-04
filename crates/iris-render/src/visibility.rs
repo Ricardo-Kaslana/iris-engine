@@ -14,6 +14,31 @@
 //!   入 `FrameStats.culled_instances`（剔除口径不变）。
 
 use iris_core::Component;
+use iris_core::entity::Entity;
+use iris_core::world::World;
+
+/// 级联可见性的父链搜索深度上限：典型游戏层级 ≤ 4；上限只防御
+/// `add_child` 未检测的构造性环（a、b 互设父级——层级传播对环同样未
+/// 定义），渲染收集不得挂死，越界按可见处理（宁可多画的既有哲学）。
+const VISIBILITY_ANCESTOR_MAX_DEPTH: usize = 64;
+
+/// 层级可见性级联：沿 `ChildOf` 父链上行，任一祖先挂
+/// [`Visibility::HIDDEN`] 即隐藏——语义即「任一祖先隐藏 ⇒ 子树全隐藏」。
+/// **渲染收集期上行遍历**实现：不加新组件、不动 `hierarchy` 数据；自身
+/// `HIDDEN` 的检查由调用方完成（本函数只补祖先链）。复杂度
+/// O(父链深度)，典型场景 ≤ 4。
+pub(crate) fn hidden_by_ancestor(world: &World, mut entity: Entity) -> bool {
+    for _ in 0..VISIBILITY_ANCESTOR_MAX_DEPTH {
+        let Some(parent) = world.parent(entity) else {
+            return false;
+        };
+        if world.get::<Visibility>(parent).is_some_and(|v| !v.visible) {
+            return true;
+        }
+        entity = parent;
+    }
+    false
+}
 
 /// 实体可见性（渲染过滤组件）。缺席 = 可见；祖先 `HIDDEN` ⇒ 子树全隐藏
 /// （模块文档的层级级联语义）。

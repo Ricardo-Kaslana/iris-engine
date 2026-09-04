@@ -54,6 +54,4 @@ criterion = "0.7"
 # 发布构建：更小体积、更快运行
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
 strip = "debuginfo"

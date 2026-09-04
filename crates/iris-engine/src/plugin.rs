@@ -7,6 +7,7 @@ use iris_render::prelude::{Camera, DirectionalLight, MaterialStore, MeshStore, T
 
 use crate::app::App;
 use crate::audio::Audio;
+use crate::ui::UiPlugin;
 
 /// 插件：一次 `build` 机会，可修改世界的资源、系统与窗口配置。
 pub trait Plugin {
@@ -316,6 +317,9 @@ impl Plugin for DefaultPlugins {
         // 空间音频与粒子同层（层级传播之后）：听者 / 声源读当帧全局位姿，
         // 当帧混音增益即跟随（访问集与粒子不相交，可同批并行）
         SpatialPlugin.build(app);
+        // UI 编排（R41）：三系统注册到 PostUpdate（渲染之前），执行序
+        // layout → menus → focus（理由见 crate::ui 模块头）
+        UiPlugin.build(app);
     }
 }
 

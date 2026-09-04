@@ -5,6 +5,57 @@
 
 ## [Unreleased]
 
+### Added（R41：UI 与菜单框架——锚定布局 + 按钮焦点导航 + 菜单栈 + 设置持久化）
+
+UI 与菜单框架落地（第 41 轮迭代，A 级清单收官；语义规范 =
+`iris-render/src/ui.rs` / `iris-engine/src/settings.rs` / `iris-engine/src/ui.rs`
+模块文档，架构记录见 ARCHITECTURE §4.13，限制见 §8.21，视觉验收
+`examples/ui_menu_snapshot.rs` → `docs/ui_menu.png`）：
+
+- **锚定布局**：`UiAnchor { point, offset }` 组件 + `UiAnchorPoint` 九宫格
+  锚点；纯函数 `anchor_to_position(point, viewport, size, offset)` 把元素
+  一角对齐到视口一角（**中心类锚点把元素中心钉在视口中心，改视口不漂移**，
+  不拉伸不缩放 `size`）。系统 `update_ui_layout` 读 `Viewport` 资源（缺席
+  = 1280×720 兜底），只处理挂 `UiAnchor` 的实体（未挂者位置零变化）。
+- **按钮 + 焦点导航**：`UiButton { label }`（便利组装，配合
+  `spawn_ui_button`）+ `Focusable` 标记 + `UiFocus` 资源（`{ current, order,
+  highlight_color, 原色映射 }`）。系统 `update_ui_focus` 收集**可见**可聚焦
+  实体按锚定后屏幕 Y 再 X 确定性排序（并列取实体 bits）；↑/← 后退、
+  ↓/→/Tab 前进、Enter/Space 与鼠标左键按下沿 + `cursor_position` 命中 →
+  发 `UiClickEvent { entity }`（事件而非回调，游戏侧 `events_mut().drain()`
+  消费）。焦点高亮 = 改写当前实体 `UiColor`（原色保存恢复，无样式表）。
+- **菜单栈**：`UiMenu(String)` 标记 + `UiMenuStack` 资源
+  （`push_menu`/`pop_menu`/`top_menu`）。系统 `update_ui_menus` 只裁决
+  可见性（**栈顶菜单实体 `VISIBLE`、其余 `HIDDEN`、空栈全隐、未挂
+  `UiMenu` 的实体不参与**；同名菜单多实体全可见）；**引擎不内置 Esc 语义**
+  （弹栈由游戏侧自行调栈）。
+- **UI Visibility 级联**：把渲染器的 `hidden_by_ancestor` 收归
+  `iris-render::visibility` 共享，UI 全部收集路径（矩形 / 文本 /
+  `UiImage` / `UiImageRtt`）统一启用**祖先级联**（任一祖先 `HIDDEN` ⇒ 子树
+  全隐藏）；自身 `HIDDEN` / 缺席 = 可见的既有语义零变化（行为变更：此前
+  UI 只看自身 `Visibility`，不看祖先）。
+- **设置持久化**：`Settings`（Resource）字段 `master_volume` /
+  `fullscreen` / `vsync` / `fov_degrees`；`Settings::load(path)` 文件缺失 /
+  损坏 / 字段缺失一律回退默认（`log::warn`，加载永不失败，字段带 serde
+  default 向后兼容）、`Settings::save(path)` 写 pretty JSON 并建父目录。
+- **系统注册序**：`UiPlugin` 加入 `DefaultPlugins`，把 `UiFocus` /
+  `UiMenuStack` 资源与 `UiClickEvent` 事件、三个系统注册到
+  `Stage::PostUpdate`（渲染收集之前，顺序
+  `update_ui_layout → update_ui_menus → update_ui_focus`，理由见
+  `crate::ui` 模块头）。**新增 `iris-platform` 依赖到 `iris-render`**（UI
+  焦点导航 / 点击消费 `Input` 资源；platform 不依赖 render，无环）。
+
+与规范的偏离：
+- **`update_ui_layout` 实现在 `iris-engine` 而非 `iris-render`**（设计指定
+  ui.rs，但 crate 边界不允许 `iris-render` 反向引用 `iris-engine` 的
+  `Viewport` 资源）；组件 / 纯函数 `anchor_to_position` 与菜单 / 焦点系统
+  仍在 `iris-render::ui`。`update_ui_focus` 需要 `Input`，故 `iris-render`
+  新增对 `iris-platform` 的依赖。
+- **`Settings` 未派生 `Default`**（设计 derive 列表含 `Default`，但派生给
+  出全零 master_volume=0 / fov=0）：改用手写 `Default`（master_volume=1.0、
+  vsync=true、fov_degrees=70.0），字段级 `#[serde(default=...)]` 兼作缺字段
+  向后兼容。
+
 ### Added（R40：多视口与渲染到纹理——小地图 / 监控屏玩法基础 + UI 图片控件）
 
 多视口与渲染到纹理落地（第 40 轮迭代；iris-render 新模块 `rendertarget` +

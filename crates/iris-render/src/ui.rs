@@ -1,4 +1,5 @@
-//! 2D UI 叠加层（HUD）：屏幕空间彩色矩形 + 内嵌位图字体文本。
+//! 2D UI 叠加层（HUD）：屏幕空间彩色矩形 + 内嵌位图字体文本，
+//! 以及围绕它的布局 / 焦点 / 菜单编排（R41）。
 //!
 //! - **像素坐标系**：原点左上、y 向下（与窗口行序一致），由 `ui.wgsl`
 //!   的顶点着色器统一翻转到 NDC；
@@ -6,16 +7,41 @@
 //! - HUD pass 位于色调映射 blit 之后，直接写 sRGB 输出目标——因此
 //!   **不参与 HDR / 泛光 / 色调映射**（HUD 应是干净的界面叠加，
 //!   不应被后期处理提亮或染雾）；
-//! - v1 无层级、无锚点、无剪裁：组件挂在任意实体上，位置即屏幕像素
-//!   （文本的排版原点复用同实体 `UiRect.position`，见 [`UiText`]）。
+//! - 文本的排版原点复用同实体 `UiRect.position`，见 [`UiText`]。
+//!
+//! # R41 编排（锚定 / 焦点 / 菜单）
+//!
+//! - **锚定布局**：[`UiAnchor`] 把元素的一角对齐到视口九宫格一角
+//!   （[`UiAnchorPoint`]），位置由纯函数 [`anchor_to_position`] 逐帧解析进
+//!   `UiRect.position`。解析系统由引擎门面层的 `Viewport` 资源驱动
+//!   （缺席兜底 1280×720），**不拉伸不缩放 `UiRect.size`**——v1 无父容器
+//!   嵌套（诚实限制）。
+//! - **按钮 + 焦点导航**：[`UiButton`] / [`Focusable`] 标记 + [`UiFocus`]
+//!   资源，`update_ui_focus` 每帧收集全部可见可聚焦实体（按锚定后屏幕 Y
+//!   再 X 确定性排序，见 [`sort_focus_items`]），↑↓/←→/Tab 换焦、
+//!   Enter/Space 与鼠标左键点击发 [`UiClickEvent`]；焦点高亮 = 改写当前
+//!   实体 `UiColor`（原色保存恢复，组件换色，无样式表）。
+//! - **菜单栈**：[`UiMenu`] 标记实体归属 + [`UiMenuStack`] 资源，
+//!   `update_ui_menus` 只裁决可见性（栈顶菜单实体 `VISIBLE`、其余
+//!   `HIDDEN`）；push/pop 由游戏侧调栈资源方法决定，**引擎不内置 Esc 语义**。
+//!
+//! 三个系统的执行序（均由引擎门面层的 `UiPlugin` 注册到
+//! `Stage::PostUpdate`，渲染发生在 PostUpdate 之后）：`update_ui_layout`
+//! （写锚定后的 `UiRect.position`）→ `update_ui_menus`（写 `Visibility`）
+//! → `update_ui_focus`（按最终位置与可见性排序 / 换焦 / 高亮）。
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use iris_core::Component;
-use iris_core::prelude::Entity;
+use iris_core::entity::Entity;
+use iris_core::world::World;
+use iris_core::{Component, Event, Resource};
+use iris_platform::input::Input;
+use iris_platform::prelude::{KeyCode, MouseButton};
 
 use crate::rendertarget::RenderTargetHandle;
 use crate::texture::TextureHandle;
+use crate::visibility::{Visibility, hidden_by_ancestor};
 
 /// UI 矩形：屏幕像素坐标（原点左上、y 向下）。
 ///
@@ -80,6 +106,188 @@ pub struct UiImage {
 pub struct UiImageRtt {
     /// 要显示的渲染目标。
     pub target: crate::rendertarget::RenderTargetHandle,
+}
+
+// =====================================================================
+// R41：锚定布局 / 按钮焦点导航 / 菜单栈
+// =====================================================================
+
+/// 视口九宫格锚点（按哪个角/边对齐元素）。
+///
+/// 与 [`UiAnchor`] 配对：`point` 选定视口的参考角，元素对应角与其对齐，
+/// `offset` 以像素平移。**不拉伸不缩放元素**（v1 无父容器嵌套）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiAnchorPoint {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+/// 锚定参数组件：把挂有本组件 + [`UiRect`] 的实体按视口九宫格一角定位。
+///
+/// 每帧由 `update_ui_layout`（引擎门面层，读 `Viewport` 资源）把锚点解析
+/// 为该实体 `UiRect.position` 的绝对像素（纯函数 [`anchor_to_position`]）；
+/// **缺失本组件的实体位置不动**（保持手写绝对坐标，既有行为零变化）。
+/// 文本实体（挂 [`UiText`]）共用本组件：其 `UiRect.size` 视作文本框
+/// 尺寸参与居中，实现「文本居中对齐到锚点」。
+#[derive(Component, Clone, Copy, Debug)]
+pub struct UiAnchor {
+    /// 视口参考角。
+    pub point: UiAnchorPoint,
+    /// 相对参考角的像素偏移（x 右、y 下）。
+    pub offset: [f32; 2],
+}
+
+/// 把锚点解析为 `UiRect.position`（纯函数，可脱离 World 单测）。
+///
+/// `viewport` = 视口宽高（像素，缺席资源时由调用方兜底 1280×720）；
+/// `ui_size` = 元素尺寸（像素）；`offset` = 相对参考角的平移。返回左上角
+/// 坐标：元素对应角与视口参考角重合再加偏移。**Center 类锚点对任意视口
+/// 尺寸都把元素中心钉在视口中心**（改视口不漂移——R41 验收点）。
+pub fn anchor_to_position(
+    point: UiAnchorPoint,
+    viewport: [f32; 2],
+    ui_size: [f32; 2],
+    offset: [f32; 2],
+) -> [f32; 2] {
+    let vw = viewport[0];
+    let vh = viewport[1];
+    let w = ui_size[0];
+    let h = ui_size[1];
+    // 视口参考角（左上原点）
+    let (px, py) = match point {
+        UiAnchorPoint::TopLeft => (0.0, 0.0),
+        UiAnchorPoint::TopCenter => (vw * 0.5, 0.0),
+        UiAnchorPoint::TopRight => (vw, 0.0),
+        UiAnchorPoint::CenterLeft => (0.0, vh * 0.5),
+        UiAnchorPoint::Center => (vw * 0.5, vh * 0.5),
+        UiAnchorPoint::CenterRight => (vw, vh * 0.5),
+        UiAnchorPoint::BottomLeft => (0.0, vh),
+        UiAnchorPoint::BottomCenter => (vw * 0.5, vh),
+        UiAnchorPoint::BottomRight => (vw, vh),
+    };
+    // 元素对齐角（与参考角对应）
+    let (cx, cy) = match point {
+        UiAnchorPoint::TopLeft => (0.0, 0.0),
+        UiAnchorPoint::TopCenter => (w * 0.5, 0.0),
+        UiAnchorPoint::TopRight => (w, 0.0),
+        UiAnchorPoint::CenterLeft => (0.0, h * 0.5),
+        UiAnchorPoint::Center => (w * 0.5, h * 0.5),
+        UiAnchorPoint::CenterRight => (w, h * 0.5),
+        UiAnchorPoint::BottomLeft => (0.0, h),
+        UiAnchorPoint::BottomCenter => (w * 0.5, h),
+        UiAnchorPoint::BottomRight => (w, h),
+    };
+    [px - cx + offset[0], py - cy + offset[1]]
+}
+
+/// 便利按钮组件：承载按钮标签元数据。
+///
+/// 组装（配合 [`spawn_ui_button`]）= 底板实体 `UiRect + UiColor(底) +
+/// Focusable + UiButton + UiMenu + UiAnchor` 与标签实体 `UiRect(文本盒) +
+/// UiText + UiColor(字色) + UiMenu + UiAnchor`。**本组件只存标签**；底板
+/// 是否绘制由实体上是否挂 [`UiText`] 决定（挂则矩形仅作定位载体，见模块
+/// 头既有规则）。
+#[derive(Component, Clone, Debug)]
+pub struct UiButton {
+    /// 按钮标签（用于菜单身份 / 消费方识别）。
+    pub label: String,
+}
+
+/// 可聚焦标记：挂上即进入焦点导航候选（见 [`UiFocus`] / `update_ui_focus`）。
+#[derive(Clone, Copy, Debug, Component)]
+pub struct Focusable;
+
+/// 点击事件：菜单 / 按钮选中（鼠标左键命中，或焦点态按 Enter/Space）。
+///
+/// 形态为**事件而非回调**——引擎保持组件 / 资源友好（无闭包注册表），
+/// 游戏侧 `events_mut::<UiClickEvent>().drain()` 每帧消费；无需注册即得
+/// （由 `UiPlugin` 注册）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Event)]
+pub struct UiClickEvent {
+    /// 被点击 / 激活的实体。
+    pub entity: Entity,
+}
+
+/// 焦点导航状态（World 资源，`UiPlugin` 插入）。
+///
+/// `current` = 当前高亮实体；`order` = 本帧可见可聚焦实体的确定性排序
+/// （锚定后屏幕 Y 再 X，见 [`sort_focus_items`]）。高亮通过改写当前实体
+/// `UiColor` 实现，`originals` 记录各实体高亮前的原色（恢复用）；`None`
+/// 或资源缺席 = 焦点导航关闭（既有 UI 渲染零变化）。
+#[derive(Resource)]
+pub struct UiFocus {
+    /// 当前焦点实体。
+    pub current: Option<Entity>,
+    /// 本帧可见可聚焦实体的确定性顺序（Y 再 X，见 [`sort_focus_items`]）。
+    pub order: Vec<Entity>,
+    /// 焦点高亮色（写进当前实体的 `UiColor`）。
+    pub highlight_color: [f32; 4],
+    /// 实体 -> 高亮前原色（焦点切走时恢复）。
+    originals: BTreeMap<Entity, [f32; 4]>,
+}
+
+impl Default for UiFocus {
+    fn default() -> Self {
+        Self {
+            current: None,
+            order: Vec::new(),
+            highlight_color: [1.0, 0.92, 0.35, 1.0],
+            originals: BTreeMap::new(),
+        }
+    }
+}
+
+/// 实体归属的菜单名（配合 [`UiMenuStack`] 决定可见性）。
+///
+/// 挂本组件的实体（通常是底板 + 按钮）由 `update_ui_menus` 按栈顶菜单
+/// 裁决 `Visibility`：**栈顶菜单的全部实体 `VISIBLE`、其余 `HIDDEN`**；
+/// **未挂本组件的实体不参与裁决**（HUD 常驻可见）。
+#[derive(Component, Clone, Debug)]
+pub struct UiMenu(pub String);
+
+/// 菜单栈（World 资源）：栈顶菜单可见，其余隐藏。
+///
+/// push/**pop**/**top** 均为资源方法；**引擎不内置 Esc 语义**——弹栈由
+/// 游戏侧在有 `UiClickEvent` / 按键输入时自行调用（`update_ui_menus` 只
+/// 裁决可见性，不读输入）。
+#[derive(Resource, Default)]
+pub struct UiMenuStack {
+    /// 栈（后进=顶层）。确定性：`Vec` 天然保序。
+    stack: Vec<String>,
+}
+
+impl UiMenuStack {
+    /// 压入菜单（顶部 = 该菜单可见）。
+    pub fn push_menu(&mut self, name: impl Into<String>) {
+        self.stack.push(name.into());
+    }
+
+    /// 弹出栈顶菜单，返回其名（空栈返回 `None`）。
+    pub fn pop_menu(&mut self) -> Option<String> {
+        self.stack.pop()
+    }
+
+    /// 当前栈顶菜单名（空栈返回 `None`）。
+    pub fn top_menu(&self) -> Option<&str> {
+        self.stack.last().map(String::as_str)
+    }
+
+    /// 栈深度。
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// 是否为空栈。
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
 }
 
 /// 公有领域 font8x8 位图字体（Daniel Hepper 整理 / Marcel Sondaar 起源，
@@ -520,7 +728,7 @@ pub(crate) fn collect_ui_vertices(world: &iris_core::world::World, out: &mut Vec
             // 挂有 UiText / UiImage / UiImageRtt 的实体上，UiRect 仅充当定位
             // / 尺寸载体（文本排版原点、图片像素盒），不绘制矩形——否则缺省
             // 白矩形会盖住文字 / 图片；需要面板背景时单独生成一个矩形实体。
-            if visibility.is_some_and(|v| !v.visible) {
+            if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, entity) {
                 return;
             }
             if world.get::<UiText>(entity).is_none()
@@ -533,7 +741,7 @@ pub(crate) fn collect_ui_vertices(world: &iris_core::world::World, out: &mut Vec
     );
     world.query::<(Entity, &UiText, &UiColor, Option<&Visibility>)>(
         |(entity, text, color, visibility)| {
-            if visibility.is_some_and(|v| !v.visible) {
+            if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, entity) {
                 return;
             }
             let origin = world
@@ -581,7 +789,7 @@ pub(crate) fn collect_ui_image_vertices(
     use crate::visibility::Visibility;
     world.query::<(Entity, &UiImage, &UiRect, &UiColor, Option<&Visibility>)>(
         |(entity, image, rect, color, visibility)| {
-            if visibility.is_some_and(|v| !v.visible) {
+            if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, entity) {
                 return;
             }
             let _ = entity;
@@ -596,7 +804,7 @@ pub(crate) fn collect_ui_image_vertices(
     );
     world.query::<(Entity, &UiImageRtt, &UiRect, &UiColor, Option<&Visibility>)>(
         |(entity, image, rect, color, visibility)| {
-            if visibility.is_some_and(|v| !v.visible) {
+            if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, entity) {
                 return;
             }
             let _ = entity;
@@ -609,6 +817,228 @@ pub(crate) fn collect_ui_image_vertices(
             });
         },
     );
+}
+
+// ---------------------------------------------------------------------
+// R41 编排系统与纯函数
+// ---------------------------------------------------------------------
+
+/// 把可见可聚焦候选按锚定后屏幕 **Y（主）再 X（次）** 排序，并列取实体
+/// bits——确定性（`total_cmp` 消除浮点比较歧义；并列按 `Entity` 派生
+/// `Ord` 比较，其序 = 索引再代数，可网络 / 存档复用）。
+pub fn sort_focus_items(mut items: Vec<(Entity, [f32; 2])>) -> Vec<Entity> {
+    items.sort_by(|a, b| {
+        a.1[1]
+            .total_cmp(&b.1[1])
+            .then(a.1[0].total_cmp(&b.1[0]))
+            .then(a.0.cmp(&b.0))
+    });
+    items.into_iter().map(|(e, _)| e).collect()
+}
+
+/// 点是否落在矩形内（含边界；像素坐标，左上原点、y 向下）。
+/// 供鼠标点击命中测试 / 单测用。
+pub fn point_in_rect(point: [f32; 2], rect: &UiRect) -> bool {
+    point[0] >= rect.position[0]
+        && point[0] <= rect.position[0] + rect.size[0]
+        && point[1] >= rect.position[1]
+        && point[1] <= rect.position[1] + rect.size[1]
+}
+
+/// 组装一个菜单按钮：底板实体（可聚焦、矩形可见）+ 标签实体（文本居中）。
+///
+/// 底板实体挂 `UiRect + UiColor(底) + Focusable + UiButton + UiMenu +
+/// UiAnchor`（无 `UiText` → 矩形被绘制成按钮面板）；标签实体挂
+/// `UiRect(文本盒) + UiText + UiColor(字色) + UiMenu + UiAnchor`（有
+/// `UiText` → 矩形仅作定位/居中载体，不绘制）。两者共用同一锚点，故
+/// `update_ui_layout` 会把标签盒居中到按钮面板中心——**视口改变时整组随
+/// 锚点移动，不漂移**。
+///
+/// 返回**底板实体**（可聚焦实体，供设置 `UiFocus.current` / 消费事件）。
+#[allow(clippy::too_many_arguments)] // 便利组装 API：参数即按钮的完整外观/布局描述
+pub fn spawn_ui_button(
+    world: &mut World,
+    label: impl Into<String>,
+    button_size: [f32; 2],
+    bg_color: [f32; 4],
+    text_color: [f32; 4],
+    scale: f32,
+    anchor: UiAnchor,
+    menu: &str,
+) -> Entity {
+    let label = label.into();
+    let button = world.spawn((
+        UiRect {
+            position: [0.0, 0.0],
+            size: button_size,
+        },
+        UiColor(bg_color),
+        Focusable,
+        UiButton {
+            label: label.clone(),
+        },
+        UiMenu(menu.into()),
+        anchor,
+    ));
+    let text_w = text_width(&UiText {
+        string: label.clone(),
+        scale,
+    });
+    let text_h = GLYPH_SIZE as f32 * scale;
+    world.spawn((
+        UiRect {
+            position: [0.0, 0.0],
+            size: [text_w, text_h],
+        },
+        UiText {
+            string: label,
+            scale,
+        },
+        UiColor(text_color),
+        UiMenu(menu.into()),
+        anchor,
+    ));
+    button
+}
+
+/// 菜单栈可见性裁决（每帧）：栈顶菜单的全部挂 [`UiMenu`] 实体
+/// `Visibility::VISIBLE`，其余 `HIDDEN`；**未挂 [`UiMenu`] 的实体不参与
+/// 裁决**（HUD 常驻可见）。空栈 = 全部菜单实体隐藏。
+///
+/// 本系统只写可见性，**不读输入**（Esc 语义由游戏侧决定）——`push`/`pop`
+/// 由游戏调 [`UiMenuStack`] 资源方法；栈资源缺席 = 无菜单（零变化）。
+pub fn update_ui_menus(world: &mut World) {
+    let top = world
+        .try_resource::<UiMenuStack>()
+        .and_then(|stack| stack.top_menu().map(str::to_owned));
+    let mut targets: Vec<(Entity, String)> = Vec::new();
+    world.query::<(Entity, &UiMenu)>(|(entity, menu)| targets.push((entity, menu.0.clone())));
+    for (entity, name) in targets {
+        let visible = top.as_deref() == Some(name.as_str());
+        world.insert(
+            entity,
+            if visible {
+                Visibility::VISIBLE
+            } else {
+                Visibility::HIDDEN
+            },
+        );
+    }
+}
+
+/// 焦点导航系统（每帧）：收集可见可聚焦实体 → 按锚定后位置确定性排序 →
+/// 键盘换焦 / 鼠标点击命中 / Enter·Space 激活 → 高亮（改写当前实体
+/// `UiColor`，原色保存恢复）。
+///
+/// **契约**：须在 `update_ui_layout`（写 `UiRect.position`）与
+/// `update_ui_menus`（写 `Visibility`）之后、渲染收集之前执行，才能按最终
+/// 位置与可见性排序 / 命中。`UiFocus` 资源缺席 = 功能关闭（既有渲染零
+/// 变化）；`Input` 资源缺席 = 只高亮当前焦点、无按键 / 鼠标响应。点击
+/// 判定 = 鼠标左键**按下沿** + `Input::cursor_position` 命中。
+pub fn update_ui_focus(world: &mut World) {
+    let Some(mut focus) = world.try_resource_mut::<UiFocus>() else {
+        return;
+    };
+
+    // 收集可见可聚焦候选（锚定后的矩形，供排序 / 命中）
+    let mut candidates: Vec<(Entity, UiRect)> = Vec::new();
+    world.query::<(Entity, &Focusable, &UiRect, Option<&Visibility>)>(|(entity, _, rect, vis)| {
+        if vis.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, entity) {
+            return;
+        }
+        candidates.push((entity, rect.clone()));
+    });
+    let order = sort_focus_items(candidates.iter().map(|(e, r)| (*e, r.position)).collect());
+    focus.order = order.clone();
+
+    let input = world.try_resource::<Input>();
+
+    let prev = focus.current;
+    let mut target = prev;
+    let mut activate: Option<Entity> = None;
+
+    if let Some(input) = &input {
+        // 键盘导航：↑/← 后退，↓/→/Tab 前进；无当前焦点时落到位序首位。
+        let back = input.key_pressed(KeyCode::ArrowUp) || input.key_pressed(KeyCode::ArrowLeft);
+        let fwd = input.key_pressed(KeyCode::ArrowDown)
+            || input.key_pressed(KeyCode::ArrowRight)
+            || input.key_pressed(KeyCode::Tab);
+        let press_activate = input.key_pressed(KeyCode::Enter) || input.key_pressed(KeyCode::Space);
+
+        if back || fwd {
+            let idx = target.and_then(|t| order.iter().position(|&e| e == t));
+            let next = match idx {
+                Some(i) if fwd => (i + 1) % order.len(),
+                Some(i) if back => (i + order.len() - 1) % order.len(),
+                _ => 0,
+            };
+            target = order.get(next).copied();
+        } else if press_activate {
+            activate = target;
+        }
+
+        // 鼠标左键按下沿 + 光标命中 → 换焦并激活
+        if input.mouse_button_pressed(MouseButton::Left) {
+            if let Some((cx, cy)) = input.cursor_position() {
+                if let Some(hit) = hit_test(&order, &candidates, [cx as f32, cy as f32]) {
+                    target = Some(hit);
+                    activate = Some(hit);
+                }
+            }
+        }
+    }
+
+    // 撤销上一焦点的高亮，恢复其原色
+    if let Some(p) = prev {
+        if let Some(base) = focus.originals.get(&p).copied() {
+            if let Some(mut color) = world.get_mut::<UiColor>(p) {
+                color.0 = base;
+            }
+        }
+    }
+
+    // 清理已销毁实体的原色记录
+    let stale: Vec<Entity> = focus
+        .originals
+        .keys()
+        .copied()
+        .filter(|e| !world.contains(*e))
+        .collect();
+    for e in stale {
+        focus.originals.remove(&e);
+    }
+
+    focus.current = target;
+
+    // 高亮当前焦点：记录原色并写入高亮色
+    if let Some(t) = target {
+        if let std::collections::btree_map::Entry::Vacant(e) = focus.originals.entry(t) {
+            if let Some(color) = world.get::<UiColor>(t) {
+                e.insert(color.0);
+            }
+        }
+        if let Some(mut color) = world.get_mut::<UiColor>(t) {
+            color.0 = focus.highlight_color;
+        }
+    }
+
+    // 发送激活事件（键入 Enter/Space 或鼠标点击命中）
+    if let Some(e) = activate {
+        world.try_send_event(UiClickEvent { entity: e });
+    }
+}
+
+/// 命中测试：按确定性 [`Self::sort_focus_items`] 顺序（Y 再 X）遍历，
+/// 返回首个包含 `point` 的矩形实体。
+fn hit_test(order: &[Entity], candidates: &[(Entity, UiRect)], point: [f32; 2]) -> Option<Entity> {
+    for &e in order {
+        if let Some((_, rect)) = candidates.iter().find(|(ce, _)| *ce == e) {
+            if point_in_rect(point, rect) {
+                return Some(e);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1043,6 +1473,282 @@ mod tests {
         assert!(
             rects.is_empty(),
             "挂图片的实体其 UiRect 只作定位载体，不应产生矩形顶点"
+        );
+    }
+
+    // ---- R41：锚定 / 焦点 / 菜单 ----
+
+    /// 锚点解析：Center 把元素中心钉在视口中心——**改视口尺寸不漂移**；
+    /// 九个锚点角的绝对坐标逐值断言（解析解对照）。
+    #[test]
+    fn anchor_center_stays_centered_and_corners_are_exact() {
+        let size = [100.0, 40.0];
+        // 改视口尺寸：Center 端到左上角坐标随视口平移，但中心恒定
+        for &(vw, vh) in &[
+            (1280.0, 720.0),
+            (800.0, 600.0),
+            (1920.0, 1080.0),
+            (256.0, 144.0),
+        ] {
+            let pos = anchor_to_position(UiAnchorPoint::Center, [vw, vh], size, [0.0, 0.0]);
+            assert_eq!(
+                pos,
+                [vw * 0.5 - 50.0, vh * 0.5 - 20.0],
+                "Center 在 {vw}x{vh} 视口的左上角（中心恒定：{pos:?}）"
+            );
+            // 元素中心 = pos + size/2 = 视口中心
+            let center = [pos[0] + 50.0, pos[1] + 20.0];
+            assert_eq!(center, [vw * 0.5, vh * 0.5], "元素中心应钉在视口中心");
+        }
+        // 全部九点：逐值解析解
+        let v = [1280.0, 720.0];
+        let cases = [
+            (UiAnchorPoint::TopLeft, [0.0, 0.0]),
+            (UiAnchorPoint::TopCenter, [640.0 - 50.0, 0.0]),
+            (UiAnchorPoint::TopRight, [1280.0 - 100.0, 0.0]),
+            (UiAnchorPoint::CenterLeft, [0.0, 360.0 - 20.0]),
+            (UiAnchorPoint::Center, [640.0 - 50.0, 360.0 - 20.0]),
+            (UiAnchorPoint::CenterRight, [1280.0 - 100.0, 360.0 - 20.0]),
+            (UiAnchorPoint::BottomLeft, [0.0, 720.0 - 40.0]),
+            (UiAnchorPoint::BottomCenter, [640.0 - 50.0, 720.0 - 40.0]),
+            (UiAnchorPoint::BottomRight, [1280.0 - 100.0, 720.0 - 40.0]),
+        ];
+        for (point, expect) in cases {
+            assert_eq!(
+                anchor_to_position(point, v, size, [0.0, 0.0]),
+                expect,
+                "{point:?} 锚点应解析到 {expect:?}"
+            );
+        }
+    }
+
+    /// 锚点 offset：以像素平移（右 / 下为正）。
+    #[test]
+    fn anchor_offset_translates() {
+        let pos = anchor_to_position(
+            UiAnchorPoint::TopLeft,
+            [1280.0, 720.0],
+            [100.0, 40.0],
+            [12.0, -8.0],
+        );
+        assert_eq!(pos, [12.0, -8.0]);
+        let center = anchor_to_position(
+            UiAnchorPoint::Center,
+            [1280.0, 720.0],
+            [100.0, 40.0],
+            [0.0, -48.0],
+        );
+        assert_eq!(center, [590.0, 292.0], "Center + y 偏移 -48");
+    }
+
+    /// 焦点排序：先 Y 再 X，并列取实体 bits（确定性）。
+    #[test]
+    fn sort_focus_items_orders_by_y_then_x_then_entity() {
+        let mut world = iris_core::world::World::new();
+        let e0 = world.spawn_empty();
+        let e1 = world.spawn_empty();
+        let e2 = world.spawn_empty();
+        let e3 = world.spawn_empty();
+        // Y 主序：e3(小 Y) 在前；同 Y 内按 X；完全并列按实体 bits
+        let items = vec![
+            (e0, [100.0, 50.0]),
+            (e1, [10.0, 200.0]),
+            (e2, [100.0, 50.0]),
+            (e3, [5.0, 5.0]),
+        ];
+        let order = sort_focus_items(items);
+        // e3(Y=5) → 并列(Y=50): e0(索引0) 先于 e2(索引2) 按 bits；e1(Y=200) 最后
+        assert_eq!(order, vec![e3, e0, e2, e1]);
+    }
+
+    /// 点在矩形内的边界包含。
+    #[test]
+    fn point_in_rect_includes_boundary() {
+        let rect = UiRect {
+            position: [10.0, 20.0],
+            size: [30.0, 40.0],
+        };
+        assert!(point_in_rect([10.0, 20.0], &rect), "左上角含边界");
+        assert!(point_in_rect([40.0, 60.0], &rect), "右下角含边界");
+        assert!(point_in_rect([25.0, 40.0], &rect), "内部点");
+        assert!(!point_in_rect([9.9, 25.0], &rect), "左侧界外");
+        assert!(!point_in_rect([25.0, 60.1], &rect), "下侧界外");
+    }
+
+    /// 菜单栈：push / pop / top / 空栈。
+    #[test]
+    fn menu_stack_push_pop_top() {
+        let mut stack = UiMenuStack::default();
+        assert!(stack.is_empty());
+        assert_eq!(stack.top_menu(), None, "空栈 top = None");
+        stack.push_menu("pause");
+        stack.push_menu("settings");
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack.top_menu(), Some("settings"), "栈顶 = 最近 push");
+        assert_eq!(stack.pop_menu(), Some("settings".into()));
+        assert_eq!(stack.top_menu(), Some("pause"));
+        assert_eq!(stack.pop_menu(), Some("pause".into()));
+        assert!(stack.is_empty());
+        assert_eq!(stack.pop_menu(), None, "空栈 pop = None");
+    }
+
+    /// 可见性裁决：栈顶菜单可见、其余隐藏；空栈全隐；同名菜单多实体全可见；
+    /// 未挂 UiMenu 的实体不参与裁决。
+    #[test]
+    fn update_ui_menus_toggles_top_only_and_empty_hides_all() {
+        let mut world = iris_core::world::World::new();
+        let menu_pause = world.spawn((UiMenu("pause".into()), UiColor::default()));
+        let menu_settings = world.spawn((UiMenu("settings".into()), UiColor::default()));
+        let pause_multi = world.spawn((UiMenu("pause".into()), UiColor::default()));
+        let hud = world.spawn((
+            UiRect {
+                position: [0.0, 0.0],
+                size: [8.0, 8.0],
+            },
+            UiColor::default(),
+        )); // 无 UiMenu
+
+        // 空栈：全部菜单实体隐藏
+        world.insert_resource(UiMenuStack::default());
+        update_ui_menus(&mut world);
+        fn visible_of(world: &iris_core::world::World, e: iris_core::entity::Entity) -> bool {
+            world.get::<Visibility>(e).is_some_and(|v| v.visible)
+        }
+        assert!(!visible_of(&world, menu_pause), "空栈 pause 隐藏");
+        assert!(!visible_of(&world, menu_settings), "空栈 settings 隐藏");
+        assert!(!visible_of(&world, pause_multi), "空栈多实体隐藏");
+        assert!(
+            world.get::<Visibility>(hud).is_none(),
+            "未挂 UiMenu 的实体不得被写入 Visibility（HUD 常驻）"
+        );
+
+        // push pause：同名两实体均可见，settings 隐藏
+        world.resource_mut::<UiMenuStack>().push_menu("pause");
+        update_ui_menus(&mut world);
+        assert!(visible_of(&world, menu_pause));
+        assert!(visible_of(&world, pause_multi));
+        assert!(!visible_of(&world, menu_settings));
+
+        // pop：回到空栈，全隐
+        world.resource_mut::<UiMenuStack>().pop_menu();
+        update_ui_menus(&mut world);
+        assert!(!visible_of(&world, menu_pause));
+        assert!(!visible_of(&world, menu_settings));
+    }
+
+    /// 祖先级联：UI 子实体挂 HIDDEN 父实体 → 子实体不产生顶点（迭代期间读
+    /// 父链，与渲染器普通网格路径同款语义）；组件缺席 = 可见（零变化）。
+    #[test]
+    fn hidden_ancestor_cascades_to_ui_child() {
+        let mut world = iris_core::world::World::new();
+        let parent = world.spawn((Visibility::HIDDEN,));
+        let child_rect = world.spawn((
+            UiRect {
+                position: [0.0, 0.0],
+                size: [8.0, 8.0],
+            },
+            UiColor::default(),
+        ));
+        world.add_child(parent, child_rect);
+        let mut out = Vec::new();
+        collect_ui_vertices(&world, &mut out);
+        assert!(
+            out.is_empty(),
+            "UI 子实体不应因祖先 HIDDEN 而进入收集（祖先级联）"
+        );
+    }
+
+    /// 焦点导航：初始无焦点 → 按 ↓ 落位首位并高亮（原色记录）；再按 ↓ →
+    /// 移动到下一项并把旧焦点恢复原色；Enter → 发 UiClickEvent。
+    #[test]
+    fn update_ui_focus_navigates_highlights_and_activates() {
+        use iris_platform::prelude::KeyCode;
+        let mut world = iris_core::world::World::new();
+        world.register_event::<UiClickEvent>();
+        let base_a = [0.2, 0.2, 0.2, 1.0];
+        let base_b = [0.3, 0.3, 0.3, 1.0];
+        let a = world.spawn((
+            UiRect {
+                position: [0.0, 0.0],
+                size: [100.0, 30.0],
+            },
+            UiColor(base_a),
+            Focusable,
+            UiMenu("m".into()),
+        ));
+        let b = world.spawn((
+            UiRect {
+                position: [0.0, 40.0],
+                size: [100.0, 30.0],
+            },
+            UiColor(base_b),
+            Focusable,
+            UiMenu("m".into()),
+        ));
+
+        world.insert_resource(UiFocus::default());
+        world.insert_resource(Input::new());
+
+        // 帧 1：按 ↓ → 落位首位 a，高亮
+        world.resource_mut::<Input>().press(KeyCode::ArrowDown);
+        update_ui_focus(&mut world);
+        assert_eq!(world.resource::<UiFocus>().current, Some(a));
+        let hl = world.resource::<UiFocus>().highlight_color;
+        assert_eq!(world.get::<UiColor>(a).unwrap().0, hl, "焦点 a 应高亮");
+        assert_eq!(world.get::<UiColor>(b).unwrap().0, base_b, "b 未高亮");
+        // 换帧：释放再按才产生新的「按下沿」（按住状态的 press 不重复触发）
+        world.resource_mut::<Input>().release(KeyCode::ArrowDown);
+        world.resource_mut::<Input>().end_frame();
+
+        // 帧 2：按 ↓ → 焦点移动到 b，a 恢复原色
+        world.resource_mut::<Input>().press(KeyCode::ArrowDown);
+        update_ui_focus(&mut world);
+        assert_eq!(world.resource::<UiFocus>().current, Some(b));
+        assert_eq!(world.get::<UiColor>(a).unwrap().0, base_a, "a 恢复原色");
+        assert_eq!(world.get::<UiColor>(b).unwrap().0, hl, "b 高亮");
+        world.resource_mut::<Input>().release(KeyCode::ArrowDown);
+        world.resource_mut::<Input>().end_frame();
+
+        // 帧 3：Enter → 发 UiClickEvent{entity: b}
+        world.resource_mut::<Input>().press(KeyCode::Enter);
+        update_ui_focus(&mut world);
+        let events: Vec<_> = world.events::<UiClickEvent>().iter().copied().collect();
+        assert_eq!(events, vec![UiClickEvent { entity: b }]);
+    }
+
+    /// 鼠标点击命中：左键按下沿 + cursor 命中矩形 → 换焦并激活该实体。
+    #[test]
+    fn update_ui_focus_click_hit_selects_and_activates() {
+        use iris_platform::prelude::{ElementState, MouseButton};
+        let mut world = iris_core::world::World::new();
+        world.register_event::<UiClickEvent>();
+        let a = world.spawn((
+            UiRect {
+                position: [10.0, 10.0],
+                size: [100.0, 30.0],
+            },
+            UiColor([0.3, 0.3, 0.3, 1.0]),
+            Focusable,
+            UiMenu("m".into()),
+        ));
+        world.insert_resource(UiFocus::default());
+        world.insert_resource(Input::new());
+        // 光标命中 a 的中心 (60, 25) + 左键按下沿
+        world.resource_mut::<Input>().on_cursor_moved((60.0, 25.0));
+        world
+            .resource_mut::<Input>()
+            .on_mouse_button(MouseButton::Left, ElementState::Pressed);
+        update_ui_focus(&mut world);
+        assert_eq!(
+            world.resource::<UiFocus>().current,
+            Some(a),
+            "点击应换焦到命中实体"
+        );
+        let events: Vec<_> = world.events::<UiClickEvent>().iter().copied().collect();
+        assert_eq!(
+            events,
+            vec![UiClickEvent { entity: a }],
+            "点击应激活命中实体"
         );
     }
 }

@@ -95,7 +95,11 @@ pub mod prelude {
     pub use crate::texture_bcn::{
         BC1_BLOCK_BYTES, bc1_eligible, encode_bc1, encoded_len, padded_extent,
     };
-    pub use crate::ui::{UiColor, UiImage, UiImageRtt, UiRect, UiText, glyph_bits, text_width};
+    pub use crate::ui::{
+        Focusable, UiAnchor, UiAnchorPoint, UiButton, UiClickEvent, UiColor, UiFocus, UiImage,
+        UiImageRtt, UiMenu, UiMenuStack, UiRect, UiText, anchor_to_position, glyph_bits,
+        sort_focus_items, spawn_ui_button, text_width, update_ui_focus, update_ui_menus,
+    };
     pub use crate::visibility::Visibility;
 }
 

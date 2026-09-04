@@ -1093,7 +1093,11 @@ HDR 域作用）：
   （UI 面向屏幕）、标准 alpha 混合（`BlendState::ALPHA_BLENDING`）。
 - **单批单 draw 的合批策略**：每帧两阶段只读查询（先矩形后文本，
   alpha 混合下文本叠于矩形之上；查询带 `Option<&Visibility>`，挂
-  `Visibility::HIDDEN` 的实体不产生顶点、组件缺席 = 可见）直接组装
+  `Visibility::HIDDEN` 的实体不产生顶点、组件缺席 = 可见，且**含层级
+  级联**——任一祖先 `HIDDEN` ⇒ 子树全隐藏（R41：把渲染器的
+  `hidden_by_ancestor` 收归 `visibility.rs` 共享，UI 全部收集路径——矩形 /
+  文本 / 图片 / 图片 RT——统一启用，此前 UI 只看自身 `Visibility`、不看
+  祖先）直接组装
   `Vec<UiVertex>`（像素位置 +
   图集 UV + 线性 RGBA 顶点色，32B POD），矩形与文本全部 UI 内容合并为
   **一次 draw call**（`stats.draw_calls` 计入）。矩形 = 6 顶点、UV 取
@@ -1112,10 +1116,37 @@ HDR 域作用）：
   字形格为「白色 + alpha = 行位码」；文本颜色由顶点色调制
   （片段 = tex × color），采样器 Nearest（位图锐利，亦弱化图集渗色）。
   等宽步进与行高均为 8×scale，`\n` 换行；非 ASCII 字符跳过并告警一次。
-- **文本定位**：v1 无锚点组件——`UiText` 的排版原点复用同实体
-  `UiRect.position`；该 `UiRect` 此时**仅作定位载体、不绘制矩形**
-  （缺省白矩形会盖住文字的实测教训），面板背景用独立矩形实体表达
-  （验收示例的血条即「深底矩形 + 红色前景矩形」两实体）。
+- **文本定位**：`UiText` 的排版原点复用同实体 `UiRect.position`；该
+  `UiRect` 此时**仅作定位载体、不绘制矩形**（缺省白矩形会盖住文字的实测
+  教训），面板背景用独立矩形实体表达（验收示例的血条即「深底矩形 + 红色
+  前景矩形」两实体）。
+- **锚定布局（R41）**：`UiAnchor { point, offset }` 组件把挂有 `UiRect`
+  的元素一角对齐到视口九宫格一角（`UiAnchorPoint` 九点），位置由**纯函数
+  `anchor_to_position(point, viewport, size, offset)`** 解析为绝对像素
+  （不拉伸不缩放 `size`）。解析系统 `update_ui_layout` 读 `Viewport`
+  资源（缺席 = 1280×720 兜底）。**Center 类锚点把元素中心钉在视口中心**，
+  改视口尺寸不漂移；文本实体复用本组件（其 `UiRect.size` 视作文本框参与
+  居中）→ 标签与按钮面板共用同一锚点时恒居中。
+- **按钮 + 焦点导航（R41）**：`UiButton { label }`（便利组装，配合
+  `spawn_ui_button` 生成「底板 + 标签」两实体）+ `Focusable`（标记）+
+  `UiFocus` 资源（`{ current, order, highlight_color }`）。`update_ui_focus`
+  每帧收集全部**可见**可聚焦实体，按锚定后屏幕 Y 再 X **确定性排序**
+  （三者全等并列取实体 bits，可网络/存档复用）；↑/← 后退、↓/→/Tab 前进、
+  Enter/Space 与鼠标左键**按下沿**+`cursor_position` 命中 → 发
+  `UiClickEvent { entity }`（事件而非回调——组件/资源友好，无闭包注册表，
+  游戏侧 `events_mut().drain()` 消费）。焦点高亮 = 改写当前实体 `UiColor`
+  为 `highlight_color`（**原色保存恢复**于 `UiFocus` 资源的映射，组件换色
+  实现，无样式表）。
+- **菜单栈（R41）**：`UiMenu(String)` 标记实体归属 + `UiMenuStack`
+  资源（`push_menu`/`pop_menu`/`top_menu`）。`update_ui_menus` 只裁决
+  可见性——**栈顶菜单的全部实体 `VISIBLE`、其余 `HIDDEN`，空栈全隐，
+  未挂 `UiMenu` 的实体不参与**（HUD 常驻可见）；同名菜单多实体全可见。
+  **引擎不内置 Esc 语义**——弹栈由游戏侧在有 `UiClickEvent` / 按键输入时
+  自行调栈资源方法（`update_ui_menus` 不读输入）。
+- **执行序**：三系统由引擎门面层 `UiPlugin` 注册到 `Stage::PostUpdate`
+  （渲染发生在 PostUpdate 之后，故本帧即对收集生效），顺序
+  `update_ui_layout`（写 `UiRect.position`）→ `update_ui_menus`（写
+  `Visibility`）→ `update_ui_focus`（按最终位置与可见性排序/换焦/高亮）。
 - **图片控件（R40，见 §4.21）**：`UiImage { texture }` / `UiImageRtt
   { target }` 把普通纹理或 RT 颜色纹理贴到屏幕（`UiRect` 定位 + `UiColor`
   乘色），UV 全屏 0..1 直角采样（Nearest）；**图片之下、文本之上**（图
@@ -2074,6 +2105,19 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
     无 bloom / 曝光 / 暗角）；RT 无读写回（v1 不做 RT 像素 map，UI 直接
     采样 GPU 纹理）；UI 图片无抗锯齿（Nearest 直角采样，像素化小地图
     天然契合）且绘制顺序固定（图片之下、文本之上）。
+21. **UI 编排（锚定 / 焦点 / 菜单）为 v1**（§4.13）：**无父容器嵌套**——
+    锚点只相对视口，`UiAnchor` 不溯源到祖先实体布局（面板 + 按钮的居中需
+    各自挂同一锚点，无「子元素相对父面板」）；**不拉伸不缩放 `UiRect.size`**
+    （锚点只平移元素，不做比例填充，DPI / 分辨率自适应留待后续）；焦点
+    导航用**屏幕 Y 再 X 的序列化顺序**而非方向自由度导航（横向 / 纵向菜单
+    混合时 ↑↓ 语义按全序走，方向键无法直接「上下左右」四向跳位）；焦点
+    高亮是**改 UiColor 的单色标记**（无样式表 / 渐变 / 动效）；`UiClickEvent`
+    只带 `entity`（无命中坐标 / 无 modifier）；菜单栈是**纯字符串栈**（无泛型
+    菜单 ID、无级联子菜单树）；`update_ui_layout` **依赖 `Viewport` 资源**
+    （自建 App 未插 `Viewport` 时按 1280×720 兜底，离屏程序需手动
+    `insert_resource(Viewport::new(w, h))`）；按钮「底板 + 标签」是**两实体
+    组装**（v1 单实体的 `UiRect` 因挂 `UiText` 只作定位载体、不绘制矩形，
+    故按钮背景需独立实体，见模块头既有规则）。
 
 ## 9. 关键设计取舍记录
 

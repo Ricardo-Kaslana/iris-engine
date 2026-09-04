@@ -9,6 +9,8 @@ authors.workspace = true
 
 [dependencies]
 iris-core = { workspace = true }
+# UI 焦点导航 / 点击消费 input.rs 的 Input 资源（platform 不依赖 render，无环）
+iris-platform = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 glam = { workspace = true }
