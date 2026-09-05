@@ -139,6 +139,9 @@ struct GpuMesh {
     num_indices: u32,
     /// 蒙皮属性缓冲（非蒙皮网格为 None）。
     skin_buf: Option<wgpu::Buffer>,
+    /// 顶点切线缓冲（R42；网格无切线为 None——绑定常驻零垫缓冲，
+    /// 零向量 = 「无顶点切线」标记，片元走屏幕空间 TBN 路径）。
+    tangent_buf: Option<wgpu::Buffer>,
 }
 
 /// 每具蒙皮的 GPU 资源：关节矩阵 storage 缓冲与对应绑定组。
@@ -269,6 +272,17 @@ pub struct Renderer {
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
     material_gpu: HashMap<u32, GpuMaterial>,
+    /// 中性法线纹理（R42，常驻）：1×1 `Rgba16Float`，值 (0.5, 0.5, 1)。
+    /// 材质缺法线槽位时绑定它——16-bit float 精确表示 0.5/1.0，采样
+    /// *2−1 后恰为 (0,0,1)，扰动恒等（8-bit unorm 做不到，见
+    /// material.rs 的逐位一致性论证）。纹理本体保活以维持 view 有效。
+    #[allow(dead_code)]
+    neutral_normal_tex: wgpu::Texture,
+    neutral_normal_view: wgpu::TextureView,
+    /// 常驻零填充切线垫缓冲（R42）：无切线网格共用（1 MiB = 65536 顶点
+    /// × 16 B；顶点数超出垫容量的网格在 `ensure_mesh` 单独分配零缓冲）。
+    /// 内容全零 = 顶点切线路径的「缺席」标记。
+    tangent_dummy_buf: wgpu::Buffer,
     /// 渲染目标（R40）GPU 缓存：句柄 → 颜色 / 深度 / HDR / 绑定组 /
     /// 专用全局与实例缓冲。按句柄惰性创建、跨帧持有（尺寸不变时零重建）。
     render_target_gpu: HashMap<u32, GpuRenderTarget>,
@@ -1345,6 +1359,59 @@ impl Renderer {
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
+        // 中性法线纹理（R42，常驻）：1×1 Rgba16Float = (0.5, 0.5, 1)。
+        // 0.5 / 1.0 在 binary16 中精确表示（位型 0x3800 / 0x3C00），着色器
+        // 采样 *2−1 后恰得 (0, 0, 1)——法线扰动恒等变换，保证无贴图材质
+        // 与 R41 逐位一致（论证链见 material.rs 模块文档）。8-bit unorm
+        // 无法精确表示 0.5（128/255 ≈ 0.502），故必须 16-bit float。
+        let neutral_normal_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.texture.neutral_normal"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // half 精度的 (0.5, 0.5, 1.0, 1.0)：f16 位型小端字节（0.5 = 0x3800，
+        // 1.0 = 0x3C00），免引 half 依赖
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &neutral_normal_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[
+                0x00, 0x38, 0x00, 0x38, // 0.5, 0.5
+                0x00, 0x3c, 0x00, 0x3c, // 1.0, 1.0
+            ],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let neutral_normal_view =
+            neutral_normal_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // 常驻零填充切线垫（R42）：无切线网格共用，1 MiB = 65536 顶点 × 16 B。
+        // wgpu 缓冲创建即零初始化，无需写入。
+        let tangent_dummy_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.mesh.tangent_dummy"),
+            size: 65536 * 16,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
         // UI 字形图集：初始化时一次性构建并上传。单一纹理同时服务矩形
         // （0 号格纯白块）与文本（字形 texel，白色 + alpha=行位码），
         // 使 UI 全部内容共享单管线单纹理单 draw。采样器 Nearest：
@@ -1493,6 +1560,9 @@ impl Renderer {
             mesh_gpu: HashMap::new(),
             texture_gpu,
             material_gpu: HashMap::new(),
+            neutral_normal_tex,
+            neutral_normal_view,
+            tangent_dummy_buf,
             render_target_gpu: HashMap::new(),
             rt_blit_sampler,
             rt_post_params_buf,
@@ -2538,6 +2608,8 @@ impl Renderer {
                 let material = &self.material_gpu[&(key as u32)];
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
+                pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 let first = index as u32;
                 let last = (index + count) as u32;
@@ -2566,6 +2638,8 @@ impl Renderer {
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
+                    pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                     pass.set_vertex_buffer(
                         1,
                         mesh.skin_buf
@@ -2704,6 +2778,8 @@ impl Renderer {
                 let material = &self.material_gpu[&(key as u32)];
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
+                pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(
                     0..mesh.num_indices,
@@ -2733,6 +2809,8 @@ impl Renderer {
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
+                    pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                     pass.set_vertex_buffer(
                         1,
                         mesh.skin_buf
@@ -3509,6 +3587,8 @@ impl Renderer {
                     let material = &self.material_gpu[&(key as u32)];
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
+                    pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.num_indices, 0, idx as u32..(idx + count) as u32);
                     idx += count;
@@ -3524,6 +3604,8 @@ impl Renderer {
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
+                        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                         pass.set_vertex_buffer(
                             1,
                             mesh.skin_buf
@@ -3552,6 +3634,8 @@ impl Renderer {
                         let material = &self.material_gpu[&(key as u32)];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
+                        pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(
                             0..mesh.num_indices,
@@ -3572,6 +3656,8 @@ impl Renderer {
                             pass.set_bind_group(1, &material.bind_group, &[]);
                             pass.set_bind_group(2, &skin.bind_group, &[]);
                             pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                            // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
+                            pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                             pass.set_vertex_buffer(
                                 1,
                                 mesh.skin_buf
@@ -3625,7 +3711,20 @@ impl Renderer {
             log::warn!("网格句柄 {handle:?} 不存在");
             return;
         };
-        let (vertex_buf, index_buf, num_indices, skin_buf) = upload_mesh(&self.gpu, data);
+        let (vertex_buf, index_buf, num_indices, skin_buf, tangent_buf) =
+            upload_mesh(&self.gpu, data);
+        // 无切线且顶点数超出零垫容量（65536）的网格：单独分配零缓冲兜底
+        // （wgpu 缓冲创建即零初始化）。常规网格恒走常驻零垫，零逐网格开销。
+        let tangent_buf = tangent_buf.or_else(|| {
+            (data.vertices.len() > Self::TANGENT_DUMMY_VERTICES).then(|| {
+                self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.mesh.tangent_zero"),
+                    size: (data.vertices.len() * 16) as u64,
+                    usage: wgpu::BufferUsages::VERTEX,
+                    mapped_at_creation: false,
+                })
+            })
+        });
         self.mesh_gpu.insert(
             handle.0,
             GpuMesh {
@@ -3633,8 +3732,19 @@ impl Renderer {
                 index_buf,
                 num_indices,
                 skin_buf,
+                tangent_buf,
             },
         );
+    }
+
+    /// 常驻零填充切线垫容量（R42）：65536 顶点 × 16 B = 1 MiB。
+    const TANGENT_DUMMY_VERTICES: usize = 65536;
+
+    /// 该网格应绑定的切线顶点缓冲（R42）：网格自带切线用自有缓冲；
+    /// 缺席绑常驻零垫。顶点数超出垫容量（> 65536）的无切线网格在
+    /// `ensure_mesh` 单独分配零缓冲兜底，此处的 `unwrap_or` 恒安全。
+    fn tangent_buf<'a>(&'a self, mesh: &'a GpuMesh) -> &'a wgpu::Buffer {
+        mesh.tangent_buf.as_ref().unwrap_or(&self.tangent_dummy_buf)
     }
 
     /// 蒙皮的关节矩阵缓冲：按关节数上限分配，不足以时整体重建。
@@ -3687,6 +3797,8 @@ impl Renderer {
         // 共用）：特性启用 + 尺寸 4 对齐 + 全不透明 → 8 倍显存节省；
         // 任一不满足回退 RGBA8（web / 无特性 / 非对齐 / 半透明自动命中，
         // 无 cfg 分支）。mipmap v1 无——单 mip 上传，`mip_level_count` 恒 1。
+        // R42 色彩空间：`srgb == false`（法线 / ORM 数据贴图）上传为线性
+        // 格式（采样即原值）；`true`（颜色数据）维持既有 sRGB 格式。
         let use_bc1 =
             crate::texture_bcn::bc1_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
         if use_bc1 {
@@ -3701,14 +3813,22 @@ impl Renderer {
                 crate::texture_bcn::encoded_len(width, height)
             );
             (
-                wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+                if cpu.srgb {
+                    wgpu::TextureFormat::Bc1RgbaUnormSrgb
+                } else {
+                    wgpu::TextureFormat::Bc1RgbaUnorm
+                },
                 std::borrow::Cow::Owned(blocks),
                 (width / 4) * 8,
                 true,
             )
         } else {
             (
-                wgpu::TextureFormat::Rgba8UnormSrgb,
+                if cpu.srgb {
+                    wgpu::TextureFormat::Rgba8UnormSrgb
+                } else {
+                    wgpu::TextureFormat::Rgba8Unorm
+                },
                 std::borrow::Cow::Borrowed(&cpu.rgba[..]),
                 width * 4,
                 false,
@@ -3785,7 +3905,26 @@ impl Renderer {
             return;
         };
         self.ensure_texture(textures, def.texture);
+        // 法线 / ORM 槽位（R42）：Some 懒上传后用真实纹理；None 绑中性
+        // 常驻纹理（法线 (0.5,0.5,1) / ORM 白色 1.0——白色兜底纹理采样
+        // 恒 1.0，与中性 ORM 语义一致）。三张贴图共用 base 采样器。
+        let normal_handle = def.normal_texture;
+        let orm_handle = def.orm_texture;
+        if let Some(tex) = normal_handle {
+            self.ensure_texture(textures, tex);
+        }
+        if let Some(tex) = orm_handle {
+            self.ensure_texture(textures, tex);
+        }
         let texture = &self.texture_gpu[&def.texture.0];
+        let normal_view = match normal_handle {
+            Some(tex) => &self.texture_gpu[&tex.0].view,
+            None => &self.neutral_normal_view,
+        };
+        let orm_view = match orm_handle {
+            Some(tex) => &self.texture_gpu[&tex.0].view,
+            None => &self.texture_gpu[&0].view,
+        };
         let raw = MaterialRaw {
             base_color: def.base_color,
             emissive: def.emissive,
@@ -3823,6 +3962,14 @@ impl Renderer {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&texture.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(orm_view),
                     },
                 ],
             });

@@ -493,6 +493,10 @@ impl MaterialSection {
             metallic: self.metallic,
             roughness: self.roughness,
             texture,
+            // 场景序列化 v1 不含法线 / ORM 贴图槽位（缺省 None =
+            // 中性纹理路径，渲染与既有场景逐位一致）
+            normal_texture: None,
+            orm_texture: None,
             alpha_mode: self.alpha_mode,
         }
     }
@@ -818,6 +822,8 @@ fn load_texture(
         width,
         height,
         rgba: rgba.into_raw(),
+        // 场景贴图是颜色数据（baseColor 语义），按 sRGB 上传
+        srgb: true,
     }))
 }
 

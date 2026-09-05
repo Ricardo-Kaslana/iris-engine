@@ -52,6 +52,7 @@ fn bullet_hole_texture() -> CpuTexture {
         width: size,
         height: size,
         rgba,
+        srgb: true,
     }
 }
 
@@ -101,6 +102,7 @@ fn blood_splat_texture() -> CpuTexture {
         width: size,
         height: size,
         rgba,
+        srgb: true,
     }
 }
 

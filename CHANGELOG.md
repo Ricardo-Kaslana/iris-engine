@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+### Added（R42：法线 / AO / ORM 材质通道——写实渲染第一块地基）
+
+`MaterialDef` 新增 `normal_texture`（切线空间法线）与 `orm_texture`
+（R=AO / G=粗糙度 / B=金属度打包，glTF metallicRoughness 的 G/B 约定 +
+occlusion 合并进 R）两个 `Option<TextureHandle>` 槽位，配套 builder
+`with_normal` / `with_orm`。**硬约束兑现：材质不带这两张贴图时渲染结果
+与 R41 逐位一致**（`tests/normal_render.rs` 以改动落地前实跑捕获的 R41
+基线全帧像素 FNV-1a 哈希 `0x609b2457f4d5cd82` 锁定，全部既有测试零改动
+通过；论证链见 `iris-render/src/material.rs` 模块文档）：
+
+- **中性纹理常驻 + 零分支 shader**：槽位 `None` 时渲染器绑 1×1 常驻
+  纹理（法线 = (0.5, 0.5, 1) 的 `Rgba16Float`——8-bit unorm 无法精确
+  表示 0.5（128/255 ≈ 0.502，×2−1 残留 0.0039 扰动），binary16 精确；
+  ORM 复用白色兜底纹理，采样恒 1.0）。采样 *2−1 恰得 (0,0,1)，扰动式
+  `T·nx + B·ny + N·nz`（TBN 第三列取**未归一化**插值世界法线）逐位还原
+  该法线，`x·1.0 = x` 保证 ORM 中性值下金属度 / 粗糙度 / AO 与标量路径
+  逐位相同。
+- **TBN 两路**：网格带 glTF TANGENT（`MeshData.tangents` 新字段，独立
+  顶点缓冲 loc12，w = 手性符号；`GltfBuilder::mesh` 同步导出）走顶点
+  切线路（Gram-Schmidt 正交化）；无切线网格渲染器垫常驻零缓冲
+  （1 MiB 共享，超 65536 顶点单独分配），片元 `dpdx/dpdy` 屏幕空间
+  推导 TBN（手性由解的几何关系给出）——零 CPU 预计算、零逐网格开销。
+- **逐像素表面参数**：粗糙度 / 金属度 = 标量因子 × ORM 通道
+  （glTF factor × texel 语义），AO 只乘环境项（IBL + 常量补光）、
+  不乘直接光；无 ORM 时逐位退化为既有标量路径。
+- **色彩空间标注**：`CpuTexture` 新增 `srgb` 字段——颜色数据
+  （baseColor / 贴花 / 程序化棋盘格）恒 sRGB（与既往上传格式逐位一致），
+  法线 / ORM 数据贴图线性（`Rgba8Unorm` / `Bc1RgbaUnorm`）；glTF 纹理
+  去重缓存键改为 (下标, 色彩空间)，同一张图可同时服务两槽。
+- **glTF 解析**：`TANGENT`（VEC4 手性）进 `MeshData`；`normalTexture` /
+  `metallicRoughnessTexture` / `occlusionTexture` 三引用解析——MR 与
+  occlusion 同下标直接引用，异下标同尺寸 CPU 通道合成（R←AO），
+  仅 occlusion 时 G/B 填 255 交标量因子；`strength` v1 忽略（诚实清单）。
+- **程序化资产**：`CpuTexture::brick_normal_orm`（砖缝高度场中心差分
+  →法线 + AO/粗糙度打包，splitmix64 每砖变化，纯函数逐位可复现）；
+  验收场景 `examples/normal_snapshot.rs` → `docs/normal.png`（左右砖墙
+  有 / 无法线对比 + 金属圆柱划痕 ORM，侧光目检：砖缝凹凸、AO 暗缝、
+  划痕高光条纹）。
+- 测试 +8：`normal_render`（R41 基线逐位锁定 + 通道生效 + 确定性）
+  2 GPU 集成；texture 2（色彩空间标注、砖纹确定性 / 语义）、material 1
+  （槽位 builder）、mesh 1（切线字节入账）、gltf 2（TANGENT + 法线/ORM
+  解析、occlusion 异下标合成）。基线 debug 640 / release 639 →
+  **debug 648 / release 647**。
+
 ### Changed（引擎 API 打磨 V：闭合 Iris Infiltration 的六条摩擦，§8.22 全清单）
 
 「现象 → 绕行 → 建议修法」的第五轮闭合（模式照打磨 I–IV：引擎侧修复 +

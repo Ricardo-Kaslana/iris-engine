@@ -161,6 +161,14 @@ struct GltfMaterial {
     pbr_metallic_roughness: Option<GltfPbr>,
     #[serde(default)]
     emissive_factor: [f32; 3],
+    /// glTF `normalTexture`：切线空间法线贴图（线性数据）。
+    #[serde(default)]
+    normal_texture: Option<GltfTextureInfo>,
+    /// glTF `occlusionTexture`：环境光遮蔽贴图（R 通道，线性数据）。
+    /// R42 合并策略：与 metallicRoughness 纹理合并进同一张 ORM 打包图
+    /// 的 R 通道（见 `material()` 的 ORM 组装）。
+    #[serde(default)]
+    occlusion_texture: Option<GltfTextureInfo>,
     /// glTF `alphaMode`：`"OPAQUE"`（默认）/ `"MASK"` / `"BLEND"`。
     /// `"BLEND"` 映射 [`AlphaMode::Blend`]（透明 pass）；`"MASK"` 需要
     /// alpha cutoff 逐像素裁剪，v1 按不透明处理（与数值直通约定一致）。
@@ -185,6 +193,9 @@ struct GltfPbr {
     roughness_factor: f32,
     #[serde(default = "default_metallic")]
     metallic_factor: f32,
+    /// glTF `metallicRoughnessTexture`：G = 粗糙度、B = 金属度（线性数据）。
+    #[serde(default)]
+    metallic_roughness_texture: Option<GltfTextureInfo>,
 }
 
 fn default_metallic() -> f32 {
@@ -380,7 +391,10 @@ struct GltfLoader {
     buffers: RefCell<HashMap<usize, Vec<u8>>>,
     mesh_handles: RefCell<HashMap<usize, MeshHandle>>,
     material_handles: RefCell<HashMap<usize, MaterialHandle>>,
-    texture_handles: RefCell<HashMap<usize, TextureHandle>>,
+    /// 纹理去重缓存：键 = (glTF texture 下标, 色彩空间)。同一张图可能
+    /// 同时被 baseColor（sRGB）与 normal / ORM（线性）引用，两种语义
+    /// 需要两份不同上传格式的 CpuTexture，故色彩空间并入缓存键（R42）。
+    texture_handles: RefCell<HashMap<(usize, bool), TextureHandle>>,
     /// 节点索引 → 已生成实体（动画目标解析用）。
     node_entities: RefCell<Vec<Option<iris_core::prelude::Entity>>>,
     /// 节点索引 → 其网格 primitive 子实体（蒙皮组件挂载用）。
@@ -607,6 +621,32 @@ impl GltfLoader {
             }
             None => None,
         };
+        // 顶点切线（R42，可选）：glTF TANGENT 为 VEC4，w = 手性符号。
+        // 缺席 = 着色器屏幕空间推导 TBN（见 standard.wgsl）。
+        let tangents = match primitive.attributes.get("TANGENT") {
+            Some(&t) => {
+                let (data, comps) = self.read_floats(t)?;
+                if comps != 4 {
+                    return Err(GltfError::OutOfRange("TANGENT 必须是 VEC4".into()));
+                }
+                if data.len() / 4 != vertex_count {
+                    return Err(GltfError::OutOfRange("切线数量与顶点数量不一致".into()));
+                }
+                Some(
+                    (0..vertex_count)
+                        .map(|i| {
+                            [
+                                data[i * 4],
+                                data[i * 4 + 1],
+                                data[i * 4 + 2],
+                                data[i * 4 + 3],
+                            ]
+                        })
+                        .collect::<Vec<[f32; 4]>>(),
+                )
+            }
+            None => None,
+        };
         // 蒙皮属性：JOINTS_0 与 WEIGHTS_0 必须成对出现
         let joints_accessor = primitive.attributes.get("JOINTS_0");
         let weights_accessor = primitive.attributes.get("WEIGHTS_0");
@@ -685,6 +725,7 @@ impl GltfLoader {
             vertices,
             indices,
             skin,
+            tangents,
         })
     }
 
@@ -718,11 +759,24 @@ impl GltfLoader {
             width,
             height,
             rgba: rgba.into_raw(),
+            // 色彩空间由调用方按纹理语义覆盖（texture_srgb / orm_texture）；
+            // 默认 sRGB（颜色数据——与 R42 前一律 sRGB 上传的行为一致）
+            srgb: true,
         })
     }
 
-    fn texture(&self, world: &mut World, index: usize) -> Result<TextureHandle, GltfError> {
-        if let Some(&handle) = self.texture_handles.borrow().get(&index) {
+    /// 按 glTF texture 下标加载纹理并注册到 TextureStore。
+    ///
+    /// `srgb` 决定色彩空间标注（R42）：baseColor 等颜色数据传 `true`
+    /// （硬件 sRGB → 线性解码），normal / ORM 等数据贴图传 `false`
+    /// （线性采样即原值）。缓存键含色彩空间（见字段文档）。
+    fn texture_srgb(
+        &self,
+        world: &mut World,
+        index: usize,
+        srgb: bool,
+    ) -> Result<TextureHandle, GltfError> {
+        if let Some(&handle) = self.texture_handles.borrow().get(&(index, srgb)) {
             return Ok(handle);
         }
         let source = self
@@ -731,10 +785,95 @@ impl GltfLoader {
             .get(index)
             .and_then(|t| t.source)
             .ok_or_else(|| GltfError::Missing(format!("texture #{index} 的 source")))?;
-        let cpu = self.load_image(source)?;
+        let mut cpu = self.load_image(source)?;
+        cpu.srgb = srgb;
         let handle = world.resource_mut::<TextureStore>().add(cpu);
-        self.texture_handles.borrow_mut().insert(index, handle);
+        self.texture_handles
+            .borrow_mut()
+            .insert((index, srgb), handle);
         Ok(handle)
+    }
+
+    /// 颜色数据纹理（baseColor，sRGB）。
+    fn texture(&self, world: &mut World, index: usize) -> Result<TextureHandle, GltfError> {
+        self.texture_srgb(world, index, true)
+    }
+
+    /// ORM 打包纹理组装（R42）：把 glTF 的 metallicRoughness（G/B）与
+    /// occlusion（R）合并进一张线性打包图，写入 [`MaterialDef::orm_texture`]。
+    ///
+    /// - 仅 metallicRoughness：直接引用（其 R 通道在 glTF 中未定义，
+    ///   AO 取该通道 = 常见「R=G=B 打包」资产的巧合正确，未打包资产
+    ///   AO 通道无意义但中性——见下方诚实限制）；
+    /// - metallicRoughness + occlusion 同一 texture 下标：直接引用；
+    /// - 两者不同下标且尺寸一致：CPU 合成——R 取 occlusion、G/B 取
+    ///   metallicRoughness，合成图注册为新纹理；
+    /// - 尺寸不一致：occlusion 忽略并告警（不静默丢弃 AO 语义）；
+    /// - 仅 occlusion：合成 G/B = 255（粗糙度 / 金属度全交给标量因子）。
+    ///
+    /// # 诚实限制
+    /// - occlusionTexture 的 `strength`（AO 强度系数）v1 忽略（按 1.0）；
+    /// - 「仅 metallicRoughness 且未与 AO 打包」的资产，其 R 通道被当作
+    ///   AO 使用——glTF 规范未定义该通道，绝大多数资产填 255（中性），
+    ///   非 255 填充的资产 AO 结果未定义。
+    fn orm_texture(
+        &self,
+        world: &mut World,
+        mr: Option<usize>,
+        occlusion: Option<usize>,
+    ) -> Result<Option<TextureHandle>, GltfError> {
+        let orm = match (mr, occlusion) {
+            (None, None) => return Ok(None),
+            // 同一 texture 下标（常见打包资产）：直接引用
+            (Some(t), None) => t,
+            (Some(t), Some(o)) if o == t => t,
+            (Some(mr_index), Some(occ_index)) => {
+                // 不同下标：CPU 通道合成（R = AO，G/B = MR）
+                let mut mr_cpu = self.load_cpu(mr_index)?;
+                mr_cpu.srgb = false;
+                let mut occ_cpu = self.load_cpu(occ_index)?;
+                occ_cpu.srgb = false;
+                if mr_cpu.width != occ_cpu.width || mr_cpu.height != occ_cpu.height {
+                    log::warn!(
+                        "occlusion #{occ_index}（{}×{}）与 metallicRoughness #{mr_index}（{}×{}）尺寸不一致，AO 忽略",
+                        occ_cpu.width,
+                        occ_cpu.height,
+                        mr_cpu.width,
+                        mr_cpu.height
+                    );
+                    let handle = world.resource_mut::<TextureStore>().add(mr_cpu);
+                    return Ok(Some(handle));
+                }
+                for (i, occ_px) in occ_cpu.rgba.chunks_exact(4).enumerate() {
+                    mr_cpu.rgba[i * 4] = occ_px[0]; // R ← AO
+                }
+                let handle = world.resource_mut::<TextureStore>().add(mr_cpu);
+                return Ok(Some(handle));
+            }
+            (None, Some(occ_index)) => {
+                let mut occ_cpu = self.load_cpu(occ_index)?;
+                occ_cpu.srgb = false;
+                // G/B 填 255：粗糙度 / 金属度逐像素全 1，标量因子直通
+                for px in occ_cpu.rgba.chunks_exact_mut(4) {
+                    px[1] = 255;
+                    px[2] = 255;
+                }
+                let handle = world.resource_mut::<TextureStore>().add(occ_cpu);
+                return Ok(Some(handle));
+            }
+        };
+        Ok(Some(self.texture_srgb(world, orm, false)?))
+    }
+
+    /// 加载 glTF texture 下标的图像为 CPU 纹理（不经 TextureStore）。
+    fn load_cpu(&self, index: usize) -> Result<CpuTexture, GltfError> {
+        let source = self
+            .doc
+            .textures
+            .get(index)
+            .and_then(|t| t.source)
+            .ok_or_else(|| GltfError::Missing(format!("texture #{index} 的 source")))?;
+        self.load_image(source)
     }
 
     fn material(&self, world: &mut World, index: usize) -> Result<MaterialHandle, GltfError> {
@@ -749,7 +888,14 @@ impl GltfLoader {
                     Some(info) => self.texture(world, info.index)?,
                     None => TextureHandle(0),
                 };
-                MaterialDef {
+                // ORM 打包（R42）：metallicRoughness 的 G/B + occlusion
+                // 合并进 R（策略见 orm_texture 文档）
+                let orm_texture = self.orm_texture(
+                    world,
+                    pbr.metallic_roughness_texture.as_ref().map(|i| i.index),
+                    mat.occlusion_texture.as_ref().map(|i| i.index),
+                )?;
+                let mut def = MaterialDef {
                     base_color: pbr.base_color_factor,
                     emissive: [mat.emissive()[0], mat.emissive()[1], mat.emissive()[2], 1.0],
                     // glTF 金属度/粗糙度工作流直通（默认 metallic 1.0 / roughness 1.0）
@@ -762,7 +908,15 @@ impl GltfLoader {
                     } else {
                         AlphaMode::Opaque
                     },
+                    normal_texture: None,
+                    orm_texture: None,
+                };
+                // 法线贴图（R42）：线性数据贴图
+                if let Some(info) = &mat.normal_texture {
+                    def.normal_texture = Some(self.texture_srgb(world, info.index, false)?);
                 }
+                def.orm_texture = orm_texture;
+                def
             }
         };
         let handle = world.resource_mut::<MaterialStore>().add(def);
@@ -1248,6 +1402,167 @@ mod tests {
         world.insert_resource(MaterialStore::new());
         world.insert_resource(TextureStore::new());
         world
+    }
+
+    /// 4×4 单色 PNG 的 data URI（测试内编码，零外部资产）。
+    fn solid_png_uri(rgba: [u8; 4]) -> String {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba(rgba))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("内存 PNG 编码不应失败");
+        format!("data:image/png;base64,{}", base64::encode(&png))
+    }
+
+    /// TANGENT 属性 + 法线 / ORM 纹理引用解析（R42）：
+    /// - TANGENT（VEC4，含手性 w）进 `MeshData.tangents`；
+    /// - 同一 texture 下标被 baseColor（sRGB）与 normal / ORM（线性）
+    ///   同时引用时按色彩空间分槽缓存为两张 CpuTexture；
+    /// - metallicRoughness 与 occlusion 同下标 → ORM 直接引用该线性纹理。
+    #[test]
+    fn loads_tangents_and_normal_orm_textures() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tangent_normal_orm.gltf");
+
+        // 顶点数据：3 位置 + 3 切线 + 索引
+        let mut buffer: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            buffer.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        for t in [
+            [1.0f32, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, -1.0],
+        ] {
+            buffer.extend_from_slice(&t.map(f32::to_le_bytes).concat());
+        }
+        buffer.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "data:application/octet-stream;base64,{}", "byteLength": {} }}],
+                "bufferViews": [
+                    {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }},
+                    {{ "buffer": 0, "byteOffset": 36, "byteLength": 48 }},
+                    {{ "buffer": 0, "byteOffset": 84, "byteLength": 6 }}
+                ],
+                "accessors": [
+                    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+                    {{ "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC4" }},
+                    {{ "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+                ],
+                "images": [{{ "uri": "{}" }}],
+                "textures": [{{ "source": 0 }}],
+                "materials": [{{
+                    "pbrMetallicRoughness": {{
+                        "baseColorTexture": {{ "index": 0 }},
+                        "metallicRoughnessTexture": {{ "index": 0 }}
+                    }},
+                    "normalTexture": {{ "index": 0 }},
+                    "occlusionTexture": {{ "index": 0 }}
+                }}],
+                "meshes": [{{ "primitives": [{{ "attributes": {{
+                    "POSITION": 0, "TANGENT": 1
+                }}, "indices": 2, "material": 0 }}] }}],
+                "nodes": [{{ "mesh": 0 }}],
+                "scenes": [{{ "nodes": [0] }}],
+                "scene": 0
+            }}"#,
+            base64::encode(&buffer),
+            buffer.len(),
+            solid_png_uri([60, 130, 246, 255]),
+        );
+        std::fs::write(&path, json).unwrap();
+
+        let mut world = world_with_stores();
+        let _spawned = spawn_gltf(&mut world, &path)?;
+
+        // TANGENT 进 MeshData（逐值，含手性 w）
+        let meshes = world.resource::<MeshStore>();
+        let data = meshes.get(MeshHandle(0)).expect("网格句柄 0");
+        let tangents = data.tangents.as_ref().expect("TANGENT 属性应被解析");
+        assert_eq!(tangents.len(), 3);
+        assert_eq!(tangents[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(tangents[2], [0.0, 0.0, 1.0, -1.0], "手性符号 w 必须保留");
+
+        // 材质：同一 texture 下标按色彩空间分槽——
+        // 句柄 1 = (index 0, sRGB) baseColor；句柄 2 = (index 0, 线性) 法线/ORM 共用
+        let materials = world.resource::<MaterialStore>();
+        let def = materials.get(MaterialHandle(1)).expect("材质句柄 1");
+        assert_eq!(def.texture, TextureHandle(1), "baseColor 走 sRGB 槽");
+        let normal = def.normal_texture.expect("normalTexture 应被解析");
+        let orm = def.orm_texture.expect("ORM 打包图应被组装");
+        assert_eq!(normal, TextureHandle(2), "法线走线性槽");
+        assert_eq!(
+            orm,
+            TextureHandle(2),
+            "MR 与 occlusion 同下标 → ORM 直接引用"
+        );
+        let textures = world.resource::<TextureStore>();
+        assert!(!textures.get(normal).unwrap().srgb, "法线必须标注线性");
+        assert!(!textures.get(orm).unwrap().srgb, "ORM 必须标注线性");
+        Ok(())
+    }
+
+    /// occlusion 与 metallicRoughness 不同下标：CPU 通道合成——
+    /// ORM 的 R ← occlusion、G/B ← metallicRoughness（R42）。
+    #[test]
+    fn merges_occlusion_into_orm_when_indices_differ() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orm_merge.gltf");
+
+        let mut buffer: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            buffer.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        buffer.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "data:application/octet-stream;base64,{}", "byteLength": {} }}],
+                "bufferViews": [
+                    {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }},
+                    {{ "buffer": 0, "byteOffset": 36, "byteLength": 6 }}
+                ],
+                "accessors": [
+                    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+                    {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+                ],
+                "images": [{{ "uri": "{}" }}, {{ "uri": "{}" }}],
+                "textures": [{{ "source": 0 }}, {{ "source": 1 }}],
+                "materials": [{{
+                    "pbrMetallicRoughness": {{
+                        "metallicRoughnessTexture": {{ "index": 0 }}
+                    }},
+                    "occlusionTexture": {{ "index": 1 }}
+                }}],
+                "meshes": [{{ "primitives": [{{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 0 }}] }}],
+                "nodes": [{{ "mesh": 0 }}],
+                "scenes": [{{ "nodes": [0] }}],
+                "scene": 0
+            }}"#,
+            base64::encode(&buffer),
+            buffer.len(),
+            solid_png_uri([10, 200, 30, 255]), // metallicRoughness：G=200 B=30
+            solid_png_uri([250, 99, 99, 255]), // occlusion：R=250
+        );
+        std::fs::write(&path, json).unwrap();
+
+        let mut world = world_with_stores();
+        let _spawned = spawn_gltf(&mut world, &path)?;
+
+        let materials = world.resource::<MaterialStore>();
+        let def = materials.get(MaterialHandle(1)).expect("材质句柄 1");
+        let orm = def.orm_texture.expect("ORM 打包图应被合成");
+        let textures = world.resource::<TextureStore>();
+        let orm_tex = textures.get(orm).unwrap();
+        assert!(!orm_tex.srgb);
+        assert_eq!(orm_tex.rgba[0], 250, "R ← occlusion");
+        assert_eq!(orm_tex.rgba[1], 200, "G ← metallicRoughness 粗糙度");
+        assert_eq!(orm_tex.rgba[2], 30, "B ← metallicRoughness 金属度");
+        assert_eq!(def.normal_texture, None, "未声明 normalTexture 应缺省");
+        Ok(())
     }
 
     #[test]

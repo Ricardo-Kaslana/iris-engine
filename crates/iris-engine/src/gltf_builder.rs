@@ -153,6 +153,9 @@ struct MeshDef {
     indices: usize,
     joints: Option<usize>,
     weights: Option<usize>,
+    /// 顶点切线 accessor（R42，`data.tangents` 为 `Some` 时写入
+    /// TANGENT 属性——VEC4 f32，w = 手性符号）。
+    tangents: Option<usize>,
     material: usize,
 }
 
@@ -374,8 +377,9 @@ impl GltfBuilder {
     ///
     /// 几何来自 [`MeshData`]：POSITION / NORMAL / TEXCOORD_0 三属性 +
     /// 索引；`data.skin` 为 `Some` 时追加 JOINTS_0（u16 VEC4，加载器
-    /// 规范子集）与 WEIGHTS_0（f32 VEC4）。索引按最大顶点下标自动选
-    /// u16 / u32。材质下标必填（单 primitive 一材质）。
+    /// 规范子集）与 WEIGHTS_0（f32 VEC4）；`data.tangents` 为 `Some`
+    /// 时追加 TANGENT（f32 VEC4，glTF 手性约定，R42）。索引按最大顶点
+    /// 下标自动选 u16 / u32。材质下标必填（单 primitive 一材质）。
     pub fn mesh(&mut self, name: &str, data: &MeshData, material: usize) -> usize {
         let mut positions = Vec::with_capacity(data.vertices.len() * 3);
         let mut normals = Vec::with_capacity(data.vertices.len() * 3);
@@ -388,6 +392,13 @@ impl GltfBuilder {
         let position = self.push_position_accessor(&positions);
         let normal = self.push_f32_accessor(&normals, "VEC3");
         let uv = self.push_f32_accessor(&uvs, "VEC2");
+        let tangents = data.tangents.as_ref().map(|tangents| {
+            let mut flat = Vec::with_capacity(tangents.len() * 4);
+            for t in tangents {
+                flat.extend_from_slice(t);
+            }
+            self.push_f32_accessor(&flat, "VEC4")
+        });
         // 索引宽度自动选型：顶点数 ≤ 65536 用 u16（多数游戏资产）
         let indices = if data.indices.iter().any(|&i| i > u16::MAX as u32) {
             self.push_u32_accessor(&data.indices, "SCALAR")
@@ -418,6 +429,7 @@ impl GltfBuilder {
             indices,
             joints,
             weights,
+            tangents,
             material,
         });
         self.meshes.len() - 1
@@ -612,6 +624,9 @@ impl GltfBuilder {
                     attributes["JOINTS_0"] = json!(joints);
                     attributes["WEIGHTS_0"] = json!(weights);
                 }
+                if let Some(tangents) = mesh.tangents {
+                    attributes["TANGENT"] = json!(tangents);
+                }
                 json!({
                     "name": mesh.name,
                     "primitives": [{
@@ -732,6 +747,7 @@ mod tests {
             ],
             indices: vec![0, 1, 2],
             skin: None,
+            tangents: None,
         }
     }
 

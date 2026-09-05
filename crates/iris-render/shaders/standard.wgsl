@@ -74,6 +74,14 @@ struct MaterialParams {
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
+// 法线 / ORM 数据贴图（R42，均线性格式）。两槽位由渲染器保证恒有绑定：
+// 材质缺省时绑中性常驻纹理（法线 = (0.5,0.5,1) 的 Rgba16Float——8-bit
+// unorm 表示不了 0.5（128/255≈0.502，*2−1 残留 0.0039 扰动），16-bit
+// float 恰好精确；ORM = (1,1,1)）。采样共用 base_sampler（Filtering）。
+// 零分支保证：无这两张贴图的材质与引入本槽位前（R41）逐位一致，
+// 论证链见 material.rs 模块文档。
+@group(1) @binding(3) var normal_texture: texture_2d<f32>;
+@group(1) @binding(4) var orm_texture: texture_2d<f32>;
 // 蒙皮：关节矩阵（vs_skinned 专用；vs_main 静态不使用，
 // 因此常规管线的 layout 无需 group 2）
 @group(2) @binding(0) var<storage, read> joint_mats: array<mat4x4<f32>>;
@@ -89,6 +97,9 @@ struct VertexInput {
     @location(7) normal0: vec4<f32>,
     @location(8) normal1: vec4<f32>,
     @location(9) normal2: vec4<f32>,
+    // 顶点切线（loc12，独立顶点缓冲；网格无切线时渲染器绑定零填充垫，
+    // 片元据此走屏幕空间 TBN 路径——xyz 全零即「无顶点切线」标记）
+    @location(12) tangent: vec4<f32>,
 };
 
 // 阴影投影改在片元做（按 view 深度选级联后乘该级联矩阵），
@@ -98,6 +109,9 @@ struct VertexOutput {
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    // 世界空间切线：xyz = 法线矩阵变换后的切线方向（未归一化，片元
+    // 正交化），w = 手性符号（±1，插值保号——凸组合不越过 0）
+    @location(3) tangent: vec4<f32>,
 };
 
 @vertex
@@ -110,6 +124,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.world_pos = world_pos.xyz;
     out.world_normal = normal_mat * in.normal;
     out.uv = in.uv;
+    out.tangent = vec4<f32>(normal_mat * in.tangent.xyz, in.tangent.w);
     return out;
 }
 
@@ -125,6 +140,7 @@ struct SkinnedVertexInput {
     @location(7) normal0: vec4<f32>,
     @location(8) normal1: vec4<f32>,
     @location(9) normal2: vec4<f32>,
+    @location(12) tangent: vec4<f32>,
     @location(10) joints: vec4<u32>,
     @location(11) weights: vec4<f32>,
 };
@@ -133,7 +149,7 @@ struct SkinnedVertexInput {
 // 关节矩阵已在 CPU 侧乘过蒙皮实体全局逆（见 skin.rs），
 // 因此 skin × position 处于蒙皮实体局部空间，随父级移动整体跟随。
 // 法线按刚性变换处理（关节矩阵的 3x3 部分）；蒙皮实体自身的
-// 非均匀缩放仍由实例法线矩阵承担。
+// 非均匀缩放仍由实例法线矩阵承担。切线同法线一路变换（方向向量）。
 @vertex
 fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     let j = in.joints;
@@ -149,6 +165,7 @@ fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     out.world_pos = skinned_pos.xyz;
     out.world_normal = normal_mat * (skin_nrm * in.normal);
     out.uv = in.uv;
+    out.tangent = vec4<f32>(normal_mat * (skin_nrm * in.tangent.xyz), in.tangent.w);
     return out;
 }
 
@@ -255,15 +272,71 @@ fn shadow_factor(world_pos: vec3<f32>) -> f32 {
     return mix(shaded, 1.0, select(0.0, 1.0, outside));
 }
 
+// ---- 切线空间（R42）----
+
+// 片元 TBN（切线 → 世界）两路选择：
+//
+// 路 1「顶点切线」：网格带 TANGENT 属性（渲染器上传独立切线缓冲）。
+// 世界空间切线经 Gram-Schmidt 对插值法线正交化后归一化；副切线 =
+// cross(N, T) × 手性 w（glTF 约定）。精度最高（逐顶点插值、无导数
+// 噪声），首选。
+//
+// 路 2「屏幕空间推导」：网格无切线（顶点切线 xyz 恒零，渲染器垫零
+// 缓冲）。用 world_pos / uv 的屏幕空间偏导解 2×2 线性方程组重建
+// T / B（「normal mapping without precomputed tangents」标准做法），
+// 手性由解的几何关系自然给出。像素级导数在高频几何上有噪声，精度
+// 略逊路 1，但免 CPU 预计算与逐网格 16 B/顶点的切线缓冲。
+//
+// 选择依据 = 顶点切线是否非零（逐片元 select，无管线变体）。两路的
+// TBN 第三列恒取**未归一化**的插值世界法线 in.world_normal：中性法线
+// 贴图采样 (0,0,1) 时 `T·0 + B·0 + N·1` 逐位等于该列（x·0 = ±0，
+// ±0 + x = x），normalize 的输入与 R41 完全同串位——这是「无纹理
+// 逐位一致」的关键，见 material.rs 模块文档。
+fn perturbed_normal(in: VertexOutput, n_geo: vec3<f32>) -> vec3<f32> {
+    // 路 1：顶点切线
+    let t1_raw = in.tangent.xyz - n_geo * dot(n_geo, in.tangent.xyz);
+    let t1 = t1_raw / max(length(t1_raw), 1e-8);
+    let b1 = cross(n_geo, t1) * sign(in.tangent.w);
+    // 路 2：屏幕空间导数
+    let dp1 = dpdx(in.world_pos);
+    let dp2 = dpdy(in.world_pos);
+    let duv1 = dpdx(in.uv);
+    let duv2 = dpdy(in.uv);
+    let p2perp = cross(dp2, n_geo);
+    let p1perp = cross(n_geo, dp1);
+    let t2 = p2perp * duv1.x + p1perp * duv2.x;
+    let b2 = p2perp * duv1.y + p1perp * duv2.y;
+    // 尺度不变归一化；uv 退化（det ≈ 0）时 t2/b2 = 0，1e-12 下限防
+    // 除零产生 Inf·0 = NaN
+    let invmax = 1.0 / sqrt(max(max(dot(t2, t2), dot(b2, b2)), 1e-12));
+    let t2n = t2 * invmax;
+    let b2n = b2 * invmax;
+
+    let has_vertex_tangent = dot(in.tangent.xyz, in.tangent.xyz) > 0.0;
+    let t = select(t2n, t1, has_vertex_tangent);
+    let b = select(b2n, b1, has_vertex_tangent);
+    // 切线空间法线解码（*2−1）+ TBN 世界变换
+    let ts = textureSample(normal_texture, base_sampler, in.uv).xyz * 2.0 - 1.0;
+    return t * ts.x + b * ts.y + n_geo * ts.z;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base = material.base_color * textureSample(base_texture, base_sampler, in.uv);
     let albedo = base.rgb;
-    let metallic = clamp(material.surface.x, 0.0, 1.0);
-    let roughness = clamp(material.surface.y, 0.045, 1.0);
+    // ORM 打包（线性采样）：R = AO、G = 粗糙度、B = 金属度；标量因子
+    // 作倍率相乘（glTF factor × texel 语义）。中性 ORM = (1,1,1) 时
+    // x·1.0 = x 逐位精确，退化为 R41 的标量路径。
+    let orm = textureSample(orm_texture, base_sampler, in.uv);
+    let metallic = clamp(material.surface.x * orm.b, 0.0, 1.0);
+    let roughness = clamp(material.surface.y * orm.g, 0.045, 1.0);
+    let ao = orm.r;
     let f0 = mix(vec3<f32>(material.surface.z), albedo, metallic);
 
-    let n = normalize(in.world_normal);
+    // 光照法线：几何法线 + 法线贴图扰动。n_geo 未归一化（见
+    // perturbed_normal 的逐位一致说明），归一化只在此处做一次，
+    // 与 R41 的 normalize(in.world_normal) 同构。
+    let n = normalize(perturbed_normal(in, in.world_normal));
     let v = normalize(globals.eye_pos.xyz - in.world_pos);
 
     // 方向光（受级联阴影遮挡）
@@ -309,6 +382,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // 环境光（IBL 分割求和）：漫反射采样辐照度贴图；镜面按粗糙度取预滤波
     // 环境 mip，乘 BRDF LUT 的 (缩放, 偏移)。intensity 可整帧关闭 IBL。
+    // AO（orm.r）乘环境项：IBL 与美术补光都被遮蔽削弱，直接光不乘
+    // （物理上 AO 描述小尺度互遮蔽的环境光损失）。中性 ORM 时 ao = 1.0，
+    // x·1.0 = x 逐位精确 = R41 行为。
     let irradiance = textureSampleLevel(irradiance_map, env_sampler, n, 0.0).rgb;
     let nov = max(dot(n, v), 0.0);
     let f_amb = fresnel_schlick_roughness(nov, f0, roughness);
@@ -317,10 +393,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                                       roughness * globals.env_params.x).rgb;
     let brdf = textureSample(brdf_lut, env_sampler, vec2<f32>(nov, roughness)).rg;
     let ibl = (kd_amb * albedo * irradiance + env_spec * (f_amb * brdf.x + brdf.y))
-            * globals.env_params.y;
+            * globals.env_params.y * ao;
     // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
-    color = color + ibl + mix(albedo, f_env, metallic) * globals.ambient.rgb + material.emissive.rgb;
+    color = color + ibl
+          + mix(albedo, f_env, metallic) * globals.ambient.rgb * ao
+          + material.emissive.rgb;
 
     return vec4<f32>(color, base.a);
 }

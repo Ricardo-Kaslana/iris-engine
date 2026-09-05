@@ -111,13 +111,37 @@ impl SkinVertex {
     };
 }
 
-/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮属性）。
+/// 顶点切线缓冲布局（R42）：每顶点 16 字节 vec4（xyz = 切线方向，
+/// w = 手性符号 ±1）。独立顶点缓冲——与蒙皮属性同理，无切线的网格
+/// 不为切线付出 16 B/顶点，渲染器垫常驻零缓冲（零向量 = 「无顶点
+/// 切线」标记，着色器据此走屏幕空间 TBN 路径，见 standard.wgsl）。
+/// shader_location 取 12：3–9 被实例数据占用、10–11 被蒙皮占用。
+pub const TANGENT_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: 16,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[wgpu::VertexAttribute {
+        offset: 0,
+        shader_location: 12,
+        format: wgpu::VertexFormat::Float32x4,
+    }],
+};
+
+/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线属性）。
+///
+/// 组件缺席语义：`skin` 缺席 = 非蒙皮网格；`tangents` 缺席 = 网格无
+/// 顶点切线——法线贴图扰动所需的 TBN 由着色器在屏幕空间用
+/// `dpdx/dpdy` 推导（`standard.wgsl`），两种路径对无切线消费的材质
+/// （法线槽位缺省）渲染结果零影响。
 #[derive(Clone, Debug, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     /// 蒙皮属性；Some 时长度必须与 `vertices` 一致。
     pub skin: Option<Vec<SkinVertex>>,
+    /// 顶点切线（R42，glTF TANGENT 语义）：xyz = 切线方向（网格局部
+    /// 空间，着色器用法线矩阵变换到世界空间），w = 手性符号（±1，
+    /// 副切线 = cross(N, T)·w）；Some 时长度必须与 `vertices` 一致。
+    pub tangents: Option<Vec<[f32; 4]>>,
 }
 
 impl MeshData {
@@ -406,10 +430,11 @@ impl MeshStore {
         self.meshes.is_empty()
     }
 
-    /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 × 32B）
-    /// （不含 Vec 分配器开销）。「低占用」卖点的观测口径之一；GPU 侧
-    /// 顶点 / 索引缓冲与源同尺寸（蒙皮缓冲同），故该值亦即 GPU 网格
-    /// 占用的准确上界估算。
+    /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 ×
+    /// 32B + 切线 × 16B）（不含 Vec 分配器开销）。「低占用」卖点的观测
+    /// 口径之一；GPU 侧顶点 / 索引缓冲与源同尺寸（蒙皮 / 切线缓冲同），
+    /// 故该值亦即 GPU 网格占用的准确上界估算（切线缺席的网格只绑定
+    /// 渲染器常驻的零填充垫缓冲，无逐网格开销）。
     pub fn memory_bytes(&self) -> u64 {
         self.meshes
             .iter()
@@ -419,22 +444,37 @@ impl MeshStore {
                     + data.skin.as_ref().map_or(0, |s| {
                         s.len() as u64 * std::mem::size_of::<SkinVertex>() as u64
                     })
+                    + data.tangents.as_ref().map_or(0, |t| (t.len() * 16) as u64)
             })
             .sum()
     }
 }
 
 /// 便捷上传：由渲染器调用，将 `MeshData` 变为 GPU 缓冲。
-/// 蒙皮属性存在时附带第三张顶点缓冲。
+/// 蒙皮属性存在时附带第三张顶点缓冲；切线存在时附带切线顶点缓冲
+/// （`None` 由渲染器绑定常驻零垫——着色器据此走屏幕空间 TBN 路径）。
 pub(crate) fn upload_mesh(
     gpu: &crate::context::Gpu,
     data: &MeshData,
-) -> (wgpu::Buffer, wgpu::Buffer, u32, Option<wgpu::Buffer>) {
+) -> (
+    wgpu::Buffer,
+    wgpu::Buffer,
+    u32,
+    Option<wgpu::Buffer>,
+    Option<wgpu::Buffer>,
+) {
     if let Some(skin) = &data.skin {
         assert_eq!(
             skin.len(),
             data.vertices.len(),
             "蒙皮属性数量必须与顶点数量一致"
+        );
+    }
+    if let Some(tangents) = &data.tangents {
+        assert_eq!(
+            tangents.len(),
+            data.vertices.len(),
+            "切线数量必须与顶点数量一致"
         );
     }
     let vertex_buf = gpu
@@ -459,7 +499,21 @@ pub(crate) fn upload_mesh(
                 usage: wgpu::BufferUsages::VERTEX,
             })
     });
-    (vertex_buf, index_buf, data.indices.len() as u32, skin_buf)
+    let tangent_buf = data.tangents.as_ref().map(|tangents| {
+        gpu.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.mesh.tangent_vbo"),
+                contents: bytemuck::cast_slice(tangents),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+    });
+    (
+        vertex_buf,
+        index_buf,
+        data.indices.len() as u32,
+        skin_buf,
+        tangent_buf,
+    )
 }
 
 #[cfg(test)]
@@ -711,7 +765,22 @@ mod tests {
                 };
                 3
             ]),
+            tangents: None,
         };
         let _ = upload_mesh(&gpu, &data);
+    }
+
+    /// 切线字节计入内存统计（R42）：16 B/顶点；缺席时零开销。
+    #[test]
+    fn tangent_bytes_count_into_memory() {
+        let mut store = MeshStore::new();
+        let mut data = primitives::cube();
+        data.tangents = Some(vec![[0.0, 0.0, 1.0, 1.0]; 24]);
+        store.add(data);
+        assert_eq!(
+            store.memory_bytes(),
+            (24 * 32 + 36 * 4 + 24 * 16) as u64,
+            "切线缓冲 16 B/顶点必须计入"
+        );
     }
 }

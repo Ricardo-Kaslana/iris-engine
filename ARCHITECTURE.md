@@ -584,6 +584,31 @@ World 查询 (Transform, MaterialHandle, MeshHandle | LodMesh)
 - WGSL 结构体对齐陷阱：`vec3<f32>` 在 WGSL 中对齐 16 字节，会把只含一个 vec3 的
   uniform 结构撑到 16 字节倍数；Iris 用 3 个独立 `f32` 填充保持与 CPU 侧 48 字节一致
   （这是 GPU 编程常见坑，集成测试曾实际捕获该问题）。
+- **法线 / ORM 材质通道（R42）**：`MaterialDef` 新增 `normal_texture`
+  （切线空间法线）与 `orm_texture`（R=AO / G=粗糙度 / B=金属度打包）两个
+  `Option` 槽位，均线性数据贴图（`CpuTexture.srgb = false` → 上传
+  `Rgba8Unorm` / `Bc1RgbaUnorm`，颜色数据仍 sRGB——色彩空间随数据走）。
+  **兼容硬约束**：槽位缺省 `None` 时渲染器绑常驻中性纹理（法线 =
+  (0.5, 0.5, 1) 的 1×1 `Rgba16Float`——8-bit unorm 表示不了 0.5，16-bit
+  float 精确；ORM = 白色兜底纹理采样恒 1.0），着色器零按材质分支，渲染
+  结果与 R41 **逐位一致**：扰动式 `T·nx + B·ny + N·nz` 的 TBN 第三列取
+  **未归一化**插值世界法线，中性采样 (0,0,1) 代入逐位还原该法线
+  （`x·0 = ±0`、`±0 + x = x`），后续 `normalize` 输入串位不变；
+  `x·1.0 = x` 保证 ORM 中性值下金属度 / 粗糙度 / AO 与标量路径逐位相同。
+  该不变量由 `tests/normal_render.rs` 的 R41 基线全帧 FNV-1a 像素哈希锁定。
+- **TBN 两路（R42）**：网格带 glTF TANGENT 属性（`MeshData.tangents`，
+  独立顶点缓冲 loc12，w = 手性符号；`GltfBuilder::mesh` 同步导出）时走
+  顶点切线路（世界空间 Gram-Schmidt 正交化，精度首选）；无切线网格由
+  渲染器垫常驻零缓冲（xyz 全零 = 标记，1 MiB 共享垫，超限网格单独分配），
+  片元用 `dpdx/dpdy` 屏幕空间导数解 2×2 方程组重建 TBN（手性由解的几何
+  关系自然给出）——免 CPU 预计算与逐网格 16 B/顶点，代价是像素级导数噪声。
+  AO 只乘环境项（IBL + 常量补光），直接光不乘；粗糙度 / 金属度 =
+  标量因子 × 贴图通道（glTF factor × texel 语义），无 ORM 时退化为标量。
+  glTF 解析：`normalTexture` 直挂线性槽；`metallicRoughnessTexture` 与
+  `occlusionTexture` 合并进同一张 ORM 打包图（同下标直接引用、异下标且
+  同尺寸 CPU 通道合成 R←AO、仅 occlusion 时 G/B 填 255 交标量因子；
+  `strength` v1 忽略）。纹理去重缓存键含色彩空间（同一张图可同时被
+  baseColor sRGB 槽与数据线性槽引用）。
 
 ### 4.4 视锥剔除
 

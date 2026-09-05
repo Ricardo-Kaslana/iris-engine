@@ -245,6 +245,29 @@ pub(crate) fn create_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 法线 / ORM 数据贴图（R42，均线性格式；材质缺省时渲染器绑
+            // 中性常驻纹理——零分支 shader，见 material.rs 模块文档）。
+            // 采样共用 binding 2 的 Filtering 采样器。
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
         ],
     });
 
@@ -297,16 +320,21 @@ pub(crate) fn create_pipeline(
                               depth_write: bool,
                               msaa: u32|
      -> wgpu::RenderPipeline {
+        // 顶点缓冲（R42 起含切线路 3/4）：普通 = [顶点, 实例, 切线]，
+        // 蒙皮 = [顶点, 蒙皮属性, 实例, 切线]（切线 loc12）。切线缓冲
+        // 按网格携带，缺席由渲染器垫零缓冲（TANGENT_LAYOUT 注释）。
         let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
             &[
                 Some(crate::mesh::Vertex::LAYOUT),
                 Some(crate::mesh::SkinVertex::LAYOUT),
                 Some(crate::instance::InstanceRaw::LAYOUT),
+                Some(crate::mesh::TANGENT_LAYOUT),
             ]
         } else {
             &[
                 Some(crate::mesh::Vertex::LAYOUT),
                 Some(crate::instance::InstanceRaw::LAYOUT),
+                Some(crate::mesh::TANGENT_LAYOUT),
             ]
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

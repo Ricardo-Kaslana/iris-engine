@@ -1,5 +1,37 @@
-//! 材质：PBR 金属度/粗糙度工作流（Cook-Torrance）+ 自发光 + 纹理引用
-//! + 透明模式（alpha 混合走独立透明 pass，见 `renderer.rs`）。
+//! 材质：PBR 金属度/粗糙度工作流（Cook-Torrance）、自发光、纹理引用、
+//! 法线 / ORM 数据贴图槽位（R42）与透明模式（alpha 混合走独立透明
+//! pass，见 `renderer.rs`）。
+//!
+//! # 法线 / ORM 槽位与逐位一致性（R42）
+//!
+//!
+//! [`MaterialDef::normal_texture`]（切线空间法线，**线性**采样）与
+//! [`MaterialDef::orm_texture`]（ORM 打包：R = AO、G = 粗糙度、
+//! B = 金属度，**线性**采样）缺省为 `None`。渲染器对 `None` 槽位绑定
+//! **常驻中性 1×1 纹理**（法线 = (0.5, 0.5, 1)、ORM = (1, 1, 1)，均为
+//! 线性格式），着色器**无任何按材质分支**——不带这两张贴图的材质与
+//! R41 之前（无此二槽位）的渲染结果**逐位一致**，论证链如下：
+//!
+//! 1. 中性法线纹理用 `Rgba16Float` 存储（0.5 与 1.0 在 binary16 中精确
+//!    表示；8-bit unorm 无法表示 0.5——128/255 ≈ 0.502，*2−1 后残留
+//!    0.0039 的扰动）。着色器采样后 `*2−1` 恰得 (0, 0, 1)；
+//! 2. 扰动法线按 `T·nx + B·ny + N·nz` 计算（TBN 的第三列取**未归一化**
+//!    的插值世界法线）：代入 (0, 0, 1) 得 `0·T + 0·B + 1·N = N`——
+//!    浮点下 `x·0 = ±0` 且 `±0 + x = x`，逐位等于 R41 直用的插值法线；
+//! 3. 之后的 `normalize` 输入与 R41 同一串位模式，输出逐位相同；
+//! 4. 中性 ORM 采样值恰为 (1, 1, 1)：`metallic = clamp(标量 × 1.0)`、
+//!    `roughness = clamp(标量 × 1.0)`（`x·1.0 = x` 精确）、`AO × 1.0`
+//!    乘在环境项上（`x·1.0 = x` 精确）——全部与 R41 标量路径逐位相同。
+//!
+//! 该不变量由 GPU 集成测试 `normal_render.rs` 的 R41 基线像素哈希锁定。
+//!
+//! # 逐像素表面参数
+//!
+//! roughness / metallic 从标量 uniform 升级为「**标量倍率 × 贴图采样**」：
+//! `roughness = clamp(roughness 标量 × orm.g)`、`metallic = clamp(metallic
+//! 标量 × orm.b)`——与 glTF 规范的 factor × texel 语义一致；无 ORM 贴图
+//! 时采样值为 1，退化为纯标量（见上）。AO 只乘环境项（IBL + 常量补光），
+//! 不乘直接光。
 
 use crate::texture::TextureHandle;
 
@@ -35,6 +67,16 @@ pub struct MaterialDef {
     pub roughness: f32,
     /// 基础色贴图（线性采样，值与 base_color 相乘）。`TextureHandle(0)` 为白色兜底。
     pub texture: TextureHandle,
+    /// 切线空间法线贴图（**线性**数据贴图，R42）。`None` 时渲染器绑定
+    /// 中性 (0.5, 0.5, 1) 纹理——法线扰动为恒等变换，见模块文档的逐位
+    /// 一致性论证。网格无顶点切线时着色器在屏幕空间推导 TBN。
+    pub normal_texture: Option<TextureHandle>,
+    /// ORM 打包贴图（**线性**数据贴图，R42）：R = AO、G = 粗糙度、
+    /// B = 金属度（glTF metallicRoughness 的 G/B 约定 + glTF occlusion
+    /// 的 R 约定共用一张打包图；加载器把 occlusion 合并进 R，见
+    /// `asset/gltf.rs`）。`None` 时渲染器绑定中性 (1, 1, 1) 纹理，
+    /// 表面参数退化为标量直通，见模块文档。
+    pub orm_texture: Option<TextureHandle>,
     /// 透明模式：`Opaque` 走不透明主 pass，`Blend` 走透明 pass（见 `AlphaMode`）。
     pub alpha_mode: AlphaMode,
 }
@@ -47,6 +89,8 @@ impl Default for MaterialDef {
             metallic: 0.0,
             roughness: 0.5,
             texture: TextureHandle(0),
+            normal_texture: None,
+            orm_texture: None,
             alpha_mode: AlphaMode::Opaque,
         }
     }
@@ -80,6 +124,20 @@ impl MaterialDef {
             alpha_mode: AlphaMode::Blend,
             ..Default::default()
         }
+    }
+
+    /// 挂法线贴图（builder 风格，R42）。`tex` 必须是线性数据贴图
+    /// （`CpuTexture.srgb == false`），切线空间编码。
+    pub fn with_normal(mut self, tex: TextureHandle) -> Self {
+        self.normal_texture = Some(tex);
+        self
+    }
+
+    /// 挂 ORM 打包贴图（builder 风格，R42）。`tex` 必须是线性数据贴图
+    /// （`CpuTexture.srgb == false`），R = AO / G = 粗糙度 / B = 金属度。
+    pub fn with_orm(mut self, tex: TextureHandle) -> Self {
+        self.orm_texture = Some(tex);
+        self
     }
 }
 
@@ -147,5 +205,20 @@ mod tests {
         let glass = MaterialDef::glass(0.6, 0.8, 1.0, 0.35);
         assert_eq!(glass.alpha_mode, AlphaMode::Blend);
         assert_eq!(glass.base_color, [0.6, 0.8, 1.0, 0.35]);
+    }
+
+    /// 法线 / ORM 槽位（R42）：默认缺省 None（中性纹理路径 = 逐位一致
+    /// 兼容），builder 链式挂载后槽位就位、其余字段不受影响。
+    #[test]
+    fn normal_and_orm_slots_default_none_and_builder_sets() {
+        assert_eq!(MaterialDef::default().normal_texture, None);
+        assert_eq!(MaterialDef::default().orm_texture, None);
+        let def = MaterialDef::metal(0.9, 0.85, 0.8, 0.35)
+            .with_normal(TextureHandle(7))
+            .with_orm(TextureHandle(9));
+        assert_eq!(def.normal_texture, Some(TextureHandle(7)));
+        assert_eq!(def.orm_texture, Some(TextureHandle(9)));
+        assert_eq!(def.metallic, 1.0, "builder 不得改写其他字段");
+        assert_eq!(def.roughness, 0.35);
     }
 }
