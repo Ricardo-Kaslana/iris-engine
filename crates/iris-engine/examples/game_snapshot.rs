@@ -68,6 +68,9 @@ impl Harness {
     }
 
     fn frame(&mut self, held: &[KeyCode]) {
+        // 帧首事件轮换（镜像 App::tick 的新生命周期：上帧事件降级为仍可读的
+        // 上一代、更早一代丢弃——打磨 V）
+        self.app.world.clear_all_events();
         // Time::advance：确定性推进（首帧即有效 delta，无须单调时钟基准）
         self.app
             .world
@@ -84,7 +87,6 @@ impl Harness {
         self.app
             .schedule
             .run(Stage::PostUpdate, &mut self.app.world);
-        self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
 

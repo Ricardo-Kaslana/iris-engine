@@ -216,10 +216,21 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 
 - **组件模型**：`Collider`（形状 Sphere / AABB / **竖直 Capsule** +
   `is_static` + `restitution`）与 `RigidBody`（速度 / `gravity_scale` /
-  摩擦 / 线性阻尼）。**组件缺席语义**：只有 `Collider`（无 `RigidBody`）
-  = 静态体（与 `is_static` 取或）——不积分不移动，只作碰撞对象；只有
-  `RigidBody`（无 `Collider`）= 仅受力积分，不参与碰撞；两者都有且非静态
-  = 完整刚体。**竖直 Capsule**（R31）：轴段恒沿世界 ±Y（端点 = 中心 ±
+  摩擦 / 线性阻尼 / `body_type`）。**组件缺席语义**：只有 `Collider`
+  （无 `RigidBody`）= 静态体（与 `is_static` 取或）——不积分不移动，只作
+  碰撞对象；只有 `RigidBody`（无 `Collider`）= 仅受力积分，不参与碰撞；
+  两者都有且非静态 = 完整刚体。**运动学刚体（`BodyType::Kinematic`，
+  打磨 V）**：游戏驱动位移（跳过重力 / 阻尼积分与速度写回，
+  `Transform` 归游戏写）但参与碰撞——动体撞它按「静态方」路径被全额
+  推离（inv_mass = 0），它自己不被物理挪动；与静态体（含 sensor）的
+  配对**照常进接触集合**产出事件（配对随游戏驱动的位移变化，begin/end
+  语义成立——运动学角色踩 sensor 压力板不再需要「动态物理代理」绕行）；
+  kinematic × kinematic 与静-静同待遇跳过；全部「静态障碍」查询口径
+  （`resolve_against_statics` / `sphere_sweep_statics` / `move_and_slide`
+  的世界收集，统一走 `effective_static`）把它按静态障碍处理。
+  **口径例外**：foot_ik 的落地查询只收**真静态体**——运动学角色胶囊常
+  与自身腿链重叠，命中自身会毁掉落地语义（foot_ik.rs 文档明文）。
+  **竖直 Capsule**（R31）：轴段恒沿世界 ±Y（端点 = 中心 ±
   (half_height − radius)·Y，`half_height ≥ radius` 构造断言）——角色
   控制器的标准形状；因为放进 `ColliderShape` 成为一等形状，broadphase
   （网格 AABB：中心 ± (radius, half_height, radius)）、detect_pair 配对、
@@ -353,10 +364,11 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   用 BTreeSet 与 broadphase 同款选型理由，事件先 Started 后 Ended 按对序
   输出，同输入两次模拟事件序列逐项相等——单测守护）；**资源缺席语义**
   （`ContactTracker` / 事件资源未注册则静默跳过，照 `Time` 缺席风格，
-  `PhysicsPlugin` 已全部注册游戏侧即得）。消费契约：事件在 `step_physics`
-  帧末产出、当帧其后注册的系统即可读（`world.events::<E>()` / 
-  `world.events_mut::<E>().drain()` 每帧恰好消费一次），帧尾
-  `clear_all_events` 兜底清空。
+  `PhysicsPlugin` 已全部注册游戏侧即得）。消费契约（打磨 V 起）：事件
+  在 `step_physics` 帧末产出、当帧其后注册的系统即可读；每帧**恰好消费
+  一次**且必须 `world.events_mut::<E>().drain()` 取走（事件可读窗口
+  覆盖产出帧与下一帧——只 `iter` 不 `drain` 会在下一帧重复看到同一
+  事件、begin 被重复计数；总纲见 §3.10）。
 - **运动学角色控制器（iris-core/character，R31）**：`move_and_slide` /
   `move_and_slide_statics`（纯函数核心，静态体列表入参可脱离世界单测）——
   竖直胶囊 + 五步管线：① 重力（`v.y += g·gravity_scale·dt`）；② 水平
@@ -441,6 +453,47 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   原子替换）；**不做增量更新 / 单元标记**（v1 限制，见 nav.rs 模块
   文档诚实清单：无高度语义 / 无增量 / 窄障碍可漏 / 修正半径 ≤ 2 cell /
   最优性仅 cell 图上）。
+
+### 3.10 事件生命周期与命令队列（打磨 V）
+
+**事件生命周期（双代轮换）**：v1 是「单 Vec + 帧尾清空」——PostUpdate
+（焦点 / 点击系统所在）产出的事件在帧尾被无条件清空，下一帧 Update 永远
+读不到（§8.22①，游戏被迫用 `MenuCommand` 信箱资源绕行；`AppExit` 更是
+帧尾退出检查在清空**之后**读、恒读空——QUIT 根本退不出）。打磨 V 改为：
+
+- **`Events<E>` 双代缓冲**（`previous` + `current`）：`send` 写入
+  `current`；读取（`iter` / `len`）见两代并集（上一代在前，产出时间序）；
+  `drain` 取走两代全部。**可读窗口 = 产出帧余下部分 + 下一帧全程**；
+- **帧首轮换**：主循环把 `clear_all_events` 从帧尾移到帧首
+  （`run_update_stages` 之前），语义改为轮换——「上一代丢弃、本帧缓冲
+  降级为上一代」。于是 PostUpdate 产出的事件本帧 Update 全程可读
+  （跨阶段投递不再需要信箱），帧尾退出检查读本帧产出（Update 与
+  PostUpdate 发的 `AppExit` 都能退出）；被丢弃的只是连续两帧未被消费
+  的残留，不无限累积；
+- **消费契约**：`iter` 非破坏性（窗口内每次读取可见，不 drain 时上帧
+  事件会再出现一次）；`drain` 即消费。每条事件流每帧**恰好一个 drain
+  方**——接触事件等 begin/end 计数型消费方必须 drain（iris-infiltration
+  已改）。`events_mut` 放宽为 `&World` 可用（照 `try_send_event` 的写锁
+  先例）——并行系统可以 drain；
+- 编排级测试：PostUpdate 发事件 → 下一帧 Update 恰好读到一次（app.rs）。
+
+**命令队列（`iris-core/commands`，最小实现）**：并行系统（`fn(&World)`）
+无法 spawn / despawn（结构性修改需要 `&mut World`）——v1 游戏被迫插
+独占系统屏障做运行期 spawn（§8.22③）。`CommandQueue` 资源（内部
+`Mutex<Vec<Command>>`，`Command = Exec(闭包) | Despawn(Entity)`）：
+
+- **入队**：`spawn_deferred(f)` / `despawn_deferred(e)`，`&World` 即可
+  （`Mutex` 内锁，照事件写锁先例）；独占上下文用 `World::command_queue()`
+  （缺席自动注册），并行系统用 `try_resource_mut::<CommandQueue>()`
+  （`CommandsPlugin` / `DefaultPlugins` 已注册）；
+- **执行**：`apply_commands` 独占系统注册在 **PostUpdate 尾部**（渲染
+  之前——本帧产出的命令本帧生效，渲染读到最终实体态）；实现为「短命
+  资源锁取走命令 → 逐条按**入队序**执行」（执行期间新入队的命令留给
+  下一帧——**单遍语义**，防闭包自激励无限循环）；
+- **确定性警示（诚实清单）**：命令按入队序执行（实体分配序确定），但
+  闭包的执行结果依赖执行时的 World 状态——确定性回放场景请把「状态差」
+  编进命令数据，慎用闭包捕获可变外部状态（`iris-core/commands` 模块
+  文档明文；iris-infiltration 的 ragdoll 命令只捕获确定性的值）。
 
 ## 4. 渲染管线（iris-render）
 
@@ -746,11 +799,16 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
 - **两骨足部 IK（v3，`foot_ik` 模块）**：动画之后的落地修正层。
   `update_foot_ik`（DefaultPlugins 注册在 `update_animations` **之后**
   ——修正对象是动画刚写出的本帧局部关节姿势；层级传播**之前**——写回
-  的也是局部 `Transform`，当帧传播全局生效）按 `FootIk` 组件开关：对
-  「hip ← knee ← foot」直连链，从脚踝世界位上抬 `ray_up_offset` 竖直
-  向下射线（**静态体 only**，收集语义同 `resolve_against_statics`——
-  动态体不参与 IK 落地，脚踩的支撑面必须稳定），命中点即踝目标；**平地
-  门**（高差 ≤ 1 mm）内不写任何变换——平地姿势 bit 级不动。解算为
+  的也是局部 `Transform`，当帧传播全局生效）按 `FootIk` 组件开关：
+  链节点实体由 `IkRig`（打磨 V：纯 IK 装配自带节点映射，与播放器解耦
+  ——§8.22②）或 `AnimationPlayer::node_entities`（回退）二选一提供。
+  对「hip ← knee ← foot」直连链，从脚踝世界位上抬 `ray_up_offset` 竖直
+  向下射线（**真静态体 only**——动态体会抖动、运动学体常与自身链的
+  角色胶囊重叠，见 §3.8 口径例外），命中点即踝目标；**平地门**（高差
+  ≤ 1 mm）内不写任何变换——平地姿势 bit 级不动。**链契约：节点
+  scale 恒 1**（打磨 V，§8.22④）：节点 scale 会进链矩阵缩水骨长，
+  系统按 `FootIk::expected_upper/lower`（构造填写或首解捕获）监测偏差
+  > 10% 时每实体一次性 `warn`——生产保护不 panic。解算为
   **完整两骨旋转解**：骨长取当前世界姿势实际距离，纯函数
   `solve_two_bone_ik` 余弦定理解膝角（`a = (d² + u² − l²)/2d`）、pole
   向量投影定弯曲方向（不可达拉伸至全长、过近钳到 |u − l|，确定性退化
@@ -2141,7 +2199,17 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
     以第三人称潜入（24×18 m 设施、NavGrid 守卫、混合空间 + 足部 IK、
     ragdoll、接触事件、RTT 监控屏、UI 菜单栈、距离关节弹簧门）整体压榨
     R34–R41。本轮为**游戏轮，引擎零改动**，全部只绕行（纪律：摩擦留给
-    下一轮打磨闭合）；条目按「现象 → 绕行 → 建议修法」记录：
+    下一轮打磨闭合）；条目按「现象 → 绕行 → 建议修法」记录。
+    （更新：**六条已全部闭合于「引擎 API 打磨 V」轮**，iris-infiltration
+    的绕行代码已同步删除并改用新 API 作回归验证——①双代事件生命周期
+    （§3.10，MenuCommand 信箱删除）、②`IkRig` 节点映射（FootIk 与
+    AnimationPlayer 解耦，零剪辑播放器删除）、③`CommandQueue` +
+    `apply_commands`（§3.10，ragdoll 独占屏障改并行系统 +
+    `spawn_deferred`）、④IK 链 scale 契约 + 骨长期望偏差 > 10% 一次性
+    `warn`（`FootIk::expected_upper/lower` + 首解捕获）、⑤
+    `set_subtree_hidden`（游戏侧递归隐藏删除）、⑥`BodyType::Kinematic`
+    （§3.8，物理代理删除——压力板与弹簧门由玩家运动学胶囊真实碰撞
+    驱动）：
     ① **`UiClickEvent` 产出阶段与事件清空冲突**：`update_ui_focus` 在
     **PostUpdate** 发事件，主循环在 PostUpdate 之后统一
     `clear_all_events`——Update 系统永远读不到按钮点击（连 `AppExit` 也

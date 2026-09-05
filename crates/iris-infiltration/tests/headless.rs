@@ -4,11 +4,12 @@
 //! `UiPlugin` 驱动真实游戏世界。与 iris-ascent 的 headless 同款约定，
 //! 重点覆盖本轮 R34–R41 八个新载荷的真实接线：
 //!
-//! - **接触事件（R34）**：压力板 sensor + 物理代理 → ContactStarted
-//!   真实触发开门（begin/end 成对计数）；
+//! - **接触事件（R34）**：压力板 sensor × 玩家运动学胶囊 →
+//!   ContactStarted 真实触发开门（begin/end 成对计数）；
 //! - **NavGrid（R35）**：守卫巡逻 / 追逐走真实 `find_path`（纯核心单测
 //!   已覆盖折点，此处验证全链路无 panic + 永不进墙）；
-//! - **距离关节（R36）**：弹簧门板被代理推开（面板位移 > 0）后自动回弹；
+//! - **距离关节（R36）**：弹簧门板被玩家运动学胶囊推开（面板位移 > 0）
+//!   后自动回弹；
 //! - **ragdoll（R37）**：击晕事件 → `spawn_ragdoll_kinematic` +
 //!   `release_ragdoll` 六肢体生成 + 翻转为动体 + 守卫模型隐藏；
 //! - **动画 v3（R38）**：双剪辑混合空间 + 足部 IK（脚踝贴地断言）；
@@ -27,14 +28,15 @@ use glam::Vec3;
 
 use iris_core::prelude::{Entity as CoreEntity, Stage};
 use iris_engine::prelude::{
-    AnimationPlayer, AnimationPlugin, App, Audio, Camera, Collider, DirectionalLight,
-    DistanceJoint, EnvironmentSettings, FootIk, GlobalTransform, HierarchyPlugin, Input, KeyCode,
-    MeshStore, Name, OffscreenRenderer, PhysicsPlugin, Plugin, RenderTargetStore, RendersTo,
-    RigidBody, Time, Transform, UiButton, UiImageRtt, UiMenuStack, UiPlugin, UiText, Visibility,
+    AnimationPlayer, AnimationPlugin, App, Audio, BodyType, Camera, Collider, CommandsPlugin,
+    DirectionalLight, DistanceJoint, EnvironmentSettings, FootIk, GlobalTransform, HierarchyPlugin,
+    Input, KeyCode, MeshStore, Name, OffscreenRenderer, PhysicsPlugin, Plugin, RenderTargetStore,
+    RendersTo, RigidBody, Time, Transform, UiButton, UiImageRtt, UiMenuStack, UiPlugin, UiText,
+    Visibility,
 };
 use iris_infiltration::{
     CORES, CORES_TEXT_NAME, GuardState, InfiltrationEntities, InfiltrationPlugin,
-    InfiltrationState, PLATE_POS, PROXY_NAME, Phase, SNEAK_SPEED, WALLS,
+    InfiltrationState, PLATE_POS, Phase, SNEAK_SPEED, WALLS,
 };
 
 /// headless 测试台：世界 + InfiltrationPlugin 系统链 + 层级 / 动画 / 物理
@@ -73,6 +75,9 @@ impl Harness {
         AnimationPlugin.build(&mut app);
         PhysicsPlugin.build(&mut app);
         UiPlugin.build(&mut app);
+        // 命令队列（打磨 V）：PostUpdate 尾部 apply_commands——ragdoll
+        // 延迟生成与窗口路径同一编排
+        CommandsPlugin.build(&mut app);
         InfiltrationPlugin::default().build_schedule(&mut app.schedule);
 
         let mut harness = Self { app };
@@ -86,9 +91,11 @@ impl Harness {
         harness
     }
 
-    /// 推进一帧：确定性 1/60 s（时序镜像 `App::tick`：Update → PostUpdate
-    /// → 事件清空 → 输入一次性状态清零）。
+    /// 推进一帧：确定性 1/60 s（时序镜像 `App::tick`：帧首事件轮换 →
+    /// Update → PostUpdate → 输入一次性状态清零——打磨 V 的事件生命
+    /// 周期，`clear_all_events` 已从帧尾移到帧首）。
     fn frame(&mut self) {
+        self.app.world.clear_all_events();
         self.app
             .world
             .resource_mut::<Time>()
@@ -97,7 +104,6 @@ impl Harness {
         self.app
             .schedule
             .run(Stage::PostUpdate, &mut self.app.world);
-        self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
 
@@ -243,14 +249,25 @@ fn startup_builds_scene_and_capability_wiring() {
         harness.app.world.get::<UiImageRtt>(monitor_ui).is_some(),
         "监控屏 HUD 实体应挂 UiImageRtt"
     );
-    // R34/R36：物理代理（动态胶囊）与弹簧门板（动态盒 + 关节）在位
-    let proxy = harness
+    // R34/R36（打磨 V）：玩家根实体挂运动学胶囊（压力板 / 弹簧门板的
+    // 真实碰撞载体，物理代理绕行已删）；弹簧门板（动态盒 + 关节）在位
+    let ents = harness.entities();
+    assert!(
+        harness
+            .app
+            .world
+            .get::<Collider>(ents.player_root)
+            .is_some()
+    );
+    let player_body = harness
         .app
         .world
-        .entity_named(PROXY_NAME)
-        .expect("物理代理应在位");
-    assert!(harness.app.world.get::<Collider>(proxy).is_some());
-    assert!(harness.app.world.get::<RigidBody>(proxy).is_some());
+        .get::<RigidBody>(ents.player_root)
+        .expect("玩家根实体应挂 RigidBody");
+    assert!(
+        player_body.body_type == BodyType::Kinematic,
+        "玩家刚体应为 Kinematic（游戏驱动位移、参与碰撞）"
+    );
     let panel = harness
         .app
         .world
@@ -265,9 +282,10 @@ fn startup_builds_scene_and_capability_wiring() {
     assert_eq!(harness.hud_text("infiltration/hud/spotted"), "SPOTTED 0/3");
 }
 
-/// R34 端到端：把玩家传送到压力板上（物理代理同步跟随）→ ContactStarted
-/// 真实触发 → 门开（静态体移除 + 导航重建）→ 离开 → ContactEnded 计数
-/// 回落。这是接触事件链路在真实物理步进下的验证。
+/// R34 端到端：把玩家传送到压力板上（运动学胶囊随之到位——位移由
+/// 逻辑写 Transform）→ ContactStarted 真实触发 → 门开（静态体移除 +
+/// 导航重建）→ 离开 → ContactEnded 计数回落。这是接触事件链路在真实
+/// 物理步进下的验证（打磨 V：不再经过物理代理）。
 #[test]
 fn pressure_plate_contact_events_open_the_door() {
     let mut harness = Harness::new();
@@ -324,9 +342,10 @@ fn pressure_plate_contact_events_open_the_door() {
     assert_eq!(collider.groups, 0, "开门后碰撞组应清零（配对恒假）");
 }
 
-/// R36 端到端：玩家代理推开弹簧门板 → 面板位移 > 0；停止推后关节把
-/// 面板拉回关闭位（位移回落到 < 0.1 m）。纯展示语义（逻辑静态体不含
-/// 面板——玩家逻辑位置不受影响）。
+/// R36 端到端：玩家运动学胶囊推开弹簧门板（动体撞运动学体按静态方
+/// 全额退让）→ 面板位移 > 0；停止推后关节把面板拉回关闭位（位移回落
+/// 到 < 0.1 m）。纯展示语义（逻辑静态体不含面板——玩家逻辑位置不受
+/// 影响）。
 #[test]
 fn spring_door_panel_is_pushed_and_pulled_back_by_joint() {
     let mut harness = Harness::new();
@@ -343,7 +362,8 @@ fn spring_door_panel_is_pushed_and_pulled_back_by_joint() {
         state.pos = Vec3::new(-7.0, 0.9, -1.0);
         state.vel = Vec3::ZERO;
     }
-    // 北行（W）1.2 秒：穿过门洞（潜行? 否——常速 4.2 m/s），代理把面板推开
+    // 北行（W）1.2 秒：穿过门洞（潜行? 否——常速 4.2 m/s），运动学
+    // 胶囊把面板推开
     harness.hold_keys(true, &[KeyCode::KeyW]);
     harness.frames(72);
     harness.hold_keys(false, &[KeyCode::KeyW]);
@@ -353,7 +373,7 @@ fn spring_door_panel_is_pushed_and_pulled_back_by_joint() {
         .get::<Transform>(ents.door_panel)
         .expect("门板应有 Transform");
     let offset = (pushed_away.position - closed.position).length();
-    assert!(offset > 0.05, "代理穿过时应推开弹簧门板（位移 {offset}）");
+    assert!(offset > 0.05, "玩家穿过时应推开弹簧门板（位移 {offset}）");
     assert!(
         (harness.state().pos.z - closed.position.z).abs() > 1.0,
         "玩家逻辑位置应已穿过门洞（面板不进逻辑静态体）"

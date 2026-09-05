@@ -2,13 +2,16 @@
 //!
 //! 主循环时序（每帧）：
 //! ```text
+//! 事件轮换（clear_all_events：上帧事件降级为仍可读的上一代，
+//!            连续两帧未消费的残留丢弃——见 iris_core::event 生命周期）
 //! 窗口事件泵（输入写入 Input 资源）
 //!   -> Time.begin_frame（可变 delta + 固定步长累积）
 //!   -> FixedUpdate × N（确定性逻辑，最多 5 步防死亡螺旋）
 //!   -> Update（可变步长逻辑，写局部变换）
 //!   -> PostUpdate（收尾系统：层级传播等，每帧一次，不在 FixedUpdate 循环内）
 //!   -> 渲染 + 呈现（读取传播后的 GlobalTransform）
-//!   -> 事件清空 / 输入一次性状态清零 / 检查 AppExit
+//!   -> 输入一次性状态清零 / 检查 AppExit（读本帧产出——Update 与
+//!      PostUpdate 发出的 AppExit 都能被读到，打磨 V 起）
 //! ```
 
 // 平台原因（wasm32）：手动驱动异步 GPU 初始化未来所需的任务原语只在
@@ -160,25 +163,31 @@ impl Runner {
         };
         let world = &mut self.app.world;
 
-        // 1. 时间推进（时间资源缺失时按无时间模式运行）
+        // 1. 帧首事件轮换（上帧事件降级为仍可读的上一代、更早一代丢弃
+        //    ——PostUpdate 产出的事件本帧 Update 全程可读，见 event 生命周期）
+        world.clear_all_events();
+
+        // 2. 时间推进（时间资源缺失时按无时间模式运行）
         if let Some(mut time) = world.try_resource_mut::<Time>() {
             // 跨平台封装 Instant：wasm 上 std::time::Instant 运行时 panic
             time.begin_frame(Instant::now());
         }
 
-        // 2. FixedUpdate × N -> Update -> PostUpdate（见 run_update_stages）
+        // 3. FixedUpdate × N -> Update -> PostUpdate（见 run_update_stages）
         run_update_stages(&mut self.app.schedule, world);
 
-        // 3. 渲染 + 呈现
+        // 4. 渲染 + 呈现
         surface.render(world);
 
-        // 4. 帧收尾：事件清空、输入一次性状态清零
-        world.clear_all_events();
+        // 5. 帧收尾：输入一次性状态清零
         if let Some(mut input) = world.try_resource_mut::<Input>() {
             input.end_frame();
         }
 
-        // 5. 退出检查
+        // 6. 退出检查：读本帧产出的事件（Update 与 PostUpdate 发出的
+        //    AppExit 都能被读到——调序前退出检查在清空之后、恒读空）。
+        //    下一帧帧首的轮换会再给一次读取机会（双代窗口），正常路径
+        //    本帧即可退出。
         if world.try_events::<AppExit>().is_some_and(|e| !e.is_empty()) {
             event_loop.exit();
         }
@@ -340,11 +349,20 @@ impl ApplicationHandler for Runner {
 mod tests {
     use super::*;
     use iris_core::Component;
+    use iris_core::Resource;
     use iris_core::prelude::{GlobalTransform, Transform, Vec3};
     use std::time::Duration;
 
     #[derive(Component)]
     struct Ticks(u32);
+
+    /// 事件生命周期事件类型（编排测试专用）。
+    #[derive(Debug, Clone, Copy, PartialEq, iris_core::Event)]
+    struct Ping(u32);
+
+    /// 事件消费方的收件箱（并行系统不能 insert_resource，用组件承载）。
+    #[derive(Component)]
+    struct Inbox(Vec<u32>);
 
     /// 阶段编排：Update 先于 PostUpdate，且 PostUpdate 每帧恰好一次
     /// （即便 FixedUpdate 跑了多步——收尾系统不在固定步长循环内）。
@@ -416,5 +434,88 @@ mod tests {
             (child_global - Vec3::new(6.0, 0.0, 0.0)).length() < 1e-5,
             "子实体应随父级当帧移动到 (6,0,0)，实际 {child_global:?}"
         );
+    }
+
+    /// 事件生命周期编排（打磨 V）：PostUpdate 产出的事件，下一帧 Update
+    /// 全程可读，可读窗口 = 产出帧 + 下一帧（不重复、不累积）。时序镜像
+    /// `Runner::tick`：帧首 `clear_all_events` 轮换 → Update → PostUpdate。
+    /// 发送方按帧计数产出可区分的值，且第 3 帧起停止发送——用于断言
+    /// 「窗口关闭后事件不再出现」。
+    #[test]
+    fn post_update_events_are_readable_next_frame_exactly_once() {
+        #[derive(Resource)]
+        struct FrameCounter(u32);
+
+        let mut world = World::new();
+        world.spawn((Inbox(vec![]),));
+        world.insert_resource(FrameCounter(0));
+        world.register_event::<Ping>(); // Update 首帧即 drain：显式预注册
+        let entity = world.entities().next().unwrap();
+
+        let mut schedule = Schedule::new();
+        schedule
+            .add_system(Stage::Update, |world: &mut World| {
+                let e = world.entities().next().unwrap();
+                let received: Vec<u32> = world.events_mut::<Ping>().drain().map(|p| p.0).collect();
+                world.get_mut::<Inbox>(e).unwrap().0.extend(received);
+            })
+            .add_system(Stage::PostUpdate, |world: &mut World| {
+                let mut counter = world.resource_mut::<FrameCounter>();
+                let value = counter.0;
+                counter.0 += 1;
+                drop(counter);
+                if value < 2 {
+                    world.send_event(Ping(value));
+                }
+            });
+
+        // 帧 1：帧首轮换（缓冲为空）→ Update 读到 0 → PostUpdate 产出 0
+        world.clear_all_events();
+        schedule.run(Stage::Update, &mut world);
+        schedule.run(Stage::PostUpdate, &mut world);
+        assert!(
+            world.get::<Inbox>(entity).unwrap().0.is_empty(),
+            "产出帧内 Update 先于 PostUpdate，读不到"
+        );
+        // 帧 2：帧首轮换（上帧事件降级为仍可读的上一代）→ Update 读到 0
+        world.clear_all_events();
+        schedule.run(Stage::Update, &mut world);
+        schedule.run(Stage::PostUpdate, &mut world);
+        assert_eq!(
+            world.get::<Inbox>(entity).unwrap().0,
+            vec![0],
+            "上帧 PostUpdate 产出的事件应在本帧 Update 读到"
+        );
+        // 帧 3：上帧（帧 2）PostUpdate 产出的 1 → Update 读到；帧 3 的
+        // PostUpdate 起停止发送
+        world.clear_all_events();
+        schedule.run(Stage::Update, &mut world);
+        schedule.run(Stage::PostUpdate, &mut world);
+        assert_eq!(
+            world.get::<Inbox>(entity).unwrap().0,
+            vec![0, 1],
+            "每帧 PostUpdate 事件恰好投递一次"
+        );
+        // 帧 4：帧 3 未产出事件、更早的 0/1 均已 drain——Update 读到空
+        //（可读窗口关闭，事件不重复投递、不无限累积）
+        world.clear_all_events();
+        schedule.run(Stage::Update, &mut world);
+        assert_eq!(
+            world.get::<Inbox>(entity).unwrap().0,
+            vec![0, 1],
+            "事件可读窗口 = 产出帧 + 下一帧，之后不再出现"
+        );
+    }
+
+    /// 事件缓冲的轮换语义经 World 装箱路径派发正确的锚点（编排测试的
+    /// 单元级对照，与 iris_core::event 的单测互为镜像——验证
+    /// `ErasedEvents::rotate` 对 `Box<dyn ErasedEvents>` 的派发）。
+    #[test]
+    fn world_event_rotation_dispatches_through_erased_trait() {
+        let mut world = World::new();
+        world.send_event(Ping(1));
+        world.clear_all_events();
+        let received: Vec<Ping> = world.events::<Ping>().iter().copied().collect();
+        assert_eq!(received, vec![Ping(1)], "装箱轮换后上帧事件应仍可读");
     }
 }

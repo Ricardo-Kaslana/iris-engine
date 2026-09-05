@@ -67,7 +67,7 @@ pub mod prelude {
     pub use crate::context::Gpu;
     pub use crate::decal::{Decal, DecalInstanceRaw};
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
-    pub use crate::foot_ik::{FootIk, solve_two_bone_ik, update_foot_ik};
+    pub use crate::foot_ik::{FootIk, IkRig, solve_two_bone_ik, update_foot_ik};
     pub use crate::frustum::Frustum;
     pub use crate::instance::InstanceRaw;
     pub use crate::light::{
@@ -100,7 +100,7 @@ pub mod prelude {
         UiImageRtt, UiMenu, UiMenuStack, UiRect, UiText, anchor_to_position, glyph_bits,
         sort_focus_items, spawn_ui_button, text_width, update_ui_focus, update_ui_menus,
     };
-    pub use crate::visibility::Visibility;
+    pub use crate::visibility::{Visibility, set_subtree_hidden};
 }
 
 /// 全引擎固定的多重采样倍率（4x MSAA）。

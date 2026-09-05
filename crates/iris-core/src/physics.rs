@@ -13,7 +13,11 @@
 //!   不积分、不移动，只作为碰撞对象（地面 / 墙 / 台面）；
 //! - 只有 `RigidBody`（无 `Collider`）→ **仅受力积分**（重力 / 阻尼照常，
 //!   不参与任何碰撞）；
-//! - 两者都有且 `Collider::is_static == false` → 完整刚体（积分 + 碰撞）。
+//! - 两者都有且 `Collider::is_static == false` → 完整刚体（积分 + 碰撞）；
+//!   `RigidBody::body_type` 选 [`BodyType::Kinematic`](BodyType) 时是
+//!   **运动学碰撞体**：跳过积分与速度写回（位移由游戏每帧写
+//!   `Transform`）、动体撞它按静态方推离、参与接触事件——语义全表见
+//!   [`BodyType`] 文档。
 //!
 //! # 求解管线
 //!
@@ -78,7 +82,10 @@
 //!
 //! [`step_physics`] 帧末把本帧接触对与上一帧（[`ContactTracker`] 资源）
 //! 差分，产出 [`CollisionStarted`] / [`CollisionEnded`] 事件——压力板 /
-//! 警报区 / 着地回调从此**免逐帧轮询**。语义要点（实现与文档一一对应）：
+//! 警报区 / 着地回调从此**免逐帧轮询**。事件在帧首轮换前可读窗口覆盖
+//! 「产出帧 + 下一帧」（见 `crate::event` 生命周期），每帧消费一次用
+//! `events_mut::<E>().drain()`（&World 并行系统可用）。语义要点（实现
+//! 与文档一一对应）：
 //!
 //! - **实体序归一化**：事件 a/b 恒满足 `a.index() ≤ b.index()`；检测
 //!   原始方向与索引序相反时 `normal` 随归一化翻转（保持「从 a 指向 b」
@@ -98,15 +105,23 @@
 //! - **sensor 正交性**：[`Collider::is_sensor`]（触发区域）与 `is_static`
 //!   正交；sensor 对**照常进接触集合报事件**、但**跳过位置/速度求解**
 //!   （不推离不反弹，彼此穿过）——两动体 sensor 相撞只报事件；
+//! - **运动学体参与接触集合（打磨 V）**：`body_type == Kinematic` 的
+//!   实体与动体、静态体（含 sensor）的配对照常检出、照常报事件——
+//!   配对随游戏驱动的位移变化，begin/end 语义成立（运动学角色踩
+//!   sensor 压力板不再需要动态代理绕行）；运动学 × 静态实体配对求解为
+//!   no-op（双方 inv_mass = 0），运动学 × 运动学与静-静同待遇跳过；
+//!   全语义见 [`BodyType`] 文档；
 //! - **资源缺席语义**（照 `Time` 缺席静默跳过的风格）：`ContactTracker`
 //!   或事件资源未注册则静默跳过对应产出，不 panic、不强制注册
 //!   （`PhysicsPlugin` 已全部注册，游戏侧即得）；
 //! - **事件顺序**：先 Started 后 Ended，各自按对序（BTree 字典序）输出
 //!   ——同输入两次模拟的事件序列逐项一致（确定性守护）；
 //! - **消费契约**：事件在 `step_physics`（Update 阶段）帧末产出，当帧
-//!   其后注册的系统即可读（`world.events::<CollisionStarted>()`），帧尾
-//!   由主循环 `clear_all_events` 清空——每帧消费一次（读 `iter` 或经
-//!   `world.events_mut::<E>().drain()` 取走），读到的是本帧物理结果。
+//!   其后注册的系统即可读；每帧**恰好消费一次**，且必须用
+//!   `world.events_mut::<E>().drain()` 取走——事件可读窗口覆盖产出帧
+//!   与下一帧（只 `iter` 不 `drain` 的消费方会在下一帧重复看到同一
+//!   事件，begin 被重复计数）；drain 即消费，读到的是本帧物理结果
+//!   （消费契约总纲见 `crate::event`）。
 //!
 //! 压力板用例（sensor 区域 + drain 事件 + 门开逻辑）：
 //!
@@ -499,7 +514,8 @@ impl ColliderShape {
 /// 刚体组件：动体才有（静态体只有 [`Collider`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Component)]
 pub struct RigidBody {
-    /// 线速度（米/秒）。
+    /// 线速度（米/秒）。`body_type = Kinematic` 时本字段不参与积分也不被
+    /// 写回（位移由游戏每帧写 `Transform`，语义见 [`BodyType::Kinematic`]）。
     pub velocity: Vec3,
     /// 重力缩放：1.0 = 标准重力（[`PHYSICS_GRAVITY`]），0 = 失重，负值反向。
     pub gravity_scale: f32,
@@ -508,6 +524,9 @@ pub struct RigidBody {
     pub friction: f32,
     /// 线性阻尼：每秒指数速度衰减（`v ×= exp(-damping × dt)`，空气阻力近似）。
     pub linear_damping: f32,
+    /// 刚体类型（打磨 V）：[`BodyType::Dynamic`]（默认，完整动力学）或
+    /// [`BodyType::Kinematic`]（游戏驱动位移、参与碰撞，见类型文档）。
+    pub body_type: BodyType,
 }
 
 impl Default for RigidBody {
@@ -517,8 +536,53 @@ impl Default for RigidBody {
             gravity_scale: 1.0,
             friction: 0.0,
             linear_damping: 0.0,
+            body_type: BodyType::Dynamic,
         }
     }
+}
+
+/// 刚体类型（打磨 V）。
+///
+/// - [`BodyType::Dynamic`]（默认）：完整动力学——重力 / 阻尼积分、接触
+///   推离与反弹、速度写回，v1 行为逐位不变；
+/// - [`BodyType::Kinematic`]：**游戏驱动位置**——跳过重力 / 阻尼积分与
+///   速度写回（`RigidBody.velocity` 对它无语义），位移由游戏每帧直接写
+///   `Transform`；但**参与碰撞与接触事件**：
+///   - 动体撞它按「静态方」路径被推离（inv_mass = 0，全部修正给动体），
+///     它自己不被物理挪动——弹簧门板被角色推开、布娃娃被角色撞飞即此；
+///   - 与静态体（含 sensor）的配对**照常进接触集合**产出
+///     [`CollisionStarted`] / [`CollisionEnded`]——kinematic 角色踩
+///     sensor 压力板不再需要「动态物理代理」绕行（§8.22⑥ 的闭合）；
+///     配对的变化由游戏驱动的位移产生，begin/end 语义成立；
+///   - kinematic × kinematic 配对与静-静同待遇：跳过检测与事件（两者
+///     位置都由游戏驱动，物理求解对它们无话可说）；
+///   - 在全部「静态体」查询口径（`resolve_against_statics` /
+///     `sphere_sweep_statics` / `move_and_slide` 的世界收集）中按**静态
+///     障碍**处理——角色控制器撞上 kinematic 体被挡住是合理语义。
+///
+/// # 组件组合语义（更新缺席语义表）
+///
+/// - 只有 `Collider`（无 `RigidBody`）→ 静态体（不变）；
+/// - `Collider` + `RigidBody { body_type: Dynamic, .. }` → 完整刚体；
+/// - `Collider` + `RigidBody { body_type: Kinematic, .. }` → 运动学碰撞体
+///   （游戏写 `Transform`，物理只回答「谁撞上了谁、把动体推去哪」）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BodyType {
+    /// 完整动力学（默认）。
+    #[default]
+    Dynamic,
+    /// 运动学：游戏驱动位移、参与碰撞与接触事件、不参与动力学积分。
+    Kinematic,
+}
+
+/// 「求解视角的静态」判定：[`Collider::is_static`]、缺席 [`RigidBody`]
+/// （组件缺席语义）或 `body_type == Kinematic`（游戏驱动位移、碰撞按
+/// 静态方处理）——积分 / 写回 / 推离查询 / 角色控制器的静态体收集统一
+/// 走本函数（各处口径一致，见 [`BodyType::Kinematic`] 文档）。
+pub fn effective_static(collider: &Collider, rigid: Option<&RigidBody>) -> bool {
+    collider.is_static
+        || rigid.is_none()
+        || rigid.is_some_and(|body| body.body_type == BodyType::Kinematic)
 }
 
 /// 距离关节：把挂载实体与 `target` 实体的**间距**约束到 `rest_length`
@@ -1282,10 +1346,16 @@ pub fn step_physics(world: &World) {
         return;
     }
 
-    // 有效静态：Collider::is_static 或缺席 RigidBody（取或，见模块文档）
+    // 有效静态：Collider::is_static 或缺席 RigidBody（取或，见模块文档）；
+    // 运动学标记：body_type == Kinematic（跳过积分与速度写回，但参与
+    // 检测与接触事件，见 BodyType::Kinematic 文档）
     let is_static: Vec<bool> = collected
         .iter()
         .map(|(_, collider, rigid)| collider.is_static || rigid.is_none())
+        .collect();
+    let is_kinematic: Vec<bool> = collected
+        .iter()
+        .map(|(_, _, rigid)| rigid.is_some_and(|body| body.body_type == BodyType::Kinematic))
         .collect();
 
     // 触发区域标记（与 is_static 正交：sensor 也可以动，见 Collider 文档）
@@ -1342,13 +1412,13 @@ pub fn step_physics(world: &World) {
     let mut current_contacts: std::collections::BTreeMap<(u64, u64), (Vec3, f32)> =
         std::collections::BTreeMap::new();
 
-    // ---- 积分（半隐式欧拉）----
+    // ---- 积分（半隐式欧拉，仅动体；静态与运动学体均跳过）----
     let mut velocities: Vec<Option<Vec3>> = collected
         .iter()
         .map(|(_, _, rigid)| rigid.map(|b| b.velocity))
         .collect();
     for index in 0..n {
-        if is_static[index] {
+        if is_static[index] || is_kinematic[index] {
             continue;
         }
         let rigid = collected[index].2.expect("非静态实体必有 RigidBody");
@@ -1358,9 +1428,13 @@ pub fn step_physics(world: &World) {
         positions[index] += velocity * dt;
         velocities[index] = Some(velocity);
     }
-    // 仅受力积分体：同样的积分式，无接触可解
+    // 仅受力积分体：同样的积分式，无接触可解（运动学飞行体同样跳过——
+    // 游戏驱动位移，velocity 无语义）
     let mut flyer_states: Vec<(Entity, Vec3, Vec3)> = Vec::new();
     for &(entity, rigid) in &flyers {
+        if rigid.body_type == BodyType::Kinematic {
+            continue;
+        }
         let Some(position) = world.get::<Transform>(entity).map(|t| t.position) else {
             continue;
         };
@@ -1370,17 +1444,19 @@ pub fn step_physics(world: &World) {
         flyer_states.push((entity, position + velocity * dt, velocity));
     }
 
-    // 求解参数快照（速度随响应即时同步，见松弛循环内的回写）
+    // 求解参数快照（速度随响应即时同步，见松弛循环内的回写）。静态与
+    // 运动学体都按「静态方」参与（velocity = None → inv_mass = 0：动体
+    // 撞运动学体被全额推离，运动学体本身不被挪动）
     let mut params: Vec<BodyParams> = Vec::with_capacity(n);
     for index in 0..n {
         let (_, collider, rigid) = &collected[index];
         params.push(BodyParams {
-            velocity: if is_static[index] {
+            velocity: if is_static[index] || is_kinematic[index] {
                 None
             } else {
                 velocities[index]
             },
-            is_static: is_static[index],
+            is_static: is_static[index] || is_kinematic[index],
             restitution: collider.restitution,
             friction: rigid.map(|b| b.friction).unwrap_or(0.0),
         });
@@ -1398,7 +1474,7 @@ pub fn step_physics(world: &World) {
         .collect();
     let mut max_span = 0.0f32;
     for index in 0..n {
-        if !is_static[index] {
+        if !is_static[index] && !is_kinematic[index] {
             max_span = max_span.max(aabb_span(&aabbs[index]));
         }
     }
@@ -1422,17 +1498,21 @@ pub fn step_physics(world: &World) {
         .collect();
 
     // 静-静对跳过（互不动，永不穿透；也从不产出事件——静-静配对永不
-    // 变化，begin/end 无语义）。位置分离即时生效（Gauss-Seidel 风格），
-    // 共 SOLVER_ITERATIONS 轮；速度响应只在首轮施加（重复施加会把
-    // 摩擦/反弹多次结算，语义错误）。接触事件只在**首轮**采样：松弛轮
-    // 的重复检出对是同一配对的求解残影，无 begin/end 语义。
+    // 变化，begin/end 无语义）。运动学 × 运动学对与静-静同待遇（位置都
+    // 由游戏驱动，物理求解对它们无话可说，见 BodyType::Kinematic）；
+    // 运动学 × 静态体（含 sensor）**不跳过**——配对随游戏驱动的位移变化，
+    // begin/end 语义成立（kinematic 角色踩 sensor 压力板即此）。位置分离
+    // 即时生效（Gauss-Seidel 风格），共 SOLVER_ITERATIONS 轮；速度响应
+    // 只在首轮施加（重复施加会把摩擦/反弹多次结算，语义错误）。接触
+    // 事件只在**首轮**采样：松弛轮的重复检出对是同一配对的求解残影，
+    // 无 begin/end 语义。
     for iteration in 0..SOLVER_ITERATIONS {
         for i in 0..n {
             for &j in &candidates[i] {
                 if j <= i {
                     continue; // 只保留下三角（j > i），与原 (i+1)..n 内层一致
                 }
-                if is_static[i] && is_static[j] {
+                if (is_static[i] && is_static[j]) || (is_kinematic[i] && is_kinematic[j]) {
                     continue;
                 }
                 // 碰撞过滤（groups/mask 位掩码，见模块文档「碰撞过滤掩码」）：
@@ -1536,9 +1616,10 @@ pub fn step_physics(world: &World) {
         }
     }
 
-    // ---- 阶段二（写回）：仅动体写 Transform / RigidBody，静态体不触碰 ----
+    // ---- 阶段二（写回）：仅动体写 Transform / RigidBody，静态体与
+    // 运动学体不触碰（运动学体的 Transform 归游戏所有）----
     for index in 0..n {
-        if is_static[index] {
+        if is_static[index] || is_kinematic[index] {
             continue;
         }
         let (entity, _, _) = collected[index];
@@ -1627,14 +1708,18 @@ fn emit_contact_events(
 /// 世界封装的静态推离查询：把 `pos` 处的 `shape` 从世界中全部静态体的
 /// 重叠中推出，返回累计修正向量（[`resolve_static_push`] 的收集 + 调用）。
 ///
-/// 「静态体」判定与 [`step_physics`] 一致：有 [`Collider`] 且
-/// `is_static` **或无** [`RigidBody`]（组件缺席语义：只有 Collider =
-/// 静态）。两阶段中的收集阶段照 `step_physics` 同款模式（只读查询一次
-/// 收齐），随后不写任何组件——纯查询，可与任何系统并存。
+/// 「静态体」判定与 [`step_physics`] 的推离口径一致：[`effective_static`]
+/// ——有 [`Collider`] 且 `is_static`、**或无** [`RigidBody`]（组件缺席
+/// 语义：只有 Collider = 静态）、**或** `body_type == Kinematic`（运动学
+/// 体按静态障碍处理，见 [`BodyType::Kinematic`]）。两阶段中的收集阶段照
+/// `step_physics` 同款模式（只读查询一次收齐），随后不写任何组件——纯
+/// 查询，可与任何系统并存。
 pub fn resolve_against_statics(world: &World, pos: Vec3, shape: &ColliderShape) -> Vec3 {
     let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
-        if collider.is_static || rigid.is_none() {
+        // 静态体收集口径含运动学体（游戏驱动位移、按静态障碍处理，
+        // 见 BodyType::Kinematic / effective_static）
+        if effective_static(collider, rigid) {
             statics.push((transform.position, collider.shape));
         }
     });
@@ -2056,8 +2141,9 @@ pub fn shape_sweep(
 
 /// 世界封装的球扫掠查询：从 `from` 出发位移 `displacement` 的半径
 /// `radius` 球，问世界中全部静态体的首次碰撞（收集语义与
-/// [`resolve_against_statics`] 一致：`is_static` 或仅 Collider 无
-/// RigidBody 的缺席语义）。纯查询：不写任何组件。
+/// [`resolve_against_statics`] 一致：[`effective_static`]——`is_static`、
+/// 仅 Collider 无 RigidBody 的缺席语义，或运动学体）。纯查询：不写任何
+/// 组件。
 pub fn sphere_sweep_statics(
     world: &World,
     from: Vec3,
@@ -2066,7 +2152,9 @@ pub fn sphere_sweep_statics(
 ) -> Option<(f32, Vec3)> {
     let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
-        if collider.is_static || rigid.is_none() {
+        // 静态体收集口径含运动学体（游戏驱动位移、按静态障碍处理，
+        // 见 BodyType::Kinematic / effective_static）
+        if effective_static(collider, rigid) {
             statics.push((transform.position, collider.shape));
         }
     });
@@ -2568,6 +2656,7 @@ mod tests {
                 gravity_scale: 0.0, // 隔离重力，只看阻尼
                 friction: 0.0,
                 linear_damping: damping,
+                body_type: BodyType::Dynamic,
             },
         ));
         let seconds = 1.0;
@@ -4622,6 +4711,216 @@ mod tests {
         assert!(
             ball_position(&world_a, lower).y > 0.0 && ball_position(&world_a, lower).y < 2.0,
             "刚杆对应落在地面上而非穿出"
+        );
+    }
+
+    // ---- 运动学刚体（打磨 V：BodyType::Kinematic，全语义见 BodyType 文档）----
+
+    /// kinematic 体跳过积分与写回：velocity / gravity_scale 对它无语义，
+    /// 位移归游戏所有（每帧写 Transform 的游戏值不被物理覆写）。
+    #[test]
+    fn kinematic_body_skips_integration_and_writeback() {
+        let mut world = make_world();
+        let kinematic = world.spawn((
+            Transform::from_xyz(3.0, 2.0, 1.0),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                velocity: Vec3::new(10.0, 0.0, 0.0),
+                gravity_scale: 1.0,
+                body_type: BodyType::Kinematic,
+                ..RigidBody::default()
+            },
+        ));
+        let bits = |t: &Transform| {
+            (
+                t.position.x.to_bits(),
+                t.position.y.to_bits(),
+                t.position.z.to_bits(),
+            )
+        };
+        let before = bits(&world.get::<Transform>(kinematic).unwrap());
+        for _ in 0..10 {
+            step(&world, DT);
+        }
+        let after = bits(&world.get::<Transform>(kinematic).unwrap());
+        assert_eq!(
+            after, before,
+            "运动学体的 Transform 应逐位不动（不积分、不被写回）"
+        );
+        assert_eq!(
+            world.get::<RigidBody>(kinematic).unwrap().velocity,
+            Vec3::new(10.0, 0.0, 0.0),
+            "运动学体的 velocity 字段不应被写回"
+        );
+    }
+
+    /// 动体撞运动学体按「静态方」路径被全额推离：kinematic 逐位不动、
+    /// 动体沿法线恢复到恰好相切。
+    #[test]
+    fn dynamic_body_is_pushed_out_of_kinematic() {
+        let mut world = make_world();
+        let kinematic = world.spawn((
+            Transform::from_xyz(1.0, 0.5, 0.0),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                body_type: BodyType::Kinematic,
+                ..RigidBody::default()
+            },
+        ));
+        // 动球叠进 kinematic 球（中心距 0.6 < 半径和 0.7，穿透 0.1；
+        // 重力 0 隔离几何——解析解对照）
+        let ball = world.spawn((
+            Transform::from_xyz(1.6, 0.5, 0.0),
+            Collider::dynamic_sphere(0.2, 0.0),
+            RigidBody {
+                gravity_scale: 0.0,
+                ..RigidBody::default()
+            },
+        ));
+        step(&world, DT);
+        // kinematic 不被挪动
+        assert_eq!(
+            world.get::<Transform>(kinematic).unwrap().position,
+            Vec3::new(1.0, 0.5, 0.0),
+            "运动学体不被物理挪动"
+        );
+        // 动体沿 +X 全额分离到恰好相切（中心距 = 0.7）
+        let ball_pos = world.get::<Transform>(ball).unwrap().position;
+        let separation = (ball_pos - Vec3::new(1.0, 0.5, 0.0)).length();
+        assert!(
+            (separation - 0.7).abs() < 1e-4,
+            "动体应被全额推离到相切（0.7），实际 {separation}"
+        );
+    }
+
+    /// kinematic × 动体配对进接触集合：重叠帧报 Started，游戏把
+    /// kinematic 挪开后报 Ended（begin/end 成对，随游戏驱动的位移变化）。
+    #[test]
+    fn kinematic_participates_in_contact_events() {
+        let mut world = make_event_world();
+        let kinematic = world.spawn((
+            Transform::from_xyz(3.0, 0.5, 0.0),
+            Collider::dynamic_sphere(0.5, 0.0),
+            RigidBody {
+                body_type: BodyType::Kinematic,
+                ..RigidBody::default()
+            },
+        ));
+        spawn_ball(
+            &mut world,
+            Vec3::new(2.9, 0.5, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+        );
+        let (started, ended) = step_collect(&mut world, DT);
+        assert_eq!(started.len(), 1, "重叠帧应报 CollisionStarted");
+        assert_eq!(ended.len(), 0);
+        // 游戏驱动：把 kinematic 挪远（写 Transform 即 kinematic 的位移方式）
+        if let Some(mut transform) = world.get_mut::<Transform>(kinematic) {
+            transform.position = Vec3::new(30.0, 0.5, 0.0);
+        }
+        let (started, ended) = step_collect(&mut world, DT);
+        assert_eq!(started.len(), 0);
+        assert_eq!(
+            ended.len(),
+            1,
+            "挪开后应报 CollisionEnded（配对销毁成对性）"
+        );
+    }
+
+    /// kinematic × 静态 sensor 配对进接触集合（压力板语义）：kinematic
+    /// 角色踩 sensor 板即得事件，不需要动态代理。
+    #[test]
+    fn kinematic_touching_static_sensor_produces_events() {
+        let mut world = make_event_world();
+        world.spawn((
+            Transform::from_xyz(0.0, 0.25, 0.0),
+            Collider::sensor_box(Vec3::new(0.9, 0.25, 0.9)),
+        ));
+        world.spawn((
+            Transform::from_xyz(0.0, 0.25, 0.0),
+            Collider::dynamic_capsule(0.4, 0.9, 0.0),
+            RigidBody {
+                body_type: BodyType::Kinematic,
+                ..RigidBody::default()
+            },
+        ));
+        let (started, ended) = step_collect(&mut world, DT);
+        assert_eq!(
+            started.len(),
+            1,
+            "运动学体踩静态 sensor 应报 CollisionStarted（压力板语义）"
+        );
+        assert_eq!(ended.len(), 0);
+    }
+
+    /// kinematic × kinematic 配对与静-静同待遇：不进接触集合、不报事件。
+    #[test]
+    fn kinematic_kinematic_pairs_are_skipped() {
+        let mut world = make_event_world();
+        for x in [0.0f32, 0.5] {
+            world.spawn((
+                Transform::from_xyz(x, 0.5, 0.0),
+                Collider::dynamic_sphere(0.5, 0.0),
+                RigidBody {
+                    body_type: BodyType::Kinematic,
+                    ..RigidBody::default()
+                },
+            ));
+        }
+        let (started, ended) = step_collect(&mut world, DT);
+        assert!(
+            started.is_empty() && ended.is_empty(),
+            "运动学 × 运动学配对应被跳过（与静-静同待遇）"
+        );
+    }
+
+    /// kinematic 体进入全部「静态障碍」查询口径：推离查询与角色控制器
+    /// 都把它当墙（BodyType::Kinematic 文档的语义承诺）。
+    #[test]
+    fn kinematic_counts_as_static_in_push_queries_and_character() {
+        use crate::character::{CharacterParams, move_and_slide};
+        let mut world = make_world();
+        // kinematic 墙（竖直薄板，西侧面 x = 0.5）
+        world.spawn((
+            Transform::from_xyz(1.0, 1.0, 0.0),
+            Collider::static_box(Vec3::new(0.5, 1.0, 2.0)),
+            RigidBody {
+                body_type: BodyType::Kinematic,
+                ..RigidBody::default()
+            },
+        ));
+        // 推离查询：起点嵌在墙内的球被沿 -X 推出
+        let fix = resolve_against_statics(
+            &world,
+            Vec3::new(0.8, 1.0, 0.0),
+            &ColliderShape::Sphere { radius: 0.2 },
+        );
+        assert!(
+            fix.x < -0.05,
+            "运动学墙应参与推离查询（沿 -X 推出），实际 {fix:?}"
+        );
+        // 角色控制器：+X 行走被 kinematic 墙挡住——墙面 x = 0.5，胶囊
+        // 半径 0.2 → 中心停在 x ≈ 0.3。（位移取 0.6 m：扫掠终点须仍与
+        // 墙体重叠——shape_sweep 的「完全贯穿不检测」诚实边界，见其文档。）
+        let params = CharacterParams {
+            radius: 0.2,
+            half_height: 0.4,
+            ..CharacterParams::default()
+        };
+        let output = move_and_slide(
+            &world,
+            Vec3::new(0.0, 0.4, 0.0),
+            Vec3::new(36.0, 0.0, 0.0),
+            DT,
+            &params,
+        );
+        assert!(
+            (output.position.x - 0.3).abs() < 5e-2,
+            "角色应被 kinematic 墙挡在 x ≈ 0.3，实际 {}",
+            output.position.x
         );
     }
 }

@@ -150,7 +150,7 @@ pub struct AnimationPlugin;
 impl Plugin for AnimationPlugin {
     fn build(&self, app: &mut App) {
         use iris_core::prelude::{Access, ChildOf, Collider, RigidBody, Stage, Transform};
-        use iris_render::prelude::{AnimationPlayer, FootIk};
+        use iris_render::prelude::{AnimationPlayer, FootIk, IkRig};
         app.schedule.add_parallel_system(
             Stage::Update,
             Access::new()
@@ -160,13 +160,15 @@ impl Plugin for AnimationPlugin {
             iris_render::animation::update_animations,
         );
         // 足部 IK（v3）：动画之后、层级传播之前（顺序理由见插件文档与
-        // foot_ik 模块文档「编排」）
+        // foot_ik 模块文档「编排」）。写 FootIk：骨长基准捕获 / scale
+        // 污染告警状态（打磨 V）
         app.schedule.add_parallel_system(
             Stage::Update,
             Access::new()
                 .write::<Transform>()
+                .write::<FootIk>()
                 .read::<AnimationPlayer>()
-                .read::<FootIk>()
+                .read::<IkRig>()
                 .read::<ChildOf>()
                 .read::<Collider>()
                 .read::<RigidBody>(),
@@ -269,8 +271,35 @@ impl Plugin for SpatialPlugin {
     }
 }
 
+/// 命令队列插件（打磨 V）：注册 [`iris_core::commands::CommandQueue`]
+/// 资源，并在 **PostUpdate 尾部**（渲染之前）注册独占系统
+/// [`iris_core::commands::apply_commands`]。
+///
+/// 编排语义：本帧入队的命令本帧生效——渲染读到最终实体态。放尾部而非
+/// 传播之前：spawn 的实体下一帧才进层级传播（新实体当帧无
+/// `GlobalTransform`，与「运行期动态组件要预挂池槽」的既有约束同族，
+/// 诚实边界见 `iris_core::commands` 模块文档）。已包含在
+/// [`DefaultPlugins`] 中；自建 App（不用 DefaultPlugins）需要 spawn /
+/// despawn 延迟执行时手动添加（headless 测试同款）。
+#[derive(Default)]
+pub struct CommandsPlugin;
+
+impl Plugin for CommandsPlugin {
+    fn build(&self, app: &mut App) {
+        use iris_core::commands::CommandQueue;
+        use iris_core::commands::apply_commands;
+        use iris_core::prelude::Stage;
+        if !app.world.contains_resource::<CommandQueue>() {
+            app.world.insert_resource(CommandQueue::default());
+        }
+        // PostUpdate 最后一个注册（UiPlugin 之后——DefaultPlugins 的注册
+        // 顺序保证）独占系统，天然晚于全部并行收尾系统
+        app.schedule.add_system(Stage::PostUpdate, apply_commands);
+    }
+}
+
 /// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 +
-/// 粒子 + 空间音频。
+/// 粒子 + 空间音频 + UI + 命令队列。
 ///
 /// ```ignore
 /// App::new().add_plugins(DefaultPlugins::new("我的游戏")).run();
@@ -320,6 +349,9 @@ impl Plugin for DefaultPlugins {
         // UI 编排（R41）：三系统注册到 PostUpdate（渲染之前），执行序
         // layout → menus → focus（理由见 crate::ui 模块头）
         UiPlugin.build(app);
+        // 命令队列（打磨 V）：PostUpdate 尾部独占 flush——本帧命令本帧
+        // 生效（渲染前），见 CommandsPlugin 文档
+        CommandsPlugin.build(app);
     }
 }
 

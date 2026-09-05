@@ -144,6 +144,9 @@ impl Harness {
     /// 去重，只有首帧产生 pressed 边沿）；`taps` 为边沿键（先强制释放再
     /// 按下，保证本帧产生 pressed——冲刺 / 确认 / 重开都是边沿语义）。
     fn frame(&mut self, held: &[KeyCode], taps: &[KeyCode]) {
+        // 帧首事件轮换（镜像 App::tick 的新生命周期：上帧事件降级为仍可读的
+        // 上一代、更早一代丢弃——打磨 V）
+        self.app.world.clear_all_events();
         self.app
             .world
             .resource_mut::<Time>()
@@ -164,7 +167,6 @@ impl Harness {
         self.app
             .schedule
             .run(Stage::PostUpdate, &mut self.app.world);
-        self.app.world.clear_all_events();
         self.app.world.resource_mut::<Input>().end_frame();
     }
 

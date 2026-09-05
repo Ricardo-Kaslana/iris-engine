@@ -5,6 +5,97 @@
 
 ## [Unreleased]
 
+### Changed（引擎 API 打磨 V：闭合 Iris Infiltration 的六条摩擦，§8.22 全清单）
+
+「现象 → 绕行 → 建议修法」的第五轮闭合（模式照打磨 I–IV：引擎侧修复 +
+游戏侧绕行删除作回归验证；语义规范 = `iris-core/src/event.rs` /
+`iris-core/src/commands.rs` / `iris-render/src/foot_ik.rs` /
+`iris-render/src/visibility.rs` / `iris-core/src/physics.rs` 模块文档，
+架构记录见 ARCHITECTURE §3.8 / §3.10 / §8.22）：
+
+- **①事件生命周期（双代轮换）**：`Events<E>` 改双代缓冲（`previous` +
+  `current`），`clear_all_events` 从帧尾移到**帧首**、语义改为轮换
+  （上一代丢弃、本帧缓冲降级）——事件可读窗口 = 产出帧余下部分 +
+  下一帧全程：PostUpdate 产出的事件下一帧 Update 全程可读（§8.22① 的
+  信箱绕行不再需要），帧尾退出检查读本帧产出（**修复既有 bug：PostUpdate
+  发出的 `AppExit` 现状被清空、QUIT 根本退不出**）。消费契约改严：
+  `iter` 非破坏性（不 drain 的消费方下帧会再看到同一事件），每条事件流
+  每帧恰好一个 `drain` 方；`events_mut` 放宽为 `&World` 可用（并行系统
+  可 drain）。游戏侧：iris-infiltration 的 `MenuCommand` 信箱资源与
+  `consume_ui_clicks` 独占系统删除，`UiClickEvent` 在 Update 直接 drain
+  消费；接触事件消费同步改 drain（防 begin 跨帧重复计数）。测试：
+  `post_update_events_are_readable_next_frame_exactly_once`（编排级）+
+  `rotation_keeps_last_frame_readable_and_drained_events_stay_gone` /
+  `unconsumed_events_are_dropped_after_second_rotation` /
+  `events_readable_until_drained`（单元级）。
+- **②FootIk 与 AnimationPlayer 解耦**：新组件 `IkRig { node_entities }`
+  （节点映射自带），`update_foot_ik` 查询 `Option<&AnimationPlayer>` /
+  `Option<&IkRig>` 二选一非空（IkRig 优先、播放器回退），构造辅助
+  `FootIk::from_rig(hip, knee, foot)`——纯 IK 装配不再被迫挂零剪辑
+  播放器。游戏侧：iris-infiltration 四条腿链改纯 IkRig（零剪辑
+  `AnimationPlayer` 删除）。测试：`pure_ik_rig_without_animation_player_works` /
+  `ik_rig_takes_precedence_over_animation_player`。
+- **③命令队列（`iris-core/commands`，最小实现）**：`CommandQueue` 资源
+  （`Mutex<Vec<Command>>`，`Command = Exec(闭包) | Despawn`）+
+  `spawn_deferred` / `despawn_deferred`（`&World` 可入队，并行系统可用）
+  + `apply_commands` 独占系统（`CommandsPlugin`，注册在 **PostUpdate
+  尾部**渲染之前——本帧命令本帧生效；单遍语义：执行期间新入队命令留给
+  下一帧，防闭包自激励）。确定性警示入文档：命令按入队序执行，但闭包
+  结果依赖执行时 World 状态，确定性回放慎用（诚实清单）。游戏侧：
+  iris-infiltration 击晕处理从独占系统屏障改**并行系统**——ragdoll
+  生成经 `spawn_deferred` 入队、守卫隐藏用引擎原语（⑤），并行吞吐
+  保留。测试：`commands_execute_in_enqueue_order` /
+  `despawn_deferred_removes_components_after_apply` /
+  `despawn_of_dead_entity_is_noop` /
+  `commands_enqueued_during_apply_wait_for_next_pass` /
+  `apply_commands_works_through_world_resource_path`。
+- **④节点 scale 污染 IK 骨长（生产保护）**：`FootIk` 新字段
+  `expected_upper` / `expected_lower`（构造期显式填写或首次解算捕获）
+  + `scale_warned`（防刷屏，每实体至多一次）——解算骨长与期望偏差
+  > 10% 时 `log::warn!` 一次（不 panic，IK 按当前骨长继续）；模块文档
+  写明契约「IK 链节点 scale 恒 1（缩放用网格子实体或父级）」。测试：
+  `scale_pollution_triggers_warn_once` /
+  `healthy_chain_captures_expected_lengths_without_warn`。
+- **⑤隐藏子树原语**：`iris-render/visibility::set_subtree_hidden(world,
+  root, hidden)`——沿 `Children` 显式栈迭代（深度帽 64 防构造性环，
+  照 `hidden_by_ancestor` 模式）翻转整棵子树；**无 `Visibility` 的子
+  实体插入** HIDDEN/VISIBLE（存储未注册时跳过 + warn——`&World` 不能
+  注册新组件类型的既有约束）；配套 `World::insert_registered`（存储
+  已注册前提下的 `&World` 插入路径）。游戏侧：iris-infiltration 的
+  `hide_subtree` 10 行递归删除。测试：
+  `subtree_hidden_flips_three_levels_and_back` /
+  `missing_visibility_components_get_inserted` /
+  `cyclic_subtree_terminates_via_depth_cap`。
+- **⑥运动学刚体（`BodyType::Kinematic`）**：`RigidBody` 新增
+  `body_type`（`Dynamic` 默认 / `Kinematic`）——**游戏驱动位置**（跳过
+  重力 / 阻尼积分与速度写回，`Transform` 归游戏写）但**参与碰撞**：
+  动体撞它按「静态方」路径全额推离（inv_mass = 0），与静态体（含
+  sensor）配对**照常进接触集合**报事件（运动学角色踩 sensor 压力板
+  不再需要动态代理绕行），kinematic × kinematic 与静-静同待遇跳过；
+  全部「静态障碍」查询口径（`resolve_against_statics` /
+  `sphere_sweep_statics` / `move_and_slide` 世界收集）统一走新函数
+  `effective_static` 把它按静态障碍处理。**口径例外**：foot_ik 落地
+  查询只收真静态体（运动学角色胶囊与自身腿链重叠，命中自身会毁掉
+  落地语义）。游戏侧：iris-infiltration 的物理代理（`PROXY_NAME`
+  实体 + 逐帧同步）删除——玩家根实体直接
+  `RigidBody { body_type: Kinematic, .. }` + 动态胶囊，压力板 sensor
+  事件与弹簧门推离由真实碰撞产出。测试：
+  `kinematic_body_skips_integration_and_writeback` /
+  `dynamic_body_is_pushed_out_of_kinematic` /
+  `kinematic_participates_in_contact_events` /
+  `kinematic_touching_static_sensor_produces_events` /
+  `kinematic_kinematic_pairs_are_skipped` /
+  `kinematic_counts_as_static_in_push_queries_and_character`。
+- **验证**：headless 全链路不改语义照跑（自动玩家全关通关 / 压力板
+  开门 / 弹簧门推回 / ragdoll 六肢体 / 菜单 RESUME 全部仍过）；测试
+  总数 614 → **636**（debug）/ 613 → **635**（release）。
+- **偏离声明**：①的双代轮换实现与「单 Vec 移动调用点」的字面方案
+  不同——单 Vec 下帧首清空必然在 Update 读取前删掉上帧 PostUpdate
+  事件，「PostUpdate 产出 → 下一帧 Update 读到」的验收测试在单 Vec
+  下不可满足；双代轮换是满足该验收语义的最小实现（每事件最多存活
+  两帧，`drain` 语义不变）。⑥的 foot_ik 口径例外同上（自身碰撞体重叠
+  的工程事实）。
+
 ### Added（游戏五：Iris Infiltration 第三人称潜入——dogfooding V，R34–R41 全量压榨）
 
 新 crate `iris-infiltration`（第 42 轮迭代，游戏轮：**引擎零改动**，八个
@@ -41,7 +132,8 @@ ARCHITECTURE §2，摩擦清单见 §8.22，视觉验收
   被迫挂零剪辑播放器）／ragdoll 生成需要 `&mut World`（缺命令队列）／
   节点 scale 污染 IK 链长（无告警）／无隐藏子树原语／运动学角色无物理
   碰撞体（代理同步绕行）——六条均「现象 → 绕行 → 建议修法」，本轮
-  引擎零改动全部只绕行。
+  引擎零改动全部只绕行。（更新：六条已全部闭合于「引擎 API 打磨 V」，
+  见上方 Changed 首节。）
 
 ### Added（R41：UI 与菜单框架——锚定布局 + 按钮焦点导航 + 菜单栈 + 设置持久化）
 

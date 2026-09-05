@@ -636,7 +636,15 @@ ALERT 0% / CAM-02 标签）完整；该帧 FrameStats：`draw_calls = 15` /
 `triangles = 348`。
 
 本轮 R42（游戏五）的**摩擦清单**（现象 → 绕行 → 建议修法，全文见
-ARCHITECTURE.md §8.22；本轮为游戏轮，全部只绕行不改引擎）：
+ARCHITECTURE.md §8.22；本轮为游戏轮，全部只绕行不改引擎。
+**更新：六条已全部闭合于「引擎 API 打磨 V」**——①事件双代轮换生命周期
+（`UiClickEvent` 在 Update 直接消费，`MenuCommand` 信箱删除；QUIT 退出
+修复）＋ 事件可读窗口跨两帧、消费必须 `drain`；②`IkRig` 组件解耦
+FootIk（零剪辑播放器删除）；③`CommandQueue` 帧末命令队列（ragdoll 生成
+改并行系统 + `spawn_deferred`）；④IK 链「节点 scale 恒 1」契约 + 骨长
+偏差 > 10% 一次性 warn；⑤`set_subtree_hidden` 引擎原语；⑥
+`RigidBody::body_type = Kinematic` 运动学碰撞体（物理代理删除，压力板 /
+弹簧门由玩家胶囊真实碰撞驱动）。各条绕行实现详见下）：
 
 1. **`UiClickEvent` 在 PostUpdate 产出、帧尾 `clear_all_events` 清空——
    Update 系统永远读不到**（焦点系统发事件在 PostUpdate，主循环事件清空
@@ -674,7 +682,7 @@ cargo run -p iris-infiltration --example infiltration_snapshot --release   # 中
 ## 测试
 
 ```sh
-cargo test --workspace   # 614 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 636 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

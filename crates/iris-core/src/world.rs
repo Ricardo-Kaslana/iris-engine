@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::RwLock;
 
+use crate::commands::CommandQueue;
 use crate::component::{Component, Components, Ref, RefMut};
 use crate::entity::{Entities, Entity};
 use crate::event::{ErasedEvents, Event, EventRef, EventRefMut, Events};
@@ -117,6 +118,23 @@ impl World {
         self.components.insert(entity, component)
     }
 
+    /// 向实体插入组件，要求该组件存储**已注册**（世界中已有同型组件）。
+    /// 与 [`World::insert`] 的区别：不注册新存储——因此 `&World` 即可调用
+    /// （存储已存在时插入不是结构性修改，并行系统可用的写路径，照
+    /// 尝试型锁模式）。存储未注册或实体已失效时返回 `None` 并 warn
+    /// （不 panic——调用方按缺席语义处理）。
+    pub fn insert_registered<C: Component>(&self, entity: Entity, component: C) -> Option<C> {
+        if !self.contains(entity) {
+            log::warn!(
+                "向已失效的实体 {entity:?} 插入组件 {}，已忽略",
+                std::any::type_name::<C>()
+            );
+            return None;
+        }
+        let mut store = self.components.borrow_mut::<C>()?;
+        store.insert(entity, component)
+    }
+
     /// 只读访问实体的组件。
     pub fn get<C: Component>(&self, entity: Entity) -> Option<Ref<'_, C>> {
         let store = self.components.borrow::<C>()?;
@@ -221,7 +239,8 @@ impl World {
             .or_insert_with(|| RwLock::new(Box::new(Events::<E>::default())));
     }
 
-    /// 发送事件（当帧内有效，帧尾清空）。事件类型未注册时自动注册
+    /// 发送事件（可读窗口 = 产出帧余下部分 + 下一帧全程，见
+    /// [`crate::event`] 模块文档「生命周期」）。事件类型未注册时自动注册
     /// （需要 `&mut World`，故本方法仅供独占系统使用）。
     pub fn send_event<E: Event>(&mut self, event: E) {
         self.register_event::<E>();
@@ -273,12 +292,16 @@ impl World {
             .unwrap_or_else(|| panic!("事件 {} 未注册", std::any::type_name::<E>()))
     }
 
-    /// 可变访问事件缓冲；类型从未注册时 panic（同 [`World::events`]）。
+    /// 可变访问事件缓冲（drain 消费用）；类型从未注册时 panic（同
+    /// [`World::events`]）。
     ///
-    /// 典型消费：`world.events_mut::<E>().drain()`——每帧**恰好取走一
-    /// 次**全部事件（读到的是本帧产出，帧尾另有 [`World::clear_all_events`]
-    /// 兜底清空；消费契约见 `iris_core::physics` 模块文档「接触事件」）。
-    pub fn events_mut<E: Event>(&mut self) -> EventRefMut<'_, E> {
+    /// `&World` 即可调用（照 [`World::try_send_event`] 的写锁先例）：
+    /// 并行系统可以 drain 已注册类型的事件——这是接触事件（Update 内
+    /// 产出、Update 内更晚批次消费，消费方常为 `fn(&World)` 并行系统）
+    /// 的标准消费姿势。**消费契约**：每条事件流每帧恰好一个 drain 方
+    /// （`drain` 取走两代全部；只 `iter` 不 `drain` 时上帧事件会再出现
+    /// 一次，见 `crate::event` 模块文档「消费契约」）。
+    pub fn events_mut<E: Event>(&self) -> EventRefMut<'_, E> {
         let cell = self
             .events
             .get(&TypeId::of::<E>())
@@ -289,11 +312,30 @@ impl World {
         ))
     }
 
-    /// 帧尾清空全部事件缓冲（由引擎主循环调用）。
+    /// 帧首事件轮换（由引擎主循环每帧调用；旧称「帧尾清空」）。语义
+    /// （双代轮换，见 `crate::event` 模块文档「生命周期」）：全部事件
+    /// 缓冲执行「上一代丢弃、本帧缓冲降级为上一代」——上帧产出的事件
+    /// 本帧全程仍可读，被丢弃的只是连续两帧未被 drain 消费的残留。
     pub fn clear_all_events(&mut self) {
         for cell in self.events.values() {
-            write_lock(cell, "事件缓冲（帧尾清理）").clear();
+            write_lock(cell, "事件缓冲（帧首轮换）").rotate();
         }
+    }
+
+    // ---- 命令队列 ----
+
+    /// 命令队列可变访问（队列缺席时自动注册——注册是结构性修改，需要
+    /// `&mut World`，故本方法仅供独占上下文）。
+    ///
+    /// 并行系统（`fn(&World)`）入队走
+    /// [`World::try_resource_mut::<CommandQueue>`]（`DefaultPlugins` /
+    /// `CommandsPlugin` 已注册资源；缺席 = 无法入队，照 `try_send_event`
+    /// 的未注册语义）。语义与确定性边界见 `crate::commands` 模块文档。
+    pub fn command_queue(&mut self) -> ResourceRefMut<'_, CommandQueue> {
+        if !self.contains_resource::<CommandQueue>() {
+            self.insert_resource(CommandQueue::default());
+        }
+        self.resource_mut::<CommandQueue>()
     }
 }
 
@@ -373,15 +415,41 @@ mod tests {
     }
 
     #[test]
-    fn events_live_within_a_frame() {
+    fn events_survive_one_rotation_dropped_after_two() {
         let mut world = World::new();
         world.send_event(Message("hello"));
         world.send_event(Message("world"));
         assert_eq!(world.events::<Message>().len(), 2);
         let collected: Vec<_> = world.events::<Message>().iter().copied().collect();
         assert_eq!(collected, vec![Message("hello"), Message("world")]);
+        // 帧首轮换（旧「帧尾清空」的新语义）：上帧事件本帧仍可读
         world.clear_all_events();
-        assert_eq!(world.events::<Message>().len(), 0);
+        assert_eq!(
+            world.events::<Message>().len(),
+            2,
+            "轮换后上帧事件应降级为上一代、仍可读"
+        );
+        // 连续两帧未消费：第二次轮换丢弃
+        world.clear_all_events();
+        assert_eq!(
+            world.events::<Message>().len(),
+            0,
+            "连续两帧未消费的残留应被丢弃"
+        );
+    }
+
+    /// 同一事件帧内多次读取可见，drain 后不可见（消费契约锚点）。
+    #[test]
+    fn events_readable_until_drained() {
+        let mut world = World::new();
+        world.send_event(Message("a"));
+        // iter 非破坏性：多次读取同见
+        assert_eq!(world.events::<Message>().len(), 1);
+        assert_eq!(world.events::<Message>().len(), 1);
+        // drain 消费（&World 即可——并行系统姿势）：取走两代全部
+        let drained: Vec<_> = world.events_mut::<Message>().drain().collect();
+        assert_eq!(drained, vec![Message("a")]);
+        assert!(world.events::<Message>().is_empty(), "drain 后不可见");
     }
 
     #[test]

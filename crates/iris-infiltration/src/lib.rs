@@ -61,6 +61,6 @@ pub use logic::{
 };
 pub use plugin::{
     ALERT_TEXT_NAME, BANNER_TEXT_NAME, BannerTimer, CORES_TEXT_NAME, InfiltrationAssets,
-    InfiltrationEntities, InfiltrationPlugin, MODEL_PATH, MenuCommand, PAUSE_MENU, PROXY_NAME,
-    REFERENCE_DISTANCE, SPOTTED_TEXT_NAME,
+    InfiltrationEntities, InfiltrationPlugin, MODEL_PATH, PAUSE_MENU, REFERENCE_DISTANCE,
+    SPOTTED_TEXT_NAME,
 };

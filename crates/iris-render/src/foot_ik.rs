@@ -36,11 +36,26 @@
 //! 3. **平地门**：地面高差 ≤ [`GROUND_EPSILON`]（1 mm，远小于 ±2 cm
 //!    验收域）时不写任何变换——平地姿势 bit 级不动。
 //!
+//! # 节点映射：IkRig 或 AnimationPlayer（打磨 V 起二选一）
+//!
+//! 链节点实体由 [`IkRig`]（纯 IK 装配：节点映射自带，与播放器无关）或
+//! [`AnimationPlayer::node_entities`](crate::animation::AnimationPlayer)
+//! （与播放器同挂的装配，回退路径）提供——查询 `Option<&AnimationPlayer>`
+//! / `Option<&IkRig>` **二选一非空**即可，[`FootIk::hip_node`] 等下标在
+//! 两者中同义（查 [`IkRig`] 优先）。纯 IK 腿链不再被迫挂零剪辑播放器
+//! （§8.22② 的闭合）；两者并存时 [`IkRig`] 胜出。
+//!
 //! # 前提与诚实边界
 //!
 //! - **链契约**：`hip / knee / foot` 三节点须经 `ChildOf` 直连成链
 //!   （knee 的父 = hip、foot 的父 = knee），不满足时 `debug_assert!` 并
 //!   跳过该实体（release 静默）；
+//! - **链上节点 scale 恒 1（契约，打磨 V）**：`chain_world` 沿父链累乘
+//!   局部矩阵——节点 scale 会进入链矩阵、把骨长按比例缩水（节点缩放
+//!   的本意通常是缩放关节网格，应放在**独立的子网格实体**或父级上）。
+//!   系统按 [`FootIk::expected_upper`] / [`FootIk::expected_lower`] 监测
+//!   骨长偏差，超过 10% 时 `log::warn!` 一次（每实体至多一次，防刷屏）
+//!   ——生产保护而非 panic，IK 仍按当前（已失真的）骨长解算；
 //! - **均匀缩放假设**：旋转回写沿父链按四元数复合（父级缩放不参与旋转
 //!   语义）——链上均匀缩放（glTF 刚性关节的常态，测试亦为 1）下关节
 //!   位置精确；非均匀缩放时旋转可能偏差（位置回写走矩阵、仍然精确）；
@@ -142,11 +157,31 @@ pub fn solve_two_bone_ik(
     (ankle, knee)
 }
 
+/// 纯 IK 装配的节点映射组件（打磨 V）：`node_entities` 下标 → 实体，
+/// 语义与 `AnimationPlayer::node_entities` 的映射部分一致。
+///
+/// 与 [`AnimationPlayer`] **二选一**即可被 [`update_foot_ik`] 命中：
+/// 纯 IK 装配（无动画的腿链 rig）挂本组件；与播放器同挂时本组件优先。
+/// 便利构造见 [`FootIk::from_rig`]。
+#[derive(Clone, Debug, iris_core::Component)]
+pub struct IkRig {
+    /// 链节点实体表（下标即 [`FootIk::hip_node`] 等声明的下标）。
+    pub node_entities: Vec<Option<Entity>>,
+}
+
+impl IkRig {
+    /// 以节点实体表构造（典型：`vec![Some(hip), Some(knee), Some(foot)]`）。
+    pub fn new(node_entities: Vec<Option<Entity>>) -> Self {
+        Self { node_entities }
+    }
+}
+
 /// 足部 IK 配置组件（v3）：声明哪条两骨链做 IK + 落地查询参数。
 ///
-/// 挂在 [`AnimationPlayer`] 同一实体上，`*_node` 为其 `node_entities`
-/// 下标；三节点须直连成链（前提与边界见模块文档）。每实体独立开关：
-/// 没挂本组件的角色零参与（系统查询不到即过）。
+/// 节点映射来源见模块文档「节点映射」——[`IkRig`] 或
+/// [`AnimationPlayer`] 二选一，`*_node` 为其下标；三节点须直连成链
+/// （前提与边界见模块文档）。每实体独立开关：没挂本组件的角色零参与
+/// （系统查询不到即过）。
 #[derive(Clone, Debug, iris_core::Component)]
 pub struct FootIk {
     /// 髋关节节点（`node_entities` 下标）。
@@ -163,6 +198,14 @@ pub struct FootIk {
     /// 射线起点自脚踝的上抬量（米）：保证脚踝插地时射线仍能命中地面
     /// （上拉修正依赖起点高于地面）。
     pub ray_up_offset: f32,
+    /// 股骨（hip→knee）期望长（米）：scale 污染监测的基准。`0.0` =
+    /// 未捕获——首次解算按当时姿势记录（首帧姿势即基准）；装配场景
+    /// 可显式填写。见模块文档「链上节点 scale 恒 1」。
+    pub expected_upper: f32,
+    /// 胫骨（knee→foot）期望长（米），语义同 [`FootIk::expected_upper`]。
+    pub expected_lower: f32,
+    /// scale 污染告警已发过（每实体至多 warn 一次，防刷屏）。
+    pub scale_warned: bool,
 }
 
 impl Default for FootIk {
@@ -176,15 +219,35 @@ impl Default for FootIk {
             pole: Vec3::NEG_Z,
             max_ground_drop: 0.5,
             ray_up_offset: 0.5,
+            expected_upper: 0.0,
+            expected_lower: 0.0,
+            scale_warned: false,
         }
+    }
+}
+
+impl FootIk {
+    /// 纯 IK 装配辅助（打磨 V）：hip ← knee ← foot 三实体直连链 →
+    /// `(IkRig, FootIk)`——两个组件同挂链根（原 `AnimationPlayer` 同体
+    /// 位置）即可被系统命中。骨长期望不在此捕获（构造期无世界访问），
+    /// 留给 `update_foot_ik` 首次解算按当时姿势记录；需要显式基准时
+    /// 直接填写 [`FootIk::expected_upper`] / [`FootIk::expected_lower`]。
+    pub fn from_rig(hip: Entity, knee: Entity, foot: Entity) -> (IkRig, FootIk) {
+        (
+            IkRig::new(vec![Some(hip), Some(knee), Some(foot)]),
+            FootIk::default(),
+        )
     }
 }
 
 /// 静态体射线（私有封装）：沿 `origin → origin + dir × max_t` 找
 /// 最近命中的静态体（`statics` 由 [`update_foot_ik`] 每帧一次收集，
-/// 语义与 `resolve_against_statics` 一致：`is_static` 或仅 Collider 无
-/// RigidBody）——动态体不参与 IK 落地（理由见模块文档「落地查询」）。
-/// `dir` 须为单位方向。纯查询。
+/// 语义为**真静态体**：`is_static` 或仅 Collider 无 RigidBody）——动态体
+/// 与**运动学体**（`BodyType::Kinematic`）都不参与 IK 落地：前者会抖动
+/// 喂进关节链（见模块文档「落地查询」），后者常与自身链的角色碰撞体
+/// 重叠——命中自身会把落地查询毁掉（打磨 V 的刻意口径差异，与
+/// `resolve_against_statics` 的推离/角色口径不同）。`dir` 须为单位方向。
+/// 纯查询。
 fn raycast_statics(
     statics: &[(Vec3, ColliderShape)],
     origin: Vec3,
@@ -227,15 +290,18 @@ fn chain_world(world: &World, entity: Entity) -> Option<(Mat4, Quat)> {
     Some((matrix, rotation))
 }
 
-/// 足部 IK 每帧系统：对每个「[`AnimationPlayer`] + [`FootIk`]」实体，
-/// 把声明的两骨链脚踝拉到脚下静态地面（算法、编排与边界见模块文档）。
+/// 足部 IK 每帧系统：对每个挂有 [`FootIk`] 且节点映射齐备（[`IkRig`] 或
+/// [`AnimationPlayer`]，二选一）的实体，把声明的两骨链脚踝拉到脚下静态
+/// 地面（算法、编排与边界见模块文档）。
 ///
 /// 只读世界签名（`&World`）：组件写访问走世界内部的尝试型锁，注册为
-/// **并行系统**（访问集：写 Transform，读 AnimationPlayer / FootIk /
-/// ChildOf / Collider / RigidBody）。两阶段：只读收集回写任务 → 统一
-/// 写局部变换（照 `update_animations` 模式）。
+/// **并行系统**（访问集：写 Transform / FootIk，读 AnimationPlayer /
+/// IkRig / ChildOf / Collider / RigidBody）。两阶段：只读收集回写任务 →
+/// 统一写局部变换与骨长基准（照 `update_animations` 模式——查询闭包持
+/// 共享借用，`FootIk` 的监测状态写回延后到阶段二）。
 pub fn update_foot_ik(world: &World) {
-    // 静态体一次收集（组件缺席 = 静态的缺席语义与 step_physics 一致）
+    // 静态体一次收集（**真静态体**：运动学体不参与 IK 落地——常与自身
+    // 链的角色碰撞体重叠，见 raycast_statics 文档）
     let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
         if collider.is_static || rigid.is_none() {
@@ -244,16 +310,27 @@ pub fn update_foot_ik(world: &World) {
     });
 
     // 阶段一（只读解算）：每实体产出「hip/knee 局部旋转 + foot 局部位置」
+    // + 骨长（scale 污染监测用，阶段二统一写 FootIk）
     let mut jobs: Vec<(Entity, Entity, Entity, Quat, Quat, Vec3)> = Vec::new();
-    world.query::<(&AnimationPlayer, &FootIk)>(|(player, ik)| {
+    let mut bone_lengths: Vec<(Entity, f32, f32)> = Vec::new();
+    world.query::<(Entity, &FootIk, Option<&AnimationPlayer>, Option<&IkRig>)>(
+        |(entity, ik, player, rig)| {
+        // 节点解析：IkRig 优先，回退 AnimationPlayer（二选一非空，见模块
+        // 文档「节点映射」）；两者都缺 = 装配错误
         let resolve = |index: usize| -> Option<Entity> {
-            match player.node_entities.get(index).copied().flatten() {
+            let mapped = rig
+                .and_then(|rig| rig.node_entities.get(index).copied().flatten())
+                .or_else(|| {
+                    player.and_then(|player| {
+                        player.node_entities.get(index).copied().flatten()
+                    })
+                });
+            match mapped {
                 Some(entity) => Some(entity),
                 None => {
                     debug_assert!(
                         false,
-                        "FootIk 节点索引越界或未映射到实体：{index} / {}",
-                        player.node_entities.len()
+                        "FootIk 节点索引越界或未映射到实体：{index}（IkRig /                          AnimationPlayer 至少挂一个且表长覆盖该下标）"
                     );
                     None
                 }
@@ -290,9 +367,11 @@ pub fn update_foot_ik(world: &World) {
         let hip = hip_world.w_axis.truncate();
         let knee = knee_world.w_axis.truncate();
         let foot = foot_world.w_axis.truncate();
-        // 骨长取当前世界姿势的实际距离（保留装配比例）；退化骨长跳过
+        // 骨长取当前世界姿势的实际距离（保留装配比例）；先记录供 scale
+        // 污染监测（阶段二统一写 FootIk，查询闭包内不可再借 FootIk）
         let upper = (knee - hip).length();
         let lower = (foot - knee).length();
+        bone_lengths.push((entity, upper, lower));
         if upper <= MIN_BONE_LENGTH || lower <= MIN_BONE_LENGTH {
             return;
         }
@@ -366,9 +445,32 @@ pub fn update_foot_ik(world: &World) {
             knee_local_rot_new,
             foot_local_pos_new,
         ));
-    });
+        },
+    );
 
-    // 阶段二（写入）：hip/knee 局部旋转 + foot 局部位置（其余字段不动）
+    // 阶段二（写入）：hip/knee 局部旋转 + foot 局部位置（其余字段不动）；
+    // FootIk 的骨长基准捕获 / scale 污染告警也在此统一写（契约见模块
+    // 文档「链上节点 scale 恒 1」）
+    for &(entity, upper, lower) in &bone_lengths {
+        if let Some(mut ik) = world.get_mut::<FootIk>(entity) {
+            if ik.expected_upper <= 0.0 || ik.expected_lower <= 0.0 {
+                // 未捕获基准：首次解算按当时姿势记录
+                ik.expected_upper = upper;
+                ik.expected_lower = lower;
+            } else {
+                let polluted = (upper - ik.expected_upper).abs() > 0.10 * ik.expected_upper
+                    || (lower - ik.expected_lower).abs() > 0.10 * ik.expected_lower;
+                if polluted && !ik.scale_warned {
+                    log::warn!(
+                        "FootIk 链骨长偏离期望超过 10%（upper {upper:.4} vs 期望                          {:.4}，lower {lower:.4} vs 期望 {:.4}）——IK 链节点 scale                          须恒 1（缩放请用网格子实体或父级），解算继续但骨长语义已失真",
+                        ik.expected_upper,
+                        ik.expected_lower
+                    );
+                    ik.scale_warned = true;
+                }
+            }
+        }
+    }
     for (hip_entity, knee_entity, foot_entity, hip_rot, knee_rot, foot_pos) in jobs {
         if let Some(mut transform) = world.get_mut::<Transform>(hip_entity) {
             transform.rotation = hip_rot;
@@ -675,5 +777,134 @@ mod tests {
         world.insert(root, player);
         world.insert(root, FootIk::default());
         update_foot_ik(&world);
+    }
+
+    // ---- 节点映射（打磨 V）：IkRig 与 AnimationPlayer 二选一 ----
+
+    /// 纯 IK 装配（只挂 IkRig，无 AnimationPlayer）：链 IK 照常生效——
+    /// §8.22② 的「被迫挂零剪辑播放器」绕行已不需要。
+    #[test]
+    fn pure_ik_rig_without_animation_player_works() {
+        // 与 slope 同场景：山球斜坡 + 纯 IkRig 链
+        let r = 10.0f32;
+        let mut world = World::new();
+        let root = world.spawn((Transform::from_xyz(2.0, 0.75, 0.0),));
+        let hip = world.spawn((Transform::IDENTITY,));
+        let knee = world.spawn((Transform::from_xyz(0.0, -0.5, 0.0),));
+        let foot = world.spawn((Transform::from_xyz(0.0, -0.5, 0.0),));
+        world.add_child(root, hip);
+        world.add_child(hip, knee);
+        world.add_child(knee, foot);
+        let (rig, ik) = FootIk::from_rig(hip, knee, foot);
+        world.insert(root, rig);
+        world.insert(root, ik);
+        world.spawn((
+            Transform::from_xyz(0.0, -r, 0.0),
+            Collider::static_sphere(r),
+        ));
+
+        update_foot_ik(&world);
+        propagate_transforms(&mut world);
+        let expected = -r + (r * r - 2.0 * 2.0).sqrt();
+        let ankle = world.get::<GlobalTransform>(foot).unwrap().position();
+        assert!(
+            (ankle.y - expected).abs() < 2e-2,
+            "纯 IkRig 链的脚踝应贴合斜坡 ±2 cm：踝 {} vs 面 {expected}",
+            ankle.y
+        );
+    }
+
+    /// 两者并存（AnimationPlayer + IkRig 同挂）：IkRig 优先——播放器的
+    /// 节点表是坏数据（全 None，会触发链契约断言的配置）也不影响。
+    #[test]
+    fn ik_rig_takes_precedence_over_animation_player() {
+        let mut world = World::new();
+        // 根在 y 0.75：地面顶 -0.2 距髋 0.95 < 全腿长 1.0（可达域内，
+        // 踝会精确落到地面——修正发生即证明 IkRig 路径生效）
+        let root = world.spawn((Transform::from_xyz(0.0, 0.75, 0.0),));
+        let hip = world.spawn((Transform::IDENTITY,));
+        let knee = world.spawn((Transform::from_xyz(0.0, -0.5, 0.0),));
+        let foot = world.spawn((Transform::from_xyz(0.0, -0.5, 0.0),));
+        world.add_child(root, hip);
+        world.add_child(hip, knee);
+        world.add_child(knee, foot);
+        // 播放器在位但节点表为坏数据（全 None）；IkRig 提供正确映射
+        let player = AnimationPlayer::new(vec![], vec![None, None, None]);
+        world.insert(root, player);
+        let (rig, ik) = FootIk::from_rig(hip, knee, foot);
+        world.insert(root, rig);
+        world.insert(root, ik);
+        world.spawn((
+            Transform::from_xyz(0.0, -1.2, 0.0),
+            Collider::static_box(Vec3::new(50.0, 1.0, 50.0)),
+        ));
+        update_foot_ik(&world);
+        propagate_transforms(&mut world);
+        let ankle = world.get::<GlobalTransform>(foot).unwrap().position();
+        assert!(
+            (ankle.y - (-0.2)).abs() < 1e-4,
+            "IkRig 应优先解析节点（踝被拉到地面 -0.2），实际 {ankle:?}"
+        );
+    }
+
+    // ---- scale 污染监测（打磨 ④）：链上节点 scale 恒 1 的契约保护 ----
+
+    /// 组装「root → hip → knee → foot」链并按需给节点 scale，返回
+    /// (world, root, foot)。
+    fn rig_with_scale(root_pos: Vec3, knee_scale: f32) -> (World, Entity, Entity) {
+        let mut world = World::new();
+        let root = world.spawn((Transform::from_xyz(root_pos.x, root_pos.y, root_pos.z),));
+        let hip = world.spawn((Transform::IDENTITY,));
+        let knee = world.spawn((Transform {
+            position: Vec3::new(0.0, -0.5, 0.0),
+            scale: Vec3::splat(knee_scale),
+            ..Transform::IDENTITY
+        },));
+        let foot = world.spawn((Transform::from_xyz(0.0, -0.5, 0.0),));
+        world.add_child(root, hip);
+        world.add_child(hip, knee);
+        world.add_child(knee, foot);
+        let (rig, ik) = FootIk::from_rig(hip, knee, foot);
+        world.insert(root, rig);
+        world.insert(root, ik);
+        (world, root, foot)
+    }
+
+    /// scale = 0.5 污染（胫骨缩半）：显式期望 0.5/0.5 → 偏差 50% > 10%
+    /// → warn 恰好一次（防刷屏：warn 过即记）。
+    #[test]
+    fn scale_pollution_triggers_warn_once() {
+        let (world, root, _foot) = rig_with_scale(Vec3::new(0.0, 1.0, 0.0), 0.5);
+        if let Some(mut ik) = world.get_mut::<FootIk>(root) {
+            ik.expected_upper = 0.5;
+            ik.expected_lower = 0.5;
+        }
+        update_foot_ik(&world);
+        assert!(
+            world.get::<FootIk>(root).unwrap().scale_warned,
+            "胫骨被节点 scale 缩半应触发告警"
+        );
+        update_foot_ik(&world);
+        update_foot_ik(&world);
+        assert!(
+            world.get::<FootIk>(root).unwrap().scale_warned,
+            "告警状态保持（每实体至多一次的标志位语义）"
+        );
+    }
+
+    /// scale = 1 的健康链：不触发告警；期望长未显式填写时由首次解算
+    /// 捕获（捕获值 ≈ 装配骨长 0.5）。
+    #[test]
+    fn healthy_chain_captures_expected_lengths_without_warn() {
+        let (world, root, _foot) = rig_with_scale(Vec3::new(0.0, 1.0, 0.0), 1.0);
+        update_foot_ik(&world);
+        let ik = world.get::<FootIk>(root).unwrap();
+        assert!(!ik.scale_warned, "健康链不应触发告警");
+        assert!(
+            (ik.expected_upper - 0.5).abs() < 1e-5 && (ik.expected_lower - 0.5).abs() < 1e-5,
+            "期望骨长应由首次解算捕获为装配值 0.5（实际 {} / {}）",
+            ik.expected_upper,
+            ik.expected_lower
+        );
     }
 }

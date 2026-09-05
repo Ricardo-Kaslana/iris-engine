@@ -8,11 +8,13 @@
 //!   内容启动 spawn 一次）；
 //! - **Update**：`run_infiltration`（读 `Input` / `Time` → 输入翻译 →
 //!   **R34** 压力板 `CollisionStarted/Ended` 消费 → [`InfiltrationState::step`]
-//!   → 写玩家 / 守卫 / 物理代理 → **R38** 混合空间参数 → **R25** 空间音频
+//!   → 写玩家 / 守卫 → **R38** 混合空间参数 → **R25** 空间音频
 //!   → **R41** Esc 菜单栈与 `UiClickEvent` 消费）→
-//!   `consume_game_events`（独占系统：**R37** 击晕 → ragdoll 生成/释放 +
-//!   守卫模型整体隐藏）→ `update_infiltration_visuals`（核心 / 门 /
-//!   出口信标表现）→ `update_infiltration_hud`（核心计数 / 警觉 / 横幅）。
+//!   `consume_game_events`（**并行系统**：**R37** 击晕 → ragdoll 命令
+//!   入队（`spawn_deferred`，帧末 `apply_commands` 执行）+ 守卫模型
+//!   子树隐藏（引擎原语 `set_subtree_hidden`））→
+//!   `update_infiltration_visuals`（核心 / 门 / 出口信标表现）→
+//!   `update_infiltration_hud`（核心计数 / 警觉 / 横幅）。
 //! - **层级传播 / 粒子 / 动画 / 物理 / 空间音频 / UI**：交给
 //!   `DefaultPlugins`；headless 测试与离屏快照需自行 build
 //!   `HierarchyPlugin` / `AnimationPlugin` / `PhysicsPlugin` / `UiPlugin`
@@ -23,23 +25,25 @@
 //! | 能力 | 接入点 |
 //! |---|---|
 //! | R35 navmesh | 守卫巡逻/追逐 `find_path`（logic）；压力门开 → `NavGrid` 便宜重建 |
-//! | R38 动画 v3 | 玩家与守卫的 `BlendSpace`（参数 = 速度 0..1）+ 双腿链 `FootIk` |
-//! | R37 ragdoll | `consume_game_events`：`spawn_ragdoll_kinematic` + `release_ragdoll` |
-//! | R34 接触事件 | 压力板 sensor + `run_infiltration` 内 begin/end 消费 |
+//! | R38 动画 v3 | 玩家与守卫的 `BlendSpace`（参数 = 速度 0..1）+ 双腿链 `FootIk`（纯 IkRig） |
+//! | R37 ragdoll | `consume_game_events`：`spawn_deferred` 命令 → `spawn_ragdoll_kinematic` + `release_ragdoll` |
+//! | R34 接触事件 | 压力板 sensor × 玩家运动学胶囊 + `run_infiltration` 内 begin/end 消费 |
 //! | R40 RTT | `build_scene` 的 RT 相机（盯核心房）+ HUD `UiImageRtt` 画中画 |
-//! | R41 UI 菜单 | Esc → `UiMenuStack` push/pop；RESUME/QUIT 按钮 + `UiClickEvent` |
-//! | R36 约束 | 弹簧门板 = 动态盒 + `DistanceJoint` 拉回关闭位（玩家代理推开） |
+//! | R41 UI 菜单 | Esc → `UiMenuStack` push/pop；RESUME/QUIT 按钮 + `UiClickEvent`（Update 直接消费） |
+//! | R36 约束 | 弹簧门板 = 动态盒 + `DistanceJoint` 拉回关闭位（玩家运动学胶囊推开） |
 //! | R25 空间音频 | 事件 → `play_spatial`（听者跟随主相机） |
 //!
-//! # 物理代理（R34/R36 的载体，诚实说明）
+//! # 玩家的物理存在（R34/R36 的载体，打磨 V 起无代理）
 //!
 //! 玩家是纯逻辑运动学角色（[`move_and_slide_statics`]，只认逻辑静态体），
-//! 而 `step_physics` 的接触事件与推挤只在**动体**之间发生——本插件额外
-//! spawn 一个「物理代理」胶囊（动态体，重力 0），每帧把它的位置 / 速度
-//! 同步为逻辑值：压力板 sensor 靠它与玩家发生接触（R34），弹簧门板靠它
-//! 被真实推开（R36）。代理的位置漂移（≤ 1 帧位移）每帧被覆写归零，
-//! 对逻辑零影响。代理与代理专属的「每帧重同步」是 v1 缺少「运动学
-//! 碰撞体」概念下的绕行（记入摩擦清单）。
+//! 位移由本插件每帧写玩家根实体的 `Transform`。玩家根实体直接挂
+//! `RigidBody { body_type: Kinematic, .. }` + 动态胶囊 Collider（打磨 V
+//! 新语义）：跳过物理积分（逻辑全权驱动位移）、但参与碰撞——压力板
+//! sensor（R34）由真实接触产出事件、弹簧门板（R36）被真实推离（动体撞
+//! 运动学体按静态方路径全额退让）。v1 曾以「动态物理代理 + 逐帧同步」
+//! 绕行（无运动学碰撞体概念），打磨 V 闭合后代理已删（§8.22⑥）。
+//! kinematic 胶囊与真静态墙体 / 地板的配对求解为 no-op（双方
+//! inv_mass = 0）、照常进接触集合——对逻辑零影响。
 //!
 //! # 击晕与表现（R37，诚实限制）
 //!
@@ -49,12 +53,20 @@
 //! 逻辑，尸体永久留在原地（ragdoll 不回收）。
 //!
 //! 本插件只使用引擎公开 API（dogfooding）：不依赖引擎内部路径。
+//! 打磨 V 闭合记录：①`UiClickEvent` 生命周期（MenuCommand 信箱已删）、
+//! ②纯 IkRig 腿链（零剪辑播放器已删）、③命令队列（ragdoll 独占屏障
+//! 已删，改并行系统 + `spawn_deferred`）、⑤`set_subtree_hidden`（游戏
+//! 侧递归隐藏已删）、⑥运动学碰撞体（物理代理已删）——§8.22 六条中
+//! ④（节点 scale）无需游戏侧改动（装配本来就守契约）。
 
 use std::path::{Path, PathBuf};
 
 use glam::{Quat, Vec2, Vec3};
 
-use iris_core::physics::{Collider, CollisionEnded, CollisionStarted, DistanceJoint, RigidBody};
+use iris_core::commands::CommandQueue;
+use iris_core::physics::{
+    BodyType, Collider, CollisionEnded, CollisionStarted, DistanceJoint, RigidBody,
+};
 use iris_core::prelude::{Access, Entity, Name, Stage};
 use iris_core::ragdoll::{RagdollDesc, release_ragdoll, spawn_ragdoll_kinematic};
 use iris_engine::prelude::*;
@@ -88,8 +100,6 @@ pub const ALERT_TEXT_NAME: &str = "infiltration/hud/alert";
 pub const BANNER_TEXT_NAME: &str = "infiltration/hud/banner";
 /// 暂停菜单名（`UiMenuStack` 栈元素）。
 pub const PAUSE_MENU: &str = "pause";
-/// 物理代理名（按名定位 / 调试用）。
-pub const PROXY_NAME: &str = "infiltration/player-proxy";
 /// 设置文件（R41 `Settings`）：启动读取（存在才读）、QUIT 时保存。
 pub const SETTINGS_PATH: &str = "infiltration_settings.json";
 
@@ -104,21 +114,6 @@ impl iris_core::resource::Resource for InfiltrationState {}
 /// 横幅剩余显示时间（秒；`run_infiltration` 置位、HUD 递减清零）。
 #[derive(Clone, Copy, Debug, Default, Resource)]
 pub struct BannerTimer(pub f32);
-
-/// 菜单命令（跨阶段信箱）：R41 的 `UiClickEvent` 由 `update_ui_focus` 在
-/// **PostUpdate** 产出，而主循环在 PostUpdate 之后统一 `clear_all_events`
-/// ——Update 系统永远读不到它（引擎摩擦，见 ARCHITECTURE §8）。绕行：
-/// PostUpdate 尾部的独占系统 `consume_ui_clicks`（注册晚于 `UiPlugin`
-/// 的焦点系统）把事件转写成本资源，`run_infiltration` 在下一帧 Update
-/// 消费。QUIT 的 `AppExit` 也必须在 Update 发送（PostUpdate 发出的会在
-/// 帧尾被清空、退出检查读不到）。
-#[derive(Clone, Copy, Debug, Default, Resource)]
-pub struct MenuCommand {
-    /// RESUME：pop 暂停菜单。
-    pub resume: bool,
-    /// QUIT：保存设置并请求退出。
-    pub quit: bool,
-}
 
 /// 预生成的程序化音效（全部确定性、Startup 一次生成）。
 #[derive(Clone, Resource)]
@@ -158,8 +153,6 @@ pub struct InfiltrationEntities {
     pub player_model: Entity,
     /// 主相机子实体（`ActiveCamera` + `SmoothFollow`；无 `RendersTo`）。
     pub camera: Entity,
-    /// 物理代理（R34/R36 载体，见模块文档）。
-    pub proxy: Entity,
     /// 守卫（下标 = [`crate::logic::GUARD_ROUTES`] 下标）。
     pub guards: Vec<GuardEntities>,
     /// 数据核心实体（下标 = [`CORES`] 下标；拾取后隐藏）。
@@ -249,7 +242,17 @@ impl InfiltrationPlugin {
                     .write::<BannerTimer>(),
                 run_infiltration,
             )
-            .add_system(Stage::Update, consume_game_events)
+            .add_parallel_system(
+                Stage::Update,
+                Access::new()
+                    .read::<InfiltrationState>()
+                    .read::<InfiltrationEntities>()
+                    .write::<Visibility>()
+                    .write::<Collider>()
+                    .write::<RigidBody>()
+                    .write::<CommandQueue>(),
+                consume_game_events,
+            )
             .add_parallel_system(
                 Stage::Update,
                 Access::new()
@@ -270,10 +273,7 @@ impl InfiltrationPlugin {
                     .write::<UiText>()
                     .write::<BannerTimer>(),
                 update_infiltration_hud,
-            )
-            // R41：PostUpdate 尾部消费 UiClickEvent（注册晚于 UiPlugin 的
-            // 焦点系统——同帧消费，见 [`MenuCommand`] 文档）
-            .add_system(Stage::PostUpdate, consume_ui_clicks);
+            );
     }
 }
 
@@ -383,7 +383,6 @@ fn build_scene(world: &mut World, model_path: &Path) {
     let (player_root, player_model, camera) = build_player(world, model_path);
     let guards = build_guards(world, model_path);
     let cores = build_cores(world);
-    let proxy = build_proxy(world);
     let (plate, door, door_panel) = build_machinery(world);
     let exit_beacon = build_exit(world);
     let monitor = build_monitor_camera(world);
@@ -393,7 +392,6 @@ fn build_scene(world: &mut World, model_path: &Path) {
         player_root,
         player_model,
         camera,
-        proxy,
         guards,
         cores,
         plate,
@@ -440,10 +438,12 @@ fn build_facility(world: &mut World) {
     }
 }
 
-/// 组装双腿链（R38 足部 IK）：wrapper（挂空剪辑 [`AnimationPlayer`] +
-/// [`FootIk`]）→ hip → knee → foot 直连链。腿根在模型局部 y 0.85、两骨
-/// 各 0.45：脚踝初始位在地板下 5 cm——平地上 IK 每帧把踝拉回 y=0
-/// （视觉证据：脚不插地）。链上三个节点都挂小方块网格（关节可见）。
+/// 组装双腿链（R38 足部 IK）：wrapper（挂纯 IK 装配 [`IkRig`] +
+/// [`FootIk`]，见 [`FootIk::from_rig`]）→ hip → knee → foot 直连链。
+/// 腿根在模型局部 y 0.85、两骨各 0.45：脚踝初始位在地板下 5 cm——
+/// 平地上 IK 每帧把踝拉回 y=0（视觉证据：脚不插地）。链上三个节点
+/// scale 恒 1，小方块网格挂独立的子网格实体（节点缩放会把骨长搅乱，
+/// 见模块文档与 ARCHITECTURE §8.22④）。
 fn build_leg(world: &mut World, parent: Entity, tag: &str, side_x: f32) -> Entity {
     let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
     let mat = world
@@ -499,10 +499,11 @@ fn build_leg(world: &mut World, parent: Entity, tag: &str, side_x: f32) -> Entit
     world.add_child(wrapper, hip);
     world.add_child(hip, knee);
     world.add_child(knee, foot);
-    // FootIk 契约：与 AnimationPlayer 同实体，node 0/1/2 = hip/knee/foot
-    let rig = AnimationPlayer::new(vec![], vec![Some(hip), Some(knee), Some(foot)]);
+    // 纯 IK 装配（打磨 V）：IkRig 自带节点映射，不再被迫挂零剪辑
+    // AnimationPlayer（§8.22② 闭合）；node 0/1/2 = hip/knee/foot
+    let (rig, ik) = FootIk::from_rig(hip, knee, foot);
     world.insert(wrapper, rig);
-    world.insert(wrapper, FootIk::default());
+    world.insert(wrapper, ik);
     wrapper
 }
 
@@ -645,6 +646,18 @@ fn fallback_bot(world: &mut World, tag: &str) -> Entity {
 fn build_player(world: &mut World, model_path: &Path) -> (Entity, Entity, Entity) {
     let spawn = crate::logic::SPAWN_FOOT + Vec3::new(0.0, HALF_HEIGHT, 0.0);
     let (root, model) = build_character(world, model_path, "player", spawn);
+    // 玩家的物理存在（打磨 V）：运动学胶囊——跳过物理积分（逻辑全权
+    // 驱动位移），但参与碰撞与接触事件：压力板 sensor（R34）由真实
+    // 接触产出事件、弹簧门板（R36）被真实推离（见模块文档「玩家的
+    // 物理存在」；v1 的动态代理绕行已删）
+    world.insert(root, Collider::dynamic_capsule(0.4, HALF_HEIGHT, 0.0));
+    world.insert(
+        root,
+        RigidBody {
+            body_type: BodyType::Kinematic,
+            ..RigidBody::default()
+        },
+    );
     let camera = world.spawn((
         Name("infiltration/player-camera".into()),
         Transform {
@@ -707,24 +720,6 @@ fn build_cores(world: &mut World) -> Vec<Entity> {
             ))
         })
         .collect()
-}
-
-/// 物理代理（R34/R36 载体）：动态胶囊 + 重力 0，每帧由
-/// `run_infiltration` 同步逻辑位置 / 速度（见模块文档「物理代理」）。
-fn build_proxy(world: &mut World) -> Entity {
-    let spawn = crate::logic::SPAWN_FOOT + Vec3::new(0.0, HALF_HEIGHT, 0.0);
-    world.spawn((
-        Name(PROXY_NAME.into()),
-        Transform::from_translation(spawn),
-        Collider::dynamic_capsule(0.4, 0.9, 0.0),
-        Visibility::VISIBLE,
-        RigidBody {
-            velocity: Vec3::ZERO,
-            gravity_scale: 0.0,
-            friction: 0.0,
-            linear_damping: 0.0,
-        },
-    ))
 }
 
 /// 机关：压力板（**R34** sensor 盒）+ 压力门（静态体，开门 = 标记）+
@@ -797,6 +792,7 @@ fn build_machinery(world: &mut World) -> (Entity, Entity, Entity) {
             gravity_scale: 0.0,
             friction: 0.6,
             linear_damping: 3.0,
+            body_type: BodyType::Dynamic,
         },
         DistanceJoint {
             target: anchor,
@@ -1018,7 +1014,7 @@ fn build_pause_menu(world: &mut World) {
 // ---------------------------------------------------------------------------
 
 /// Update 1：读输入与时间 → **R34** 压力板接触事件消费 → 推进纯逻辑 →
-/// 写玩家 / 代理 / 守卫 → **R38** 混合空间参数 → **R25** 空间音频 →
+/// 写玩家 / 守卫 → **R38** 混合空间参数 → **R25** 空间音频 →
 /// **R41** Esc 菜单栈与 `UiClickEvent` 消费。菜单栈非空 = 暂停（逻辑
 /// 冻结；物理 / 动画表现照常——v1 暂停只冻结对局状态机，诚实边界）。
 fn run_infiltration(world: &World) {
@@ -1045,15 +1041,21 @@ fn run_infiltration(world: &World) {
             }
         }
     }
-    // UiClickEvent 经 PostUpdate 信箱 MenuCommand 转交（见类型文档）
-    let (resume_requested, quit_requested) = world
-        .try_resource_mut::<MenuCommand>()
-        .map(|mut command| {
-            let (resume, quit) = (command.resume, command.quit);
-            *command = MenuCommand::default();
-            (resume, quit)
-        })
-        .unwrap_or((false, false));
+    // UiClickEvent 直接消费（打磨 V：事件生命周期闭合 §8.22①）——
+    // `update_ui_focus` 在 PostUpdate 产出，事件可读窗口覆盖下一帧全程，
+    // 本帧 Update 经上一代窗口读到并 drain（不再需要 MenuCommand 信箱）
+    let mut resume_requested = false;
+    let mut quit_requested = false;
+    for click in world.events_mut::<UiClickEvent>().drain() {
+        let label = world
+            .get::<UiButton>(click.entity)
+            .map(|button| button.label.clone());
+        match label.as_deref() {
+            Some("RESUME") => resume_requested = true,
+            Some("QUIT") => quit_requested = true,
+            _ => {}
+        }
+    }
     if resume_requested || quit_requested {
         if let Some(mut stack) = world.try_resource_mut::<UiMenuStack>() {
             if stack.top_menu() == Some(PAUSE_MENU) {
@@ -1062,11 +1064,9 @@ fn run_infiltration(world: &World) {
         }
     }
     if quit_requested {
-        // R41 设置持久化：QUIT 落盘后请求退出（AppExit 由主循环消费；
-        // headless 测试从不点击 QUIT，不产生写盘竞态）
-        // R41 设置持久化：QUIT 落盘后请求退出。AppExit 必须在 Update
-        // 发送——主循环在 PostUpdate 后清空事件，帧尾的退出检查只读得到
-        // Update 阶段发出的事件（headless 测试从不点击 QUIT，无写盘竞态）
+        // R41 设置持久化：QUIT 落盘后请求退出（AppExit 由主循环帧尾
+        // 退出检查读本帧产出——打磨 V 调序后 Update / PostUpdate 发出的
+        // 都能读到；headless 测试从不点击 QUIT，无写盘竞态）
         if let Some(settings) = world.try_resource::<Settings>() {
             let _ = settings.save(plugin_settings_path(world));
         }
@@ -1102,13 +1102,15 @@ fn run_infiltration(world: &World) {
         // 本阶段更早的批次产出（注册序在先），读到的是本帧物理结果 ----
         if let Some(ents) = world.try_resource::<InfiltrationEntities>() {
             let plate = ents.plate;
-            for event in world.events::<CollisionStarted>().iter() {
+            // drain 消费（打磨 V 消费契约：事件可读窗口跨两帧，iter 不取
+            // 走会在下一帧重复计数 begin）
+            for event in world.events_mut::<CollisionStarted>().drain() {
                 if event.a == plate || event.b == plate {
                     state.enter_plate();
                     state.press_plate();
                 }
             }
-            for event in world.events::<CollisionEnded>().iter() {
+            for event in world.events_mut::<CollisionEnded>().drain() {
                 if event.a == plate || event.b == plate {
                     state.leave_plate();
                 }
@@ -1153,13 +1155,6 @@ fn run_infiltration(world: &World) {
     if let Some(ents) = world.try_resource::<InfiltrationEntities>() {
         if let Some(mut transform) = world.get_mut::<Transform>(ents.player_root) {
             transform.position = state.pos;
-        }
-        // 物理代理：位置 / 速度逐帧同步为逻辑值（漂移 ≤ 1 帧即被覆写）
-        if let Some(mut transform) = world.get_mut::<Transform>(ents.proxy) {
-            transform.position = state.pos;
-        }
-        if let Some(mut body) = world.get_mut::<RigidBody>(ents.proxy) {
-            body.velocity = Vec3::new(state.vel.x, 0.0, state.vel.z);
         }
         // 玩家模型：朝向 + 混合空间参数（速度比 = 水平速度 / 巡航速度）
         if let Some(mut transform) = world.get_mut::<Transform>(ents.player_model) {
@@ -1228,14 +1223,20 @@ fn plugin_settings_path(_world: &World) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Update 2（独占）：击晕 → ragdoll（R37）
+// Update 2（并行）：击晕 → ragdoll 命令入队（R37）
 // ---------------------------------------------------------------------------
 
-/// Update 2（独占系统——ragdoll 生成需要 `&mut World`，实体分配是结构性
-/// 修改）：消费本帧 `GuardStunned` 事件 → 在守卫脚底生成六球人形 ragdoll
-/// 并立即释放（受击方向 = 守卫面朝方向轻踢）→ 守卫模型子树整体隐藏。
-/// 独占系统与并行批次互为屏障，天然晚于 `run_infiltration` 执行。
-fn consume_game_events(world: &mut World) {
+/// Update 2（**并行系统**，打磨 V 起不再独占）：消费本帧 `GuardStunned`
+/// 事件 → ragdoll 生成经命令队列入队（`spawn_deferred`——实体分配是
+/// 结构性修改，帧末 `apply_commands` 独占执行，并行系统吞吐保留，
+/// §8.22③ 闭合）→ 守卫模型子树整体隐藏（引擎原语
+/// [`set_subtree_hidden`]，§8.22⑤ 闭合）。
+///
+/// ragdoll 的「生成 + 立即释放（受击方向轻踢）」打包进同一条命令：闭包
+/// 按值捕获击晕数据（`Send`），执行结果只依赖捕获值与生成时的确定性的
+/// `RagdollDesc`——命令队列的确定性警示见 `iris_core::commands` 模块
+/// 文档（本处闭包不读可变外部状态，回放安全）。
+fn consume_game_events(world: &World) {
     let Some(events) = world
         .try_resource::<InfiltrationState>()
         .map(|state| state.frame_events.clone())
@@ -1244,65 +1245,24 @@ fn consume_game_events(world: &mut World) {
     };
     for event in events {
         if let InfiltrationEvent::GuardStunned { pos, facing, index } = event {
-            // 瘫倒：静态肢体（动画接管期）→ 立即释放（物理接管期）
+            // 瘫倒：静态肢体（动画接管期）→ 立即释放（物理接管期）——
+            // 帧末独占执行
             let foot = pos - Vec3::new(0.0, HALF_HEIGHT, 0.0);
-            let limbs = spawn_ragdoll_kinematic(world, foot, &RagdollDesc::humanoid());
-            let kick_dir = Vec3::new(-facing.sin(), 0.0, -facing.cos());
-            release_ragdoll(world, &limbs, Vec3::ZERO, Some((kick_dir, 1.2)));
+            if let Some(queue) = world.try_resource::<CommandQueue>() {
+                queue.spawn_deferred(move |world: &mut World| {
+                    let limbs = spawn_ragdoll_kinematic(world, foot, &RagdollDesc::humanoid());
+                    let kick_dir = Vec3::new(-facing.sin(), 0.0, -facing.cos());
+                    release_ragdoll(world, &limbs, Vec3::ZERO, Some((kick_dir, 1.2)));
+                });
+            }
             // 守卫模型隐藏（根 + 全子树：模型 / 腿链 / 网格节点）
             let guard_root = world
                 .try_resource::<InfiltrationEntities>()
                 .and_then(|ents| ents.guards.get(index).map(|guard_view| guard_view.root));
             if let Some(root) = guard_root {
-                hide_subtree(world, root);
+                set_subtree_hidden(world, root, true);
             }
         }
-    }
-}
-
-/// PostUpdate 尾部（独占）：把 `update_ui_focus` 发出的 [`UiClickEvent`]
-/// 转写成 [`MenuCommand`]（跨阶段信箱，理由见类型文档）。独占系统因
-/// `events_mut` 需要 `&mut World`；注册序晚于 `UiPlugin` 的焦点系统，
-/// 同帧即消费。
-fn consume_ui_clicks(world: &mut World) {
-    // 先取走实体（借用于事件缓冲），再查标签（borrow 分离）
-    let entities: Vec<Entity> = world
-        .events_mut::<UiClickEvent>()
-        .drain()
-        .map(|click| click.entity)
-        .collect();
-    let mut clicks: Vec<String> = Vec::with_capacity(entities.len());
-    for entity in entities {
-        let label = world
-            .get::<UiButton>(entity)
-            .map(|button| button.label.clone())
-            .unwrap_or_default();
-        clicks.push(label);
-    }
-    if clicks.is_empty() {
-        return;
-    }
-    if !world.contains_resource::<MenuCommand>() {
-        world.insert_resource(MenuCommand::default());
-    }
-    let mut command = world.resource_mut::<MenuCommand>();
-    for label in clicks {
-        match label.as_str() {
-            "RESUME" => command.resume = true,
-            "QUIT" => command.quit = true,
-            _ => {}
-        }
-    }
-}
-
-/// 递归隐藏子树（引擎没有「隐藏子树」原语——摩擦清单条目：表现层被迫
-/// 自持遍历）。
-fn hide_subtree(world: &mut World, entity: Entity) {
-    if let Some(mut visibility) = world.get_mut::<Visibility>(entity) {
-        *visibility = Visibility::HIDDEN;
-    }
-    for child in world.children(entity) {
-        hide_subtree(world, child);
     }
 }
 
@@ -1439,31 +1399,6 @@ fn update_infiltration_hud(world: &World) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// hide_subtree：根 + 全后代都置 HIDDEN（击晕表现的基础语义）。
-    #[test]
-    fn hide_subtree_hides_all_descendants() {
-        let mut world = World::new();
-        let root = world.spawn((Transform::IDENTITY, Visibility::VISIBLE));
-        let child = world.spawn((Transform::IDENTITY, Visibility::VISIBLE));
-        let grandchild = world.spawn((Transform::IDENTITY, Visibility::VISIBLE));
-        world.add_child(root, child);
-        world.add_child(child, grandchild);
-        hide_subtree(&mut world, root);
-        for entity in [root, child, grandchild] {
-            assert_eq!(
-                *world.get::<Visibility>(entity).unwrap(),
-                Visibility::HIDDEN,
-                "子树实体 {entity:?} 应被隐藏"
-            );
-        }
-        // 子树外的实体不受影响
-        let outside = world.spawn((Transform::IDENTITY, Visibility::VISIBLE));
-        assert_eq!(
-            *world.get::<Visibility>(outside).unwrap(),
-            Visibility::VISIBLE
-        );
-    }
 
     /// 自动玩家 drive 的簿记语义：只在到点时推进游标，输入恒潜行。
     #[test]

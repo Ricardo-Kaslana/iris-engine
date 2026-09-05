@@ -88,7 +88,7 @@
 //! ```
 
 use iris_core::name::Name;
-use iris_core::physics::{Collider, ColliderShape, RigidBody};
+use iris_core::physics::{BodyType, Collider, ColliderShape, RigidBody};
 use iris_core::prelude::{Entity, Quat, Transform, Vec3, World};
 use iris_core::{Component, Resource};
 use iris_render::asset::{GltfError, HdrError, load_hdr, spawn_gltf_instance};
@@ -787,6 +787,7 @@ fn spawn_section(
                 gravity_scale: body.gravity_scale,
                 friction: body.friction,
                 linear_damping: body.linear_damping,
+                body_type: BodyType::Dynamic,
             },
         );
     }

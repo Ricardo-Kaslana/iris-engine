@@ -16,6 +16,7 @@ extern crate self as iris_core;
 
 pub mod broadphase;
 pub mod character;
+pub mod commands;
 pub mod component;
 pub mod entity;
 pub mod event;
@@ -43,6 +44,7 @@ pub mod prelude {
     pub use crate::character::{
         CharacterOutput, CharacterParams, move_and_slide, move_and_slide_statics,
     };
+    pub use crate::commands::{Command, CommandQueue, apply_commands};
     pub use crate::component::Component;
     pub use crate::entity::Entity;
     pub use crate::event::{AppExit, Event, Events};
@@ -52,8 +54,8 @@ pub mod prelude {
     pub use crate::name::Name;
     pub use crate::nav::{NavGrid, NavGridParams};
     pub use crate::physics::{
-        Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker, DistanceJoint,
-        PHYSICS_GRAVITY, RigidBody, TargetJoint, step_physics,
+        BodyType, Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker,
+        DistanceJoint, PHYSICS_GRAVITY, RigidBody, TargetJoint, effective_static, step_physics,
     };
     pub use crate::query::QueryPart;
     pub use crate::ragdoll::{

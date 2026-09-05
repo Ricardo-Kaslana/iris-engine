@@ -5,7 +5,8 @@
 //! 与 [`crate::physics::resolve_static_push`] 同款哲学：**查询而非系统**
 //! ——纯函数核心（[`move_and_slide_statics`]，静态体列表入参）可脱离
 //! 世界单测；世界封装 [`move_and_slide`] 只收集静态体（语义与
-//! `resolve_against_statics` 一致：`is_static` 或仅 Collider 无 RigidBody
+//! `resolve_against_statics` 一致：`is_static`、或仅 Collider 无 RigidBody、
+//! 或运动学体——见 `physics::BodyType::Kinematic`
 //! 的组件缺席语义），不积分、不写任何组件。调用方（游戏逻辑）保留输入
 //! 与状态所有权：每帧传入位置 / 速度，拿回结果自行写回。
 //!
@@ -314,10 +315,12 @@ pub fn move_and_slide_statics(
     }
 }
 
-/// 世界封装的角色控制器：收集世界中全部静态体（[`Collider::is_static`]
-/// 或仅 Collider 无 RigidBody 的组件缺席语义，与
-/// [`crate::physics::resolve_against_statics`] 一致）后调用纯函数核心
-/// [`move_and_slide_statics`]。纯查询：不写任何组件。
+/// 世界封装的角色控制器：收集世界中全部静态体（[`crate::physics::
+/// effective_static`] 口径——[`Collider::is_static`]、仅 Collider 无
+/// RigidBody 的组件缺席语义，或 `body_type == Kinematic` 的运动学体
+/// ——运动学体按静态障碍处理：游戏驱动位移的碰撞体挡住角色是合理
+/// 语义，与 [`crate::physics::resolve_against_statics`] 一致）后调用
+/// 纯函数核心 [`move_and_slide_statics`]。纯查询：不写任何组件。
 pub fn move_and_slide(
     world: &World,
     pos: Vec3,
@@ -327,7 +330,7 @@ pub fn move_and_slide(
 ) -> CharacterOutput {
     let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
-        if collider.is_static || rigid.is_none() {
+        if crate::physics::effective_static(collider, rigid) {
             statics.push((transform.position, collider.shape));
         }
     });
