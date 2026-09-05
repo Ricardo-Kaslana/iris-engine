@@ -1,0 +1,34 @@
+// 临时调试：自动玩家推进轨迹
+#[test]
+fn debug_autopilot_progress() {
+    use crate::logic::*;
+    let mut state = InfiltrationState::new();
+    let mut last_route = 0;
+    for frame in 0..60 * 180 {
+        let input = AutoPilot.drive(&mut state);
+        state.step(&input);
+        if state.autopilot_route != last_route {
+            println!(
+                "frame {frame} ({:.1}s): route -> {} pos ({:.1},{:.1}) detections {} door {}",
+                frame as f32 / 60.0,
+                state.autopilot_route,
+                state.pos.x,
+                state.pos.z,
+                state.detections,
+                state.door_open
+            );
+            last_route = state.autopilot_route;
+        }
+        if state.phase != Phase::Playing {
+            println!("终局 {:?} at frame {frame}", state.phase);
+            break;
+        }
+    }
+    println!(
+        "end: route {} pos ({:.1},{:.1}) cores {:?} detections {}",
+        state.autopilot_route, state.pos.x, state.pos.z, state.cores, state.detections
+    );
+    for g in &state.guards {
+        println!("guard pos ({:.1},{:.1}) state {:?} route_next {}", g.pos.x, g.pos.z, g.state, g.route_next);
+    }
+}

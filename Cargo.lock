@@ -1082,6 +1082,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-infiltration"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
+ "log",
+]
+
+[[package]]
 name = "iris-macros"
 version = "0.1.0"
 dependencies = [

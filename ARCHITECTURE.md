@@ -25,6 +25,7 @@ iris-engine（门面，用户唯一入口）────┘
     ↑
 iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
           └── iris-bastion（下游示范游戏 III）── iris-ascent（下游示范游戏 IV）
+                              └── iris-infiltration（下游示范游戏 V）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -87,6 +88,24 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   （19.5 s / 宝石 14/14 / 检查点 3/3 / 坠落 0）。第四轮撞到的摩擦
   （crossfade 缺通道定格 / GLB 手写 JSON / 子实体相机平滑范式 /
   move_and_slide 衔接参数域）见 §8.18。
+- **iris-infiltration**：与前三作同层的第五作（示范游戏 Iris
+  Infiltration，第三人称潜入）——同一依赖纪律（iris-engine 门面 +
+  glam），把 R34–R41 的新能力当载荷压榨：**NavGrid 寻路（R35）**（守卫
+  巡逻 / 追逐全走 `find_path`，压力门开 → 整图「便宜重建」）、**动画 v3
+  （R38）**（`BlendSpace` 参数 = 移动速度 0..1 的连续混合 + 每角色双腿链
+  两骨足部 IK，脚踝贴地 ±2 cm headless 断言）、**ragdoll（R37）**（背后
+  击晕 → 六球人形生成 + 立即释放，v1 不醒来）、**接触事件（R34）**（压力
+  板 sensor + 物理代理胶囊，begin/end 成对计数）、**RTT（R40）**（RT
+  相机俯瞰核心房 + `UiImageRtt` 画中画锚定 HUD 右上）、**UI 菜单栈
+  （R41）**（Esc push/pop + 焦点导航 + `UiClickEvent` 经 PostUpdate 信箱
+  消费 + `Settings` QUIT 落盘）、**距离关节（R36）**（弹簧门板被物理代理
+  真实推开、`DistanceJoint` 拉回关闭位）。设施 24×18 m 四室一走廊，走廊
+  刻意无守卫（3.6 m 直通区无掩体，迎面视锥无法走位避开——设计上交给
+  时机）。headless 经真实键盘注入全关通关（49.5 s / 核心 3/3 / 被发现
+  0，设计余量 ≤ 1）。第五轮撞到的摩擦（UiClickEvent 产出阶段 vs 事件
+  清空 / FootIk 与 AnimationPlayer 强耦合 / ragdoll 需要 &mut World /
+  节点 scale 污染 IK 链长 / 无隐藏子树原语 / 运动学角色无物理碰撞体）
+  见 §8.22。
 
 ## 3. ECS 设计（iris-core）
 
@@ -2118,6 +2137,47 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
     `insert_resource(Viewport::new(w, h))`）；按钮「底板 + 标签」是**两实体
     组装**（v1 单实体的 `UiRect` 因挂 `UiText` 只作定位载体、不绘制矩形，
     故按钮背景需独立实体，见模块头既有规则）。
+22. **dogfooding V 发现的引擎摩擦（iris-infiltration 实践反馈）**——第五轮
+    以第三人称潜入（24×18 m 设施、NavGrid 守卫、混合空间 + 足部 IK、
+    ragdoll、接触事件、RTT 监控屏、UI 菜单栈、距离关节弹簧门）整体压榨
+    R34–R41。本轮为**游戏轮，引擎零改动**，全部只绕行（纪律：摩擦留给
+    下一轮打磨闭合）；条目按「现象 → 绕行 → 建议修法」记录：
+    ① **`UiClickEvent` 产出阶段与事件清空冲突**：`update_ui_focus` 在
+    **PostUpdate** 发事件，主循环在 PostUpdate 之后统一
+    `clear_all_events`——Update 系统永远读不到按钮点击（连 `AppExit` 也
+    只有 Update 阶段发出的能被帧尾退出检查读到，PostUpdate 发的会被
+    清空）。**绕行**：游戏侧在 PostUpdate 尾部加独占系统（注册晚于
+    `UiPlugin` 焦点系统，同帧即消费）把事件转写成 `MenuCommand` 信箱
+    资源，Update 下一帧消费。**建议**：焦点系统改写命令资源 / 回调，
+    或让 PostUpdate 产出的事件存活到下一帧 Update；② **FootIk 与
+    `AnimationPlayer` 强耦合**：`update_foot_ik` 查询
+    `(&AnimationPlayer, &FootIk)`——纯 IK 装配（无剪辑的腿链 rig）也
+    必须挂一个**零剪辑** `AnimationPlayer` 才能被系统命中（语义无害但
+    费解，`update_animations` 对空剪辑世界空转一次查询）。**绕行**：
+    每条腿挂零剪辑播放器。**建议**：FootIk 改查自己的 rig 组件（节点
+    映射自带），或文档明示「空播放器 = 纯 IK rig」惯例；③ **ragdoll
+    生成需要 `&mut World`**：实体分配是结构性修改，游戏并行系统
+    （`&World`）无法在事件帧 spawn——v1 缺命令队列。**绕行**：游戏
+    Update 插独占系统（屏障语义天然隔离批次）读逻辑事件后
+    `spawn_ragdoll_kinematic` + `release_ragdoll`。**建议**：引擎提供
+    帧末 flush 的命令队列（`Commands::spawn` 类 API），保留并行系统的
+    吞吐；④ **节点 `Transform.scale` 污染 IK 链长**：`chain_world` 沿
+    父链累乘局部矩阵——若用节点 scale 缩放关节网格（常见捷径），scale
+    进入链矩阵、骨长按比例缩水（本作实测腿长缩到一半、IK 落地查询
+    全错），且无任何告警。**绕行**：关节节点 scale 恒 1，网格尺寸放在
+    独立子网格实体。**建议**：foot_ik 模块文档写明「链上节点禁止
+    非均匀 scale」契约，`debug_assert` 骨长帧间突变告警；⑤ **无
+    「隐藏子树」原语**：击晕后要藏整个角色（GLB 模型 + 双腿链 +
+    网格子孙），`Visibility` 是逐实体的——游戏侧只能沿 `Children`
+    递归 set `HIDDEN`。**绕行**：`hide_subtree` 10 行递归。**建议**：
+    `visibility` 模块提供 `set_subtree_hidden(world, root)`；⑥ **运动学
+    角色无物理碰撞体**：`move_and_slide` 角色只认调用方静态体列表，
+    不参与 `step_physics` 的接触事件与推挤——要踩 sensor 压力板
+    （R34）、要推开 `DistanceJoint` 弹簧门（R36），必须额外 spawn 一个
+    动态胶囊「物理代理」逐帧同步逻辑位置 / 速度（漂移 ≤ 1 帧位移即被
+    覆写，对逻辑零影响，但概念上是重复体）。**绕行**：代理同步实体
+    （`PROXY_NAME`）。**建议**：`RigidBody` 增加 kinematic 体类型
+    （位置由调用方驱动、参与检测与推挤、不参与动力学积分）。
 
 ## 9. 关键设计取舍记录
 

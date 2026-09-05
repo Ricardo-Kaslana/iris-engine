@@ -5,6 +5,44 @@
 
 ## [Unreleased]
 
+### Added（游戏五：Iris Infiltration 第三人称潜入——dogfooding V，R34–R41 全量压榨）
+
+新 crate `iris-infiltration`（第 42 轮迭代，游戏轮：**引擎零改动**，八个
+新能力当载荷逐一压榨；语义规范 = `crates/iris-infiltration/src/logic.rs` /
+`plugin.rs` 模块文档，crate 图与游戏清单见 README「用 Iris 做的游戏 V」与
+ARCHITECTURE §2，摩擦清单见 §8.22，视觉验收
+`examples/infiltration_snapshot.rs` → `docs/infiltration.png`）：
+
+- **玩法**：俯视偏斜 45° 第三人称的 24×18 m 单层设施潜入——绕过 2 名
+  巡逻守卫取 3 个数据核心、抵达出口获胜；被发现 3 次告负。Shift 潜行
+  （视锥发现半径减半）、E 背后击晕、Esc 暂停菜单。纯逻辑核心（`logic`）
+  零渲染依赖、逐位确定性；结构照抄 iris-ascent（logic + plugin +
+  headless 自动玩家 + 快照 example）。
+- **八能力接入**：① R35 NavGrid——守卫巡逻 / 追逐全走 `find_path`，
+  压力门开 → 整图「便宜重建」（守卫可穿门追逐）；② R38 动画 v3——
+  双剪辑 `BlendSpace`（参数 = 移动速度 0..1）连续混合 + 每角色双腿链
+  两骨足部 IK（脚踝贴地 ±2 cm headless 断言）；③ R37 ragdoll——击晕
+  → `spawn_ragdoll_kinematic` + `release_ragdoll` 瘫倒（v1 不醒来）；
+  ④ R34 接触事件——压力板 sensor + 物理代理胶囊，begin/end 成对计数、
+  踩上开门（单向闩锁）；⑤ R40 RTT——RT 相机俯瞰核心房 + `UiImageRtt`
+  画中画（`UiAnchor` 锚定右上，改视口不漂移）；⑥ R41 UI 菜单栈——
+  Esc push/pop + 焦点导航 + `UiClickEvent` 经 PostUpdate 信箱消费 +
+  `Settings` QUIT 落盘；⑦ R36 距离关节——弹簧门板被物理代理真实推开、
+  `DistanceJoint` 拉回关闭位（纯展示语义）；⑧ R25 空间音频——事件
+  定位声源（警报 / 拾取 / 击晕 / 门）、听者跟随主相机。
+- **验证**：headless 真实键盘注入自动玩家全关通关（49.5 s / 核心 3/3 /
+  被发现 0，设计余量 ≤ 1）；纯核心 12 项单测（视锥三要素 / 警觉累积
+  衰减 / 巡逻绕墙不进墙 / 压力板双路径 / 击晕背面限定 / 逐位确定性等）+
+  插件 / headless 集成 10 项（接触事件端到端 / 弹簧门推回 / ragdoll
+  六肢体翻转 / 菜单栈焦点点击 / 混合参数 + 踝贴地 / 双 Harness 逐位）。
+  测试总数 590 → **614**（debug）/ 589 → **613**（release）。
+- **摩擦清单（一级交付物，§8.22）**：UiClickEvent 产出阶段 vs 帧尾事件
+  清空（Update 永远读不到）／FootIk 与 AnimationPlayer 强耦合（纯 IK rig
+  被迫挂零剪辑播放器）／ragdoll 生成需要 `&mut World`（缺命令队列）／
+  节点 scale 污染 IK 链长（无告警）／无隐藏子树原语／运动学角色无物理
+  碰撞体（代理同步绕行）——六条均「现象 → 绕行 → 建议修法」，本轮
+  引擎零改动全部只绕行。
+
 ### Added（R41：UI 与菜单框架——锚定布局 + 按钮焦点导航 + 菜单栈 + 设置持久化）
 
 UI 与菜单框架落地（第 41 轮迭代，A 级清单收官；语义规范 =

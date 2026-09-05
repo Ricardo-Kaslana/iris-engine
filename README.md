@@ -216,7 +216,8 @@ iris-engine/
 │   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
 │   ├── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
 │   ├── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
-│   └── iris-ascent/     # 引擎下游示范游戏 IV：3D 平台跳跃 Iris Ascent（同上）
+│   ├── iris-ascent/     # 引擎下游示范游戏 IV：3D 平台跳跃 Iris Ascent（同上）
+│   └── iris-infiltration/ # 引擎下游示范游戏 V：第三人称潜入 Iris Infiltration（同上）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -594,10 +595,86 @@ cargo run -p iris-ascent --release                  # 玩游戏（WASD 移动 / 
 cargo run -p iris-ascent --example ascent_snapshot --release   # 中段战局离屏验收帧
 ```
 
+### V. Iris Infiltration（`crates/iris-infiltration`）——第三人称潜入
+
+**Dogfooding V**——俯视偏斜 45° 第三人称的 24×18 m 单层设施潜入：玩家从
+走廊西端潜入，绕过两名巡逻守卫取 3 个数据核心，抵达出口获胜；被发现 3 次
+告负。Shift 潜行（守卫视锥发现半径减半）、E 从背后 2.2 m 内击晕守卫、
+Esc 暂停菜单。全部机制集中在纯逻辑核心 `logic.rs`。
+
+本作把 R34–R41 的新能力当载荷压榨：**NavGrid 寻路（R35）**——守卫巡逻 /
+追逐全部走 `NavGrid::find_path` 航点（硬编码的只有「路线环目标点」，逐段
+走位交给导航图），压力门被踩开后按引擎文档推荐的「便宜重建」姿势整图重建；
+**动画 v3（R38）**——玩家与守卫共用双剪辑**混合空间**（`BlendSpace` 参数 =
+移动速度 0..1，idle ↔ walk 连续混合，潜行半速时参数停在 ~0.48 的中间
+姿势）+ **两骨足部 IK**（每角色双腿链 hip→knee→foot，脚踝贴地 ±2 cm，
+headless 断言量化）；**ragdoll（R37）**——背后击晕 → `spawn_ragdoll_
+kinematic` + `release_ragdoll` 六球人形瘫倒（v1 击晕不醒来，诚实限制）；
+**接触事件（R34）**——压力板 sensor + 物理代理胶囊，`ContactStarted/Ended`
+begin/end 成对计数（踩上开门为单向闩锁）；**RTT（R40）**——固定 RT 相机
+俯瞰核心房，`UiImageRtt` 画中画贴 HUD 右上（R41 `UiAnchor` 锚定，改视口
+不漂移）；**UI 菜单栈（R41）**——Esc push/pop `UiMenuStack`、按钮焦点
+导航（↓ + Enter）、`UiClickEvent` 消费（RESUME/QUIT）、`Settings` 加载 /
+QUIT 落盘；**距离关节（R36）**——NW 门洞的「弹簧门」动态面板被玩家物理
+代理真实推开、`DistanceJoint` 拉回关闭位（纯展示语义，不在逻辑静态体）。
+
+**脚本化自动玩家**（恒潜行 + 预设路线点 + 视线避让：被巡逻守卫看见就朝
+反方向撤退、守卫背身窗口出现即恢复推进——「潜行跟随」行为涌现）：
+headless 集成测试经**真实键盘注入**全关通关——**用时 49.5 s、核心 3/3、
+被发现 0（设计余量 ≤ 1）、压力门已开**；纯核心单测另有逐位确定性（两次
+模拟 to_bits 逐帧比对）、守卫巡逻绕墙断言（任意帧不进墙 0.3 m 域）、
+视锥三要素（距离 / 夹角 / 遮挡）与警觉累积衰减的精确断言。
+
+![潜入中段验收](docs/infiltration.png)
+
+实测（`docs/infiltration.png`，640×360 离屏单帧）：自动玩家真实推进到
+「核心 A 已到手、正穿走廊奔压力板」的中段定格——玩家（teal 机器人）
+潜行中、守卫在身后 NW 室巡逻、右上角监控屏画中画（RT 相机俯瞰核心房：
+金色核心 C 与红色压力门清晰可辨）、HUD（CORES 1/3 / SPOTTED 0/3 /
+ALERT 0% / CAM-02 标签）完整；该帧 FrameStats：`draw_calls = 15` /
+`instances = 29` / `culled_instances = 14`（外墙背面视锥剔除）/
+`triangles = 348`。
+
+本轮 R42（游戏五）的**摩擦清单**（现象 → 绕行 → 建议修法，全文见
+ARCHITECTURE.md §8.22；本轮为游戏轮，全部只绕行不改引擎）：
+
+1. **`UiClickEvent` 在 PostUpdate 产出、帧尾 `clear_all_events` 清空——
+   Update 系统永远读不到**（焦点系统发事件在 PostUpdate，主循环事件清空
+   在 PostUpdate 之后；连 `AppExit` 也只有 Update 阶段发出的能被帧尾退出
+   检查读到）→ 绕行：游戏侧 PostUpdate 尾部独占系统（注册晚于 `UiPlugin`
+   焦点系统）把事件转写成 `MenuCommand` 信箱资源，Update 消费 → **建议**：
+   焦点系统改发「命令资源 / 回调」或事件清空移到窗口事件之后；
+2. **`update_foot_ik` 与 `AnimationPlayer` 强耦合**——纯 IK 装配（无剪辑
+   的腿链）也必须挂一个空 `AnimationPlayer` 才能被系统查询到 → 绕行：
+   挂零剪辑播放器（语义无害但费解）→ **建议**：FootIk 独立查询或
+   `IkRig` 组件；
+3. **ragdoll 生成需要 `&mut World`**——实体分配是结构性修改，并行系统
+   （`&World`）无法 spawn → 绕行：游戏 Update 里插独占系统做生成（屏障
+   语义天然隔离）→ **建议**：命令队列（`World::spawn_batch` 类 API）；
+4. **节点 scale 会污染 IK 链长**——用节点 `Transform.scale` 缩放关节网格
+   时，scale 被 `chain_world` 的链矩阵继承，骨长随之缩水（腿直接缩短到
+   一半），IK 落地查询跟着错 → 绕行：关节节点 scale 恒 1，网格尺寸放在
+   独立子网格实体上 → **建议**：foot_ik 模块文档加「链上禁止非均匀
+   scale」契约（或文档 + debug_assert 骨长突变告警）；
+5. **「隐藏子树」无引擎原语**——击晕后要藏整个角色（模型 + 双腿链 +
+   网格），只能游戏侧沿 `Children` 递归 `Visibility::HIDDEN` → 绕行：
+   `hide_subtree` 10 行递归 → **建议**：`visibility` 模块提供
+   `set_subtree_hidden`；
+6. **运动学角色没有「物理碰撞体」概念**——逻辑角色（`move_and_slide`）
+   要参与 R34 接触事件 / 推开 R36 动态门，必须额外 spawn 一个动态胶囊
+   「物理代理」并逐帧同步位置 / 速度（漂移 ≤ 1 帧即被覆写）→ 绕行：
+   代理同步（本作 `PROXY_NAME` 实体）→ **建议**：RigidBody 增加
+   kinematic 模式（位置由调用方驱动、参与检测与推挤、不被动力学积分）。
+
+```sh
+cargo run -p iris-infiltration --release                  # 玩游戏（WASD 移动 / Shift 潜行 / E 击晕 / Esc 菜单）
+cargo run -p iris-infiltration --example infiltration_snapshot --release   # 中段战局离屏验收帧
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 590 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 614 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
