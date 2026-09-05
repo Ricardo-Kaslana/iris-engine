@@ -30,9 +30,9 @@ use iris_core::prelude::{Entity as CoreEntity, Stage};
 use iris_engine::prelude::{
     AnimationPlayer, AnimationPlugin, App, Audio, BodyType, Camera, Collider, CommandsPlugin,
     DirectionalLight, DistanceJoint, EnvironmentSettings, FootIk, GlobalTransform, HierarchyPlugin,
-    Input, KeyCode, MeshStore, Name, OffscreenRenderer, PhysicsPlugin, Plugin, RenderTargetStore,
-    RendersTo, RigidBody, Time, Transform, UiButton, UiImageRtt, UiMenuStack, UiPlugin, UiText,
-    Visibility,
+    Input, KeyCode, MaterialHandle, MeshHandle, MeshStore, Name, OffscreenRenderer, PhysicsPlugin,
+    Plugin, RenderTargetStore, RendersTo, RigidBody, Time, Transform, UiButton, UiImageRtt,
+    UiMenuStack, UiPlugin, UiText, Visibility,
 };
 use iris_infiltration::{
     CORES, CORES_TEXT_NAME, GuardState, InfiltrationEntities, InfiltrationPlugin,
@@ -434,6 +434,28 @@ fn stun_spawns_ragdoll_and_hides_guard_model() {
         });
     assert_eq!(limb_count, 6, "应生成六球人形 ragdoll，实际 {limb_count}");
     assert_eq!(dynamic_limbs, 6, "release_ragdoll 后全部肢体应为动体");
+    // 肢体渲染表现（击晕不消失）：ragdoll 只给物理原语，球体网格 +
+    // 材质 + 可见由插件层补挂——否则守卫模型子树隐藏后肢体凭空消失
+    let mut visual_limbs = 0usize;
+    harness
+        .app
+        .world
+        .query::<(&Collider, &MeshHandle, &MaterialHandle, &Visibility)>(
+            |(collider, _mesh, _material, visibility)| {
+                if collider.groups == 1 && collider.mask == !1u32 {
+                    visual_limbs += 1;
+                    assert_eq!(
+                        *visibility,
+                        Visibility::VISIBLE,
+                        "瘫倒肢体应可见（渲染表现由插件层挂载）"
+                    );
+                }
+            },
+        );
+    assert_eq!(
+        visual_limbs, 6,
+        "六肢体都应挂球体网格与材质且可见，实际 {visual_limbs}"
+    );
     // 守卫模型子树隐藏
     let ents = harness.entities();
     assert_eq!(
@@ -684,6 +706,59 @@ fn blendspace_param_follows_speed_and_ik_keeps_feet_grounded() {
         ankles_checked >= 4,
         "应检查玩家 + 守卫共 4 只脚踝，实际 {ankles_checked}"
     );
+}
+
+/// 打磨修复（过门腿部变形）端到端：压力门打开后玩家常速穿过门洞——
+/// 门盒已随开门「标记失效」（组位/掩码清零），不再被足部 IK 落地查询
+/// 当作地面（失效前：穿门瞬间射线起点落入门盒，t=0 异常采样把踝逐帧
+/// 上拉直至飞出盒顶，随后全腿拉伸指向异常目标 = 腿部网格拉成大平面）。
+/// 过门全程双脚踝贴地 ±5 cm。
+#[test]
+fn player_crosses_pressure_door_without_foot_deformation() {
+    let mut harness = Harness::new();
+    harness.frames(2);
+    // 踩压力板开门（真实接触事件路径）
+    {
+        let mut state = harness.app.world.resource_mut::<InfiltrationState>();
+        state.pos = Vec3::new(PLATE_POS.x, 0.9, PLATE_POS.y);
+        state.vel = Vec3::ZERO;
+    }
+    harness.frame();
+    harness.frame();
+    assert!(harness.state().door_open, "踩板应开门");
+    // 玩家置于压力门走廊口，北行（常速）穿门
+    {
+        let mut state = harness.app.world.resource_mut::<InfiltrationState>();
+        state.pos = Vec3::new(7.0, 0.9, 0.0);
+        state.vel = Vec3::ZERO;
+    }
+    harness.hold_keys(true, &[KeyCode::KeyW]);
+    let mut crossed = false;
+    for _ in 0..120 {
+        harness.frame();
+        if harness.state().pos.z < -4.0 {
+            crossed = true;
+            break;
+        }
+        // 过门全程：玩家双脚踝贴地 ±5 cm（初始插地 5 cm 由首帧 IK 拉回；
+        // 门盒若仍被命中，踝会被逐帧上拉远超此域）
+        iris_core::hierarchy::propagate_transforms(&mut harness.app.world);
+        harness
+            .app
+            .world
+            .query::<(&Name, &GlobalTransform)>(|(name, global)| {
+                if name.0.starts_with("infiltration/player-leg") && name.0.ends_with("/foot") {
+                    let y = global.position().y;
+                    assert!(
+                        y.abs() <= 0.05,
+                        "过门时脚踝 {} 应贴地 ±5 cm，实际 y = {y}",
+                        name.0
+                    );
+                }
+            });
+    }
+    harness.hold_keys(false, &[KeyCode::KeyW]);
+    assert!(crossed, "开门后应能穿过压力门门洞");
 }
 
 /// 确定性（逐位）：两套独立 Harness 同输入推进 10 秒，全部状态摘要

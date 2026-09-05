@@ -19,7 +19,8 @@
 //! - **UI 菜单栈（R41）**：Esc 暂停菜单（`UiMenuStack` push/pop + 焦点
 //!   导航 + `UiClickEvent` 消费）+ 主 HUD；
 //! - **距离关节（R36）**：设施门洞里的「弹簧门」——`DistanceJoint` 把
-//!   门板拉回关闭位（玩家物理代理推开自动回弹，纯展示语义）。
+//!   门板拉回关闭位（玩家运动学胶囊真实推开自动回弹；青色微发光配色
+//!   区别于墙，「可推开」的视觉提示）。
 //!
 //! 结构（iris-game / iris-arena / iris-bastion / iris-ascent 同款分层）：
 //! - [`logic`]：纯逻辑状态机（关卡写死、事件自带世界坐标、逐位确定性；
@@ -56,7 +57,7 @@ pub use logic::{
     CORE_RADIUS, CORES, DOOR, EXIT_CENTER, EXIT_HALF, FOV_COS, GUARD_ROUTES, Guard, GuardState,
     HALF_HEIGHT, InfiltrationEvent, InfiltrationInput, InfiltrationState, MAX_DETECTIONS,
     MOVE_SPEED, NAV_AGENT_RADIUS, NAV_BOUNDS_MAX, NAV_BOUNDS_MIN, NAV_CELL_SIZE, PATROL_SPEED,
-    PLATE_POS, Phase, REPATH_INTERVAL, SNEAK_SPEED, SNEAK_VIEW_DISTANCE, SPAWN_FOOT,
+    PLATE_POS, PLATE_RADIUS, Phase, REPATH_INTERVAL, SNEAK_SPEED, SNEAK_VIEW_DISTANCE, SPAWN_FOOT,
     STUN_BEHIND_COS, STUN_RADIUS, VIEW_DISTANCE, WALLS, Wall, run_until,
 };
 pub use plugin::{

@@ -22,12 +22,26 @@
 //! 视为腾空，不修正）。命中点即脚踝目标：竖直射线 ⇒ 命中点 = 脚踝正下方
 //! 的地面点，脚踝低于地面（插地）时目标在上方 → 上拉，悬空时 → 下探。
 //!
+//! # 不可达回退（为何要放弃而非钳制）
+//!
+//! 解算前检查目标可达性：目标距髋超出 `( |upper − lower|, upper + lower )`
+//! 可达域时**本帧放弃该腿的修正**（不写任何变换）。原因：两骨链的全腿长
+//! 就是角色腿长，落地目标竟超出腿长（或近到双腿无法展开），唯一解释是
+//! 射线采样到了**非地面几何**——过门、贴墙瞬间命中门框 / 墙顶，或起点
+//! 落入几何内部（t = 0 异常采样）；此时钳制解算（拉伸至全长 / 钳到最小
+//! 距离）会把腿部网格猛地指向异常目标，出现「腿拉成平面」式变形。放弃
+//! 一帧修正是视觉上最小的错误（保持动画姿势），`max_ground_drop` 的正常
+//! 下探容差语义不受影响。同类口径：**sensor**（事件域不是地面）与
+//! **碰撞组 / 掩码清零**（标记失效的碰撞体，如游戏侧的开门标记）都不
+//! 参与落地查询。
+//!
 //! # 解算与回写（完整两骨旋转解）
 //!
 //! 1. **世界系两骨解**（[`solve_two_bone_ik`]，纯函数）：骨长取**当前世界
 //!    姿势的实际距离**（保留装配比例），余弦定理解膝角、pole 投影定弯曲
 //!    方向，返回 `(ankle, knee)` 世界位——不可达拉伸至全长、过近钳制到
-//!    最小距离（双腿长差）。
+//!    最小距离（双腿长差）；调用前系统先做**不可达回退门**（见上文「
+//!    不可达回退」），可达域外的目标根本不进入解算。
 //! 2. **旋转回写**：髋骨 / 膝骨的世界方向从 `hip→knee / knee→ankle` 的
 //!    旧方向旋到新方向（`Quat::from_rotation_arc` 最小旋转弧），再除以
 //!    各自父级旋转反推**局部旋转**；foot 局部旋转不动、按膝关节新世界
@@ -242,7 +256,9 @@ impl FootIk {
 
 /// 静态体射线（私有封装）：沿 `origin → origin + dir × max_t` 找
 /// 最近命中的静态体（`statics` 由 [`update_foot_ik`] 每帧一次收集，
-/// 语义为**真静态体**：`is_static` 或仅 Collider 无 RigidBody）——动态体
+/// 语义为**真静态体**：`is_static` 或仅 Collider 无 RigidBody，且**不是
+/// sensor、碰撞组/掩码未清零**——sensor 是事件域、清零是标记失效，
+/// 两者都不是可站立的地面）——动态体
 /// 与**运动学体**（`BodyType::Kinematic`）都不参与 IK 落地：前者会抖动
 /// 喂进关节链（见模块文档「落地查询」），后者常与自身链的角色碰撞体
 /// 重叠——命中自身会把落地查询毁掉（打磨 V 的刻意口径差异，与
@@ -301,10 +317,14 @@ fn chain_world(world: &World, entity: Entity) -> Option<(Mat4, Quat)> {
 /// 共享借用，`FootIk` 的监测状态写回延后到阶段二）。
 pub fn update_foot_ik(world: &World) {
     // 静态体一次收集（**真静态体**：运动学体不参与 IK 落地——常与自身
-    // 链的角色碰撞体重叠，见 raycast_statics 文档）
+    // 链的角色碰撞体重叠，见 raycast_statics 文档；sensor 是事件域、
+    // 碰撞组/掩码清零是标记失效，两者同样不是地面）
     let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
         if collider.is_static || rigid.is_none() {
+            if collider.is_sensor || collider.groups == 0 || collider.mask == 0 {
+                return;
+            }
             statics.push((transform.position, collider.shape));
         }
     });
@@ -385,6 +405,16 @@ pub fn update_foot_ik(world: &World) {
         ) else {
             return;
         };
+        // 不可达回退门：踝目标距髋超出 (|upper − lower|, upper + lower)
+        // 可达域时**本帧放弃该腿的 IK 修正**（保持动画/当前姿势，不写任何
+        // 变换）——不可达或过近说明射线采样到了非地面几何（过门、贴墙
+        // 瞬间的门框 / 墙顶命中，或起点入体的异常采样），把踝拉到位必然
+        // 错：拉伸至全长会把腿部网格指向异常目标。`max_ground_drop` 的
+        // 正常下探容差语义不变（容差内的地面照常修正）。
+        let target_dist = (hit.point - hip).length();
+        if target_dist > upper + lower || target_dist < (upper - lower).abs() {
+            return;
+        }
         // 平地门：高差低于容差不写任何变换（bit 级不动）
         if (hit.point.y - foot.y).abs() <= GROUND_EPSILON {
             return;
@@ -678,30 +708,89 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_ground_stretches_leg() {
+    fn unreachable_ground_leaves_pose_untouched() {
         // 地面在脚踝下 0.4（探地范围内），但髋到目标 1.4 > 全腿长 1.0：
-        // 全腿伸直朝向目标，踝停在髋下 1.0 处（不再下探）
+        // 不可达域 = 射线采样到非地面几何的信号 → 本帧放弃修正、姿势
+        // bit 级不动（不再拉伸至全长——那会把腿拉向门框 / 墙顶式异常
+        // 目标，产生「腿拉成平面」的变形）
         let (mut world, _root, hip, knee, foot) = rig(Vec3::new(0.0, 0.6, 0.0));
         platform(&mut world, -0.8);
+        let joints = vec![hip, knee, foot];
+        let before = joint_bits(&world, &joints);
         update_foot_ik(&world);
-        propagate_transforms(&mut world);
-        let hip_pos = world.get::<GlobalTransform>(hip).unwrap().position();
-        let ankle = world.get::<GlobalTransform>(foot).unwrap().position();
-        let knee_pos = world.get::<GlobalTransform>(knee).unwrap().position();
-        assert!(
-            ((ankle - hip_pos).length() - 1.0).abs() < 1e-4,
-            "不可达应全腿伸直：长 {}",
-            (ankle - hip_pos).length()
+        assert_eq!(
+            joint_bits(&world, &joints),
+            before,
+            "不可达目标（> 全腿长）应放弃本帧修正：姿势 bit 级不动"
         );
-        assert!(
-            (ankle.y - (hip_pos.y - 1.0)).abs() < 1e-4,
-            "踝应朝地面拉伸到全长（y ≈ 髋 − 1.0），实际 {}",
-            ankle.y
+    }
+
+    #[test]
+    fn too_close_target_leaves_pose_untouched() {
+        // 胫骨短的链（upper 0.7 / lower 0.2 → 过近域 < |0.7 − 0.2| = 0.5）：
+        // 平台顶 y = 0.55，髋(1.0)到目标 0.45 落入过近域 → 本帧放弃修正
+        // （纯函数本身会钳到最小距离，系统门在解算之前拦截）
+        let mut world = World::new();
+        let root = world.spawn((Transform::from_xyz(0.0, 1.0, 0.0),));
+        let hip = world.spawn((Transform::IDENTITY,));
+        let knee = world.spawn((Transform::from_xyz(0.0, -0.7, 0.0),));
+        let foot = world.spawn((Transform::from_xyz(0.0, -0.2, 0.0),));
+        world.add_child(root, hip);
+        world.add_child(hip, knee);
+        world.add_child(knee, foot);
+        let (rig, ik) = FootIk::from_rig(hip, knee, foot);
+        world.insert(root, rig);
+        world.insert(root, ik);
+        // 平台顶 y = 0.55：踝(0.1)上抬 0.5 → 射线起点 0.6 可命中顶面
+        world.spawn((
+            Transform::from_xyz(0.0, -0.45, 0.0),
+            Collider::static_box(Vec3::new(50.0, 1.0, 50.0)),
+        ));
+        let joints = vec![hip, knee, foot];
+        let before = joint_bits(&world, &joints);
+        update_foot_ik(&world);
+        assert_eq!(
+            joint_bits(&world, &joints),
+            before,
+            "过近域目标（< |upper − lower|）应放弃本帧修正：姿势 bit 级不动"
         );
-        assert!(
-            (knee_pos.y - (hip_pos.y - 0.5)).abs() < 1e-4,
-            "直腿膝应落在链上，实际 {}",
-            knee_pos.y
+    }
+
+    #[test]
+    fn sensor_volume_is_not_ground() {
+        // 脚正下方的 sensor 盒（事件域，顶面恰在射线起点处）不参与
+        // IK 落地——若被当作地面，t=0 命中会把踝上拉到起点高度
+        let (mut world, _root, hip, knee, foot) = rig(Vec3::new(0.0, 1.0, 0.0));
+        world.spawn((
+            Transform::from_xyz(0.0, 0.25, 0.0),
+            Collider::sensor_box(Vec3::new(1.0, 0.25, 1.0)),
+        ));
+        let joints = vec![hip, knee, foot];
+        let before = joint_bits(&world, &joints);
+        update_foot_ik(&world);
+        assert_eq!(
+            joint_bits(&world, &joints),
+            before,
+            "sensor 事件域不应作为 IK 落地面：姿势 bit 级不动"
+        );
+    }
+
+    #[test]
+    fn disabled_collider_is_not_ground() {
+        // 碰撞组清零（标记失效，如游戏侧的开门标记：组位/掩码 = 0 →
+        // 配对恒假）的静态体不参与 IK 落地——射线起点在其体内也不命中
+        let (mut world, _root, hip, knee, foot) = rig(Vec3::new(0.0, 1.0, 0.0));
+        let mut disabled = Collider::static_box(Vec3::new(1.0, 1.25, 0.2));
+        disabled.groups = 0;
+        disabled.mask = 0;
+        world.spawn((Transform::from_xyz(0.0, 1.25, 0.0), disabled));
+        let joints = vec![hip, knee, foot];
+        let before = joint_bits(&world, &joints);
+        update_foot_ik(&world);
+        assert_eq!(
+            joint_bits(&world, &joints),
+            before,
+            "碰撞组清零（标记失效）的静态体不应作为 IK 落地面"
         );
     }
 

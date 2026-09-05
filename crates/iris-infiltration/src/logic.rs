@@ -216,8 +216,10 @@ pub const DOOR: Wall = Wall {
 /// [`PLATE_RADIUS`]；实体侧是 sensor 盒（R34 接触事件），插件层两条
 /// 路径调用同一入口 [`InfiltrationState::press_plate`]（幂等）。
 pub const PLATE_POS: Vec2 = Vec2::new(2.0, 0.5);
-/// 压力板踩上判定半径（米）：与实体侧 sensor 盒半宽 0.9 同源同值。
-pub const PLATE_RADIUS: f32 = 0.9;
+/// 压力板踩上判定半径（米）：语义 = **玩家中心进入板投影内**（板面
+/// 0.9×0.9 m 的半宽 0.45，站上板面才触发，靠近不触发）；与插件层的
+/// sensor 盒半宽、视觉板 `scale = 0.9` 三方同源同值。
+pub const PLATE_RADIUS: f32 = 0.45;
 
 /// 三个数据核心（XZ 坐标，y = 拾取高度）：NW（门洞直达）、NE（压力门
 /// 之后——必经压力板）、SE（南排东室）。

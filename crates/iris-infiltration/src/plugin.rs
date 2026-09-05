@@ -49,8 +49,12 @@
 //!
 //! `GuardStunned` 事件 → 在守卫脚底生成六球人形 ragdoll 并立即释放
 //! （受击方向 = 守卫面朝方向，轻踢倒地）；守卫模型子树整体
-//! `Visibility::HIDDEN`。**v1 击晕后不醒来**——没有苏醒计时与重定向
-//! 逻辑，尸体永久留在原地（ragdoll 不回收）。
+//! `Visibility::HIDDEN`。ragdoll 只提供物理原语（引擎侧刻意不含渲染），
+//! 肢体的**渲染表现是游戏侧的选择**：生成后逐肢体挂球体网格（半径 =
+//! 肢体定义半径）+ 守卫配色材质 + `Visibility::VISIBLE`——否则模型
+//! 隐藏后瘫倒肢体不可见（「击晕即凭空消失」的体验缺陷）。
+//! **v1 击晕后不醒来**——没有苏醒计时与重定向逻辑，尸体永久留在原地
+//! （ragdoll 不回收）。
 //!
 //! 本插件只使用引擎公开 API（dogfooding）：不依赖引擎内部路径。
 //! 打磨 V 闭合记录：①`UiClickEvent` 生命周期（MenuCommand 信箱已删）、
@@ -73,7 +77,7 @@ use iris_engine::prelude::*;
 
 use crate::logic::{
     CORES, DOOR, HALF_HEIGHT, InfiltrationEvent, InfiltrationInput, InfiltrationState, MOVE_SPEED,
-    PLATE_POS, Phase, WALLS,
+    PLATE_POS, PLATE_RADIUS, Phase, WALLS,
 };
 
 // ---------------------------------------------------------------------------
@@ -736,21 +740,34 @@ fn build_machinery(world: &mut World) -> (Entity, Entity, Entity) {
         ..MaterialDef::default()
     });
     let door_mat = stores.add(MaterialDef::solid(0.45, 0.25, 0.2, 1.0));
-    let panel_mat = stores.add(MaterialDef::solid(0.3, 0.4, 0.45, 1.0));
+    // 弹簧门板配色刻意区别于墙体（墙 0.3,0.32,0.38）：青色 + 微发光
+    // ——「这块方块能推开」的视觉提示（弹簧门是设计语义：动态盒 +
+    // 关节回拉，玩家可推开穿过，松手回弹关门）
+    let panel_mat = stores.add(MaterialDef {
+        base_color: [0.2, 0.55, 0.6, 1.0],
+        emissive: [0.1, 0.45, 0.5, 1.0],
+        metallic: 0.4,
+        roughness: 0.35,
+        ..MaterialDef::default()
+    });
     drop(stores);
     // 压力板：实体 = sensor 载体（中心 y 0.25、半高 0.25，检测域
-    // y 0..0.5 覆盖脚部；不阻挡不反弹，只报接触事件）；视觉薄板挂子实体
+    // y 0..0.5 覆盖脚部；不阻挡不反弹，只报接触事件）；视觉薄板挂子实体。
+    // sensor 半宽 = 板面半宽 [`PLATE_RADIUS`]（0.45）——「站上板面才
+    // 触发」：sensor 只在玩家胶囊接触到板面投影时出事件（胶囊半径使其
+    // 比纯逻辑的中心距离判定早 ~0.4 m 报 begin，两条路径调用同一幂等
+    // 入口，门是单向闩锁，语义无碍）
     let plate = world.spawn((
         Name("infiltration/plate".into()),
         Transform::from_xyz(PLATE_POS.x, 0.25, PLATE_POS.y),
-        Collider::sensor_box(Vec3::new(0.9, 0.25, 0.9)),
+        Collider::sensor_box(Vec3::new(PLATE_RADIUS, 0.25, PLATE_RADIUS)),
         Visibility::VISIBLE,
     ));
     let plate_visual = world.spawn((
         Name("infiltration/plate-visual".into()),
         Transform {
             position: Vec3::new(PLATE_POS.x, 0.05, PLATE_POS.y),
-            scale: Vec3::new(1.8, 0.1, 1.8),
+            scale: Vec3::new(PLATE_RADIUS * 2.0, 0.1, PLATE_RADIUS * 2.0),
             ..Transform::IDENTITY
         },
         cube,
@@ -773,8 +790,9 @@ fn build_machinery(world: &mut World) -> (Entity, Entity, Entity) {
         Visibility::VISIBLE,
     ));
     // 弹簧门板（NW 门洞）：动态盒 + 关节锚（无碰撞体——`DistanceJoint`
-    // 的 target 只需 Transform）+ 弹簧参数。玩家物理代理把它推开，关节
-    // 每轮松弛拉回关闭位（纯展示：不在逻辑静态体里，玩家逻辑畅通）。
+    // 的 target 只需 Transform）+ 弹簧参数。玩家运动学胶囊把它推开，
+    // 关节每轮松弛拉回关闭位（**设计语义**：可推开的回弹门，不在逻辑
+    // 静态体里、玩家逻辑畅通；配色微发光区别于墙，见 panel_mat 注释）。
     let panel_center = Vec3::new(-7.0, 1.25, -2.0);
     let anchor = world.spawn((
         Name("infiltration/door-panel-anchor".into()),
@@ -1232,10 +1250,11 @@ fn plugin_settings_path(_world: &World) -> std::path::PathBuf {
 /// §8.22③ 闭合）→ 守卫模型子树整体隐藏（引擎原语
 /// [`set_subtree_hidden`]，§8.22⑤ 闭合）。
 ///
-/// ragdoll 的「生成 + 立即释放（受击方向轻踢）」打包进同一条命令：闭包
-/// 按值捕获击晕数据（`Send`），执行结果只依赖捕获值与生成时的确定性的
-/// `RagdollDesc`——命令队列的确定性警示见 `iris_core::commands` 模块
-/// 文档（本处闭包不读可变外部状态，回放安全）。
+/// ragdoll 的「生成 + 立即释放（受击方向轻踢）+ 逐肢体挂球体网格与
+/// 材质（渲染表现是游戏侧选择，见模块文档「击晕与表现」）」打包进同一
+/// 条命令：闭包按值捕获击晕数据（`Send`），执行结果只依赖捕获值与生成
+/// 时的确定性的 `RagdollDesc`——命令队列的确定性警示见
+/// `iris_core::commands` 模块文档（本处闭包不读可变外部状态，回放安全）。
 fn consume_game_events(world: &World) {
     let Some(events) = world
         .try_resource::<InfiltrationState>()
@@ -1250,7 +1269,28 @@ fn consume_game_events(world: &World) {
             let foot = pos - Vec3::new(0.0, HALF_HEIGHT, 0.0);
             if let Some(queue) = world.try_resource::<CommandQueue>() {
                 queue.spawn_deferred(move |world: &mut World| {
-                    let limbs = spawn_ragdoll_kinematic(world, foot, &RagdollDesc::humanoid());
+                    let desc = RagdollDesc::humanoid();
+                    let limbs = spawn_ragdoll_kinematic(world, foot, &desc);
+                    // 肢体可见化：ragdoll 只提供物理原语（Transform +
+                    // Collider + RigidBody），渲染表现是游戏侧的选择——
+                    // 不挂网格的话守卫模型子树一隐藏，瘫倒肢体就「凭空
+                    // 消失」。逐肢体挂球体网格（半径 = 肢体定义半径，
+                    // 视觉与碰撞体同源）+ 守卫配色暗材质 + 可见。
+                    let mut meshes = world.resource_mut::<MeshStore>();
+                    let mesh_handles: Vec<_> = desc
+                        .limbs
+                        .iter()
+                        .map(|def| meshes.add(MeshData::uv_sphere(def.radius, 16, 12)))
+                        .collect();
+                    drop(meshes);
+                    let material = world
+                        .resource_mut::<MaterialStore>()
+                        .add(MaterialDef::solid(0.55, 0.2, 0.2, 1.0));
+                    for (&limb, mesh) in limbs.iter().zip(&mesh_handles) {
+                        world.insert(limb, *mesh);
+                        world.insert(limb, material);
+                        world.insert(limb, Visibility::VISIBLE);
+                    }
                     let kick_dir = Vec3::new(-facing.sin(), 0.0, -facing.cos());
                     release_ragdoll(world, &limbs, Vec3::ZERO, Some((kick_dir, 1.2)));
                 });

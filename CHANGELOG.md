@@ -96,6 +96,35 @@
   两帧，`drain` 语义不变）。⑥的 foot_ik 口径例外同上（自身碰撞体重叠
   的工程事实）。
 
+### Fixed（Infiltration 实测反馈四连修：压力板误触 / 过门腿部变形 / 击晕凭空消失 / 弹簧门无辨识度）
+
+- **压力板靠近即触发 → 站上板面才触发**：`PLATE_RADIUS` 0.9 → **0.45**（语义 =
+  玩家中心进入板投影内），插件层 sensor 盒半宽与视觉板 `scale` 同步缩到板面
+  大小（三方同源同值；sensor 在胶囊接触面即报 begin，比中心距离判定早
+  ~0.4 m，两路径调用同一幂等入口、单向闩锁，语义无碍）。测试：既有
+  `plate_opens_door_and_player_passes_through` / `pressure_plate_contact_events_open_the_door`
+  语义不变照跑。
+- **过门时足部网格拉成大平面**（引擎侧，`iris-render/src/foot_ik.rs`）：
+  ①`update_foot_ik` 新增**不可达回退门**——踝目标距髋超出
+  `(|upper − lower|, upper + lower)` 可达域时本帧放弃该腿修正（保持姿势不写
+  变换）：不可达/过近唯一解释是射线采样到非地面几何（过门、贴墙瞬间的门框
+  /墙顶命中），钳制解算（拉伸至全长）会把腿指向异常目标；②落地查询不再
+  收 **sensor**（事件域不是地面）与**碰撞组/掩码清零**（标记失效，如压力门
+  开门标记）的碰撞体——失效前穿门瞬间射线起点落入门盒、t=0 异常采样把踝
+  逐帧上拉直至飞出盒顶，正是变形的实测机理。纯函数 `solve_two_bone_ik`
+  钳制语义不变（系统门在其之前拦截）。测试：`unreachable_ground_leaves_pose_untouched`
+  （原 `unreachable_ground_stretches_leg` 按新语义改写）+
+  `too_close_target_leaves_pose_untouched` / `sensor_volume_is_not_ground` /
+  `disabled_collider_is_not_ground`（iris-render）；`player_crosses_pressure_door_without_foot_deformation`
+  （iris-infiltration headless，过门全程脚踝贴地 ±5 cm）。
+- **守卫被击晕后凭空消失**（游戏侧）：`spawn_ragdoll_kinematic` 只提供物理
+  原语（文档明示渲染是游戏的选择），插件层 ragdoll 生成后逐肢体挂球体网格
+  （半径 = 肢体定义半径）+ 守卫配色材质 + `Visibility::VISIBLE`。测试：
+  `stun_spawns_ragdoll_and_hides_guard_model` 增加六肢体 MeshHandle/材质/可见断言。
+- **门洞里的可碰撞方块 = 弹簧门板（设计如此，非 bug）**：R36 的动态盒 +
+  `DistanceJoint` 回拉门（可推开、松手回弹），原配色与墙体几乎无差、缺视觉
+  提示——改为青色 + 微发光材质，注释与模块文档写明设计语义。
+
 ### Added（游戏五：Iris Infiltration 第三人称潜入——dogfooding V，R34–R41 全量压榨）
 
 新 crate `iris-infiltration`（第 42 轮迭代，游戏轮：**引擎零改动**，八个
