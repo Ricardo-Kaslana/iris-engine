@@ -31,10 +31,21 @@
 //!   - **已知限制——身后不消音**：无 HRTF / 耳间延迟差，源在正后方与正前方
 //!     对称（pan 同为 0、衰减只随距离）——前后靠本模型不可区分，仅左右与
 //!     远近有空间线索；非空间 `play` 恒为居中声像、无衰减，听者位姿不影响。
+//! - **流式音乐总线**（R44，[`AudioMixer::play_music`]）：常驻采样量与曲目
+//!   长度**无关**的一条独立通道（OGG/Vorbis 分块解码在专用线程，混音回调按
+//!   块取数，见 `stream` 模块文档）。总线上一次只放一条音乐：淡入淡出是
+//!   采样级线性斜坡、循环在生产者侧 rewind、下溢填静音且游标不推进。
+//!   音乐**不参与空间化**（恒总线增益），也不占 `slots` / `active_count`。
+//! - **混响**（R44，[`AudioMixer::set_reverb`]）：简化 Schroeder 链（4 comb +
+//!   2 allpass，见 `reverb` 模块），当前 v1 **只挂在音乐总线上**，普通与空间
+//!   音效不受影响；`wet = 0`（默认）为逐位透明的旁路，此时音乐与既有路径
+//!   完全同形（不多一次拷贝、不多一次浮点运算）。
 
 use glam::Vec3;
 
 use crate::clip::AudioClip;
+use crate::reverb::{Reverb, ReverbSettings};
+use crate::stream::{AudioStream, MusicBus, MusicHandle};
 
 /// 空间声音的默认距离参考（米）：`att = ref / (ref + d)` 在 d = ref 处衰减
 /// 恰为一半——4 m 适合第一人称 / 角色脚边尺度的声源；俯视相机等悬空听者
@@ -158,6 +169,77 @@ impl SoundId {
     }
 }
 
+/// 一路声音在**一帧**上的增益因子（音量 / 空间衰减 / 包络的合成结果）。
+///
+/// 立体声输出用 `left` / `right`（恒功率声像拆分），其余声道数用 `mono`。
+pub(crate) struct FrameGains {
+    pub(crate) left: f32,
+    pub(crate) right: f32,
+    pub(crate) mono: f32,
+}
+
+/// 交错源采样视图（剪辑或流式块通用），把「游标 → 采样 → 声道映射 → 增益
+/// 叠加」这段混音数学收敛成**一处实现**：`AudioMixer` 的槽位声音与
+/// `MusicBus` 的流式声音走同一份逐位一致的路径（不复制第二份数学）。
+pub(crate) struct SourceFrames<'a> {
+    samples: &'a [f32],
+    channels: usize,
+}
+
+impl<'a> SourceFrames<'a> {
+    pub(crate) fn new(samples: &'a [f32], channels: usize) -> Self {
+        Self { samples, channels }
+    }
+
+    /// 把源帧 `[i0, i1]` 按 `frac` 线性插值后叠加进 `dst`（一帧输出）。
+    ///
+    /// 声道映射口径（与 R44 之前的 `mix` 逐位一致）：等声道直取；单声道源
+    /// 复制到全部输出通道；输出单声道时平均全部源通道；其余罕见布局逐通道
+    /// 取 `min(c, 源声道 − 1)`。
+    pub(crate) fn add_frame(
+        &self,
+        dst: &mut [f32],
+        i0: usize,
+        i1: usize,
+        frac: f32,
+        gains: &FrameGains,
+    ) {
+        let channels_out = dst.len();
+        let channels_src = self.channels;
+        for (c, out) in dst.iter_mut().enumerate() {
+            let value = if channels_src == channels_out {
+                lerp_channel(self.samples, channels_src, i0, i1, frac, c)
+            } else if channels_src == 1 {
+                // 上混：单声道源复制到全部输出通道
+                lerp_channel(self.samples, channels_src, i0, i1, frac, 0)
+            } else if channels_out == 1 {
+                // 下混：平均全部源通道
+                let mut sum = 0.0;
+                for k in 0..channels_src {
+                    sum += lerp_channel(self.samples, channels_src, i0, i1, frac, k);
+                }
+                sum / channels_src as f32
+            } else {
+                // 罕见布局回退：逐输出通道取 min(c, 源声道-1)
+                lerp_channel(
+                    self.samples,
+                    channels_src,
+                    i0,
+                    i1,
+                    frac,
+                    c.min(channels_src - 1),
+                )
+            };
+            let factor = if channels_out == 2 {
+                if c == 0 { gains.left } else { gains.right }
+            } else {
+                gains.mono
+            };
+            *out += value * factor;
+        }
+    }
+}
+
 /// 一个活动声音：共享剪辑 + 播放状态（+ 空间化 v1 的声源定位字段）。
 struct Voice {
     clip: AudioClip,
@@ -185,6 +267,8 @@ struct VoiceSlot {
 ///
 /// 声音表用「槽位 + 空闲链」而非紧凑 Vec：stop / 自然播完只把槽位置空，
 /// 下次 `play` 复用槽位并递增世代——长会话不反复搬移内存，句柄防悬垂。
+/// 流式音乐**不进槽位表**（它没有常驻剪辑可引用），单独挂在 [`Self::music`]
+/// 音乐总线上，因此 `active_count` 只统计音效声音，不含音乐。
 pub struct AudioMixer {
     slots: Vec<VoiceSlot>,
     free: Vec<u32>,
@@ -192,6 +276,12 @@ pub struct AudioMixer {
     listener: ListenerParams,
     /// 空间声音的距离参考默认值（米），`play_spatial` 时固化进声音槽位。
     reference_distance: f32,
+    /// 流式音乐总线（R44）。
+    music: MusicBus,
+    /// 音乐总线混响（R44）；`wet = 0` 为旁路，此时音乐走零拷贝直通叠加。
+    reverb: Reverb,
+    /// 混响启用时暂存音乐干信号的可复用缓冲（避免实时路径每次分配）。
+    music_scratch: Vec<f32>,
 }
 
 impl Default for AudioMixer {
@@ -201,13 +291,17 @@ impl Default for AudioMixer {
 }
 
 impl AudioMixer {
-    /// 创建空混音器（听者默认：原点、前方 -Z、右轴 +X）。
+    /// 创建空混音器（听者默认：原点、前方 -Z、右轴 +X；音乐总线空闲；
+    /// 混响旁路）。
     pub fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
             listener: ListenerParams::default(),
             reference_distance: DEFAULT_REFERENCE_DISTANCE,
+            music: MusicBus::default(),
+            reverb: Reverb::default(),
+            music_scratch: Vec::new(),
         }
     }
 
@@ -361,9 +455,92 @@ impl AudioMixer {
         }
     }
 
-    /// 当前活动声音数（含尚未被 `mix` 推进过的）。
+    /// 当前活动声音数（含尚未被 `mix` 推进过的）。**不含**流式音乐
+    /// （音乐在独立总线上，用 [`AudioMixer::music_is_playing`] 查询）。
     pub fn active_count(&self) -> usize {
         self.slots.iter().filter(|s| s.voice.is_some()).count()
+    }
+
+    // ---- 流式音乐总线（R44）----
+
+    /// 在音乐总线上播放一条流（OGG/Vorbis 或任何 [`AudioStream`] 实现）。
+    ///
+    /// 与 [`AudioMixer::play`] 的根本差别：采样**不全量常驻**——解码在专用
+    /// 后台线程分块产出，混音回调按需取块（机制与语义见 `stream` 模块文档）。
+    ///
+    /// - `volume` 钳制到 ≥ 0（负数 / NaN 按静音，口径同 `play`）；
+    /// - `fade_in` 秒线性淡入（≤ 0 或 NaN 为立即满音量）；
+    /// - `looping = true` 时流耗尽后调 [`AudioStream::rewind`] 重播；不支持
+    ///   rewind 的流播完即止；
+    /// - **单轨**：新轨启动会立即硬拆上一轨（v1 不做 crossfade），上一轨已
+    ///   排队的块被丢弃；
+    /// - 音乐不参与空间化（无距离衰减 / 声像），也不进 `slots`（`stop` /
+    ///   `active_count` 管不到它）。
+    ///
+    /// 返回 [`MusicHandle`]：与 [`AudioMixer::music_handle`] 比对可知「我放的
+    /// 这条是否仍是当前轨」。病态流（0 声道 / 0 采样率）不启动、句柄立即失效。
+    pub fn play_music<S: AudioStream + 'static>(
+        &mut self,
+        stream: S,
+        volume: f32,
+        fade_in: f32,
+        looping: bool,
+    ) -> MusicHandle {
+        self.music.play(stream, volume, fade_in, looping)
+    }
+
+    /// 停止当前音乐轨。`fade_out > 0` 时按秒线性淡出、到位后拆轨（混响尾巴
+    /// 继续衰减）；`fade_out <= 0` / NaN 立即拆轨。此前有轨在播返回 `true`。
+    pub fn stop_music(&mut self, fade_out: f32) -> bool {
+        self.music.stop(fade_out)
+    }
+
+    /// 调整音乐总线音量（下一次 `mix` 即时生效；负数 / NaN 按静音）。
+    /// 总线音量与淡入淡出包络相乘，二者独立。
+    pub fn set_music_volume(&mut self, volume: f32) {
+        self.music.set_volume(volume);
+    }
+
+    /// 音乐总线是否占用中（含淡出中）。
+    pub fn music_is_playing(&self) -> bool {
+        self.music.is_playing()
+    }
+
+    /// 当前音乐轨句柄（`None` = 空闲）。
+    pub fn music_handle(&self) -> Option<MusicHandle> {
+        self.music.handle()
+    }
+
+    /// 后台解码线程是否已退出（`stop_music` 后轮询本方法可确认线程真正结束；
+    /// 内联解码模式恒 `true`——本来就没有线程）。
+    pub fn music_producer_finished(&self) -> bool {
+        self.music.producer_finished()
+    }
+
+    /// 阻塞等待最近一条音乐的后台解码线程退出（`stop_music` 之后调用即为
+    /// 干净的收尾）。**会阻塞**，不要在实时音频回调里调用。返回 `true` =
+    /// 确实等到并回收了一个正常退出的线程；`false` = 无句柄可回收（内联解码
+    /// 模式、已回收过），或该线程 panic（音频路径不因一次 panic 永久失能，
+    /// 但这里如实报 false）。
+    pub fn join_music_producer(&mut self) -> bool {
+        self.music.join_producer()
+    }
+
+    // ---- 混响（R44）----
+
+    /// 设置音乐总线混响（简化 Schroeder 链，算法与限制见 `reverb` 模块）。
+    /// 参数被卫生化（非有限 → 0，有限值钳到 `[0, 1]`），读回用
+    /// [`AudioMixer::reverb_settings`]。
+    ///
+    /// `wet = 0`（默认）为旁路：音乐走零拷贝直通叠加、逐位与不启用混响一致。
+    /// **v1 只作用于音乐总线**——普通音效与空间音效不受本方法影响。
+    pub fn set_reverb(&mut self, settings: ReverbSettings) {
+        self.reverb.set_settings(settings);
+    }
+
+    /// 当前混响参数（卫生化后的值）。
+    pub fn reverb_settings(&self) -> ReverbSettings {
+        self.reverb.settings()
     }
 
     /// 混音到输出帧缓冲（交错帧，帧数 = `out.len() / channels_out`）。
@@ -426,6 +603,13 @@ impl AudioMixer {
                 (volume, volume, volume)
             };
 
+            let gains = FrameGains {
+                left: factor_l,
+                right: factor_r,
+                mono: factor_mono,
+            };
+            let source = SourceFrames::new(samples, channels_src);
+
             for out_frame in out.chunks_exact_mut(channels_out) {
                 if *looping {
                     // 循环回绕：保留游标小数部分，相位连续
@@ -445,31 +629,35 @@ impl AudioMixer {
                 } else {
                     frames - 1
                 };
-                for (c, dst) in out_frame.iter_mut().enumerate() {
-                    let value = if channels_src == channels_out {
-                        lerp_channel(samples, channels_src, i0, i1, frac, c)
-                    } else if channels_src == 1 {
-                        // 上混：单声道源复制到全部输出通道
-                        lerp_channel(samples, channels_src, i0, i1, frac, 0)
-                    } else if channels_out == 1 {
-                        // 下混：平均全部源通道
-                        let mut sum = 0.0;
-                        for k in 0..channels_src {
-                            sum += lerp_channel(samples, channels_src, i0, i1, frac, k);
-                        }
-                        sum / channels_src as f32
-                    } else {
-                        // 罕见布局回退：逐输出通道取 min(c, 源声道-1)
-                        lerp_channel(samples, channels_src, i0, i1, frac, c.min(channels_src - 1))
-                    };
-                    let factor = if channels_out == 2 {
-                        if c == 0 { factor_l } else { factor_r }
-                    } else {
-                        factor_mono
-                    };
-                    *dst += value * factor;
-                }
+                source.add_frame(out_frame, i0, i1, frac, &gains);
                 *cursor += ratio;
+            }
+        }
+
+        // 流式音乐总线（R44）：音效之后、限幅之前叠加（音乐与音效同样受软限幅）。
+        {
+            let AudioMixer {
+                music,
+                reverb,
+                music_scratch,
+                ..
+            } = self;
+            if reverb.is_bypassed() {
+                // 直通路径：零额外拷贝；总线空闲时完全不触碰 out
+                music.render_into(out, channels_out, sample_rate_out);
+            } else {
+                // 混响路径：干信号先进可复用 scratch，再由混响以 dry + wet 叠加。
+                // 即便音乐已拆轨（无产出、scratch 全零），混响尾巴也继续衰减。
+                music_scratch.resize(out.len(), 0.0);
+                music_scratch.fill(0.0);
+                let frames = out.len();
+                music.render_into(&mut music_scratch[..frames], channels_out, sample_rate_out);
+                reverb.add(
+                    &music_scratch[..frames],
+                    out,
+                    channels_out as u16,
+                    sample_rate_out,
+                );
             }
         }
 
@@ -508,7 +696,8 @@ fn lerp_channel(
 }
 
 /// 音量卫生：钳到 ≥ 0，NaN / 无穷按静音处理（混音路径不传播病态值）。
-fn sanitize_volume(volume: f32) -> f32 {
+/// `pub(crate)`：音乐总线音量与混响湿量共用同一口径。
+pub(crate) fn sanitize_volume(volume: f32) -> f32 {
     if volume.is_finite() {
         volume.max(0.0)
     } else {
@@ -1077,5 +1266,535 @@ mod tests {
             assert!((frame[0] - want).abs() < 1e-4, "覆写 ref=12 后应衰减 0.75");
         }
         assert!(mixer.stop(id), "收尾 stop 回收循环声音");
+    }
+
+    // ---- 流式音乐总线与混响（R44）----
+
+    use crate::stream::SampleStream;
+
+    /// 恒非零的测试源采样（`0.25 … 0.75` 区间抖动）：于是「静音」可与「源里
+    /// 恰好有 0 采样」区分开，过滤 / 断言都不依赖巧合。
+    fn ramp_source(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .map(|i| 0.25 + (i % 71) as f32 * 0.005 + (i % 13) as f32 * 0.01)
+            .collect()
+    }
+
+    /// 等后台解码线程退出：把「整条流已在队列里」变成确定的前置条件，
+    /// 而不是碰运气赌生产者跑得过消费者（要求各块总量不超过队列容量）。
+    fn wait_producer_finished(mixer: &AudioMixer) {
+        for _ in 0..400 {
+            if mixer.music_producer_finished() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("后台解码线程未在 2 s 内退出");
+    }
+
+    /// **块拼接逐位直通**：采样率一致、音量 1.0、无淡变时，流式输出的采样
+    /// 序列与源序列逐位相同——跨 5 个块边界（末块不足一块）、并跨两次混音
+    /// （第二次混音的游标要接上第一次剪掉的前缀）。
+    #[test]
+    fn music_block_splices_are_sample_exact() {
+        let src = ramp_source(5_000);
+        let mut mixer = AudioMixer::new();
+        let handle = mixer.play_music(SampleStream::new(mono(&src), 1_024), 1.0, 0.0, false);
+        assert_eq!(mixer.music_handle(), Some(handle));
+        assert!(mixer.music_is_playing());
+        // 5 块 < 队列容量 8 块 ⇒ 线程退出即全部数据就位，不可能下溢
+        wait_producer_finished(&mixer);
+
+        let mut heard = Vec::with_capacity(src.len() + 8);
+        let mut first = vec![7.0f32; 2_000];
+        mixer.mix(&mut first, 1, 48_000);
+        heard.extend_from_slice(&first);
+        let mut second = vec![7.0f32; src.len() - 2_000 + 8];
+        mixer.mix(&mut second, 1, 48_000);
+        heard.extend_from_slice(&second);
+
+        for (i, (got, want)) in heard[..src.len()].iter().zip(&src).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "第 {i} 帧应逐位等于源采样（跨块、跨混音调用都不得引入误差）"
+            );
+        }
+        assert_eq!(&heard[src.len()..], &[0.0; 8][..], "播完后的富余帧应为静音");
+        assert!(
+            !mixer.music_is_playing(),
+            "非循环流播完且待播缓冲耗尽后应自动拆轨"
+        );
+        assert_eq!(mixer.music_handle(), None);
+        assert_eq!(mixer.active_count(), 0, "音乐不占音效槽位");
+    }
+
+    /// **下溢语义**：数据没到时本缓冲剩余帧填静音、**游标停住不推进**；数据
+    /// 到位后从原处精确续播（两段合起来 == 完整源序列）。
+    #[test]
+    fn music_underrun_is_silence_and_resumes_exactly() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        /// 第一块立刻产出、第二块等测试放行的工具流（可控下溢）。
+        struct Gated {
+            first: Vec<f32>,
+            second: Vec<f32>,
+            sent_first: bool,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl AudioStream for Gated {
+            fn channels(&self) -> u16 {
+                1
+            }
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn next_block(&mut self, out: &mut Vec<f32>) -> bool {
+                if !self.sent_first {
+                    out.extend_from_slice(&self.first);
+                    self.sent_first = true;
+                    return true;
+                }
+                let mut guard = self
+                    .gate
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*guard {
+                    guard = self
+                        .gate
+                        .1
+                        .wait(guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                out.extend_from_slice(&self.second);
+                false
+            }
+        }
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let first = ramp_source(1_000);
+        let second = ramp_source(1_000);
+        let mut mixer = AudioMixer::new();
+        mixer.play_music(
+            Gated {
+                first: first.clone(),
+                second: second.clone(),
+                sent_first: false,
+                gate: Arc::clone(&gate),
+            },
+            1.0,
+            0.0,
+            false,
+        );
+
+        // 第一次混音只有第一块可用 ⇒ 前 1000 帧逐位、其余 500 帧静音
+        let mut out = vec![9.0f32; 1_500];
+        mixer.mix(&mut out, 1, 48_000);
+        for (i, (got, want)) in out[..first.len()].iter().zip(&first).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "已到位的块应逐位输出 @{i}");
+        }
+        assert!(
+            out[first.len()..].iter().all(|s| *s == 0.0),
+            "下溢的剩余帧应填静音"
+        );
+        assert!(mixer.music_is_playing(), "下溢不是结束：轨仍在总线上");
+
+        // 放行第二块 → 等线程退出 → 续播应精确接在第一块之后
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        wait_producer_finished(&mixer);
+        let mut rest = vec![9.0f32; second.len()];
+        mixer.mix(&mut rest, 1, 48_000);
+        for (i, (got, want)) in rest.iter().zip(&second).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "游标必须在静音期间停住、续播逐位接上 @{i}"
+            );
+        }
+        assert!(!mixer.music_is_playing(), "两块都播完后应拆轨");
+    }
+
+    /// **循环回绕**：循环轨持续产出并按源长回绕，采样级无缝（比对只取非静音
+    /// 帧 ⇒ 不依赖生产者与消费者的相对速度，队列取空的下溢帧被自然跳过）。
+    #[test]
+    fn music_looping_wraps_without_gaps() {
+        let src = ramp_source(500);
+        let mut mixer = AudioMixer::new();
+        mixer.play_music(SampleStream::new(mono(&src), 500), 1.0, 0.0, true);
+        let want = src.len() * 3;
+        let mut heard: Vec<f32> = Vec::new();
+        // 块长 401 与源长 500 互质：跨块、跨圈都不会刻意对齐
+        let mut chunk = vec![0.0f32; 401];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while heard.len() < want && std::time::Instant::now() < deadline {
+            mixer.mix(&mut chunk, 1, 48_000);
+            heard.extend(chunk.iter().filter(|s| **s != 0.0).copied());
+            if heard.len() < want {
+                // 下溢静音是设计行为：给后台线程一点时间（断言只看非静音帧，
+                // 因此不依赖这里的等待是否恰好足够）
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        assert!(
+            heard.len() >= want,
+            "循环应能连续产出 3 圈，实际 {}",
+            heard.len()
+        );
+        for (i, got) in heard[..want].iter().enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                src[i % src.len()].to_bits(),
+                "第 {i} 个非静音采样应等于源的圈回绕值"
+            );
+        }
+        assert!(mixer.stop_music(0.0), "循环轨应可立即停止");
+        assert!(!mixer.music_is_playing());
+        assert!(
+            mixer.join_music_producer(),
+            "close 信号应让后台解码线程自行退出"
+        );
+        wait_producer_finished(&mixer);
+    }
+
+    /// **淡入 / 淡出包络**：满幅常量源上的增益斜坡解析可算（线性、到位后恒定
+    /// 直通），淡出到位自动拆轨。
+    #[test]
+    fn music_fade_in_and_out_are_linear_and_teardown() {
+        // 8 块 × 400 帧 = 整条流可一次性排进队列（等待线程退出即无下溢）
+        let src = vec![0.8f32; 3_200];
+        let mut mixer = AudioMixer::new();
+        mixer.play_music(SampleStream::new(mono(&src), 400), 1.0, 0.01, false); // 10 ms = 480 帧
+        wait_producer_finished(&mixer);
+
+        let mut out = vec![0.0f32; 1_000];
+        mixer.mix(&mut out, 1, 48_000);
+        assert_eq!(out[0], 0.0, "淡入首帧静音");
+        assert!(
+            out.iter().all(|s| (0.0..=0.8).contains(s)),
+            "包络不得过冲满幅"
+        );
+        // 线性斜坡：第 i 帧增益 = i / 480。容差按 f32 每帧累加的最坏舍入给
+        // （480 步 × ulp(1.0)/2 ≈ 3e-5 的增益误差，×0.8 后 2.4e-5）
+        for i in [1usize, 120, 240, 479] {
+            let want = 0.8 * (i as f32 / 480.0);
+            assert!(
+                (out[i] - want).abs() < 5e-5,
+                "淡入第 {i} 帧应为 {want}，实际 {}",
+                out[i]
+            );
+        }
+        assert!(out.windows(2).all(|w| w[1] >= w[0]), "淡入包络必须单调不降");
+        // 到位帧：f32 累加落到 1.0 的确切帧号允许 ±4 帧抖动
+        let full = out
+            .iter()
+            .position(|s| *s == 0.8)
+            .expect("斜坡应在缓冲内到位");
+        assert!(
+            (476..=484).contains(&full),
+            "480 帧斜坡的到位帧应为 {full}（允许 ±4 帧舍入）"
+        );
+        for (i, got) in out[full..].iter().enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                src[full + i].to_bits(),
+                "到位后应满增益逐位直通（首个越界下标 {}）",
+                full + i
+            );
+        }
+
+        // 淡出 5 ms = 240 帧：从 0.8 线性降到 0，之后静音并拆轨
+        assert!(mixer.stop_music(0.005));
+        let mut tail = vec![0.0f32; 600];
+        mixer.mix(&mut tail, 1, 48_000);
+        assert_eq!(tail[0], 0.8, "淡出首帧沿用当前包络");
+        let want = 0.8 * (1.0 - 30.0 / 240.0);
+        assert!(
+            (tail[30] - want).abs() < 5e-5,
+            "淡出第 30 帧应为 {want}，实际 {}",
+            tail[30]
+        );
+        assert!(
+            tail.windows(2).all(|w| w[1] <= w[0]),
+            "淡出包络必须单调不升"
+        );
+        let done = tail
+            .iter()
+            .position(|s| *s == 0.0)
+            .expect("淡出应在缓冲内归零");
+        assert!(
+            (236..=244).contains(&done),
+            "240 帧淡出的归零帧应为 {done}（允许 ±4 帧舍入）"
+        );
+        assert!(
+            tail[done..].iter().all(|s| *s == 0.0),
+            "归零后应保持静音（钳住而不是穿过 0 变负）"
+        );
+        assert!(!mixer.music_is_playing(), "淡出到位应自动拆轨");
+    }
+
+    /// 总线音量：即时生效、与包络相乘；负数 / NaN 按静音（口径同 `play`）。
+    #[test]
+    fn music_volume_is_immediate_and_sanitized() {
+        let src = ramp_source(2_000);
+        let mut mixer = AudioMixer::new();
+        mixer.play_music(SampleStream::new(mono(&src), 500), 0.5, 0.0, false);
+        wait_producer_finished(&mixer);
+
+        let mut out = vec![0.0f32; 1_000];
+        mixer.mix(&mut out, 1, 48_000);
+        for (i, got) in out.iter().enumerate() {
+            assert!(
+                (got - src[i] * 0.5).abs() <= src[i] * 1e-7 + 1e-7,
+                "音量 0.5 应减半 @{i}"
+            );
+        }
+        mixer.set_music_volume(0.0);
+        let mut muted = vec![9.0f32; 100];
+        mixer.mix(&mut muted, 1, 48_000);
+        assert!(muted.iter().all(|s| *s == 0.0), "音量 0 应静音");
+        mixer.set_music_volume(f32::NAN);
+        let mut nan_out = vec![0.0f32; 100];
+        mixer.mix(&mut nan_out, 1, 48_000);
+        assert!(
+            nan_out.iter().all(|s| *s == 0.0),
+            "NaN 音量应被卫生化为静音而不是传播 NaN"
+        );
+        assert!(mixer.stop_music(0.0));
+    }
+
+    /// 音乐与音效线性叠加、同样受软限幅；声道映射复用同一条路径
+    /// （立体声源 → 单声道输出为平均下混）。
+    #[test]
+    fn music_and_effects_sum_linearly_and_share_channel_mapping() {
+        let frames = 512usize;
+        let stereo: Vec<f32> = [0.6f32, 0.2].repeat(frames);
+        let clip = AudioClip::from_interleaved(stereo.clone(), 2, 48_000).expect("合法");
+        let mut mixer = AudioMixer::new();
+        mixer.play(mono(&[0.1; 512]), 1.0, false);
+        mixer.play_music(SampleStream::new(clip, 128), 1.0, 0.0, false);
+        wait_producer_finished(&mixer);
+        let mut out = vec![0.0f32; frames * 2];
+        mixer.mix(&mut out, 2, 48_000);
+        for frame in out.chunks_exact(2) {
+            assert!((frame[0] - 0.7).abs() < 1e-6, "左 = 音效 0.1 + 音乐 0.6");
+            assert!((frame[1] - 0.3).abs() < 1e-6, "右 = 音效 0.1 + 音乐 0.2");
+        }
+
+        // 立体声音乐 → 单声道输出：下混为平均（(0.6 + 0.2) / 2 = 0.4）
+        let mut mixer = AudioMixer::new();
+        mixer.play_music(
+            SampleStream::new(
+                AudioClip::from_interleaved(stereo, 2, 48_000).expect("合法"),
+                128,
+            ),
+            1.0,
+            0.0,
+            false,
+        );
+        wait_producer_finished(&mixer);
+        let mut mono_out = vec![0.0f32; frames];
+        mixer.mix(&mut mono_out, 1, 48_000);
+        assert!(
+            mono_out.iter().all(|s| (s - 0.4).abs() < 1e-6),
+            "立体声音乐下混应平均两声道，实际 {:?}",
+            &mono_out[..4]
+        );
+
+        // 软限幅对音乐同样有效：两路满幅叠加钳到 1.0
+        let mut mixer = AudioMixer::new();
+        mixer.play(mono(&[1.0; 256]), 1.0, false);
+        mixer.play_music(SampleStream::new(mono(&[1.0; 256]), 64), 1.0, 0.0, false);
+        wait_producer_finished(&mixer);
+        let mut hot = vec![0.0f32; 256];
+        mixer.mix(&mut hot, 1, 48_000);
+        assert!(hot.iter().all(|s| *s == 1.0), "2.0 叠加应钳到 1.0");
+    }
+
+    /// 重采样：44.1 kHz 音乐流混到 48 kHz 输出，与「同一源做成常驻剪辑走音效
+    /// 路径」数值一致（块游标会周期性剪前缀，f64 舍入路径不同 ⇒ 只主张数值
+    /// 等价、不主张逐位；采样率一致时的逐位等价由上面的直通测试锁定）。
+    #[test]
+    fn music_resamples_to_output_rate_like_voices() {
+        let src = ramp_source(4_410); // 0.1 s @ 44.1 kHz
+        let mut mixer = AudioMixer::new();
+        mixer.play_music(
+            SampleStream::new(
+                AudioClip::from_interleaved(src.clone(), 1, 44_100).expect("合法"),
+                1_000,
+            ),
+            1.0,
+            0.0,
+            false,
+        );
+        wait_producer_finished(&mixer);
+        let mut out = vec![0.0f32; 4_800];
+        mixer.mix(&mut out, 1, 48_000);
+
+        let mut reference = AudioMixer::new();
+        reference.play(
+            AudioClip::from_interleaved(src, 1, 44_100).expect("合法"),
+            1.0,
+            false,
+        );
+        let mut want = vec![0.0f32; 4_800];
+        reference.mix(&mut want, 1, 48_000);
+        let worst = out
+            .iter()
+            .zip(&want)
+            .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+        assert!(
+            worst < 1e-6,
+            "流式与剪辑路径的重采样结果应数值一致，最大偏差 {worst}"
+        );
+        assert!(out.iter().any(|s| *s != 0.0), "重采样后仍应有信号");
+    }
+
+    /// 单轨语义 + 句柄识别：新轨硬拆上一轨、旧句柄不再是当前轨；病态流不启动。
+    #[test]
+    fn music_bus_is_single_track_and_handles_are_identifiable() {
+        let mut mixer = AudioMixer::new();
+        let first = mixer.play_music(
+            SampleStream::new(mono(&ramp_source(600)), 300),
+            1.0,
+            0.0,
+            true,
+        );
+        let second = mixer.play_music(
+            SampleStream::new(mono(&ramp_source(600)), 300),
+            1.0,
+            0.0,
+            true,
+        );
+        assert_ne!(first, second, "轨序号必须递增");
+        assert_eq!(mixer.music_handle(), Some(second), "总线上只留最后一轨");
+        assert!(mixer.stop_music(0.0));
+        assert!(!mixer.stop_music(0.0), "空闲总线 stop 返回 false");
+        assert_eq!(mixer.music_handle(), None);
+        // stop 不销毁 JoinHandle（留作干净收尾）：第一次 join 回收线程、第二次无事可做
+        wait_producer_finished(&mixer);
+        assert!(mixer.join_music_producer(), "应能回收上一轨的解码线程");
+        assert!(
+            !mixer.join_music_producer(),
+            "已回收后再次 join 返回 false（无新轨）"
+        );
+
+        /// 0 声道 / 0 采样率的病态流：不得占用总线。
+        struct Broken;
+        impl AudioStream for Broken {
+            fn channels(&self) -> u16 {
+                0
+            }
+            fn sample_rate(&self) -> u32 {
+                0
+            }
+            fn next_block(&mut self, _out: &mut Vec<f32>) -> bool {
+                false
+            }
+        }
+        let broken = mixer.play_music(Broken, 1.0, 0.0, false);
+        assert_eq!(mixer.music_handle(), None, "病态流不应占用总线");
+        assert!(!mixer.music_is_playing());
+        assert_ne!(mixer.music_handle(), Some(broken));
+    }
+
+    /// **混响接线**：不调 `set_reverb`、`wet = 0`、`wet = NaN`（卫生化为 0）
+    /// 三条路径逐位一致；`wet > 0` 必须真的改变音乐输出且不产出病态值；
+    /// 音效路径完全不受 `set_reverb` 影响（v1 声明的限制）。
+    #[test]
+    fn reverb_bypass_is_bit_exact_and_wet_affects_only_music() {
+        let run = |settings: Option<ReverbSettings>| -> Vec<u32> {
+            let src = ramp_source(4_000);
+            let mut mixer = AudioMixer::new();
+            if let Some(settings) = settings {
+                mixer.set_reverb(settings);
+            }
+            mixer.play_music(SampleStream::new(mono(&src), 1_000), 1.0, 0.0, false);
+            wait_producer_finished(&mixer);
+            // 8 kHz 输出：comb / allpass 延迟缩到几十到几百帧，尾巴落在缓冲内
+            let mut out = vec![0.0f32; src.len() + 2_000];
+            mixer.mix(&mut out, 1, 8_000);
+            out.iter().map(|s| s.to_bits()).collect()
+        };
+        let unset = run(None);
+        let zero = run(Some(ReverbSettings {
+            wet: 0.0,
+            room_size: 0.7,
+        }));
+        let nan = run(Some(ReverbSettings {
+            wet: f32::NAN,
+            room_size: f32::INFINITY,
+        }));
+        assert_eq!(unset, zero, "wet = 0 应与「不启用混响」逐位一致");
+        assert_eq!(zero, nan, "病态参数卫生化后应同为旁路");
+        let wet = run(Some(ReverbSettings {
+            wet: 0.4,
+            room_size: 0.7,
+        }));
+        assert_ne!(unset, wet, "wet > 0 必须改变音乐总线输出");
+        assert!(
+            wet.iter().all(|bits| f32::from_bits(*bits).is_finite()),
+            "混响不得产出 NaN / Inf"
+        );
+
+        // 音效路径不受 set_reverb 影响
+        let src = ramp_source(64);
+        let mut plain = AudioMixer::new();
+        plain.play(mono(&src), 0.9, false);
+        let mut out_plain = vec![0.0f32; 64];
+        plain.mix(&mut out_plain, 1, 48_000);
+        let mut reverbed = AudioMixer::new();
+        reverbed.set_reverb(ReverbSettings {
+            wet: 1.0,
+            room_size: 1.0,
+        });
+        reverbed.play(mono(&src), 0.9, false);
+        let mut out_reverbed = vec![0.0f32; 64];
+        reverbed.mix(&mut out_reverbed, 1, 48_000);
+        assert_eq!(
+            out_plain, out_reverbed,
+            "v1 混响不作用于音效（模块文档声明的限制）"
+        );
+        assert_eq!(
+            reverbed.reverb_settings(),
+            ReverbSettings {
+                wet: 1.0,
+                room_size: 1.0
+            },
+            "set_reverb 应可回读"
+        );
+    }
+
+    /// 默认参数即旁路（不显式设置时混音行为与 R44 之前一致）。
+    #[test]
+    fn reverb_defaults_to_bypass() {
+        let mixer = AudioMixer::new();
+        assert_eq!(
+            mixer.reverb_settings(),
+            ReverbSettings::default(),
+            "新建混音器的混响应为默认参数"
+        );
+        assert_eq!(mixer.reverb_settings().wet, 0.0, "默认 wet = 0 = 旁路");
+    }
+
+    /// 音乐路径确定性：同一源两次独立播放（含混响）逐位一致——块拼接与包络
+    /// 都不引入与运行时机相关的量。
+    #[test]
+    fn music_playback_is_bit_deterministic_across_runs() {
+        let run = || -> Vec<u32> {
+            let src = ramp_source(3_000);
+            let mut mixer = AudioMixer::new();
+            mixer.set_reverb(ReverbSettings {
+                wet: 0.3,
+                room_size: 0.6,
+            });
+            mixer.play_music(SampleStream::new(mono(&src), 700), 0.7, 0.002, false);
+            wait_producer_finished(&mixer);
+            let mut out = vec![0.0f32; 3_000];
+            mixer.mix(&mut out, 2, 48_000);
+            out.iter().map(|s| s.to_bits()).collect()
+        };
+        assert_eq!(run(), run(), "同输入两次流式混音应逐位一致");
     }
 }

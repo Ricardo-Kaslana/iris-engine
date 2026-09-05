@@ -43,6 +43,22 @@ impl AudioClip {
         })
     }
 
+    /// 从 OGG / Vorbis 字节解码构造（**整条解码进内存**）。
+    ///
+    /// 适用面是短音效：与 WAV 剪辑同形态，因此既有混音路径零改动即可用
+    /// OGG 资产（文件小一个量级）。长配乐不要用本方法——常驻内存 =
+    /// 采样数 × 4 字节（60 s 立体声 48 kHz ≈ 22 MB），改把
+    /// [`OggVorbisStream`](crate::OggVorbisStream) 交给
+    /// [`AudioMixer::play_music`](crate::AudioMixer::play_music) 走流式通道，
+    /// 常驻内存只有一块有界队列 + 一块待播缓冲（60 s 立体声实测约 0.4 MB，
+    /// 与曲目长度无关；对比数字见 ARCHITECTURE 音频章节）。
+    ///
+    /// 未做显式 gapless 裁剪（首尾是否带编码窗冗余取决于容器粒位置，
+    /// 实测细节与限制见 `ogg` 模块文档）。
+    pub fn from_ogg(bytes: &[u8]) -> Result<Self, AudioError> {
+        crate::ogg::parse_ogg(bytes)
+    }
+
     /// 声道数（1 = 单声道，2 = 立体声）。
     pub fn channels(&self) -> u16 {
         self.channels

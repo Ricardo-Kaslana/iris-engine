@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use glam::Vec3;
 
-use iris_audio::{AudioClip, AudioMixer, AudioOutput, ListenerParams, SoundId};
+use iris_audio::{
+    AudioClip, AudioMixer, AudioOutput, AudioStream, ListenerParams, MusicHandle, ReverbSettings,
+    SoundId,
+};
 
 use iris_core::Resource;
 
@@ -137,6 +140,64 @@ impl Audio {
             .set_sound_reference_distance(id, reference_distance)
     }
 
+    // ---- 流式音乐总线与混响（R44）----
+
+    /// 播放背景音乐（流式：OGG/Vorbis 或任何 [`AudioStream`] 实现）。
+    ///
+    /// 与 [`Audio::play`] 的差别：采样**不全量常驻内存**——解码在专用后台
+    /// 线程分块产出，混音回调按需取块（机制与诚实限制见 `iris_audio::stream`
+    /// 模块文档）。headless 与有设备同语义：无设备时照常推进（离线混音可
+    /// 断言），只是不出声。
+    ///
+    /// ```ignore
+    /// let music = iris_audio::OggVorbisStream::open("assets/music.ogg")?;
+    /// // 0.7 音量、1.5 s 淡入、循环
+    /// let handle = audio.play_music(music, 0.7, 1.5, true);
+    /// ```
+    pub fn play_music<S: AudioStream + 'static>(
+        &self,
+        stream: S,
+        volume: f32,
+        fade_in: f32,
+        looping: bool,
+    ) -> MusicHandle {
+        self.mixer().play_music(stream, volume, fade_in, looping)
+    }
+
+    /// 停止当前音乐轨（`fade_out > 0` 秒线性淡出后拆轨，≤ 0 立即停）。
+    /// 此前有轨在播返回 `true`。
+    pub fn stop_music(&self, fade_out: f32) -> bool {
+        self.mixer().stop_music(fade_out)
+    }
+
+    /// 调整音乐总线音量（下一次混音即时生效）。
+    pub fn set_music_volume(&self, volume: f32) {
+        self.mixer().set_music_volume(volume);
+    }
+
+    /// 音乐总线是否占用中（含淡出中）。
+    pub fn music_is_playing(&self) -> bool {
+        self.mixer().music_is_playing()
+    }
+
+    /// 当前音乐轨句柄（`None` = 空闲）。与 [`Audio::play_music`] 的返回值比对
+    /// 可知「我放的这条是否仍是当前轨」（切轨后旧句柄自然失配）。
+    pub fn music_handle(&self) -> Option<MusicHandle> {
+        self.mixer().music_handle()
+    }
+
+    /// 设置音乐总线混响（简化 Schroeder 链，算法与限制见 `iris_audio::reverb`）。
+    /// 默认 `wet = 0` 为旁路（逐位不改动混音结果）；**v1 只作用于音乐总线**，
+    /// 音效与空间音效不受影响。
+    pub fn set_reverb(&self, settings: ReverbSettings) {
+        self.mixer().set_reverb(settings);
+    }
+
+    /// 当前混响参数（卫生化后的值）。
+    pub fn reverb_settings(&self) -> ReverbSettings {
+        self.mixer().reverb_settings()
+    }
+
     /// 读取空间源差分快照（上一帧活跃列表；`crate::spatial` 的差分管理用）。
     pub(crate) fn spatial_active(&self) -> Vec<(u64, SoundId)> {
         self.spatial_active
@@ -227,5 +288,55 @@ mod tests {
         // 差分快照初值：headless 构造即空表，替换 / 读回对称
         assert!(audio.spatial_active().is_empty());
         audio.set_spatial_active(Vec::new());
+    }
+
+    /// 音乐总线与混响门面：headless 下 `play_music` 照常入总线、混音可离线
+    /// 断言（首个预探块内取数 ⇒ 无后台线程时序竞态），`set_reverb` 可回读，
+    /// `stop_music` 立即释放总线。
+    #[test]
+    fn music_and_reverb_facade_forwards_to_mixer() {
+        use iris_audio::SampleStream;
+
+        let audio = Audio::headless();
+        assert!(!audio.music_is_playing(), "新建总线应空闲");
+        assert_eq!(
+            audio.reverb_settings(),
+            ReverbSettings::default(),
+            "混响默认旁路（不显式设置时结果与 R44 之前一致）"
+        );
+
+        // 常量满幅流：混音结果可直接按采样值断言
+        let clip = iris_audio::AudioClip::from_interleaved(vec![0.5; 2_048], 1, 48_000)
+            .expect("测试剪辑合法");
+        let handle = audio.play_music(SampleStream::new(clip, 512), 1.0, 0.0, false);
+        assert!(audio.music_is_playing());
+        let mut out = vec![0.0f32; 512 * 2];
+        audio.mixer().mix(&mut out, 2, 48_000);
+        assert!(
+            out.iter().all(|s| *s == 0.5),
+            "单声道常量流上混应为复制，实际 {:?}",
+            &out[..4]
+        );
+        assert_eq!(audio.mixer().active_count(), 0, "音乐不占音效槽位");
+
+        audio.set_music_volume(0.0);
+        let mut muted = vec![9.0f32; 256 * 2];
+        audio.mixer().mix(&mut muted, 2, 48_000);
+        assert!(muted.iter().all(|s| *s == 0.0), "音量 0 应静音");
+
+        audio.set_reverb(ReverbSettings {
+            wet: 0.25,
+            room_size: 0.6,
+        });
+        assert_eq!(
+            audio.reverb_settings().wet,
+            0.25,
+            "set_reverb 应转发到混音器"
+        );
+
+        assert!(audio.stop_music(0.0));
+        assert!(!audio.music_is_playing());
+        assert_eq!(audio.music_handle(), None);
+        assert!(!audio.music_is_playing(), "句柄 {handle:?} 所属轨已停");
     }
 }

@@ -33,9 +33,10 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
 - **iris-core**：不依赖任何图形/窗口库，可独立用于无渲染的服务端模拟或工具链。
 - **iris-render**：只依赖 winit 类型做窗口句柄，不反向依赖 engine 门面；离屏渲染完全不触碰窗口。
 - **iris-platform**：窗口配置与输入状态，薄封装 winit。
-- **iris-audio**：不依赖任何 iris 内部 crate 的纯音频库（软件混音核心 + WAV + 程序化音效），
-  可脱离引擎独立使用；混音数学全部纯函数（§4.14），cpal 设备层为 native 专属依赖，
-  wasm32 下优雅降级为纯混音器。
+- **iris-audio**：不依赖任何 iris 内部 crate 的纯音频库（软件混音核心 + WAV /
+  OGG-Vorbis 加载 + 流式音乐总线 + 音乐混响 + 程序化音效），可脱离引擎独立使用；
+  混音数学全部纯函数（§4.14），解码依赖 symphonia（纯 Rust、`forbid(unsafe_code)`），
+  cpal 设备层为 native 专属依赖，wasm32 下优雅降级为纯混音器。
 - **iris-engine**：App 框架、插件、winit `ApplicationHandler` 主循环，把三者粘合；
   另承载**场景序列化**（§4.15——场景横跨 mesh / material / 灯光 / 物理，
   属门面层的编排职责）。
@@ -1388,6 +1389,97 @@ DOF / MB 排在泛光**之前**：焦外亮源与运动拖影应参与后续亮�
   位姿取相机 `GlobalTransform`、悬于场地上方，pan 由 XZ 平面方位决定；
   竞技场尺度把距离参考放大到 25 m——默认 4 m 会让全场音效衰减到不可闻）。
 
+**音频 v2（R44：OGG/Vorbis 流式解码 + 音乐总线 + 混响）**：
+
+**为什么做**：`AudioClip` 是全量常驻的 f32 PCM（60 s 立体声 48 kHz = 22 MB），
+30 分钟配乐用 WAV 是几百 MB——「低占用」卖点在音频侧破功。本轮把「采样从哪来」
+抽象成 trait，让 OGG 分块解码喂进一条新的**流式音乐总线**，常驻内存与曲目长度脱钩。
+
+```text
+  assets/*.ogg ──► OggVorbisStream（symphonia 分块解码）
+                          │ 后台线程 iris-audio-music（只有满队列才阻塞）
+                          ▼
+  有界块队列 8 × 4096 帧         混音回调 try_lock 三态 poll      ┌─► out（音效之后、限幅之前）
+  （生产端 Condvar / 消费端不等待）──────────────────────────► MusicBus ─► Reverb ─► out
+                                                                 块拼接 + 线性包络      dry + wet
+```
+
+- **OGG/Vorbis 解码**（`ogg.rs`）：依赖 **symphonia 0.5**（feature 只开
+  `ogg + vorbis`）。选型硬理由：symphonia 全家族 crate 顶部
+  **`#![forbid(unsafe_code)]`**（编译器强制、不公开裸指针 C API）——与本仓库
+  「全库零 unsafe」定位一致（同类解码器 `lewton` 含大量 unsafe，故不选）；
+  拉取式 `FormatReader::next_packet` + `Decoder::decode` 状态机天然匹配
+  「后台线程分块喂混音」；`ogg + vorbis` 子集依赖树最小（arrayvec / bitflags /
+  bytemuck / lazy_static / encoding_rs，无 rustfft / regex）。两条消费路径：
+  `AudioClip::from_ogg` / `load_ogg`（整条解成交剪辑——短音效，混音路径零改动）
+  与 `OggVorbisStream`（实现 `AudioStream`，分块解码喂流式通道）。Vorbis 输出的
+  f32 平面按帧交错重排（`L0 R0 L1 R1…`），**值原样搬运不缩放**。坏包跳过继续，
+  其他解码错误：一次性路径回传 `AudioError`，流式路径 `log::warn` + 按结束处理
+  （后台线程里没有 Result 可回传）。
+- **流式通道**（`stream.rs`）：`AudioStream` 契约 = 布局恒定（`channels` /
+  `sample_rate`）+ `next_block(&mut Vec<f32>) -> bool`（**追加**语义，块长上限
+  针对本次追加量，返回 false 时缓冲里可能仍有最后一段）+ `rewind`（循环能力，
+  默认不可循环）+ 「每次调用必须有进展」（连续 8 次空转被解码线程判为流结束）。
+  `SampleStream` 把常驻剪辑按块喂出去（流式机制与格式无关 ⇒ 确定性测试全走它）。
+  `MusicBus` 语义：新轨硬拆上一轨（v1 单总线不做 crossfade）、淡入淡出是
+  **按输出帧推进的线性 f32 斜坡**（秒数在第一次混音拿到输出采样率时才落地）、
+  总线音量与包络相乘、`stop_music(fade_out)` 淡出到位或流耗尽即拆轨（**混响尾巴
+  继续**，因为混响状态挂在混音器上）。
+- **块队列（实时原则的延伸）**：生产者（解码线程）满队列时阻塞在 `Condvar`；
+  消费者（混音回调）`poll` 只做一次 `try_lock` ⇒ 三态 `Block / End / Empty`，
+  **忙或空即判下溢**，绝不等待（与设备回调的 `try_lock` 填静音是同一条原则）。
+  下溢时该缓冲剩余帧**不写音乐采样、游标不推进**，下次混音从原处续播（表现为
+  卡顿而非爆音，是解码跟不上实时消费的信号）。生产者退出统一由 `ProducerGuard`
+  （`Drop`）标记 `finished` + `producer_done`，panic 也不会让消费者无限期停在
+  静音；`stop_music` / 切轨 / 混音器析构 → `close()` 唤醒阻塞中的生产者自行退出
+  （`music_producer_finished` 观测、`join_music_producer` 供干净收尾）。线程创建
+  失败（wasm32：std 的 wasm PAL 是「桩件直接返回错误」）时退化为**混音调用内
+  同步解码**——wasm 本就没有 cpal 实时回调，混音由主线程推进。
+- **块拼接的逐位一致性**（本轮的确定性硬账）：取出的块 `extend_from_slice` 接到
+  待播缓冲尾部，每次混音后把已消费的**整数帧**从缓冲与游标里剪掉（f64 减整数在
+  块长量级下无舍入 ⇒ 游标相位跨块、跨混音调用连续），块边界因此不出现在采样序列
+  里；且音乐与音效共用同一个 `SourceFrames::add_frame`（声道映射 + 插值 + 增益
+  叠加的数学**收敛成一处实现**，不复制第二份）。验证方式：
+  `music_block_splices_are_sample_exact` 以「等待生产者退出 ⇒ 数据全部就位、
+  不可能下溢」为前置条件，跨 5 个块、跨 2 次混音调用逐 `to_bits()` 比对
+  「输出序列 == 源序列」；`streaming_blocks_match_full_decode` 逐位比对
+  「OGG 流式分块拼接 == 一次性整条解码」。采样率不一致时只主张**数值**一致
+  （`music_resamples_to_output_rate_like_voices`，容差 1e-6）——两条路径的 f64
+  游标累加区间不同，逐位等价只在 ratio = 1（精确整数）时成立。
+- **混响**（`reverb.rs`，简化 Schroeder / Freeverb 精简版）：每声道 4 条 comb
+  并联求和 → 2 条 allpass 串联，左右用同一延迟整列表的**不同置换** + 不同
+  allpass 表展宽；表以 44100 Hz 为基准按 `round(base × rate / 44100)` 缩放
+  （换采样率保持时间尺度）。comb：`y[n] = b[n−M]`、`b[n] = x[n] + g·y[n]`，
+  `g = COMB_FEEDBACK[k] × room_size` ⇒ 单位冲激下 `y[kM] = g^(k−1)` **严格成立**
+  （单测逐采样锁定），`RT60 = ln(0.001) / ln(g) × M / rate`；allpass：
+  `y[n] = b[n−M] − g·x[n]`、`b[n] = x[n] + g·y[n]` ⇒ 冲激响应
+  `[−g, …, 1−g², …, g(1−g²), …]`、Σy² = 1。输出 `dst += dry + wet × 湿项`，
+  `wet = 0`（默认）为**逐位透明的旁路**，混音器据此直接跳过整条混响路径
+  （不拷 scratch、不做无谓浮点运算）。纯 f32 乘加 + 整数环下标 ⇒ 同输入逐位
+  一致、且**与混音分块大小无关**（两条都有断言）。v1 只挂音乐总线，不做
+  Freeverb 阻尼低通 / 预延迟 / 逐声音 send。
+- **内存实测**（`cargo run -p iris-audio --release --example music_memory`，
+  60 s 立体声 48 kHz 同内容对比；流式侧按「队列容量 × 实测块长 + demuxer 读缓冲」
+  计账，**不是** RSS 直测）：
+
+  | 形态 | 常驻字节 | 说明 |
+  |---|---|---|
+  | WAV 全量（f32 混音态） | 23,040,000（22.0 MB） | 采样数 × 4 |
+  | WAV 磁盘（16-bit PCM） | 11,520,044（11.0 MB） | 头 44 + 采样数 × 2 |
+  | OGG 压缩体积 | 704,070（0.7 MB） | fixture 实测 94 kbps 外推 |
+  | **流式常驻（`open(path)`）** | **429,568（0.41 MB）** | 8 块队列 + 待播块 + 64 KB 读缓冲 |
+  | 流式常驻（`from_bytes`） | 1,133,638（1.08 MB） | 上面 + 整条压缩码流常驻 |
+
+  ⇒ **常驻比 54×**（open 路径）/ 20×（bytes 路径），且计账式子里没有「曲目时长」
+  这一项（长度无关是结构性的：队列有界 + 块长固定）。示例自带 `ratio ≥ 20` 的
+  回归断言。
+- **门面与测试资产**：iris-engine `Audio` 转发 `play_music` / `stop_music` /
+  `set_music_volume` / `music_is_playing` / `music_handle` / `set_reverb` /
+  `reverb_settings`（headless 与有设备同语义：无设备时照常推进、可离线断言）。
+  真实资产 `crates/iris-audio/tests/fixtures/tone_2s.ogg`（ffmpeg libvorbis 编码
+  的 48 kHz 立体声 2 s 正弦 + 噪声，23 KB / 94 kbps，实测解出恰好 96000 帧；
+  集成测试文件头写明重生成命令）。v1 限制清单见 **§8.23**。
+
 ### 4.15 场景序列化（iris-engine/scene）
 
 **关卡数据与游戏代码分离**：JSON 场景描述文件 ↔ 世界实体（`load_scene` /
@@ -1793,6 +1885,7 @@ pass，「后画者在上」由 pass 内顺序统一裁决（小地图底图应�
 | 并行系统读写竞争 | 数据竞争 / UB | 类型级访问集分批 + 冲突即 panic 兜底 |
 | GPU 缓冲悬垂 | 手写生命周期，易错 | wgpu 引用计数 + Usage 校验 |
 | 类型混淆的句柄 | 强转 UB | `TypeId` + `downcast` + 泛型封装 |
+| 第三方音频解码 | FFI 绑定 libvorbis / stb_vorbis | 选 symphonia（crate 顶部 `#![forbid(unsafe_code)]`，编译器强制），iris-audio 自身零 unsafe（§4.14，R44） |
 | 全库 | 手工内存管理 | **零 unsafe，全程借用检查** |
 
 ## 6. 跨平台策略
@@ -2335,6 +2428,24 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
     边缘，无逐 tap 门控）；MB 屏幕外重投影点不做剔除（上一帧不可见的
     像素按无运动透传兜底）；MB 只服务主相机（RT 相机无后处理链，
     §8.20）。
+23. **音频 v2 为 v1 限定**（§4.14，R44）：**只支持 OGG 容器里的 Vorbis**
+    （feature 只开 `ogg + vorbis`，MP3 / FLAC / Opus 报 `Unsupported`，不做
+    静默降级），声道数上限 8；**音乐总线单轨**——新轨硬拆上一轨，无
+    crossfade / 无多轨混音，且不参与空间化（无距离衰减与声像）；**混响只挂
+    音乐总线**，音效与空间音效不受 `set_reverb` 影响，且简化 Schroeder 无
+    阻尼低通（高低频同速衰减，尾巴偏亮）、无预延迟、无逐声音 send 量；
+    **下溢填静音不做任何补偿**（不拉伸、不补帧——解码跟不上实时消费时听感
+    是卡顿，队列深度即抖动预算，8 × 4096 帧 @ 48 kHz ≈ 0.68 s）；
+    `OggVorbisStream::from_bytes` 在构造与每次 `rewind` 时**复制一次压缩字节**
+    （symphonia 的 `MediaSourceStream` 接管所有权；`open(path)` 路径改为重开
+    文件，不常驻）；**循环用「重建 demuxer / decoder」实现而不是容器 seek**
+    （省掉 seek 后解码器状态一致性这一类易错空间，代价是一次 re-probe）；
+    **解码错误在流式路径不可回传**（跑在后台线程）：坏包跳过、其余错误
+    `log::warn` 后按「流结束」处理——需要明确错误的场合走 `parse_ogg` 一次性
+    路径；未做显式 gapless 裁剪（实测本仓库 fixture 帧数与时长精确相符，
+    但缺粒位置提示的码流可能保留约 2 k 采样头尾冗余）；**wasm32 无线程**
+    ⇒ 退化为混音调用内同步解码（该平台上解码耗时计入当次混音，因其本无
+    cpal 实时回调）。
 
 ## 9. 关键设计取舍记录
 

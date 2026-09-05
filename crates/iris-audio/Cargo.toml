@@ -11,6 +11,13 @@ authors.workspace = true
 log = { workspace = true }
 # 空间音频 v1 的三维数学（听者 / 声源位置、声像投影）；纯数学库，wasm32 可用
 glam = { workspace = true }
+# OGG/Vorbis 解码（R44）。选型理由见 `src/ogg.rs` 模块文档，要点：symphonia
+# 全家族 crate 顶部 `#![forbid(unsafe_code)]`（编译器强制，且不公开裸指针 C API），
+# 与本仓库「全库零 unsafe」定位一致；`ogg + vorbis` 子集的依赖树最小
+# （arrayvec / bitflags / bytemuck / lazy_static / encoding_rs，无 rustfft / regex）；
+# `FormatReader::next_packet` + `Decoder::decode` 是拉取式状态机，一次调用一块输出，
+# 天然匹配「后台线程分块喂混音」的流式音乐架构。
+symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis"] }
 
 # 平台原因（wasm32）：cpal 在 wasm32-unknown-unknown 上不可用（其 Web 后端
 # 依赖 Web Audio 回调模型与 wasm-bindgen 链路，当前无法编译），因此设备层

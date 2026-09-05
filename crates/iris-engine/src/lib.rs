@@ -56,9 +56,12 @@ pub mod prelude {
     pub use crate::ui::{UiPlugin, update_ui_layout};
     // 设置持久化（R41）：加载 / 保存全局设置
     pub use crate::settings::Settings;
-    // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV 加载）
+    // 音频类型（混音器 / 剪辑 / 句柄 / 错误 / 程序化生成与 WAV、OGG 加载）；
+    // R44 追加流式音乐通道（`AudioStream` / `SampleStream` / `MusicHandle`）
+    // 与音乐总线混响参数（`ReverbSettings`）
     pub use iris_audio::{
-        AudioClip, AudioError, AudioMixer, AudioOutput, ListenerParams, SoundId, load_wav, noise,
-        parse_wav, sine, square,
+        AudioClip, AudioError, AudioMixer, AudioOutput, AudioStream, ListenerParams, MusicHandle,
+        OggVorbisStream, ReverbSettings, SampleStream, SoundId, load_ogg, load_wav, noise,
+        parse_ogg, parse_wav, sine, square,
     };
 }

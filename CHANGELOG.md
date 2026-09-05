@@ -5,6 +5,81 @@
 
 ## [Unreleased]
 
+### Added（R44：OGG/Vorbis 流式解码 + 音乐总线 + 混响——音频 v2）
+
+音频侧补上「体积」这块短板：此前只支持 WAV 全量内存（60 s 立体声 48 kHz
+= 22 MB，30 分钟配乐几百 MB），「低占用」卖点在音频侧破功。本轮
+`iris-audio` 新增三个模块 + 一个第三方解码依赖（保持**零引擎依赖**纪律）：
+
+- **OGG/Vorbis 解码**（`ogg.rs`）：依赖 **symphonia 0.5**（feature 只开
+  `ogg + vorbis`）。选型硬理由＝symphonia 全家族 crate 顶部
+  **`#![forbid(unsafe_code)]`**（编译器强制），与本仓库「全库零 unsafe」
+  一致（同类解码器 lewton 含大量 unsafe，故不选）；拉取式
+  `next_packet` + `decode` 状态机天然匹配「后台线程分块喂混音」；子集依赖树
+  最小（无 rustfft / regex）。两条消费路径：`AudioClip::from_ogg` /
+  `load_ogg`（整条解成交剪辑，短音效走既有混音路径**零改动**）与
+  `OggVorbisStream`（实现 `AudioStream`，分块解码喂流式通道）。Vorbis 的
+  f32 平面按帧交错重排，值原样搬运不缩放。
+- **流式音乐总线**（`stream.rs`）：`AudioMixer::play_music(stream, volume,
+  fade_in, looping)` / `stop_music(fade_out)` / `set_music_volume` /
+  `music_is_playing` / `music_handle` / `music_producer_finished` /
+  `join_music_producer`。`AudioStream` 契约（布局恒定 + `next_block` 追加
+  语义 + `rewind` 循环能力 + 进展保证）；`SampleStream` 让常驻剪辑也走流式
+  路径（**流式机制与格式无关**，故确定性测试全部用它）。解码在专用后台线程
+  `iris-audio-music` 分块产出，经**有界块队列**（8 × 4096 帧）交混音回调：
+  生产者满队列才阻塞 `Condvar`，消费者只做一次 `try_lock`（三态
+  `Block / End / Empty`）——与 cpal 回调同一条「实时线程绝不等待」原则。
+  **下溢语义**：该缓冲剩余帧不写音乐、游标不推进，下次混音从原处续播
+  （听感是卡顿不是爆音，队列深度即抖动预算）。**循环在生产者侧** `rewind`
+  重建 demuxer（不走容器 seek，免掉 seek 后解码器状态一致性的易错空间）。
+  淡入淡出是**按输出帧推进的线性 f32 斜坡**；单总线单轨（切轨硬拆上一轨，
+  v1 无 crossfade）；音乐不空间化。线程创建失败（wasm32）退化为混音调用内
+  同步解码。
+- **块拼接的逐位一致性**（确定性硬账）：块 `extend_from_slice` 接待播缓冲
+  尾部，每次混音后把已消费的**整数帧**从缓冲与游标里剪掉（f64 减整数在块长
+  量级无舍入 ⇒ 游标相位跨块、跨调用连续），块边界不出现在采样序列里；音乐
+  与音效共用同一个 `SourceFrames::add_frame`（声道映射 + 插值 + 增益叠加
+  数学**收敛成一处实现**）。验证：`music_block_splices_are_sample_exact`
+  以「等生产者退出 ⇒ 数据全就位」为前置条件，跨 5 块、跨 2 次混音逐
+  `to_bits()` 比对「输出 == 源」；`streaming_blocks_match_full_decode`
+  比对「OGG 流式分块拼接 == 一次性整条解码」。采样率不一致只主张数值一致
+  （容差 1e-6，两路径 f64 游标累加区间不同）。
+- **音乐总线混响**（`reverb.rs`）：简化 Schroeder / Freeverb 精简版——
+  每声道 4 comb 并联 → 2 allpass 串联，左右用同一延迟整列表的不同置换 +
+  不同 allpass 表展宽，表按 `round(base × rate / 44100)` 缩放。
+  `ReverbSettings { wet, room_size }`（参数卫生化，非有限 → 0）；
+  `out = dry + wet × 湿项` ⇒ **`wet = 0`（默认）为逐位透明旁路**，混音器据此
+  跳过整条混响路径（不拷 scratch）。纯 f32 乘加 + 整数环下标 ⇒ 逐位确定，
+  且**与混音分块大小无关**（两条断言）。comb / allpass 的冲激响应解析可算
+  （`y[kM] = g^(k−1)`、`[−g, …, 1−g², …]`、Σy² = 1）并逐采样锁定。
+  v1 只挂音乐总线（音效 / 空间音效不受 `set_reverb` 影响）。
+- **内存实测**（一级交付物，`cargo run -p iris-audio --release --example
+  music_memory`，60 s 立体声 48 kHz 同内容）：WAV 全量常驻 **22.0 MB**
+  （磁盘 16-bit 11.0 MB）、OGG 压缩 **0.7 MB**（fixture 实测 94 kbps 外推）、
+  **流式常驻 0.41 MB**（8 块队列 + 待播块 + 64 KB demuxer 读缓冲，
+  `open(path)` 路径）/ 1.08 MB（`from_bytes` 路径）⇒ **常驻比 54× / 20×**，
+  式子里没有「曲目时长」项（长度无关是结构性的）。示例自带 `ratio ≥ 20`
+  回归断言。
+- **测试资产**：`crates/iris-audio/tests/fixtures/tone_2s.ogg`（ffmpeg
+  libvorbis 编码的 48 kHz 立体声 2 s 正弦 + 噪声，23 KB，实测解出**恰好
+  96000 帧**；集成测试文件头写明重生成命令）。OGG 解码走真实资产的集成测试
+  `tests/ogg_vorbis.rs`（7 项：布局 / 长度 / 逐位确定性 / 流式 vs 一次性一致 /
+  经混音器采样级直通 / 截断容错 / 两入口同源）。
+- **门面**：iris-engine `Audio` 转发 `play_music` / `stop_music` /
+  `set_music_volume` / `music_is_playing` / `music_handle` / `set_reverb` /
+  `reverb_settings`，prelude 追加 `AudioStream` / `SampleStream` /
+  `MusicHandle` / `OggVorbisStream` / `ReverbSettings` / `load_ogg` /
+  `parse_ogg`；headless 与有设备同语义。
+
+新增测试 38 项（`iris-audio` lib 38 → 68：mixer 流式组 +11、reverb +9、
+stream +9、ogg 单元 +1；OGG 集成测试 +7；引擎门面转发 +1），测试总数
+**657 → 695**（debug）/ **656 → 694**（release）。
+诚实限制清单见 ARCHITECTURE **§8.23**（只支持 OGG 里的 Vorbis、单轨、音乐
+不空间化、混响只挂音乐且无阻尼低通 / 预延迟、下溢不补偿、`from_bytes` 每次
+rewind 复制一次压缩字节、流式路径解码错误不可回传、未做显式 gapless 裁剪、
+wasm32 退化内联解码）；设计与实测细节见 **§4.14**。既有 iris-audio 测试
+零改动全过（混音核心逐位文化不动）。
+
 ### Added（R43：景深 DOF + 运动模糊 MB——后处理链写实扩展）
 
 后处理链新增两个**相机级**效果 pass（`iris-render`）：景深

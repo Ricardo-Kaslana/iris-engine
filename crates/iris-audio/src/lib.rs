@@ -23,19 +23,35 @@
 //! 空间化 v1：[`AudioMixer::set_listener`] + [`AudioMixer::play_spatial`] +
 //! [`AudioMixer::set_sound_position`]——距离软倒数衰减 + 恒功率立体声声像
 //! （模型与已知限制见 `mixer` 模块文档）。
+//!
+//! 音频 v2（R44）：OGG/Vorbis 解码（[`AudioClip::from_ogg`] 小音效进内存、
+//! [`OggVorbisStream`] 分块解码喂流式通道）+ 流式音乐总线
+//! （[`AudioMixer::play_music`] / [`AudioMixer::stop_music`]，常驻内存与曲目
+//! 长度无关：8×4096 帧有界队列 + 待播块 + demuxer 读缓冲，60 s 立体声实测
+//! ≈ 0.4 MB，而同内容 WAV 全量常驻 22 MB）+ 音乐总线混响
+//! （[`AudioMixer::set_reverb`]，简化 Schroeder 链）。机制与诚实限制分别见
+//! `stream` / `reverb` / `ogg` 模块文档。
 
 use std::fmt;
 
 pub mod clip;
 pub mod device;
 pub mod mixer;
+pub mod ogg;
 pub mod procedural;
+pub mod reverb;
+pub mod stream;
 pub mod wav;
 
 pub use clip::AudioClip;
 pub use device::AudioOutput;
 pub use mixer::{AudioMixer, DEFAULT_REFERENCE_DISTANCE, ListenerParams, SoundId, spatial_gain};
+pub use ogg::{OggVorbisStream, load_ogg, parse_ogg};
 pub use procedural::{noise, sine, square};
+pub use reverb::{DelayLine, Reverb, ReverbSettings};
+pub use stream::{
+    AudioStream, DEFAULT_BLOCK_FRAMES, DEFAULT_QUEUE_BLOCKS, MusicHandle, SampleStream,
+};
 pub use wav::{load_wav, parse_wav};
 
 /// 音频子系统错误。风格与 iris-render 的 `GltfError` / `HdrError` 一致：
