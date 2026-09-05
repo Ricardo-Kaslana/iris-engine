@@ -1069,29 +1069,65 @@ v1 的单张阴影贴图以注视点为中心、`shadow_range`（24 m）为半�
 `Renderer::draw` 的 CPU 耗时与读回路径解耦，见 §4.4.1）。
 GPU 适配器缺失时构造返回 `None`，调用方优雅降级——测试可跳过而非失败。
 
-### 4.11 后处理链 v1（pass 串联框架：泛光 / 曝光 / 暗角）
+### 4.11 后处理链 v1（pass 串联框架：景深 / 运动模糊 / 泛光 / 曝光 / 暗角）
 
-**pass 链顺序**（编译期有序；tonemap/blit 是链的固定终点，暗角在线性
-HDR 域作用）：
+**pass 链顺序**（编译期有序；tonemap/blit 是链的固定终点，全部效果都在
+线性 HDR 域作用）：
 
 ```text
 主 HDR 解析缓冲（不透明 → 蒙皮 → 透明 → 粒子的混合结果 + 天空背景）
+  → 景深 DOF（可选，全分辨率）：逐像素 CoC → 12-tap 泊松盘 HDR 平均
+      （采样主相机深度副本，见下「场景深度副本」）
+  → 运动模糊 MB（可选，全分辨率）：深度重建世界位 → 上帧相机重投影
+      → 屏幕速度方向 N-tap 采样（v1 只覆盖相机运动）
   → 泛光（可选）：亮度提取 → 高斯模糊（半分辨率 ping-pong A/B，三轮分离迭代）
   → 暗角（可选）：全分辨率 HDR → HDR，UV 距中心 smoothstep 压暗四角
   → blit：叠加泛光（x）+ 曝光（y）+ ACES 色调映射 → sRGB 目标
   → UI 叠加层（blit 之后，见 §4.13，不吃任何后处理）
 ```
 
+DOF / MB 排在泛光**之前**：焦外亮源与运动拖影应参与后续亮度提取
+（HDR 线性域先混合、后做镜头合成，与暗角先于曝光同理）。两者默认
+关闭（资源缺席 = 关），关闭时整段跳过、链与 R42 基线逐位一致（
+`tests/post_render.rs` FNV 哈希锁定）；DOF 的清晰带覆盖全深度 / MB
+的相机静止路径在**启用时**也逐位透传（select 原色分支）。
+
 - **pass 串联框架**（`post.rs`，防过度设计——编译期有序链，不做运行时
   注册 / trait 对象注册表 / 拓扑排序）：全屏后处理 pass =
-  `PostPassDesc`（管线 + 组 0 布局 + 参数 uniform + 源 + 目标槽位），
-  编码统一走 `encode_post_pass` 单一函数——泛光三段循环与暗角的
-  begin_pass / set_bind_group / draw 样板只此一份。中间纹理由
-  `PostScratch` ping-pong 分配器按**分辨率等级**（泛光 = 半分辨率、
-  暗角 = 全分辨率按需）各缓存一对 Rgba16Float 纹理，命中同尺寸跨帧
-  复用、尺寸变化整体重建；泛光的槽位交替（读 A 写 B / 读 B 写 A）由
-  纯函数 `bloom_blur_slots` 单点定义（任意轮数输出恒回 A = blit 固定
-  采样槽），CPU 单测守护「不读写同槽、链连续、落点恒 A」。
+  `PostPassDesc`（管线 + 组 0 布局 + 参数 uniform + 源 + 目标槽位 +
+  可选附加纹理 `extra_texture`——DOF / MB 据此绑深度副本，组布局用
+  `post_depth_layout`：binding 3 = R32Float 非过滤纹理，不依赖
+  float32-filterable 扩展），编码统一走 `encode_post_pass` 单一函数
+  ——链上全部 pass 的 begin_pass / set_bind_group / draw 样板只此一份。
+  中间纹理由 `PostScratch` ping-pong 分配器按**分辨率等级**（泛光 =
+  半分辨率、其余 = 全分辨率按需）各缓存一对 Rgba16Float 纹理，命中同
+  尺寸跨帧复用、尺寸变化整体重建；槽位拓扑由两个纯函数单点定义并各
+  有 CPU 单测守护：泛光的 `bloom_blur_slots`（任意轮数输出恒回 A）与
+  全分辨率链的 `full_chain_slots`（DOF 写 A、MB 写 B、暗角写链头对面
+  槽位防同 pass 读写互斥、blit 源 = 暗角输出或链头，8 种开关组合的
+  拓扑不变量有测试）。
+- **场景深度副本**（R43，`shaders/scene_depth.wgsl`）：主 pass 的深度
+  附件是外部传入的 Depth32Float **MSAA** 纹理（仅 RENDER_ATTACHMENT，
+  不可绑采样、无深度解析），DX12 下 depth-only 采样另有写入异常的教训
+  （§4.7）——因此照搬阴影的「深度写颜色 R 通道 + Depth32Float 双附件」
+  方案：仅 DOF / MB 启用时把不透明 + 蒙皮实例从相机视角重画一遍，
+  R32Float 单采样附件存**线性视距**（clip.w；varying 透视校正插值对
+  1/w 线性恰给出逐像素精确视距），天空清空为 z_far；自带 Depth32Float
+  附件（Less）做最近面裁决。资源随尺寸惰性创建、跨帧复用。
+- **景深**（`DepthOfFieldSettings { enabled, focus_distance,
+  focus_range, max_blur_radius }`，`shaders/dof.wgsl`）：薄透镜简化
+  ——CoC = clamp(|d − focus| / range − 1) × max_radius（d = 深度副本
+  的线性视距，textureLoad 读取），12-tap 泊松盘 HDR 平均；清晰带内
+  CoC 恒 0 走 select 原色透传（半纹素以下同样透传）。focus_distance
+  口径为沿视线方向的 view-Z（画面边缘的斜向距离略长，§8）。
+- **运动模糊**（`MotionBlurSettings { enabled, strength, max_samples }`，
+  `shaders/motion_blur.wgsl`）：逐像素深度 → NDC z（DirectX [0,1]
+  约定的解析重建 z = f/(f−n) − (n·f/(f−n))/d，CPU 预计算两系数）→
+  inv_view_proj 反投影世界位 → prev_view_proj 重投影 → 屏幕 UV 速度
+  → 沿速度方向 n = clamp(|v| × strength, 1, max_samples) tap 采样
+  （循环恒跑 32 槽按 n 掩码加权，规避 WGSL uniform 控制流限制）。
+  渲染器存上一帧主相机矩阵（首帧用当前帧补位）；**只覆盖相机运动**
+  （§8）。相机静止（两帧矩阵逐位相同 → 速度 0）时原色透传。
 - **泛光三段式**：亮度提取（smoothstep 软阈值，HDR 亮度超过
   `BloomSettings.threshold` 才参与）→ 可分离高斯模糊（9 tap 线性采样，
   半分辨率，水平/垂直管线共用、三轮迭代扩展半径）→ blit 合成（ACES
@@ -1109,13 +1145,18 @@ HDR 域作用）：
   **链位与顺序理由**：暗角在泛光之后、blit 之前（线性 HDR 域作用）；
   暗角（镜头遮挡）先于曝光（传感器增益）——光先被镜头边缘挡住、再
   落到传感器上放大，blit 中的乘曝光因此排在暗角之后。开启时 blit 的
-  hdr 源切到全分辨率 A 槽（接入绑定组随纹理对惰性构建、跨帧复用）。
+  hdr 源切到暗角输出槽（DOF / MB 入链时写链头**对面**槽位，A/B 两个
+  接入绑定组随纹理对惰性构建、跨帧复用）。
 - **资源缺席语义（零开销默认路径）**：`BloomSettings` 缺席 = 默认启用；
   `ExposureSettings` 缺席 = 1.0 中性（画面与无曝光控制逐位一致）；
-  `VignetteSettings` 缺席或 `strength = 0` = 整段跳过暗角 pass、blit
-  直读主解析缓冲（与无暗角帧逐位一致）。三者都**不在 DefaultPlugins
-  强制注册**，需要时手动 `insert_resource`。GPU 测试逐位断言：
-  「曝光缺席 ≡ 显式 1.0」「暗角 0/缺席 ≡ 无 pass 帧」。
+  `VignetteSettings` 缺席或 `strength = 0` = 整段跳过暗角 pass；
+  `DepthOfFieldSettings` / `MotionBlurSettings` 缺席或 `enabled = false`
+  = 整段跳过对应 pass（连同场景深度副本 pass）与额外按需资源。全部
+  关闭时 blit 直读主解析缓冲，与 R42 基线帧逐位一致。以上资源都**不在
+  DefaultPlugins 强制注册**，需要时手动 `insert_resource`。GPU 测试
+  逐位断言：「曝光缺席 ≡ 显式 1.0」「暗角 0/缺席 ≡ 无 pass 帧」
+  「DOF/MB 关闭 ≡ R42 基线 FNV 哈希」「DOF 清晰带覆盖全深度 ≡ 透传」
+  「MB 启用 + 相机静止 ≡ 透传」。
 - **uniform 对齐陷阱**：泛光三个 pass 的参数曾放在同一缓冲的 32B 插槽
   里，触发 `min_uniform_buffer_offset_alignment`（典型 256）校验错误——
   绑定偏移必须 256 对齐；改为三个独立小缓冲后消除。全链共享合成参数
@@ -2280,6 +2321,20 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
     覆写，对逻辑零影响，但概念上是重复体）。**绕行**：代理同步实体
     （`PROXY_NAME`）。**建议**：`RigidBody` 增加 kinematic 体类型
     （位置由调用方驱动、参与检测与推挤、不参与动力学积分）。
+22. **景深 / 运动模糊为 v1**（§4.11，R43）：**MB 只覆盖相机运动**——
+    物体级速度缓冲（逐实体运动向量 + 物体级重投影 + tile 分类）是大
+    工程，运动物体在相机静止帧中无拖影；**DOF 的 focus_distance 口径
+    为 view-Z**（沿视线方向的线性视距）而非径向距离——画面边缘的
+    斜向物体实际距离更远，聚焦判定偏近（真实薄透镜按光程，需逐像素
+    径向深度）；**场景深度副本不含透明 / 贴花 / 粒子**（半透明表面
+    深度无定义，被透明物遮住的不透明面在副本中可见 → 透过玻璃看远处
+    时 DOF / MB 按不透明面深度计算）；**副本为单采样**而主色为 4x
+    MSAA（边缘像素的深度与颜色来自不同采样分布，焦外边缘可能有 1 px
+    级噪声）；DOF 为**逐像素常量盘形平均**（不区分前景 / 背景倾角、
+    无孔径形状 / 色散、采样不检查邻居 CoC——焦外亮源会渗入焦内像素
+    边缘，无逐 tap 门控）；MB 屏幕外重投影点不做剔除（上一帧不可见的
+    像素按无运动透传兜底）；MB 只服务主相机（RT 相机无后处理链，
+    §8.20）。
 
 ## 9. 关键设计取舍记录
 

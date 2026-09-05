@@ -82,7 +82,9 @@ pub mod prelude {
     pub use crate::particles::{
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };
-    pub use crate::post::{BloomSettings, ExposureSettings, VignetteSettings};
+    pub use crate::post::{
+        BloomSettings, DepthOfFieldSettings, ExposureSettings, MotionBlurSettings, VignetteSettings,
+    };
     pub use crate::renderer::{
         CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,
     };

@@ -46,6 +46,17 @@ pub(crate) struct PipelineBundle {
     pub bloom_blur_pipeline: wgpu::RenderPipeline,
     /// 暗角 pass 管线（全分辨率 HDR → HDR，pass 串联框架的示范 pass）。
     pub vignette_pipeline: wgpu::RenderPipeline,
+    /// 景深 pass 管线（R43，全分辨率 HDR → HDR + 深度副本采样，
+    /// `post_depth_layout`：组 0 多一路 binding 3 的非过滤纹理）。
+    pub dof_pipeline: wgpu::RenderPipeline,
+    /// 运动模糊 pass 管线（R43，全分辨率 HDR → HDR + 深度副本采样，
+    /// 参数 uniform 含当前 / 上一帧视图投影矩阵）。
+    pub motion_blur_pipeline: wgpu::RenderPipeline,
+    /// 主相机场景深度副本管线（R43）：R32Float 颜色附件存线性视距 +
+    /// Depth32Float 双附件（阴影既有方案，见 scene_depth.wgsl）。
+    pub scene_depth_pipeline: wgpu::RenderPipeline,
+    /// 场景深度副本蒙皮变体（组 1 绑定关节矩阵，深度随骨骼变形）。
+    pub scene_depth_skinned_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
@@ -90,6 +101,10 @@ pub(crate) struct PipelineBundle {
     /// 2 = 采样器（泛光 / 暗角等全部链上中间 pass 同构，pass 串联框架
     /// 据此用一个编码函数服务所有 pass）。
     pub post_layout: wgpu::BindGroupLayout,
+    /// 带附加纹理的后处理组布局（R43，DOF / MB 专用）：`post_layout` 的
+    /// 基础上多一路 binding 3 = 深度副本纹理（R32Float 非过滤——该格式
+    /// 不可过滤，声明 filterable = false 不依赖 float32-filterable 扩展）。
+    pub post_depth_layout: wgpu::BindGroupLayout,
     /// UI 绑定组布局：binding 0 = 字形图集纹理、1 = 采样器、
     /// 2 = 屏幕尺寸 uniform（顶点阶段）。
     pub ui_layout: wgpu::BindGroupLayout,
@@ -949,6 +964,202 @@ pub(crate) fn create_pipeline(
     let vignette_pipeline =
         make_post_pipeline("iris.pipeline.vignette", &vignette_shader, "fs_main");
 
+    // 景深 / 运动模糊（R43）：与暗角同构的全屏 pass，但多采样一路主相机
+    // 深度副本（scene_depth pass 的 R32Float 线性视距）——组 0 用
+    // post_depth_layout（binding 3 = 非过滤纹理），其余与 post_layout
+    // 逐项一致。深度读取走 textureLoad（整数纹素坐标），非过滤声明是
+    // 对 R32Float 不可过滤的匹配（见 dof.wgsl / motion_blur.wgsl 模块头）。
+    let scene_depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.scene_depth"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/scene_depth.wgsl").into()),
+    });
+    let dof_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.dof"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/dof.wgsl").into()),
+    });
+    let motion_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.motion_blur"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_blur.wgsl").into()),
+    });
+    let post_depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.post_depth"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+        ],
+    });
+    let post_depth_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.post_depth.pipeline.layout"),
+            bind_group_layouts: &[Some(&post_depth_layout)],
+            immediate_size: 0,
+        });
+    let make_post_depth_pipeline = |label: &'static str,
+                                    shader: &wgpu::ShaderModule,
+                                    fs: &'static str|
+     -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&post_depth_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: post_target,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let dof_pipeline = make_post_depth_pipeline("iris.pipeline.dof", &dof_shader, "fs_main");
+    let motion_blur_pipeline =
+        make_post_depth_pipeline("iris.pipeline.motion_blur", &motion_blur_shader, "fs_main");
+
+    // 场景深度副本管线（R43）：与阴影管线同构（R32Float 颜色附件存深度
+    // 通道 + Depth32Float 深度附件 Less 测试 + cull None，绕开 DX12
+    // depth-only 写入异常的既有方案），区别是存**线性视距**（clip.w）
+    // 而非裁剪 z——供 DOF 的 CoC 与 MB 的重投影直接消费（scene_depth.wgsl）。
+    let scene_depth_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.scene_depth.pipeline.layout"),
+            bind_group_layouts: &[Some(&cascade_layout)],
+            immediate_size: 0,
+        });
+    let scene_depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.scene_depth"),
+        layout: Some(&scene_depth_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &scene_depth_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &scene_depth_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            // 与阴影管线同款：cull None（环绕方向的实证结论见阴影管线）
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    // 深度副本蒙皮变体：组 1 绑定关节矩阵（与蒙皮阴影管线同构）
+    let scene_depth_skinned_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.scene_depth.skinned.pipeline.layout"),
+            bind_group_layouts: &[Some(&cascade_layout), Some(&joints_layout)],
+            immediate_size: 0,
+        });
+    let scene_depth_skinned_pipeline =
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("iris.pipeline.scene_depth_skinned"),
+            layout: Some(&scene_depth_skinned_layout),
+            vertex: wgpu::VertexState {
+                module: &scene_depth_shader,
+                entry_point: Some("vs_skinned"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    Some(crate::mesh::Vertex::LAYOUT),
+                    Some(crate::mesh::SkinVertex::LAYOUT),
+                    Some(crate::instance::InstanceRaw::LAYOUT),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_depth_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
     // 2D UI 叠加层：像素坐标顶点 + 字形图集采样。写 blit 之后的 sRGB 目标：
     // 无深度附件（叠加而非遮挡）、cull None（UI 面向屏幕）、无 MSAA
     // （目标是 blit 后的单采样缓冲）、标准 alpha 混合（文本/半透明矩形）。
@@ -1215,6 +1426,10 @@ pub(crate) fn create_pipeline(
         bloom_threshold_pipeline,
         bloom_blur_pipeline,
         vignette_pipeline,
+        dof_pipeline,
+        motion_blur_pipeline,
+        scene_depth_pipeline,
+        scene_depth_skinned_pipeline,
         ui_pipeline,
         rt_pipeline,
         rt_skinned_pipeline,
@@ -1231,6 +1446,7 @@ pub(crate) fn create_pipeline(
         joints_layout,
         blit_layout,
         post_layout,
+        post_depth_layout,
         ui_layout,
         particle_layout,
         decal_layout,

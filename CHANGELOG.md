@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+### Added（R43：景深 DOF + 运动模糊 MB——后处理链写实扩展）
+
+后处理链新增两个**相机级**效果 pass（`iris-render`）：景深
+（`DepthOfFieldSettings { enabled, focus_distance, focus_range,
+max_blur_radius }`，`shaders/dof.wgsl`）与运动模糊
+（`MotionBlurSettings { enabled, strength, max_samples }`，
+`shaders/motion_blur.wgsl`），链位在泛光**之前**（HDR 线性域——焦外
+亮源与拖影参与后续亮度提取更物理）、暗角之前。**硬约束兑现：两资源
+缺席或 `enabled = false` 时整帧像素与 R42 基线逐位一致**
+（`tests/post_render.rs` 复用 `normal_render.rs` 的 R41 基线哈希
+`0x609b2457f4d5cd82` 交叉锁定；DOF 清晰带覆盖全深度、MB 启用 + 相机
+静止两条**启用态透传**路径亦逐位断言）。验收示例
+`examples/dof_snapshot.rs`（四帧：DOF 关/对焦中排/对焦远景/运动
+模糊，ffmpeg 2×2 拼图 `docs/dof_motion.png`）：
+
+- **场景深度副本**（`shaders/scene_depth.wgsl`）：主 pass 深度附件是
+  MSAA Depth32Float 且不可采样——照搬阴影的「深度写颜色 R 通道 +
+  Depth32Float 双附件」既有方案，仅 DOF / MB 启用时把不透明 + 蒙皮
+  实例从相机视角重画一遍，R32Float 附件存**线性视距**（clip.w，透视
+  校正插值恰给出逐像素精确视距）；透明 / 贴花 / 粒子不进副本（§8.22）。
+- **DOF**：薄透镜简化 CoC（清晰带半宽 `focus_range`，最大模糊半径按
+  纹素）→ 12-tap 泊松盘 HDR 平均；深度用 `textureLoad`（R32Float 非
+  过滤，不依赖 float32-filterable 扩展）；清晰带 CoC 恒 0 走 select
+  原色透传（逐位无损）。
+- **MB**：逐像素深度 → NDC z 解析重建（DirectX [0,1] 约定，
+  z = f/(f−n) − (n·f/(f−n))/d，CPU 预计算系数）→ inv_view_proj 反
+  投影世界位 → 上一帧相机矩阵重投影 → 屏幕 UV 速度 → 沿速度方向
+  n-tap 采样（循环恒跑 32 槽按 tap 数掩码加权，规避 WGSL uniform 控制
+  流限制）。渲染器保存上一帧主相机矩阵，首帧 / 相机静止 → 速度 0 →
+  原色透传。**诚实边界：只覆盖相机运动**（物体级速度缓冲留待后续，
+  §8.22）。
+- **框架增量化**：`PostPassDesc` 增加可选附加纹理槽 `extra_texture`
+  （组 0 binding 3，新 `post_depth_layout` = `post_layout` + 非过滤
+  纹理）；全分辨率链槽位拓扑由纯函数 `full_chain_slots` 单点定义
+  （DOF 写 A、MB 写 B、暗角写链头对面槽位防同 pass 读写互斥、blit
+  源 = 暗角输出或链头），8 种开关组合的拓扑不变量有 CPU 单测；blit
+  的全分辨率 A/B 接入绑定组随纹理对惰性构建（`ensure_full_targets`
+  取代 `ensure_vignette_target`，暗角单开行为不变）。
+- **测试**（`tests/post_render.rs` 5 → 12）：基线 FNV 锁定、显式
+  关闭 ≡ 缺席、DOF 远景高频方差下降（高通残差方差——盒式模糊近似保
+  全变差，整块方差对模糊不敏感）、聚焦带近无损、DOF 全清晰带逐位
+  透传、MB 静止逐位透传、平移后水平 L2 梯度能量下降且垂直不变（方向
+  选择性证据）、同输入两次渲染逐位一致。
+
 ### Added（R42：法线 / AO / ORM 材质通道——写实渲染第一块地基）
 
 `MaterialDef` 新增 `normal_texture`（切线空间法线）与 `orm_texture`

@@ -332,6 +332,13 @@ pub struct Renderer {
     /// HDR 中间缓冲（MSAA 4x 颜色附件 + 单采样解析目标 + blit 绑定组）。
     hdr: Option<HdrTargets>,
     hdr_size: (u32, u32),
+    /// 主相机场景深度副本（R43，仅 DOF / MB 启用时创建）。
+    scene_depth: Option<SceneDepthTargets>,
+    /// 深度副本尺寸（复用判定键）。
+    scene_depth_size: (u32, u32),
+    /// 上一帧主相机视图投影（R43 运动模糊的重投影基准）。`None` = 尚未
+    /// 渲染过任何帧（首帧）——MB 用当前帧矩阵补位，速度恒 0、原色透传。
+    prev_view_proj: Option<glam::Mat4>,
     /// UI 字形图集纹理（初始化时一次性构建；字段仅为保持 view 存活）。
     #[allow(dead_code)]
     ui_atlas: wgpu::Texture,
@@ -410,15 +417,19 @@ struct HdrTargets {
     #[allow(dead_code)]
     resolved: wgpu::Texture,
     resolved_view: wgpu::TextureView,
-    /// blit 合成绑定组：hdr_texture = 主解析缓冲（暗角关闭时的默认路径，
-    /// 与 pass 串联框架引入前的绑定逐项一致）。
+    /// blit 合成绑定组：hdr_texture = 主解析缓冲（链上无任何入链的全
+    /// 分辨率 pass 时的默认路径，与 pass 串联框架引入前的绑定逐项一致）。
     blit_bind_group: wgpu::BindGroup,
-    /// blit 合成绑定组的暗角变体：hdr_texture = 全分辨率 A 槽（链尾为
-    /// 暗角时 blit 的源）。全分辨率对按需分配，故本组随之惰性构建、
-    /// 跨帧复用；HdrTargets 尺寸重建时随集合一起丢弃。
-    blit_vignetted_bg: Option<wgpu::BindGroup>,
+    /// blit 合成绑定组的全分辨率 A 槽变体：hdr_texture = 全分辨率 A 槽
+    /// （链尾为暗角输出或 DOF 输出时 blit 的源）。全分辨率对按需分配，
+    /// 故本组随之惰性构建、跨帧复用；HdrTargets 尺寸重建时随集合丢弃。
+    blit_full_a_bg: Option<wgpu::BindGroup>,
+    /// blit 合成绑定组的全分辨率 B 槽变体（链尾为运动模糊输出时 blit
+    /// 的源；构建时机与 A 槽变体一致）。
+    blit_full_b_bg: Option<wgpu::BindGroup>,
     /// 后处理中间纹理 ping-pong 分配器（post.rs 框架）：半分辨率对在
-    /// 建集合时即建好（泛光默认启用），全分辨率对由暗角按需分配。
+    /// 建集合时即建好（泛光默认启用），全分辨率对由暗角 / DOF / MB
+    /// 按需分配。
     post_scratch: crate::post::PostScratch,
     /// 后处理链共享过滤采样器（各中间 pass 与 blit 同一采样行为）。
     post_sampler: wgpu::Sampler,
@@ -428,9 +439,29 @@ struct HdrTargets {
     bloom_params: [wgpu::Buffer; 3],
     /// 暗角参数缓冲（PostParamsRaw 布局，z 分量生效；pass 关闭时不写）。
     vignette_params: wgpu::Buffer,
+    /// 景深参数缓冲（DofParamsRaw 布局；pass 关闭时不写）。
+    dof_params: wgpu::Buffer,
+    /// 运动模糊参数缓冲（MbParamsRaw 布局；pass 关闭时不写）。
+    motion_blur_params: wgpu::Buffer,
     /// blit 合成参数（16B，PostParamsRaw：x 泛光强度 / y 曝光 / z 暗角 /
     /// w 保留）。每帧整体覆写。
     post_params: wgpu::Buffer,
+}
+
+/// 主相机场景深度副本（R43）：R32Float 单采样纹理（R = 线性视距）+
+/// 自带 Depth32Float 单采样深度附件。仅 DOF / MB 启用时创建并编码
+/// （零开销默认路径）；尺寸变化时整体重建。
+struct SceneDepthTargets {
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    /// 进 post_depth_layout binding 3 的采样视图。
+    view: wgpu::TextureView,
+    #[allow(dead_code)]
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    /// 64B 相机矩阵 uniform（CascadeParams 同布局，cascade_layout 复用）。
+    params: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 impl HdrTargets {
@@ -458,10 +489,41 @@ const _: () = assert!(
     "PostParams 必须与 WGSL blit_params 布局一致"
 );
 
+/// 与 WGSL `DofParams` 对齐（32 字节，POD）：景深 pass 参数。
+/// a = (聚焦距离, 清晰带半宽, 最大模糊半径/纹素, 保留)；
+/// b = (1/宽, 1/高, 0, 0)——纹素半径 → UV 偏移的换算。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DofParamsRaw {
+    a: [f32; 4],
+    b: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<DofParamsRaw>() == 32,
+    "DofParams 必须与 WGSL 布局一致"
+);
+
+/// 与 WGSL `MbParams` 对齐（144 字节，POD）：运动模糊 pass 参数。
+/// 当前帧逆视图投影（深度 → 世界位反投影）+ 上一帧视图投影（重投影）+
+/// 标量（速度缩放 / tap 上限 / 深度→NDC z 的两个预计算系数）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MbParamsRaw {
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    scalars: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<MbParamsRaw>() == 144,
+    "MbParams 必须与 WGSL 布局一致"
+);
+
 /// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
-/// 与暗角变体惰性构建（`ensure_vignette_target`，源 = 全分辨率 A 槽）
-/// 共用条目清单，避免两处漂移；泛光纹理恒为半分辨率 A 槽（泛光链的
-/// 固定输出槽，见 post.rs `bloom_blur_slots`）。
+/// 与全分辨率 A/B 槽变体惰性构建（`ensure_full_targets`，源 = 暗角 /
+/// DOF / MB 的链尾槽位）共用条目清单，避免两处漂移；泛光纹理恒为半
+/// 分辨率 A 槽（泛光链的固定输出槽，见 post.rs `bloom_blur_slots`）。
 fn build_blit_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -1583,6 +1645,9 @@ impl Renderer {
             env_baked_generation: 0,
             hdr: None,
             hdr_size: (0, 0),
+            scene_depth: None,
+            scene_depth_size: (0, 0),
+            prev_view_proj: None,
             ui_atlas,
             ui_bind_group,
             ui_sampler,
@@ -1722,6 +1787,20 @@ impl Renderer {
         };
         let post_params = make_post_params("iris.post.params");
         let vignette_params = make_post_params("iris.vignette.params");
+        // DOF 参数 32B、MB 参数 144B（两个矩阵 + 标量），均超出 16B——
+        // 独立按各自 Raw 布局建（uniform 缓冲尺寸必须与写入字节数一致）
+        let dof_params = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.dof.params"),
+            size: std::mem::size_of::<DofParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let motion_blur_params = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.motion_blur.params"),
+            size: std::mem::size_of::<MbParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let post_sampler = self
             .gpu
             .device
@@ -1741,44 +1820,115 @@ impl Renderer {
             resolved,
             resolved_view,
             blit_bind_group,
-            blit_vignetted_bg: None,
+            blit_full_a_bg: None,
+            blit_full_b_bg: None,
             post_scratch,
             post_sampler,
             bloom_params,
             vignette_params,
+            dof_params,
+            motion_blur_params,
             post_params,
         });
     }
 
-    /// 暗角开启时的按需资源：全分辨率中间纹理对（ping-pong 分配器惰性
-    /// 分配、跨帧复用）与「blit 读暗角输出」的接入绑定组。二者随
-    /// `HdrTargets` 尺寸重建一并失效（`blit_vignetted_bg` 归 `None`、
-    /// 纹理对重新按需分配）。仅在 `draw` 开头、`hdr` 不可变借用建立之前
-    /// 调用。
-    fn ensure_vignette_target(&mut self, width: u32, height: u32) {
+    /// 暗角 / 景深 / 运动模糊任一开启时的按需资源：全分辨率中间纹理对
+    /// （ping-pong 分配器惰性分配、跨帧复用）与「blit 读全分辨率链尾」
+    /// 的 A / B 两个接入绑定组。随 `HdrTargets` 尺寸重建一并失效（
+    /// `blit_full_*_bg` 归 `None`、纹理对重新按需分配）。仅在 `draw`
+    /// 开头、`hdr` 不可变借用建立之前调用。
+    fn ensure_full_targets(&mut self, width: u32, height: u32) {
         let hdr = self
             .hdr
             .as_mut()
             .expect("draw 开头已 ensure_hdr_targets，HDR 中间缓冲必就绪");
         hdr.post_scratch
             .ensure(&self.gpu, crate::post::PostScale::Full, width, height);
-        if hdr.blit_vignetted_bg.is_none() {
-            let (full_a_view, _) = hdr
+        if hdr.blit_full_a_bg.is_none() || hdr.blit_full_b_bg.is_none() {
+            let (full_a_view, full_b_view) = hdr
                 .post_scratch
                 .pair_views(crate::post::PostScale::Full)
                 .expect("全分辨率中间纹理对应已按需创建");
-            hdr.blit_vignetted_bg = Some(build_blit_bind_group(
-                &self.gpu.device,
-                &self.bundle.blit_layout,
-                full_a_view,
-                hdr.post_scratch
-                    .pair_views(crate::post::PostScale::Half)
-                    .expect("半分辨率中间纹理对应已随集合创建")
-                    .0,
-                &hdr.post_sampler,
-                &hdr.post_params,
-            ));
+            let bloom_view = hdr
+                .post_scratch
+                .pair_views(crate::post::PostScale::Half)
+                .expect("半分辨率中间纹理对应已随集合创建")
+                .0;
+            let make = |hdr_view: &wgpu::TextureView| {
+                build_blit_bind_group(
+                    &self.gpu.device,
+                    &self.bundle.blit_layout,
+                    hdr_view,
+                    bloom_view,
+                    &hdr.post_sampler,
+                    &hdr.post_params,
+                )
+            };
+            hdr.blit_full_a_bg = Some(make(full_a_view));
+            hdr.blit_full_b_bg = Some(make(full_b_view));
         }
+    }
+
+    /// 主相机场景深度副本的按需资源（R32Float 线性视距 + Depth32Float
+    /// 附件 + 相机矩阵 uniform 与绑定组）。仅 DOF / MB 启用时调用（
+    /// `draw` 开头、`hdr` 借用建立之前）；尺寸变化时整体重建。
+    fn ensure_scene_depth(&mut self, width: u32, height: u32) {
+        if self.scene_depth.is_some() && self.scene_depth_size == (width, height) {
+            return;
+        }
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.scene_depth.texture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.scene_depth.depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.scene_depth.params"),
+            size: std::mem::size_of::<CascadeParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.scene_depth.bg"),
+                layout: &self.bundle.cascade_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                }],
+            });
+        self.scene_depth_size = (width, height);
+        self.scene_depth = Some(SceneDepthTargets {
+            texture,
+            view,
+            depth,
+            depth_view,
+            params,
+            bind_group,
+        });
     }
 
     pub fn set_clear_color(&mut self, color: wgpu::Color) {
@@ -1811,15 +1961,30 @@ impl Renderer {
         // 环境源失效检查在最前：重烘焙与绑定组重建必须发生在本帧编码之前
         self.ensure_environment(world);
         self.ensure_hdr_targets(width, height);
-        // 暗角按需资源（全分辨率中间对 + blit 接入绑定组）必须在贯穿全部
-        // pass 的 hdr 不可变借用建立之前惰性分配（强度 0 / 资源缺席零开销
-        // 跳过——与可见性、粒子同款「缺席零开销」哲学）
+        // 暗角 / 景深 / 运动模糊的按需资源（全分辨率中间对 + blit 接入
+        // 绑定组 + 主相机深度副本）必须在贯穿全部 pass 的 hdr 不可变借用
+        // 建立之前惰性分配（关闭 = 零开销跳过——与可见性、粒子同款
+        // 「缺席零开销」哲学）
         let vignette_strength = world
             .try_resource::<crate::post::VignetteSettings>()
             .map(|v| v.strength.max(0.0))
             .unwrap_or(0.0);
-        if vignette_strength > 0.0 {
-            self.ensure_vignette_target(width, height);
+        // 资源缺席语义：DOF / MB 缺席 = 关闭（与暗角同款零开销默认路径）
+        let dof = world
+            .try_resource::<crate::post::DepthOfFieldSettings>()
+            .map(|d| *d)
+            .unwrap_or_default();
+        let mb = world
+            .try_resource::<crate::post::MotionBlurSettings>()
+            .map(|m| *m)
+            .unwrap_or_default();
+        let dof_on = dof.enabled;
+        let mb_on = mb.enabled;
+        if vignette_strength > 0.0 || dof_on || mb_on {
+            self.ensure_full_targets(width, height);
+        }
+        if dof_on || mb_on {
+            self.ensure_scene_depth(width, height);
         }
         self.stats = FrameStats::default();
         // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），
@@ -1874,6 +2039,11 @@ impl Renderer {
             return;
         };
         let texture_store = world.try_resource::<TextureStore>();
+        // 运动模糊的重投影基准（R43）：上一帧主相机视图投影；首帧用当前
+        // 帧矩阵补位（速度恒 0 → 原色透传）。保存时机在全部早退路径之后
+        // （被跳过的帧不产生「上一帧」）。
+        let prev_vp = self.prev_view_proj.unwrap_or(vp);
+        self.prev_view_proj = Some(vp);
 
         // RT（R40）相机收集：全部 (ActiveCamera + RendersTo) 实体，数量上限
         // RENDER_TARGET_MAX（小地图 / 监控屏两个典型用例，超出 warn 跳过）。
@@ -2885,11 +3055,103 @@ impl Renderer {
             triangles_drawn += 2 * particle_total;
             particles_drawn = particle_total;
         }
-        // ---- 后处理链（ARCHITECTURE §4.11）：泛光（半分辨率，可选）→
-        // 暗角（全分辨率，强度 > 0 才入链）→ blit 色调映射（链的固定终
-        // 点）。pass 编码统一走 post.rs 的 encode_post_pass（描述 → 编码）。
-        // 资源缺席语义：BloomSettings 缺席 = 默认启用；ExposureSettings
-        // 缺席 = 1.0 中性；VignetteSettings 缺席 = 0.0 关闭。
+        // 主相机场景深度副本 pass（R43）：仅 DOF / MB 启用时编码。把
+        // 不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件存线性
+        // 视距（clip.w，见 scene_depth.wgsl 的插值推导），自带
+        // Depth32Float 附件做最近面裁决——阴影的「深度写颜色 + 双附件」
+        // 既有方案（主 pass 的深度附件是 MSAA 且无 TEXTURE_BINDING，
+        // 不可直接采样，DX12 下 depth-only 采样另有写入异常的教训）。
+        // 透明 / 贴花 / 粒子不进副本（半透明深度无定义，ARCHITECTURE §8）。
+        if (dof_on || mb_on) && opaque_total > 0 {
+            let sd = self
+                .scene_depth
+                .as_ref()
+                .expect("DOF/MB 开启时应已创建深度副本");
+            self.gpu.queue.write_buffer(
+                &sd.params,
+                0,
+                bytemuck::bytes_of(&CascadeParamsRaw {
+                    view_proj: vp.to_cols_array_2d(),
+                }),
+            );
+            let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+            let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.scene_depth"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &sd.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // 天空 / 无几何像素 = 远平面视距（DOF 视为最远
+                        // 模糊带；MB 反投影到远平面点）
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: z_far as f64,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &sd.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // 普通不透明批（区间 [0, total)）：与阴影 pass 同款逐批 draw
+            depth_pass.set_pipeline(&self.bundle.scene_depth_pipeline);
+            depth_pass.set_bind_group(0, &sd.bind_group, &[]);
+            depth_pass.set_vertex_buffer(1, instance_buf.slice(..));
+            let mut d = 0usize;
+            while d < total {
+                let key = items[d].key;
+                let mut count = 1;
+                while d + count < total && items[d + count].key == key {
+                    count += 1;
+                }
+                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                depth_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                depth_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                depth_pass.draw_indexed(0..mesh.num_indices, 0, d as u32..(d + count) as u32);
+                d += count;
+            }
+            // 蒙皮：深度随骨骼变形（组 1 关节矩阵，与蒙皮阴影管线同构）
+            if !skinned.is_empty() {
+                depth_pass.set_pipeline(&self.bundle.scene_depth_skinned_pipeline);
+                depth_pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, item) in skinned.iter().enumerate() {
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    depth_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    depth_pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    depth_pass
+                        .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    depth_pass.set_bind_group(1, &skin.bind_group, &[]);
+                    let base = (total + i) as u32;
+                    depth_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                }
+            }
+        }
+        // ---- 后处理链（ARCHITECTURE §4.11）：景深（可选）→ 运动模糊
+        // （可选）→ 泛光（半分辨率，可选）→ 暗角（全分辨率，强度 > 0 才
+        // 入链）→ blit 色调映射（链的固定终点）。pass 编码统一走 post.rs
+        // 的 encode_post_pass（描述 → 编码）。资源缺席语义：
+        // BloomSettings 缺席 = 默认启用；ExposureSettings 缺席 = 1.0 中性；
+        // VignetteSettings / DepthOfFieldSettings / MotionBlurSettings
+        // 缺席 = 关闭（enabled = false 等价）。
         let bloom = world
             .try_resource::<crate::post::BloomSettings>()
             .map(|b| *b)
@@ -2915,6 +3177,108 @@ impl Renderer {
                 _reserved: 0.0,
             }),
         );
+        // 全分辨率链（DOF / MB / 暗角）的槽位分配：纯函数单点定义（
+        // post.rs，离线单测守护拓扑不变量）
+        let slots = crate::post::full_chain_slots(dof_on, mb_on, vignette_strength > 0.0);
+        // 链头（泛光与暗角的源）：DOF/MB 输出槽或主解析缓冲
+        let head_input = match slots.head {
+            Some(slot) => crate::post::PostInput::Scratch(crate::post::PostScratchRef::Full(slot)),
+            None => crate::post::PostInput::Scene,
+        };
+        // 景深（DOF）：主解析缓冲 → 全分辨率 A 槽。CoC 按逐像素线性视距
+        // 计算，12-tap 泊松盘 HDR 平均；位于泛光之前（HDR 线性域——焦外
+        // 亮源参与亮度提取更物理）。
+        if dof_on {
+            self.gpu.queue.write_buffer(
+                &hdr.dof_params,
+                0,
+                bytemuck::bytes_of(&DofParamsRaw {
+                    a: [
+                        dof.focus_distance.max(0.0),
+                        dof.focus_range.max(1e-6),
+                        dof.max_blur_radius.max(0.0),
+                        0.0,
+                    ],
+                    b: [
+                        1.0 / width.max(1) as f32,
+                        1.0 / height.max(1) as f32,
+                        0.0,
+                        0.0,
+                    ],
+                }),
+            );
+            let depth_view = &self
+                .scene_depth
+                .as_ref()
+                .expect("DOF 开启时应已创建深度副本")
+                .view;
+            let views = hdr.post_views();
+            crate::post::encode_post_pass(
+                &mut encoder,
+                &self.gpu.device,
+                &views,
+                &hdr.post_sampler,
+                crate::post::PostPassDesc {
+                    label: "iris.pass.dof",
+                    pipeline: &self.bundle.dof_pipeline,
+                    layout: &self.bundle.post_depth_layout,
+                    params: &hdr.dof_params,
+                    src: crate::post::PostInput::Scene,
+                    dst: crate::post::PostScratchRef::Full(
+                        slots.dof_dst.expect("DOF 开启时必有目标槽位"),
+                    ),
+                    extra_texture: Some(depth_view),
+                },
+            );
+        }
+        // 运动模糊（MB）：链头 → 全分辨率 B 槽。逐像素深度重建世界位 →
+        // 上一帧相机重投影 → 屏幕速度方向 N-tap 采样；只覆盖相机运动
+        // （物体级速度缓冲是 v1 限制，ARCHITECTURE §8）。首帧 / 相机静止
+        // 时 prev_vp == vp → 速度 0 → 原色透传（逐位一致）。
+        if mb_on {
+            // 深度 → NDC z 的两个预计算系数（DirectX [0,1] 深度约定，
+            // 推导见 motion_blur.wgsl 模块头）：z_ndc = f/(f−n) − (n·f/(f−n))/d
+            let z_den = (z_far - z_near).max(1e-6);
+            let a_coef = z_far / z_den;
+            let b_coef = z_near * z_far / z_den;
+            self.gpu.queue.write_buffer(
+                &hdr.motion_blur_params,
+                0,
+                bytemuck::bytes_of(&MbParamsRaw {
+                    inv_view_proj: vp.inverse().to_cols_array_2d(),
+                    prev_view_proj: prev_vp.to_cols_array_2d(),
+                    scalars: [mb.strength.max(0.0), mb.max_samples as f32, a_coef, b_coef],
+                }),
+            );
+            let depth_view = &self
+                .scene_depth
+                .as_ref()
+                .expect("MB 开启时应已创建深度副本")
+                .view;
+            let views = hdr.post_views();
+            crate::post::encode_post_pass(
+                &mut encoder,
+                &self.gpu.device,
+                &views,
+                &hdr.post_sampler,
+                crate::post::PostPassDesc {
+                    label: "iris.pass.motion_blur",
+                    pipeline: &self.bundle.motion_blur_pipeline,
+                    layout: &self.bundle.post_depth_layout,
+                    params: &hdr.motion_blur_params,
+                    src: match slots.mb_src {
+                        Some(slot) => {
+                            crate::post::PostInput::Scratch(crate::post::PostScratchRef::Full(slot))
+                        }
+                        None => crate::post::PostInput::Scene,
+                    },
+                    dst: crate::post::PostScratchRef::Full(
+                        slots.mb_dst.expect("MB 开启时必有目标槽位"),
+                    ),
+                    extra_texture: Some(depth_view),
+                },
+            );
+        }
         if bloom.enabled {
             let bw = (width / 2).max(1) as f32;
             let bh = (height / 2).max(1) as f32;
@@ -2939,7 +3303,7 @@ impl Renderer {
                     .write_buffer(buffer, 0, bytemuck::bytes_of(&raw));
             }
             let views = hdr.post_views();
-            // 提取：主解析缓冲 → 半分辨率 A 槽
+            // 提取：链头（DOF/MB 输出槽或主解析缓冲）→ 半分辨率 A 槽
             crate::post::encode_post_pass(
                 &mut encoder,
                 &self.gpu.device,
@@ -2950,8 +3314,9 @@ impl Renderer {
                     pipeline: &self.bundle.bloom_threshold_pipeline,
                     layout: &self.bundle.post_layout,
                     params: &hdr.bloom_params[0],
-                    src: crate::post::PostInput::Scene,
+                    src: head_input,
                     dst: crate::post::PostScratchRef::Half(crate::post::PingPongSlot::A),
+                    extra_texture: None,
                 },
             );
             // 模糊：槽位交替由 bloom_blur_slots 单点定义（任意轮数输出恒回
@@ -2980,13 +3345,16 @@ impl Renderer {
                             src,
                         )),
                         dst: crate::post::PostScratchRef::Half(dst),
+                        extra_texture: None,
                     },
                 );
             }
         }
         // 暗角：全分辨率 HDR → HDR（镜头物理遮挡近似，线性域压暗四角），
         // 位于泛光之后、blit 之前。强度 0（或缺席资源）整段跳过——blit
-        // 直读主解析缓冲，与无暗角帧逐位一致（零开销默认路径）。
+        // 直读主解析缓冲，与无暗角帧逐位一致（零开销默认路径）。DOF/MB
+        // 入链时源切到链头、目标写链头对面槽位（同 pass 读写互斥，
+        // 槽位由 full_chain_slots 单点定义）。
         if vignette_strength > 0.0 {
             self.gpu.queue.write_buffer(
                 &hdr.vignette_params,
@@ -3009,21 +3377,29 @@ impl Renderer {
                     pipeline: &self.bundle.vignette_pipeline,
                     layout: &self.bundle.post_layout,
                     params: &hdr.vignette_params,
-                    src: crate::post::PostInput::Scene,
-                    dst: crate::post::PostScratchRef::Full(crate::post::PingPongSlot::A),
+                    src: head_input,
+                    dst: crate::post::PostScratchRef::Full(
+                        slots.vignette_dst.expect("暗角开启时必有目标槽位"),
+                    ),
+                    extra_texture: None,
                 },
             );
         }
-        // 色调映射 blit：链尾输出 -> sRGB 输出。暗角开启时 blit 的源切到
-        // 全分辨率 A 槽（绑定组在 ensure_vignette_target 惰性构建）；关闭
-        // 时直读主解析缓冲（默认绑定组，与引入暗角前逐项一致）。
+        // 色调映射 blit：链尾输出 -> sRGB 输出。链尾 = 暗角输出（暗角开）
+        // 或 DOF/MB 输出槽（相机级效果开）或主解析缓冲（全关——默认绑定
+        // 组，与引入暗角前逐项一致）。全分辨率槽位的接入绑定组在
+        // ensure_full_targets 惰性构建、跨帧复用。
         {
-            let blit_bg = if vignette_strength > 0.0 {
-                hdr.blit_vignetted_bg
+            let blit_bg = match slots.blit_hdr {
+                None => &hdr.blit_bind_group,
+                Some(crate::post::PingPongSlot::A) => hdr
+                    .blit_full_a_bg
                     .as_ref()
-                    .expect("暗角开启时应已惰性构建 blit 接入绑定组")
-            } else {
-                &hdr.blit_bind_group
+                    .expect("全分辨率 A 槽 blit 接入绑定组应已惰性构建"),
+                Some(crate::post::PingPongSlot::B) => hdr
+                    .blit_full_b_bg
+                    .as_ref()
+                    .expect("全分辨率 B 槽 blit 接入绑定组应已惰性构建"),
             };
             let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.blit"),
