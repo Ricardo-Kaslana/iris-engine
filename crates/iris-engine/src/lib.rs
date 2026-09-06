@@ -57,8 +57,8 @@ pub mod prelude {
         load_scene_from, save_scene,
     };
     // 编程式 glTF / GLB 构造器（打磨 IV）：记账归 builder，人只声明
-    // 几何 / 层级 / 关键帧
-    pub use crate::gltf_builder::{AnimChannel, GltfBuilder, GltfNodeDesc};
+    // 几何 / 层级 / 关键帧；打磨 VI 追加纹理通道声明（material_textured）
+    pub use crate::gltf_builder::{AnimChannel, GltfBuilder, GltfMaterialTextures, GltfNodeDesc};
     // 平滑追随范式（打磨 IV）：子实体相机 + 帧率无关指数趋近
     pub use crate::camera_rig::{SmoothFollow, update_smooth_follow};
     // 空间音频 v1（听者 / 声源组件与每帧同步系统）

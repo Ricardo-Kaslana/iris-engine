@@ -111,15 +111,16 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   节点 scale 污染 IK 链长 / 无隐藏子树原语 / 运动学角色无物理碰撞体）
   见 §8.22。
 - **iris-assault**：与五作同层的第六作（示范游戏 Iris Assault，写实
-  战斗庭院，写实路线垂直切片）——同一依赖纪律（iris-engine 门面 +
-  glam；**一处显式偏离**：R45 的 GLB 内存加载入口
-  `spawn_gltf_instance_from_bytes` 未进 iris-render prelude，pack 路径
-  是一级载荷，故直依 iris-render，见 §8.26②），把 **R42–R47 六轮新
-  能力当载荷全量实弹**：**写实材质（R42）**（地面石板 / 砖墙用引擎
-  `brick_normal_orm`，刀身拉丝划痕 / 布料褶皱为本 crate 纯函数生成器
-  ——splitmix64 无状态哈希 + 确定性单测；GLB 材质加载后克隆 +
-  `with_normal/with_orm` 替换）、**DOF / MB（R43）**（战斗逐帧对焦在
-  交战距离——焦外敌人虚化即距离感；MB 覆盖演出相机 spline 运动）、
+  战斗庭院，写实路线垂直切片）——依赖纪律与其他各作一致（iris-engine
+  门面 + glam；R48 曾为 R45 的 GLB 内存加载入口直依 iris-render，
+  **打磨 VI 摩擦② 已把该入口补进 prelude、偏离删除**，见 §8.26②），
+  把 **R42–R47 六轮新能力当载荷全量实弹**：**写实材质（R42）**（地面
+  石板 / 砖墙用引擎 `brick_normal_orm`，刀身拉丝划痕 / 布料褶皱为本
+  crate 纯函数生成器——splitmix64 无状态哈希 + 确定性单测；经
+  `GltfBuilder::material_textured` 把法线 / ORM 通道 PNG 内嵌进 GLB，
+  摩擦③ 闭合）、**DOF / MB（R43）**（战斗对焦 `focus_target` 指向
+  交战目标骨，引擎解析视距——焦外敌人虚化即距离感，摩擦⑤ 闭合；MB
+  覆盖演出相机 spline 运动）、
   **流式音频（R44）**（pack 内 OGG 上音乐总线循环 + 混响；8 种程序化
   音效 `play_spatial`）、**pack（R45）**（GLB + OGG 打包
   `assets/assault.ipak` 单文件、`AssetMount(Pack)` 挂载、GLB 走内存
@@ -136,7 +137,8 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   第六轮撞到的摩擦（**足部 IK 回写四元数不归一化逐帧平方复合爆炸**
   / 内存加载入口不在 prelude / GltfBuilder 无纹理 / 无 Vorbis 编码器 /
   DOF 动态对焦无辅助 / 骨架下标契约全手工 / example 跨 crate 同名
-  冲突）见 §8.26。
+  冲突）见 §8.26——**七条已在「打磨 VI」全部闭合**（①②③⑤⑥ 引擎修复
+  + 游戏侧删绕行，④⑦ 文档 / 约定闭合）。
 
 ## 3. ECS 设计（iris-core）
 
@@ -761,8 +763,17 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   accessor）声明完即 `build_glb()` / `build_json_and_bin(uri)`；与
   加载器互为逆操作（单测「构造 → 加载 → 剪辑 / 节点映射 / 蒙皮」守
   护），gen_asset 示例的全部资产生成已经迁移。
+  **打磨 VI 摩擦③ 追加 `material_textured`**：`GltfMaterialTextures`
+  三通道（baseColor / 法线 / ORM）收 CPU 端 `CpuTexture` 像素，登记时
+  校验尺寸与非零缓冲，build 时 PNG → base64 写成 `data:` URI 内嵌
+  （**不用 bufferView 引用图片**——加载器对该形态仍显式报 Unsupported，
+  见上「v1 不支持」；data URI 也保证 GLB 自包含、内存加载路径可用）；
+  ORM 图同下标写进 `metallicRoughnessTexture` 与 `occlusionTexture`
+  两通道，走加载器「同下标免重打包」快路（§4.6 ORM 合并策略）。
+  无纹理声明时 `images` / `textures` 两键不写 ⇒ 既有资产产物逐字不变。
 - **去重**：同一 glTF 的 mesh / material / texture 按 (索引[, primitive]) 缓存句柄，
-  多节点引用同一网格不重复上传 CPU 目录。
+  多节点引用同一网格不重复上传 CPU 目录；builder 侧按**像素内容**去重
+  （同图多通道 / 多材质只嵌一份 image）。
 - **容错与降级**：所有错误收敛为 `GltfError`（Io / Json / Image / Unsupported /
   Missing / OutOfRange），越界引用不 panic；NORMAL 缺失时按三角形自动生成
   平面法线；TEXCOORD 缺失填充 (0,0)。
@@ -781,7 +792,13 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   端点外钳制到首/末关键帧。
 - **播放**：`AnimationPlayer` 组件持有剪辑、节点映射与播放状态
   （active / time / speed / playing / looping），挂在 glTF 根实体上；
-  `instance.player()` 一行挂载。
+  `instance.player()` 一行挂载。**打磨 VI 摩擦⑥**：播放器另有
+  `node_names`（与 `node_entities` 同下标的 glTF 节点名表，加载器从
+  `nodes[].name` 填入，随 `player()` 带入），配套
+  `node_entity_by_name(name)` 供装配层（IK 链 / 武器挂点 / 材质覆写）
+  按名寻骨——重名取先（向量序确定），无名表（手工构造的播放器）恒
+  None。动画**通道**仍以节点下标为寻址键（`AnimationChannel.node` =
+  glTF 节点索引，与 `AnimationMask` 的节点集同源），名不参与采样。
 - **系统**（`update_animations`，DefaultPlugins 在层级传播前注册）：
   两阶段——先只读查询推进时间并采样出「目标实体 → 覆写字段」任务列表，
   再统一写入目标 `Transform`（被动画的属性覆写，其余字段保持静止姿势）。
@@ -862,7 +879,11 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   向下射线（**真静态体 only**——动态体会抖动、运动学体常与自身链的
   角色胶囊重叠，见 §3.8 口径例外；**sensor** 是事件域、**碰撞组/掩码
   清零**是标记失效（如压力门开门标记），两者同样不参与落地查询），
-  命中点即踝目标；**不可达回退门**：目标距髋超出
+  命中点即踝目标；**回写四元数一律先 `normalize()`**（打磨 VI 摩擦①）
+  ——IK 是唯一覆写「不被剪辑逐帧重置的骨旋转」的系统，非单位写回在
+  无覆写的下一帧会作为复合链输入再乘（共轭不再是逆）⇒ 范数逐帧平方
+  复合直至 NaN，归一化责任归 IK 本身（`foot_ik` 模块文档有推导；
+  `update_hand_ik` 同款）；**不可达回退门**：目标距髋超出
   `(|upper − lower|, upper + lower)` 可达域时本帧放弃该腿修正（保持姿势
   不写任何变换）——不可达/过近唯一解释是射线采样到非地面几何（过门、
   贴墙瞬间的门框/墙顶命中或起点入体），钳制解算会把腿部网格拉成平面式
@@ -1200,11 +1221,18 @@ DOF / MB 排在泛光**之前**：焦外亮源与运动拖影应参与后续亮�
   1/w 线性恰给出逐像素精确视距），天空清空为 z_far；自带 Depth32Float
   附件（Less）做最近面裁决。资源随尺寸惰性创建、跨帧复用。
 - **景深**（`DepthOfFieldSettings { enabled, focus_distance,
-  focus_range, max_blur_radius }`，`shaders/dof.wgsl`）：薄透镜简化
+  focus_range, max_blur_radius, focus_target }`，`shaders/dof.wgsl`）：
+  薄透镜简化
   ——CoC = clamp(|d − focus| / range − 1) × max_radius（d = 深度副本
   的线性视距，textureLoad 读取），12-tap 泊松盘 HDR 平均；清晰带内
   CoC 恒 0 走 select 原色透传（半纹素以下同样透传）。focus_distance
   口径为沿视线方向的 view-Z（画面边缘的斜向距离略长，§8）。
+  **打磨 VI 摩擦⑤**：`focus_target: Option<Entity>` 让对焦距离由引擎
+  逐帧解析——`post::resolve_focus_distance`（纯函数）取目标实体
+  `GlobalTransform` 世界位经主相机视图矩阵的 −z（同 view-Z 口径），
+  解析点在 `Renderer::draw` 的 DOF uniform 上传处（DOF 关闭时不解析）；
+  目标失效 / 无 `GlobalTransform` / `Visibility::HIDDEN` 或非有限值 →
+  回退 `focus_distance` 标量（资源是配置不是状态，解析结果不回写）。
 - **运动模糊**（`MotionBlurSettings { enabled, strength, max_samples }`，
   `shaders/motion_blur.wgsl`）：逐像素深度 → NDC z（DirectX [0,1]
   约定的解析重建 z = f/(f−n) − (n·f/(f−n))/d，CPU 预计算两系数）→
@@ -1563,6 +1591,20 @@ DOF / MB 排在泛光**之前**：焦外亮源与运动拖影应参与后续亮�
   真实资产 `crates/iris-audio/tests/fixtures/tone_2s.ogg`（ffmpeg libvorbis 编码
   的 48 kHz 立体声 2 s 正弦 + 噪声，23 KB / 94 kbps，实测解出恰好 96000 帧；
   集成测试文件头写明重生成命令）。v1 限制清单见 **§8.23**。
+- **编码管线（打磨 VI 摩擦④：明文接受外部工具链，引擎不做编码器）**：
+  运行时只需要**解码**（`AudioClip::from_ogg` / `OggVorbisStream`）；
+  Vorbis 编码器要给 `iris-audio` 加一整个外部依赖（symphonia 只有解码），
+  换到的却是「游戏运行时能吐出自制音效文件」这种没人要的能力——编码是
+  **资产生产期**的事，归工具链。标准命令（README「环境要求」同步收录）：
+
+  ```sh
+  ffmpeg -i in.wav -c:a libvorbis -q 4 in.ogg   # 16-bit PCM WAV → OGG
+  ```
+
+  本机实测（48 kHz 单声道 1 s 正弦）：88,278 B WAV → 5,391 B OGG（16.4×），
+  `ffprobe` 确认容器编码 `vorbis`；引擎侧对该命令产物的解码路径由
+  `tone_2s.ogg` fixture 的同源集成测试覆盖。转换结果经 `PackWriter`
+  进 pack（§7.3）即完成「自制音效 → 运行时播放」的资产闭环。
 
 ### 4.15 场景序列化（iris-engine/scene）
 
@@ -2158,6 +2200,14 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 build 后 test 则 test 的全部编译单元命中缓存，只剩纯运行时间。clippy
 放最后（自有 check-profile 缓存，与前后互不干扰）。
 
+**example 命名约定（打磨 VI 摩擦⑦）**：example 名必须**跨 crate 唯一**，
+游戏 crate 一律带游戏前缀（`gen_assault_assets` / `assault_snapshot`，
+不是 `gen_asset` / `snapshot`）。cargo 把全部 example 编到同一个
+`target/.../examples/` 目录，同名即互相覆盖产物、并在构建期报
+"will become a hard error" 警告；许多 example 还会往仓库根写 BMP/PNG
+验收图，同名时更是互相抹掉对方的验收结果。引擎侧无修法（改 cargo 的
+产物布局不归我们管），故记为约定。
+
 **sccache 编译缓存**（`.cargo/config.toml` 的 `rustc-wrapper`，仓库级
 自动生效）：新机器先 `cargo install sccache`（否则一切 cargo 命令失败，
 见 config 注释）。诚实预期：**workspace 内部源码变更的重编无法避免**
@@ -2690,7 +2740,9 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
 
 26. **dogfooding VI 发现的引擎摩擦（iris-assault 实践反馈）**——第六轮
     （写实垂直切片，六轮新能力全量实弹）。游戏轮纪律：只绕行不改引擎，
-    各条绕行实现写在 iris-assault 内。
+    各条绕行实现写在 iris-assault 内。**→ 打磨 VI 已把七条全部闭合**
+    （①②③⑤⑥ 引擎侧修复 + 游戏侧删除绕行验证；④⑦ 文档 / 工程约定
+    闭合），逐条「闭合」段标注如下，R48 记录原文保留作历史。
     - **①足部 IK 回写四元数不归一化 → 逐帧平方复合爆炸（本轮最重，
       引擎真 bug 级）**：`update_foot_ik` 的旋转回写（世界系旋转弧
       `from_rotation_arc` 复合 + 父共轭反推局部）**不做归一化**，四元数
@@ -2700,41 +2752,94 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
       386 → 5.8e7 → NaN，随后骨长 NaN 撞 `solve_two_bone_ik` 的正值
       断言 panic）。iris-infiltration 未触发纯属侥幸（其 walk 剪辑每帧
       覆写双腿旋转，覆写即重置）。→ 绕行：资产侧给 idle 剪辑补恒值腿
-      通道（每帧以单位四元数重置被 IK 写的骨）→ **建议修法**：
-      `update_foot_ik` / `update_hand_ik` 回写前 `normalize()`（引擎轮
-      闭合 + 单测锁定 ‖q‖−1 ≤ 1e-5）；
+      通道（每帧以单位四元数重置被 IK 写的骨）→ **闭合（打磨 VI）**：
+      两处 IK（`update_foot_ik` / `update_hand_ik`）在局部旋转产生处
+      `normalize()`——归一化是 IK 的责任（它是唯一覆写「不被剪辑重置的
+      骨旋转」的系统，`foot_ik` 模块文档有推导）；回归锁
+      `foot_ik::tests::foot_ik_quaternion_norm_stable_without_clip_overwrite`
+      与 hand 侧同名测试（剪辑只写髋 / 肩平移、无腿臂旋转通道，600 帧
+      逐帧断言分量有限 + ‖q‖−1 ≤ 1e-3 + 骨长保持，并比对同相位两帧的
+      关节世界位 ≤ 1e-3）；iris-assault 的 idle 恒值腿通道**删除**
+      （资产重生成），实弹锁在
+      `iris-assault/tests/headless.rs::intro_cinematic_plays_and_hands_over_control`
+      （撤掉修复即复现 R48 的 `solve_two_bone_ik` panic）；
     - **②GLB 内存加载入口不在 prelude**：R45 的
       `spawn_gltf_instance_from_bytes`（pack / mount 路径的刚需入口）
       未列入 `iris-render` prelude——依赖纪律「游戏 crate 只依门面」
       的下游拿不到它 → 绕行：iris-assault 显式直依 iris-render
-      （Cargo.toml 注明偏离）→ **建议**：补进 prelude；
+      （Cargo.toml 注明偏离）→ **闭合（打磨 VI）**：
+      `spawn_gltf_instance_from_bytes` 已进 `iris-render` prelude，
+      iris-assault 的 iris-render 直依与其 Cargo.toml 偏离注释一并删除
+      （游戏 crate 依赖纪律回归：全局只剩 glam 一条非引擎依赖线）；
     - **③GltfBuilder 不支持纹理引用**：R42 材质通道（法线 / ORM）无法
       在资产生成端表达，程序化写实资产断链 → 绕行：加载后克隆
       `MaterialDef` + `with_normal/with_orm` 替换（游戏侧二次处理）
-      → **建议**：builder 增加 `material_textured`（GLB 内嵌图片或
-      data URI）；
+      → **闭合（打磨 VI）**：`GltfBuilder::material_textured` +
+      `GltfMaterialTextures`（baseColor / 法线 / ORM 三通道，ORM 图同
+      下标写进 `metallicRoughnessTexture` 与 `occlusionTexture`，走
+      加载器的「同下标免重打包」快路）——像素 build 时 PNG → base64
+      `data:` URI **内嵌 GLB**（自包含，`spawn_gltf_instance_from_bytes`
+      可用；登记时校验宽高与非零像素缓冲，内容相同的图只嵌一份）。
+      往返测试 `iris-engine/gltf_builder.rs::tests::built_textured_material_roundtrips_through_the_memory_loader`
+      断言三通道像素逐字节一致（PNG 无损）+ 色彩空间按通道标注 + 两材质
+      共享同一 store 条目。iris-assault 侧克隆材质绕行删除，插件层只剩
+      敌我 `base_color` 配色覆写。诚实代价：角色 GLB 55 KB → 241 KB
+      （4 张 128² 法线 / ORM 图 base64 后占绝对大头），换来资产端一次
+      生成即可渲染写实材质；
     - **④无 Vorbis 编码器**（R44 只有解码）：程序化生成的音效 /
       氛围无法编码进 OGG，pack 的音频条目只能取外部资产 → 绕行：复用
-      引擎音频测试 fixture（2 s 正弦）作占位氛围 → **建议**：
-      `procedural` 增加直写 OGG 编码，或明文接受外部资产管线；
+      引擎音频测试 fixture（2 s 正弦）作占位氛围 → **闭合（打磨 VI，
+      工程 / 文档侧）**：明文接受**外部资产管线**——引擎不做编码器
+      （运行时只需解码；编码属资产生产期，见 §4.14「编码管线」），
+      标准命令 `ffmpeg -i in.wav -c:a libvorbis -q 4 in.ogg` 收录进
+      README「环境要求」与 §4.14（本机实测 16.4× 压缩、`ffprobe` 确认
+      vorbis 编码）。游戏侧占位氛围保持不变（不把二进制音频塞进仓库）；
     - **⑤DOF 动态对焦无引擎辅助**：`DepthOfFieldSettings` 是静态资源，
       而「战斗中对焦交战目标」要求逐帧更新对焦距离（静态值在快速接近
       时把敌人糊成一团——本轮实测确认需逐帧更新，资源形态下游戏侧每帧
       写可用但无原语）→ 绕行：插件层每帧算相机→最近敌距离写资源
-      → **建议**：`FocusTarget(Entity)` 组件 + 渲染器读
-      `GlobalTransform` 自动对焦；
+      → **闭合（打磨 VI）**：`DepthOfFieldSettings::focus_target:
+      Option<Entity>`（**资源字段而非新组件**——对焦目标是「谁来配这台
+      镜头」的一次性配置，不需要组件存储的迭代语义）；解析走纯函数
+      `post::resolve_focus_distance(world, &settings, &view)`，调用点在
+      `Renderer::draw` 的 DOF uniform 上传处（相机已解析、链头第一个
+      全分辨率 pass 之前，DOF 关闭时不解析——缺席零开销）；口径与
+      `focus_distance` 一致为 **view-Z**（目标世界位经视图矩阵取 −z）；
+      实体缺席 / 无 `GlobalTransform` / 自身 `Visibility::HIDDEN` →
+      回退标量，解析值非有限同样回退。测试：`post::tests` 三条纯函数
+      单测（None 回退、目标移动跟随、偏轴 view-Z、缺席 / 隐藏回退）+
+      `iris-render/tests/post_render.rs::dof_focus_target_overrides_scalar_bitwise`
+      （经目标帧与同值标量帧逐位一致 = 渲染器读取路径的锁）。
+      iris-assault 逐帧写 `focus_distance` 的绕行删除，改为对焦最近活敌
+      的胸骨（无活敌回玩家，演出期标量喷泉）；
     - **⑥骨架下标契约全手工**：glTF 加载器不带节点名，
       「资产生成器 ↔ 骨架表 ↔ 插件层」三方的 22 节点下标契约只能靠
       headless 守护测试（节点数 + 腿链父子形状）兜底；且**网格必须
       直挂骨节点**——若做成骨的独立子节点，加载器拆 primitive 子实体
       会引入额外节点使 `node_entities` 错位（本轮第一版 42 ≠ 22 立刻
       爆出）→ 绕行：`skeleton` 模块单一事实来源 + `NODE_COUNT` 守护
-      断言 → **建议**：`GltfInstance` 携带节点名（`node_named` API）；
+      断言 → **闭合（打磨 VI）**：`AnimationPlayer::node_names`（与
+      `node_entities` **同下标**的 glTF 节点名表，由
+      `GltfInstance::node_names` 随 `player()` 带入——加载器给
+      `GltfNode` 补 `name` 反序列化）+ 查询 API
+      `AnimationPlayer::node_entity_by_name(name)`；**重名取先**
+      （向量序确定 ⇒ 结果确定；glTF 不强制名字唯一，唯一性由资产侧
+      保证，`iris-assault/src/skeleton.rs` 的 `names` / `NAMES` 表 +
+      `bone_names_are_unique_and_complete` 测试即此保证）。测试
+      `gltf::tests::node_names_drive_lookup_by_name`（名字表与实体表
+      对齐、按名与按下标命中同一实体）与
+      `animation::tests::node_entity_by_name_takes_first_and_tolerates_gaps`
+      （重名取先 / 有名无实体 / 无名表恒 None）。**下标仍是动画通道与
+      `AnimationMask` 的寻址键**（引擎侧通道数据即「节点下标 + 路径」，
+      不改），所以骨架表的分工变成：下标服务动画、名服务装配；
+      iris-assault 迁移范围＝装配层全部（IK 链、枪身挂点、敌我配色、
+      枪身隐藏），动画通道与遮罩保留下标契约并在生成器内加
+      「声明顺序 = 骨架表下标」断言（错位当场爆炸）；
     - **⑦example 跨 crate 同名冲突**：iris-assault 的 `gen_asset`
       example 与 iris-engine 的同名 example 输出文件互相覆盖
       （cargo 警告 "may become a hard error"）→ 绕行：改名
-      `gen_assault_assets` → **建议**：无引擎侧修法，记录命名约定
-      （游戏 crate 的 example 加游戏前缀）。
+      `gen_assault_assets` → **闭合（打磨 VI，工程约定）**：命名约定
+      写入 §7.2（example 名跨 crate 唯一，游戏 crate 带游戏前缀）。
 
 ## 9. 关键设计取舍记录
 

@@ -22,7 +22,7 @@
 //! 程序化美术数据生成允许 `f32::sqrt` 直接使用（非物理确定性路径，
 //! 与引擎 `brick_normal_orm` 同口径）。
 
-use iris_render::texture::CpuTexture;
+use iris_engine::prelude::CpuTexture;
 
 /// splitmix64 终结函数（无状态哈希；与引擎 `texture.rs` 同源同式）。
 fn mix64(mut z: u64) -> u64 {

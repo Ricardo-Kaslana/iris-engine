@@ -529,6 +529,7 @@ fn dof_blurs_far_background_reducing_variance() {
         focus_distance: 6.0,
         focus_range: 0.5,
         max_blur_radius: 12.0,
+        ..Default::default()
     })));
     let with = renderer.read_pixels();
 
@@ -582,6 +583,7 @@ fn dof_focus_range_covering_scene_is_bitwise_transparent() {
         focus_distance: 6.0,
         focus_range: 1000.0,
         max_blur_radius: 12.0,
+        ..Default::default()
     })));
     let with = renderer.read_pixels();
     assert_eq!(
@@ -778,6 +780,65 @@ fn motion_blur_panning_reduces_gradient_energy() {
     );
 }
 
+/// 焦点实体端到端（打磨 VI 摩擦⑤）：`focus_target` 必须真的驱动 DOF
+/// uniform。① 无网格的焦点实体放到远排深度（视距 ≈ 21.8）→ 解析值必须
+/// 离开标量 6.0（否则本测试无意义）；② 「经目标解析」帧与「标量
+/// `focus_distance` 手写成同一解析值」帧**逐位一致**——这就是渲染器读取
+/// 路径的锁（字段被忽略时两帧必然不同）；③ 目标 `Visibility::HIDDEN` →
+/// 逐位回退标量对焦帧。
+#[test]
+fn dof_focus_target_overrides_scalar_bitwise() {
+    let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let base = DepthOfFieldSettings {
+        enabled: true,
+        focus_distance: 6.0,
+        focus_range: 0.5,
+        max_blur_radius: 12.0,
+        ..Default::default()
+    };
+    let mut world = dof_scene(None);
+    let focus = world.spawn((Transform::from_xyz(0.0, 1.5, -16.0),));
+    propagate_transforms(&mut world);
+    let mut via_target = base;
+    via_target.focus_target = Some(focus);
+    let view = world.resource::<Camera>().view_matrix();
+    let resolved = resolve_focus_distance(&world, &via_target, &view);
+    assert!(
+        (resolved - base.focus_distance).abs() > 1.0,
+        "焦点实体在远排，解析值必须离开标量 6.0（实际 {resolved}）"
+    );
+
+    world.insert_resource(via_target);
+    renderer.render(&world);
+    let target_frame = renderer.read_pixels();
+    // 同一解析值改由标量给出：两帧必须逐位一致（证明 uniform 用的就是解析值）
+    let mut via_scalar = base;
+    via_scalar.focus_distance = resolved;
+    world.insert_resource(via_scalar);
+    renderer.render(&world);
+    assert_eq!(
+        renderer.read_pixels(),
+        target_frame,
+        "焦点实体解析出的对焦距离必须与同值标量逐位一致"
+    );
+
+    // 隐藏目标 → 回退标量：与「无焦点实体」帧逐位一致
+    world.insert(focus, Visibility::HIDDEN);
+    world.insert_resource(via_target);
+    renderer.render(&world);
+    let hidden_frame = renderer.read_pixels();
+    world.insert_resource(base);
+    renderer.render(&world);
+    assert_eq!(
+        renderer.read_pixels(),
+        hidden_frame,
+        "隐藏的焦点实体应回退 focus_distance 标量（与无目标帧逐位一致）"
+    );
+}
+
 /// 确定性（同输入两次跑逐位一致）：DOF 开启场景渲染两遍全帧相等。
 /// 深度副本 pass 与 DOF/MB pass 均无随机性来源（泊松盘偏移是编译期
 /// 常量表，无状态哈希流不涉及）。
@@ -792,6 +853,7 @@ fn dof_render_is_deterministic() {
         focus_distance: 6.0,
         focus_range: 0.5,
         max_blur_radius: 12.0,
+        ..Default::default()
     }));
     renderer.render(&world);
     let first = renderer.read_pixels();

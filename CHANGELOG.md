@@ -5,6 +5,102 @@
 
 ## [Unreleased]
 
+### Changed（引擎 API 打磨 VI：闭合 Iris Assault 的七条摩擦，§8.26 全清单）
+
+「现象 → 绕行 → 建议修法」的第六轮闭合（模式照打磨 I–V：引擎侧修复 +
+游戏侧绕行删除作回归验证；④⑦ 两条以文档 / 工程约定闭合。架构记录见
+ARCHITECTURE §4.6 / §4.6.1 / §4.11 / §4.14 / §7.2 / §8.26）：
+
+- **①IK 回写四元数不归一化 → 逐帧平方复合爆炸（引擎真 bug，本轮最重）**：
+  `update_foot_ik` / `update_hand_ik` 的局部旋转在**产生处**
+  `normalize()`——两骨解走 `Quat::from_rotation_arc` + 父级共轭反推，
+  两处都带浮点范数漂移；写回非单位值后，若下帧没有剪辑通道覆写该骨，
+  它作为复合链的输入再乘（共轭不再是逆）⇒ 范数逐帧平方复合（R48 实测
+  idle 角色 1.9 s 内 386 → 5.8e7 → NaN → `solve_two_bone_ik` 断言
+  panic）。归一化不放通用 `Transform` 写路径（热路径 + 剪辑采样值本由
+  关键帧插值保证单位），**谁引入非单位四元数谁负责**——IK 是唯一覆写
+  「不被剪辑重置的骨旋转」的系统。归一化责任与推导写进 `foot_ik` 模块
+  文档（hand 侧引用同源）。测试：
+  `foot_ik::tests::foot_ik_quaternion_norm_stable_without_clip_overwrite`
+  与 `hand_ik::tests::hand_ik_quaternion_norm_stable_without_clip_overwrite`
+  ——剪辑只写髋 / 肩的**平移**通道（腿臂旋转无覆写），600 帧（10 s = 5
+  个整循环）逐帧断言分量有限、‖q‖−1 ≤ 1e-3、骨长保持 0.5，并比对同
+  相位（相隔 2 个整循环）两帧的关节世界位 ≤ 1e-3（位形口径不比旋转：
+  最小弧只约束骨方向，四元数沿骨轴的 twist 分量由写入历史携带、不参与
+  任何关节位置，是本 IK 表述的自由度）。两测试在撤掉 `normalize()` 后
+  分别于第 14 / 17 帧失败（实测），即永久回归锁。游戏侧：iris-assault
+  的 idle 剪辑**删除四条恒值腿旋转通道**（资产重生成），实弹锁在
+  `intro_cinematic_plays_and_hands_over_control`（站立即足部 IK 每帧写
+  四条腿骨 → 断言单位范数；撤修复即复现 R48 的断言 panic）。
+- **②GLB 内存加载入口进 prelude**：`iris-render` prelude 的 `asset` 导出
+  补 `spawn_gltf_instance_from_bytes`（R45 pack / mount 路径的刚需入口）。
+  游戏侧：`iris-assault` 的 `iris-render` 直依赖与 Cargo.toml 偏离注释
+  删除，`plugin.rs` / `textures.rs` / `tests/headless.rs` /
+  `examples/gen_assault_assets.rs` 全部回到 `iris_engine::prelude` 一条
+  门路面（依赖纪律回归：游戏 crate 全局只剩 glam 非引擎依赖线）。
+- **③`GltfBuilder::material_textured`（纹理通道）**：新
+  `GltfMaterialTextures { base_color, normal, orm }` 三通道收 CPU 端
+  `CpuTexture` 像素，登记时校验（尺寸非零 + `rgba.len() == w×h×4`，中文
+  断言）并按**像素内容**去重（同图多材质只嵌一份），build 时 PNG →
+  base64 写成 `data:` URI 内嵌 GLB（自包含 ⇒ 内存加载路径可用；加载器
+  对 `bufferView` 引用图片仍显式报 Unsupported，未扩面）；ORM 图同下标
+  写进 `metallicRoughnessTexture` 与 `occlusionTexture`，走加载器「同
+  下标免重打包」快路；无纹理声明时 `images` / `textures` 两键不写 ⇒
+  既有产物 JSON 逐字不变。测试：
+  `gltf_builder::tests::built_textured_material_roundtrips_through_the_memory_loader`
+  ——builder → `spawn_gltf_instance_from_bytes` 读回，三通道像素逐字节
+  一致（PNG 无损）、色彩空间按通道标注（baseColor sRGB / 法线 ORM 线性）、
+  两材质共享同一 TextureStore 条目。游戏侧：「加载后克隆材质 +
+  `with_normal/with_orm`」绕行删除（法线 / ORM 随 GLB 自带），插件层只
+  剩敌我 `base_color` 配色覆写；诚实代价——角色 GLB 55 KB → 241 KB。
+- **④Vorbis 编码 = 外部管线（明文闭合，引擎不做编码器）**：运行时只需
+  解码，编码属资产生产期（做编码器要给 `iris-audio` 加整个外部依赖，
+  换的是没人要的「运行时吐出自制音效文件」能力）。标准命令
+  `ffmpeg -i in.wav -c:a libvorbis -q 4 in.ogg` 收录 README「环境要求」
+  与 ARCHITECTURE §4.14（本机实测 88,278 B WAV → 5,391 B OGG，`ffprobe`
+  确认 `vorbis`）；转换结果经 `PackWriter` 进 pack 即闭环。游戏侧占位
+  氛围不变（不把二进制音频塞仓库）。
+- **⑤`DepthOfFieldSettings::focus_target`（DOF 动态对焦原语）**：资源
+  新增 `focus_target: Option<Entity>`（**字段而非新组件**——对焦目标是
+  一次性配置，不需要组件存储迭代语义）；新纯函数
+  `post::resolve_focus_distance(world, &settings, &view)` 取目标
+  `GlobalTransform` 世界位经主相机视图矩阵的 −z（**view-Z**，与
+  `focus_distance` 同口径），调用点在 `Renderer::draw` 的 DOF uniform
+  上传处（相机已解析、链头第一个全分辨率 pass 之前；DOF 关闭时不解析 =
+  缺席零开销）；目标失效 / 无 `GlobalTransform` / `Visibility::HIDDEN`
+  / 非有限 → 回退标量；解析结果不回写资源（资源是配置不是状态）。测试：
+  `post::tests` 三条（None 回退 / 目标移动跟随 + 偏轴 view-Z 口径 /
+  缺席与隐藏回退）+
+  `iris-render/tests/post_render.rs::dof_focus_target_overrides_scalar_bitwise`
+  （经目标帧 vs 同值标量帧**逐位一致** = 渲染器读取路径的锁，另断言
+  隐藏目标回退）。游戏侧：逐帧算相机→敌距离写 `focus_distance` 的绕行
+  删除，改 `focus_target` 指向最近活敌的**胸骨**（无活敌回玩家，演出期
+  标量对焦喷泉）；headless 采样改走同一纯函数，断言「采样帧过半由焦点
+  实体驱动」+ 解析值仍随交战几何变化。
+- **⑥`AnimationPlayer::node_entity_by_name`（按名寻骨）**：加载器给
+  `GltfNode` 补 `name` 反序列化 ⇒ `GltfInstance::node_names`（与
+  `node_entities` 同下标）随 `player()` 进入
+  `AnimationPlayer::node_names`，新查询 `node_entity_by_name(name)`
+  **重名取先**（向量序确定 ⇒ 结果确定；glTF 不强制名字唯一 ⇒ 唯一性由
+  资产侧保证）。下标仍是动画通道与 `AnimationMask` 的寻址键（引擎侧
+  通道数据即「节点下标 + 路径」），分工改为**下标服务动画、名服务
+  装配**。测试：`gltf::tests::node_names_drive_lookup_by_name`（名字表
+  与实体表对齐、按名与按下标命中同一实体、未知名 None）、
+  `animation::tests::node_entity_by_name_takes_first_and_tolerates_gaps`
+  （重名取先 / 有名无实体 / 无名表恒 None）。游戏侧：`skeleton.rs` 新增
+  `names` 模块与 `NAMES` 换算表（+ `bone_names_are_unique_and_complete`
+  守护），装配层（腿 / 臂 IK 链、枪身挂点、敌我配色、枪身隐藏、ADS 目标）
+  全部改按名寻骨，`bone_entities` / `grip_entity` 下标版辅助删除；资产
+  生成器的 `bone()` 按下标声明并**当场断言**「声明顺序 = 骨架表下标」。
+- **⑦example 跨 crate 同名冲突（工程约定闭合）**：R48 已改名
+  `gen_assault_assets`；命名约定（example 名跨 crate 唯一、游戏 crate 带
+  游戏前缀）写入 ARCHITECTURE §7.2——cargo 把所有 example 编到同一
+  `target/.../examples/` 目录，同名既互相覆盖产物（cargo 报 future hard
+  error）也互相抹掉对方写在仓库根的验收图；引擎侧无修法。
+
+摩擦清单原文与逐条闭合标注见 **ARCHITECTURE §8.26**。
+
+
 ### Added（R48：iris-assault 写实战斗庭院——R42–R47 六轮能力全量实弹的垂直切片）
 
 新 crate `crates/iris-assault`（下游示范游戏 VI，dogfooding VI）：20×14 m

@@ -1,14 +1,24 @@
-//! 角色骨架节点表：GLB 节点下标的**单一事实来源**。
+//! 角色骨架节点表：GLB 节点**下标**与**名**的单一事实来源。
 //!
-//! 资产生成器（`examples/gen_asset.rs`）按下表顺序声明节点、把动画
-//! 通道指向这些下标；插件层按同一组常量把
-//! [`GltfInstance::node_entities`](iris_render::asset::GltfInstance::node_entities)
-//! 下标解析为实体（加载器不携带节点名——按名查找不可用，下标即契约）。
-//! **两处必须同步修改**；守护测试（`tests/headless.rs`）断言加载产物
-//! 层级形状（节点数 / 腿链父子关系 / 剪辑数），错位会在测试期爆炸而非
-//! 在画面上漂移。
+//! 两套寻址，各有其主（打磨 VI 摩擦⑥ 的分工）：
 //!
-//! # 节点树（20 节点；Y 负向为臂腿自然下垂方向）
+//! - **下标**（本模块常量 [`ROOT`]..[`FOREGRIP`]）：只服务两处——资产
+//!   生成器（`examples/gen_assault_assets.rs`）声明动画通道的
+//!   `AnimChannel { node }`，以及运行期 [`AnimationMask`] 的节点集
+//!   [`UPPER_BODY`]。引擎侧的动画通道本就是「节点下标 + 路径」，下标即
+//!   契约这件事由**剪辑数据本身**承担；
+//! - **名**（[`names`] 模块）：装配层（IK 链、武器挂点、材质覆写）经
+//!   [`iris_engine::prelude::AnimationPlayer::node_entity_by_name`] 按名
+//!   寻骨。R48 时这条路径走裸下标（`node_entities[i]`），加载器多拆一个
+//!   节点就让全部装配静默错位（实测 42 ≠ 22 立刻爆出）；改为按名后
+//!   错位只在**动画通道**这一处暴露，且守护测试（`tests/headless.rs`
+//!   断言节点数 / 腿链父子形状 / 剪辑数）仍在测试期爆炸而非画面上漂移。
+//!
+//! 名字唯一性由本表保证（生成器与插件层都取 `names::*`，两边不可能拼写
+//! 分叉）。**网格必须直挂骨节点**——若做成骨的独立子节点，加载器拆
+//! primitive 子实体引入额外节点，`node_entities` 下标即与动画通道错位。
+//!
+//! # 节点树（22 节点；Y 负向为臂腿自然下垂方向）
 //!
 //! ```text
 //! 0  root                        模型根（插件层挂朝向旋转）
@@ -39,7 +49,7 @@
 //! y = 0（pelvis 0.95 − 0.05 − 0.45 − 0.45 = 0）——与插件层足部 IK 的
 //! 「平地拉踝贴地」基线吻合。臂链长 0.32 + 0.30。
 //!
-//! 节点集合划分（`LOWER_BODY` ∪ `UPPER_BODY` ∪ {`ROOT`} = 全部 20 节点）：
+//! 节点集合划分（`LOWER_BODY` ∪ `UPPER_BODY` ∪ {`ROOT`} = 全部 22 节点）：
 //! 步态剪辑只驱动下身、动作剪辑只驱动上身——两层各自的
 //! `AnimationPlayer` 写入的节点集不相交，组合姿势（跑动中挥砍 / 瞄准
 //! 不打断腿）由这一划分保证。
@@ -117,6 +127,63 @@ pub const UPPER_BODY: [usize; 14] = [
     FOREGRIP,
 ];
 
+/// 骨骼节点名（GLB 节点 `name` 字段）：装配层按名寻骨的寻址键
+/// （打磨 VI 摩擦⑥）。生成器声明节点与本表**共用这些常量**，两侧不可能
+/// 拼写分叉；名字唯一性由本表保证（引擎侧重名取先，见
+/// [`AnimationPlayer::node_entity_by_name`](iris_engine::prelude::AnimationPlayer)）。
+pub mod names {
+    pub const ROOT: &str = "root";
+    pub const PELVIS: &str = "pelvis";
+    pub const TORSO: &str = "torso";
+    pub const CHEST: &str = "chest";
+    pub const HEAD: &str = "head";
+    pub const L_THIGH: &str = "l_thigh";
+    pub const L_SHIN: &str = "l_shin";
+    pub const L_FOOT: &str = "l_foot";
+    pub const R_THIGH: &str = "r_thigh";
+    pub const R_SHIN: &str = "r_shin";
+    pub const R_FOOT: &str = "r_foot";
+    pub const L_UPPERARM: &str = "l_upperarm";
+    pub const L_FOREARM: &str = "l_forearm";
+    pub const L_HAND: &str = "l_hand";
+    pub const R_UPPERARM: &str = "r_upperarm";
+    pub const R_FOREARM: &str = "r_forearm";
+    pub const R_HAND: &str = "r_hand";
+    pub const SWORD: &str = "sword";
+    pub const SWORD_BLADE: &str = "sword_blade";
+    pub const RIFLE: &str = "rifle";
+    pub const RIFLE_GRIP: &str = "rifle_grip";
+    pub const FOREGRIP: &str = "foregrip";
+}
+
+/// 下标 → 名（与上面的节点树图逐行对应）。两套寻址的换算表：生成器按
+/// 本表顺序声明节点（下标 = 动画通道索引），守护测试按本表断言
+/// `node_names` 与骨架表一致（改名 / 换序必须同时改本表，测试会爆炸）。
+pub const NAMES: [&str; NODE_COUNT] = [
+    names::ROOT,
+    names::PELVIS,
+    names::TORSO,
+    names::CHEST,
+    names::HEAD,
+    names::L_THIGH,
+    names::L_SHIN,
+    names::L_FOOT,
+    names::R_THIGH,
+    names::R_SHIN,
+    names::R_FOOT,
+    names::L_UPPERARM,
+    names::L_FOREARM,
+    names::L_HAND,
+    names::R_UPPERARM,
+    names::R_FOREARM,
+    names::R_HAND,
+    names::SWORD,
+    names::SWORD_BLADE,
+    names::RIFLE,
+    names::RIFLE_GRIP,
+    names::FOREGRIP,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +200,17 @@ mod tests {
         }
         assert_eq!(seen.len(), NODE_COUNT, "划分应恰好覆盖全部节点");
         assert_eq!(*seen.last().expect("非空"), NODE_COUNT - 1);
+    }
+
+    /// 名字表不变量（打磨 VI 摩擦⑥）：`NAMES` 长度 = 节点数且**无重名**
+    /// ——按名寻骨的键必须唯一（引擎侧重名取先 ⇒ 资产侧重名即遮蔽）。
+    #[test]
+    fn bone_names_are_unique_and_complete() {
+        assert_eq!(NAMES.len(), NODE_COUNT, "名字表应逐节点覆盖");
+        let mut seen = BTreeSet::new();
+        for name in NAMES.iter() {
+            assert!(seen.insert(*name), "节点名 {name} 重复（按名寻骨会遮蔽）");
+        }
     }
 
     /// 几何不变量：腿链两节各 0.45、静止脚底贴地（0.95 − 0.05 − 0.45

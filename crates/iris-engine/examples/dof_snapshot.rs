@@ -84,6 +84,7 @@ fn main() {
             focus_distance: 14.0, // 相机到中排的视距（5 + 9）
             focus_range: 1.5,
             max_blur_radius: 10.0,
+            ..Default::default()
         }),
         None,
     );
@@ -94,6 +95,7 @@ fn main() {
             focus_distance: 25.0, // 远排
             focus_range: 1.5,
             max_blur_radius: 10.0,
+            ..Default::default()
         }),
         None,
     );

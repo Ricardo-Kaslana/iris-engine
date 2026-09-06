@@ -3189,12 +3189,15 @@ impl Renderer {
         // 计算，12-tap 泊松盘 HDR 平均；位于泛光之前（HDR 线性域——焦外
         // 亮源参与亮度提取更物理）。
         if dof_on {
+            // 焦点实体解析（打磨 VI 摩擦⑤）：解析点就在链参数上传处——
+            // 相机视图矩阵已就绪、不新增每帧系统、不回写资源字段
+            let focus = crate::post::resolve_focus_distance(world, &dof, &view);
             self.gpu.queue.write_buffer(
                 &hdr.dof_params,
                 0,
                 bytemuck::bytes_of(&DofParamsRaw {
                     a: [
-                        dof.focus_distance.max(0.0),
+                        focus.max(0.0),
                         dof.focus_range.max(1e-6),
                         dof.max_blur_radius.max(0.0),
                         0.0,

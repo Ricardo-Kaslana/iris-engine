@@ -49,6 +49,15 @@ fn gameplay(world: &mut World) {
 
 - Rust 1.85+（`rustup update stable`）
 - 支持 Vulkan / DX12 / Metal 的 GPU（软件回退亦可）
+- **ffmpeg（资产工具链，非运行时依赖）**：引擎侧只做 Vorbis **解码**
+  （运行时职责），不做编码器——音频资产的转换走外部管线，标准命令：
+
+  ```sh
+  ffmpeg -i in.wav -c:a libvorbis -q 4 in.ogg   # 16-bit PCM WAV → OGG
+  ```
+
+  编好的 `.ogg` 直接进 `AudioClip::from_ogg` / `OggVorbisStream`（短音效 /
+  流式音乐两条路径），或经 `PackWriter` 打进 pack 归档（§7.3）。
 
 ### 运行示例
 
@@ -710,11 +719,12 @@ cargo run -p iris-infiltration --example infiltration_snapshot --release   # 中
 - **写实材质（R42）**——地面石板 / 砖墙用引擎 `brick_normal_orm`
   程序化法线 + ORM 对；刀身拉丝划痕（`scratched_metal_normal_orm`）与
   布料褶皱（`cloth_normal_orm`）为本 crate 纯函数生成器（splitmix64
-  哈希、确定性单测锁定）；GLB 材质加载后克隆 + `with_normal/with_orm`
-  替换（GltfBuilder 不支持纹理引用的绕行，见 §8.26）；
-- **DOF / MB（R43）**——战斗默认开：`DepthOfFieldSettings` **逐帧对焦**
-  在交战距离（相机到最近活敌），焦外敌人虚化即距离感；`MotionBlur`
-  覆盖演出相机的 spline 运动；
+  哈希、确定性单测锁定），经 `GltfBuilder::material_textured` 把法线 /
+  ORM 通道 PNG 内嵌进角色 GLB（打磨 VI 摩擦③ 闭合，运行期只剩敌我配色
+  覆写）；
+- **DOF / MB（R43）**——战斗默认开：`DepthOfFieldSettings::focus_target`
+  指向最近活敌的胸骨，引擎每帧解析视距（焦外敌人虚化即距离感，摩擦⑤
+  闭合）；`MotionBlur` 覆盖演出相机的 spline 运动；
 - **流式音频（R44）**——pack 内 OGG 氛围循环上音乐总线（`play_music`
   后台线程分块解码 + `set_reverb` 庭院混响，v1 只作用于音乐总线）；
   挥砍 / 枪声 / 命中 / 换弹 / 胜负共 8 种程序化音效走 `play_spatial`
@@ -785,6 +795,31 @@ ARCHITECTURE.md §8.26；本轮为游戏轮，全部只绕行不改引擎）：
    error）→ 绕行：改名 `gen_assault_assets` → **建议**：无引擎修法，
    记录命名约定（游戏 crate example 加游戏前缀）。
 
+**打磨 VI 已把七条全部闭合**（引擎侧修复 + 本 crate 侧绕行删除，
+ARCHITECTURE §8.26 逐条标注）：
+
+1. **①** `update_foot_ik` / `update_hand_ik` 写回前 `normalize()`——
+   归一化是 IK 的责任（模块文档有推导）；600 帧回归锁
+   `foot_ik::tests::foot_ik_quaternion_norm_stable_without_clip_overwrite`
+   与 hand 侧同名测试（逐帧断言 ‖q‖−1 ≤ 1e-3 + 同相位位形一致）；
+   idle 的恒值腿通道**删除**（资产重生成）。删改前该场景在
+   `intro_cinematic_plays_and_hands_over_control` 里 1.9 s 必炸；
+2. **②** `spawn_gltf_instance_from_bytes` 进 `iris-render` prelude ⇒
+   iris-assault 的 iris-render 直依删除（依赖纪律回归）；
+3. **③** `GltfBuilder::material_textured`：baseColor / 法线 / ORM 三通道
+   像素 PNG → base64 data URI 内嵌 GLB（自包含，内存加载路径可用），
+   内容相同去重；插件层「加载后克隆材质挂纹理」的绕行删除，运行期只剩
+   敌我 `base_color` 配色覆写；
+4. **④** 引擎不做编码器（运行时职责，明文接受外部资产管线）——
+   WAV → OGG 标准命令进 README「环境要求」与 ARCHITECTURE §4.14；
+5. **⑤** `DepthOfFieldSettings::focus_target`（引擎每帧解析目标
+   `GlobalTransform` → 视距，缺席 / 隐藏回退标量）——插件层逐帧写
+   `focus_distance` 的绕行删除，战斗中对焦最近活敌的胸骨；
+6. **⑥** `AnimationPlayer::node_names`（加载器携带 GLB 节点名）+
+   `node_entity_by_name`——装配层（IK 链 / 挂点 / 配色）改按名寻骨，
+   下标只服务动画通道与遮罩；
+7. **⑦** example 命名约定（跨 crate 唯一前缀）记入 ARCHITECTURE §7.2。
+
 ```sh
 cargo run -p iris-assault --release                  # 玩游戏（WASD 移动 / 空格·左键挥刀 / F 开火 / Q·右键瞄准 / R 换弹）
 cargo run -p iris-assault --example assault_snapshot --release   # 战斗中段两帧离屏验收
@@ -794,7 +829,7 @@ cargo run -p iris-assault --example gen_assault_assets --release # 重新生成 
 ## 测试
 
 ```sh
-cargo test --workspace   # 779 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 789 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

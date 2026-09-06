@@ -61,7 +61,7 @@ pub mod prelude {
     };
     pub use crate::asset::{
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
-        write_glb,
+        spawn_gltf_instance_from_bytes, write_glb,
     };
     pub use crate::camera::{
         ActiveCamera, Camera, screen_ray_from_global, view_from_global, view_proj_from_global,
@@ -86,7 +86,8 @@ pub mod prelude {
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };
     pub use crate::post::{
-        BloomSettings, DepthOfFieldSettings, ExposureSettings, MotionBlurSettings, VignetteSettings,
+        BloomSettings, DepthOfFieldSettings, ExposureSettings, MotionBlurSettings,
+        VignetteSettings, resolve_focus_distance,
     };
     pub use crate::renderer::{
         CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,

@@ -22,8 +22,8 @@
 //!
 //! | 能力 | 接入点 |
 //! |---|---|
-//! | R42 写实材质 | 地面石板 / 砖墙用引擎 `brick_normal_orm`；刀身划痕与布料褶皱用 `crate::textures` 纯函数生成器；GLB 材质加载后克隆 + `with_normal/with_orm` 替换（GltfBuilder 不支持纹理的绕行，见摩擦清单） |
-//! | R43 DOF / MB | `DepthOfFieldSettings` 逐帧对焦（交战距离）+ `MotionBlurSettings`（演出相机运动拖影） |
+//! | R42 写实材质 | 地面石板 / 砖墙用引擎 `brick_normal_orm`；刀身划痕与布料褶皱用 `crate::textures` 纯函数生成器，**在资产侧**经 `GltfBuilder::material_textured` 把法线 / ORM 通道嵌进 GLB（打磨 VI 摩擦③ 闭合，R48 的「加载后克隆材质挂纹理」绕行删除）；运行期只剩敌我 `base_color` 配色覆写 |
+//! | R43 DOF / MB | `DepthOfFieldSettings::focus_target` 指向交战目标骨（引擎每帧解析视距，摩擦⑤ 闭合——R48 的逐帧写标量绕行删除）+ `MotionBlurSettings`（演出相机运动拖影） |
 //! | R44 流式音频 | pack 内 OGG → `OggVorbisStream::from_bytes` → `Audio::play_music`（音乐总线循环 + 混响）；音效 `play_spatial` 程序化剪辑 |
 //! | R45 pack | 全部 GLB / OGG 打包 `assets/assault.ipak`；`AssetMount(Pack)` 挂载；GLB 经 `spawn_gltf_instance_from_bytes` 加载（自包含 GLB） |
 //! | R46 动画 v4 | 上下身**双 `AnimationPlayer`**：下半身 `BlendSpace` 步态 + 上半身动作剪辑 + `AnimationMask` 过滤；受击 = `AdditiveLayer` 上身抖动；`HandIk` 双臂（ADS 时 `IkTarget` 吸附枪身挂点） |
@@ -78,16 +78,11 @@ use iris_core::ragdoll::{RagdollDesc, release_ragdoll, spawn_ragdoll_kinematic};
 use iris_core::resource::Resource;
 use iris_engine::prelude::*;
 
-// MouseButton 来自 iris_engine::prelude（iris_platform::prelude 的再导出）
-use iris_render::animation::{AnimationClip, AnimationMask, AnimationPlayer};
-use iris_render::asset::{GltfInstance, spawn_gltf_instance_from_bytes};
-use iris_render::decal::Decal;
-use iris_render::foot_ik::{FootIk, IkRig};
-use iris_render::hand_ik::{HandIk, IkTarget};
-use iris_render::material::MaterialDef;
-use iris_render::particles::{ParticleBlend, ParticleEmitter};
-use iris_render::post::{DepthOfFieldSettings, MotionBlurSettings};
-use iris_render::texture::CpuTexture;
+// MouseButton 来自 iris_engine::prelude（iris_platform::prelude 的再导出）。
+// 渲染层类型（AnimationPlayer / GltfInstance / FootIk / HandIk / Decal /
+// DepthOfFieldSettings / CpuTexture …）同样经 iris_engine::prelude 直达
+// ——iris-render 的 prelude 已含 GLB 内存加载入口（打磨 VI 摩擦② 闭合），
+// 本 crate 不再直依 iris-render。
 
 use crate::logic::{
     self, AssaultEvent, AssaultInput, AssaultState, EnemyState, HALF_HEIGHT, MOVE_SPEED, Phase,
@@ -340,11 +335,15 @@ fn setup_resources(world: &mut World, pack_path: &Path) {
     world.register_event::<TimelineEvent>();
 
     // ---- R43：DOF（战斗默认开）+ MB（演出相机运动拖影）----
+    // focus_distance 自打磨 VI 起是**回退值**：无焦点实体时（启动头几帧 /
+    // 资产降级路径 / 演出期）才生效，战斗中由 run_assault 每帧把
+    // focus_target 指向交战目标（引擎解析视距，见 §8.26⑤ 闭合说明）。
     world.insert_resource(DepthOfFieldSettings {
         enabled: true,
-        focus_distance: 9.0,
+        focus_distance: 12.0,
         focus_range: 4.0,
         max_blur_radius: 5.0,
+        focus_target: None,
     });
     world.insert_resource(MotionBlurSettings {
         enabled: true,
@@ -716,7 +715,7 @@ fn build_character(
         Ok(instance) => {
             log::warn!(
                 "AssaultPlugin：角色 GLB 节点数 {} ≠ 骨架表 {}——资产与 skeleton.rs 不同步，\
-                 降级为静态占位（重跑 gen_asset example）",
+                 降级为静态占位（重跑 gen_assault_assets example）",
                 instance.node_entities.len(),
                 sk::NODE_COUNT
             );
@@ -741,9 +740,8 @@ fn build_character(
             return (root, model, action, Some(hand_r), Some(hand_l));
         }
         // 敌人：枪身子树隐藏（敌人是持刀近战——枪不参与表现）
-        let bones = bone_entities(world, model);
-        if let Some(Some(rifle)) = bones.get(&sk::RIFLE) {
-            set_subtree_hidden(world, *rifle, true);
+        if let Some(rifle) = bone(world, model, sk::names::RIFLE) {
+            set_subtree_hidden(world, rifle, true);
         }
     }
     (root, model, action, None, None)
@@ -771,8 +769,8 @@ fn load_character_gltf(world: &mut World) -> Result<GltfInstance, String> {
 
 /// 双播放器组装：模型根挂下半身播放器（idle / walk / run + 混合空间），
 /// 空子实体挂上半身播放器（guard / sword×3 / aim / reload / flinch +
-/// `AnimationMask`）。GLB 材质按节点做写实替换（R42）。返回
-/// (model, action)。
+/// `AnimationMask`）；敌人按骨名做 `base_color` 配色覆写（法线 / ORM
+/// 通道随 GLB 自带）。返回 (model, action)。
 fn assemble_animated_character(
     world: &mut World,
     root: &Entity,
@@ -781,85 +779,13 @@ fn assemble_animated_character(
     is_player: bool,
 ) -> (Entity, Entity) {
     let clips = instance.clips.clone();
-    let node_entities = instance.node_entities.clone();
     let model = instance.roots[0];
     world.add_child(*root, model);
     world.insert(model, Name(format!("assault/{tag}-model")));
 
-    // ---- R42：GLB 材质写实替换（摩擦绕行：GltfBuilder 不支持纹理引用
-    // → 加载后按 primitive 实体的 MaterialHandle 读出基础参数，克隆 +
-    // with_normal/with_orm 生成新材质替换组件；敌人上身换暗红配色）----
-    let (cloth_normal, cloth_orm) = {
-        let mut store = world.resource_mut::<TextureStore>();
-        let (normal, orm) = textures::cloth_normal_orm(128, 0x00C1_0711);
-        (store.add(normal), store.add(orm))
-    };
-    let (scratch_normal, scratch_orm) = {
-        let mut store = world.resource_mut::<TextureStore>();
-        let (normal, orm) = textures::scratched_metal_normal_orm(128, 0xD00D_FEED);
-        (store.add(normal), store.add(orm))
-    };
-    let tint = |world: &mut World, node: usize, recolor: Option<[f32; 3]>, kind: BodySurface| {
-        let Some(node_entity) = node_entities.get(node).copied().flatten() else {
-            return;
-        };
-        let children: Vec<Entity> = world
-            .get::<Children>(node_entity)
-            .map(|children| children.0.clone())
-            .unwrap_or_default();
-        for child in children {
-            let Some(handle) = world.get::<MaterialHandle>(child).map(|h| *h) else {
-                continue;
-            };
-            let base = world
-                .resource::<MaterialStore>()
-                .get(handle)
-                .map(|def| def.base_color)
-                .unwrap_or([0.5, 0.5, 0.5, 1.0]);
-            let base = match recolor {
-                Some([r, g, b]) => [r, g, b, base[3]],
-                None => base,
-            };
-            let mut def = MaterialDef {
-                base_color: base,
-                metallic: 0.0,
-                roughness: 0.8,
-                ..MaterialDef::default()
-            };
-            match kind {
-                BodySurface::Cloth => {
-                    def = def.with_normal(cloth_normal).with_orm(cloth_orm);
-                }
-                BodySurface::Blade => {
-                    def.metallic = 1.0;
-                    def.roughness = 0.22;
-                    def.base_color = [0.82, 0.84, 0.88, 1.0];
-                    def = def.with_normal(scratch_normal).with_orm(scratch_orm);
-                }
-            }
-            let new_handle = world.resource_mut::<MaterialStore>().add(def);
-            world.insert(child, new_handle);
-        }
-    };
-    let enemy_tint = if is_player {
-        None
-    } else {
-        Some([0.44, 0.13, 0.11])
-    };
-    for node in [
-        sk::PELVIS,
-        sk::TORSO,
-        sk::CHEST,
-        sk::L_THIGH,
-        sk::R_THIGH,
-        sk::L_SHIN,
-        sk::R_SHIN,
-    ] {
-        tint(world, node, enemy_tint, BodySurface::Cloth);
-    }
-    tint(world, sk::SWORD_BLADE, None, BodySurface::Blade);
-
     // ---- 下半身播放器（模型根）：步态混合空间（R46 / R38 同款）----
+    // 先挂播放器：`instance.player()` 携带 GLB 节点名表（打磨 VI 摩擦⑥），
+    // 其后的装配（配色 / IK / 挂点）一律按名寻骨
     let idle_idx = clip_index(&clips, "idle");
     let walk_idx = clip_index(&clips, "walk");
     let run_idx = clip_index(&clips, "run");
@@ -877,10 +803,30 @@ fn assemble_animated_character(
     locomotion.capture_rest(world);
     world.insert(model, locomotion);
 
+    // ---- 敌人配色（R42 写实材质的表现层差异）----
+    // 打磨 VI 摩擦③ 闭合：法线 / ORM 通道随 GLB 自带（生成器走
+    // `GltfBuilder::material_textured`，PNG 内嵌 data URI）——「加载后克隆
+    // 材质挂纹理」的绕行删除。此处克隆只为改 base_color（同资产两阵营），
+    // 通道句柄沿用加载器解析出的那份。
+    if !is_player {
+        for name in [
+            sk::names::PELVIS,
+            sk::names::TORSO,
+            sk::names::CHEST,
+            sk::names::L_THIGH,
+            sk::names::R_THIGH,
+            sk::names::L_SHIN,
+            sk::names::R_SHIN,
+        ] {
+            recolor_primitives(world, bone(world, model, name), [0.44, 0.13, 0.11]);
+        }
+    }
+
     // ---- 上半身播放器（空子实体）：动作剪辑 + 骨骼遮罩（R46）----
     let action = world.spawn((Name(format!("assault/{tag}-action")), Transform::IDENTITY));
     world.add_child(*root, action);
-    let mut actuator = AnimationPlayer::new(clips.clone(), node_entities.clone());
+    // 与下半身播放器同源（`instance.player()` 携带节点实体表与节点名表）
+    let mut actuator = instance.player();
     // 遮罩 = 上身节点集：即使某剪辑误写下身通道也不会覆写（双重保险；
     // 与「下半身播放器只写下身」共同保证两层写入集不相交）
     actuator.mask = Some(AnimationMask {
@@ -895,12 +841,31 @@ fn assemble_animated_character(
     (model, action)
 }
 
-/// 材质替换的表面类别。
-enum BodySurface {
-    /// 布料（法线褶皱 + 粗糙 ORM）。
-    Cloth,
-    /// 金属刀身（划痕法线 + 高光 ORM）。
-    Blade,
+/// 把某骨节点下全部 primitive 子实体的材质换成新 base_color（其余字段
+/// 含法线 / ORM 句柄原样保留）——同一资产两阵营的配色差异。节点实体
+/// 缺席（未映射 / 名字不符）静默跳过。
+fn recolor_primitives(world: &mut World, node: Option<Entity>, color: [f32; 3]) {
+    let Some(node) = node else { return };
+    let children: Vec<Entity> = world
+        .get::<Children>(node)
+        .map(|children| children.0.clone())
+        .unwrap_or_default();
+    for child in children {
+        let Some(handle) = world.get::<MaterialHandle>(child).map(|handle| *handle) else {
+            continue;
+        };
+        // `.cloned()`：读材质的借用必须在语句末释放，否则与下面的
+        // resource_mut 撞「already borrowed」
+        let Some(source) = world.resource::<MaterialStore>().get(handle).cloned() else {
+            continue;
+        };
+        let def = MaterialDef {
+            base_color: [color[0], color[1], color[2], source.base_color[3]],
+            ..source
+        };
+        let new_handle = world.resource_mut::<MaterialStore>().add(def);
+        world.insert(child, new_handle);
+    }
 }
 
 /// 按名查剪辑下标（GLB 剪辑名即契约）。
@@ -909,20 +874,23 @@ fn clip_index(clips: &[AnimationClip], name: &str) -> Option<usize> {
 }
 
 /// 腿链足部 IK（R46 / R38 同款）：wrapper（挂 `IkRig` + `FootIk`）——
-/// 链节点实体来自 GLB 骨架表（thigh → shin → foot 直连链）。
+/// 链节点实体按**节点名**解析（thigh → shin → foot 直连链）。
 fn build_leg_ik(world: &mut World, model: Entity, tag: &str) {
-    let bones = bone_entities(world, model);
     for (side, nodes) in [
-        ("l", [sk::L_THIGH, sk::L_SHIN, sk::L_FOOT]),
-        ("r", [sk::R_THIGH, sk::R_SHIN, sk::R_FOOT]),
+        (
+            "l",
+            [sk::names::L_THIGH, sk::names::L_SHIN, sk::names::L_FOOT],
+        ),
+        (
+            "r",
+            [sk::names::R_THIGH, sk::names::R_SHIN, sk::names::R_FOOT],
+        ),
     ] {
-        let Some(thigh) = bones.get(&nodes[0]).copied().flatten() else {
-            continue;
-        };
-        let Some(shin) = bones.get(&nodes[1]).copied().flatten() else {
-            continue;
-        };
-        let Some(foot) = bones.get(&nodes[2]).copied().flatten() else {
+        let (Some(thigh), Some(shin), Some(foot)) = (
+            bone(world, model, nodes[0]),
+            bone(world, model, nodes[1]),
+            bone(world, model, nodes[2]),
+        ) else {
             continue;
         };
         let wrapper = world.spawn((
@@ -940,9 +908,8 @@ fn build_leg_ik(world: &mut World, model: Entity, tag: &str) {
 /// `IkTarget`（握把 / 护木），**不在手骨链子树内**（枪挂胸节点下）。
 /// 目标每帧由 `run_assault` 切换（ADS 吸附 / 平时 None）。
 fn build_hand_ik(world: &mut World, model: Entity, tag: &str) -> (Entity, Entity) {
-    let bones = bone_entities(world, model);
-    let grip = bones.get(&sk::RIFLE_GRIP).copied().flatten();
-    let foregrip = bones.get(&sk::FOREGRIP).copied().flatten();
+    let grip = bone(world, model, sk::names::RIFLE_GRIP);
+    let foregrip = bone(world, model, sk::names::FOREGRIP);
     // IkTarget 标记挂在枪身节点实体上（手 IK 的目标源）
     if let Some(grip) = grip {
         world.insert(grip, IkTarget);
@@ -950,11 +917,11 @@ fn build_hand_ik(world: &mut World, model: Entity, tag: &str) -> (Entity, Entity
     if let Some(foregrip) = foregrip {
         world.insert(foregrip, IkTarget);
     }
-    let make_arm = |world: &mut World, prefix: &str, nodes: [usize; 3], target: Option<Entity>| {
+    let make_arm = |world: &mut World, prefix: &str, nodes: [&str; 3], target: Option<Entity>| {
         let (Some(shoulder), Some(elbow), Some(hand)) = (
-            bones.get(&nodes[0]).copied().flatten(),
-            bones.get(&nodes[1]).copied().flatten(),
-            bones.get(&nodes[2]).copied().flatten(),
+            bone(world, model, nodes[0]),
+            bone(world, model, nodes[1]),
+            bone(world, model, nodes[2]),
         ) else {
             // 骨架不齐：返回占位实体（不可达——守护测试锁定骨架形状）
             return world.spawn((Name(format!("assault/{tag}-hand-{prefix}-orphan")),));
@@ -983,35 +950,34 @@ fn build_hand_ik(world: &mut World, model: Entity, tag: &str) -> (Entity, Entity
     let right = make_arm(
         world,
         "r",
-        [sk::R_UPPERARM, sk::R_FOREARM, sk::R_HAND],
+        [
+            sk::names::R_UPPERARM,
+            sk::names::R_FOREARM,
+            sk::names::R_HAND,
+        ],
         None,
     );
     let left = make_arm(
         world,
         "l",
-        [sk::L_UPPERARM, sk::L_FOREARM, sk::L_HAND],
+        [
+            sk::names::L_UPPERARM,
+            sk::names::L_FOREARM,
+            sk::names::L_HAND,
+        ],
         None,
     );
     (right, left)
 }
 
-/// 骨架节点实体快照（骨架表下标 → 实体）：读模型根上的下半身播放器的
-/// `node_entities`（组装时保存的完整映射）。
-fn bone_entities(
-    world: &World,
-    model: Entity,
-) -> std::collections::BTreeMap<usize, Option<Entity>> {
+/// 按**节点名**寻骨（打磨 VI 摩擦⑥）：读模型根上下半身播放器携带的
+/// GLB 节点名表（`AnimationPlayer::node_entity_by_name`）。装配层
+/// （IK 链 / 武器挂点 / 材质配色）据此寻址，不再依赖节点下标——
+/// 加载器拆出的实体数变化不会让装配错位。
+fn bone(world: &World, model: Entity, name: &str) -> Option<Entity> {
     world
         .get::<AnimationPlayer>(model)
-        .map(|player| {
-            player
-                .node_entities
-                .iter()
-                .enumerate()
-                .map(|(index, &entity)| (index, entity))
-                .collect()
-        })
-        .unwrap_or_default()
+        .and_then(|player| player.node_entity_by_name(name))
 }
 
 /// 静态降级占位（GLB 不可用时）：单盒身，无动画（游戏逻辑不受影响）。
@@ -1346,17 +1312,31 @@ fn run_assault(world: &World) {
     };
     write_character_visuals(world, &ents, &state, cinematic);
 
-    // ---- R43：DOF 动态对焦。战斗中对焦距离 = 相机到最近活敌的直线
-    // 距离的俯角近似（相机→玩家 + 玩家→敌人）——结论：**需要逐帧更新**
-    // （对焦距离是交战几何的函数，静态值会让快速接近的敌人糊成一团），
-    // 摩擦记录见 ARCHITECTURE §8。演出期间对焦喷泉（固定 12 m）。
+    // ---- R43：DOF 动态对焦（打磨 VI 摩擦⑤：引擎 FocusTarget 原语）----
+    // 战斗中对焦「最近活敌的胸骨」（按名寻骨，摩擦⑥）——引擎每帧从该
+    // 实体的 GlobalTransform 解析视距，快速接近的敌人始终清晰；全歼后
+    // 焦点回到玩家；演出期无目标，标量 12 m 对焦喷泉。R48 的「插件层每
+    // 帧把相机→敌直线距离写进 focus_distance」绕行删除（那条路径还得
+    // 自己按俯角近似、自己钳制范围）。
+    let focus_bone = if cinematic {
+        None
+    } else if let Some((index, _)) = state.nearest_enemy() {
+        // `nearest_enemy` 已排除死亡者：有活敌 → 对焦其胸骨
+        ents.enemies
+            .get(index)
+            .and_then(|enemy| bone(world, enemy.model, sk::names::CHEST))
+    } else {
+        // 全歼（终局演出前）/ 尚未开战 → 焦点回玩家
+        bone(world, ents.player_model, sk::names::CHEST)
+    };
     if let Some(mut dof) = world.try_resource_mut::<DepthOfFieldSettings>() {
         dof.enabled = true;
-        if cinematic {
-            dof.focus_distance = 12.0;
-        } else {
-            let focus = state.nearest_enemy().map(|(_, dist)| dist).unwrap_or(8.0);
-            dof.focus_distance = (CAMERA_OFFSET.length() + focus).clamp(3.0, 16.0);
+        match focus_bone {
+            Some(entity) => dof.focus_target = Some(entity),
+            None => {
+                dof.focus_target = None;
+                dof.focus_distance = 12.0;
+            }
         }
     }
 
@@ -1460,8 +1440,8 @@ fn write_character_visuals(
     // 手 IK 目标切换（R46）：ADS 时双手吸附枪身挂点；平时回动作剪辑
     let aiming = state.player.aiming && !reloading;
     if aiming {
-        let grip = grip_entity(world, ents.player_model, sk::RIFLE_GRIP);
-        let foregrip = grip_entity(world, ents.player_model, sk::FOREGRIP);
+        let grip = bone(world, ents.player_model, sk::names::RIFLE_GRIP);
+        let foregrip = bone(world, ents.player_model, sk::names::FOREGRIP);
         if let Some(hand) = ents.player_hand_r {
             if let Some(mut ik) = world.get_mut::<HandIk>(hand) {
                 ik.target = grip;
@@ -1534,13 +1514,6 @@ fn write_character_visuals(
             }
         }
     }
-}
-
-/// 从模型骨架表按节点下标取实体（IkTarget 所在节点的实体句柄）。
-fn grip_entity(world: &World, model: Entity, node: usize) -> Option<Entity> {
-    world
-        .get::<AnimationPlayer>(model)
-        .and_then(|player| player.node_entities.get(node).copied().flatten())
 }
 
 /// HUD 文本刷新：生命 / 弹药 / 敌数 + 横幅按阶段与计时切换。

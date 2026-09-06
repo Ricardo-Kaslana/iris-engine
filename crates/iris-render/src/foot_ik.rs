@@ -50,6 +50,22 @@
 //! 3. **平地门**：地面高差 ≤ [`GROUND_EPSILON`]（1 mm，远小于 ±2 cm
 //!    验收域）时不写任何变换——平地姿势 bit 级不动。
 //!
+//! # 回写四元数归一化是 IK 的责任（打磨 VI 摩擦①）
+//!
+//! IK 是**唯一**会覆写「不被剪辑逐帧重置的骨旋转」的系统：`solve_two_bone_ik`
+//! 的世界系解走 `Quat::from_rotation_arc` + 父级共轭反推局部旋转，两处都
+//! 带浮点范数漂移。写回非单位四元数的后果取决于下帧有没有剪辑通道覆写该
+//! 骨——有覆写则被重置（walk 驱动双腿的资产侥幸免疫），无覆写则该值作为
+//! 输入再进复合链（共轭不再是逆），**范数逐帧平方复合**：R48 实测 idle
+//! 角色（骨盆 bob 把脚抬离地面 → IK 每帧写，但 idle 无腿通道）1.9 s 内
+//! thigh 旋转范数 386 → 5.8e7 → NaN，随后骨长 NaN 撞
+//! [`solve_two_bone_ik`] 的正值断言 panic。因此**两个 IK 系统写回的局部
+//! 旋转一律先 `normalize()`**（单位化后复合链收敛，漂移被限制在 1e-7 量级）
+//! ——归一化不放在 `Transform` 写入的通用路径上（那是热路径且动画侧的采样
+//! 值本由关键帧插值保证单位），谁引入非单位四元数谁负责。回归锁：
+//! `foot_ik::tests::foot_ik_quaternion_norm_stable_without_clip_overwrite`
+//! （600 帧逐帧断言 ‖q‖ ≤ 1 + 1e-3、无 NaN、位形稳定）。
+//!
 //! # 节点映射：IkRig 或 AnimationPlayer（打磨 V 起二选一）
 //!
 //! 链节点实体由 [`IkRig`]（纯 IK 装配：节点映射自带，与播放器无关）或
@@ -439,8 +455,15 @@ pub fn update_foot_ik(world: &World) {
         let parent_rot = hip_world_rot * hip_local_rot.conjugate();
         let hip_world_rot_new = arc_hip * hip_world_rot;
         let knee_world_rot_new = arc_knee * knee_world_rot;
-        let hip_local_rot_new = parent_rot.conjugate() * hip_world_rot_new;
-        let knee_local_rot_new = hip_world_rot_new.conjugate() * knee_world_rot_new;
+        // 归一化是 IK 的责任（打磨 VI 摩擦①）：本系统是唯一会覆写
+        // **不被剪辑逐帧重置**的骨旋转的系统——`from_rotation_arc` 产物
+        // 与父级共轭反推链都带浮点范数漂移，若把非单位四元数写回，下一帧
+        // 无剪辑通道覆写时被当作输入再乘（共轭不再是逆）→ 范数逐帧平方
+        // 复合直至 NaN。剪辑覆写的骨每帧重置故免疫（infiltration 的 walk
+        // 恰覆写双腿 = 未触发本 bug 的侥幸）。归一化点选在局部旋转的产生
+        // 处：位置回写（下方 hip/knee 新世界矩阵）与旋转回写共用同一份。
+        let hip_local_rot_new = (parent_rot.conjugate() * hip_world_rot_new).normalize();
+        let knee_local_rot_new = (hip_world_rot_new.conjugate() * knee_world_rot_new).normalize();
         // foot 局部位置：膝关节新世界矩阵的逆 × 踝目标（hip 局部旋转已
         // 更新、knee 局部位置不动 ⇒ 膝世界位 = 解算值；foot 局部旋转不动）
         let Some(hip_local) = world.get::<Transform>(hip_entity).map(|t| *t) else {
@@ -996,6 +1019,97 @@ mod tests {
             "期望骨长应由首次解算捕获为装配值 0.5（实际 {} / {}）",
             ik.expected_upper,
             ik.expected_lower
+        );
+    }
+
+    // ---- 回写四元数归一化（打磨 VI 摩擦① 的永久回归锁）----
+
+    /// 摩擦① 场景的最小复刻：剪辑**只有髋的下探平移通道**（4–12 cm /
+    /// 2 s 循环；下探而非上抬——上抬会让目标超出可达域被门放弃），髋与膝
+    /// 的旋转没有任何通道覆写 ⇒ IK 写回的旋转每帧作为下一帧复合链的输入。
+    /// 幅度**不回到装配全长**（髋踝距离恒 < 1.0）：膝在全伸配置处几何
+    /// 奇异（h → 0），采样时刻的微小差异被放大成 mm 级膝位差——那不是
+    /// 漂移，是病态条件；同相位位形须在良定义域内比较。
+    /// 修复前范数逐帧平方复合（R48 实测 idle 角色 ~1.9 s 内
+    /// 386 → 5.8e7 → NaN，随后骨长 NaN 撞 [`solve_two_bone_ik`] 的正值
+    /// 断言 panic）；修复后跑 600 帧（10 s = 5 个整循环）逐帧断言：
+    /// ① 旋转分量有限；② ‖q‖ − 1 ≤ 1e-3；③ 骨长保持 0.5；④ 末帧与
+    /// 同相位（提前 2 个整循环 = 120 帧）的膝 / 踝**世界位置**一致
+    /// ≤ 1e-3。
+    ///
+    /// ④ 为何比位置不比旋转：最小旋转弧只约束**骨方向**，四元数沿骨轴的
+    /// 自转（twist）分量不参与任何关节位置、且由写入历史逐帧携带——它是
+    /// 本 IK 表述的自由度（装配上由网格朝向吸收），同相位两帧的 twist 可
+    /// 差 ~0.5° 而位形完全一致。范数爆炸则必然破坏位置与骨长，故位置口径
+    /// 既稳定又是有效锁。
+    #[test]
+    fn foot_ik_quaternion_norm_stable_without_clip_overwrite() {
+        use crate::animation::{
+            AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath,
+            update_animations,
+        };
+        use iris_core::prelude::Time;
+        use std::time::Duration;
+
+        let (mut world, root, hip, knee, foot) = rig(Vec3::new(0.0, 1.0, 0.0));
+        platform(&mut world, 0.0);
+        let clip = AnimationClip {
+            name: "idle".into(),
+            channels: vec![AnimationChannel {
+                node: 0, // hip：只写平移，旋转通道缺席 = 本测试的前提
+                path: AnimationPath::Translation,
+                interpolation: AnimationInterpolation::Linear,
+                times: vec![0.0, 1.0, 2.0],
+                values: vec![0.0, -0.04, 0.0, 0.0, -0.12, 0.0, 0.0, -0.04, 0.0],
+            }],
+            duration: 2.0,
+            events: Vec::new(),
+        };
+        world.insert(
+            root,
+            AnimationPlayer::new(vec![clip], vec![Some(hip), Some(knee), Some(foot)]),
+        );
+        world.insert_resource(Time::default());
+
+        // 每帧位形快照（膝 / 踝世界位置）供同相位比对
+        let mut poses: Vec<(Vec3, Vec3)> = Vec::new();
+        let dt = Duration::from_secs_f64(1.0 / 60.0);
+        for frame in 0..600 {
+            world.resource_mut::<Time>().advance(dt);
+            update_animations(&world);
+            update_foot_ik(&world);
+            for &(joint, what) in &[(hip, "hip"), (knee, "knee")] {
+                let rotation = world.get::<Transform>(joint).unwrap().rotation;
+                assert!(
+                    rotation.is_finite(),
+                    "第 {frame} 帧 {what} 旋转出现非有限分量（平方复合爆炸的直接表现）：{rotation:?}"
+                );
+                let norm = rotation.length();
+                assert!(
+                    (norm - 1.0).abs() <= 1e-3,
+                    "第 {frame} 帧 {what} 旋转范数偏离单位超过 1e-3：‖q‖ = {norm}"
+                );
+            }
+            let hip_world = chain_world(&world, hip).unwrap().0.w_axis.truncate();
+            let knee_world = chain_world(&world, knee).unwrap().0.w_axis.truncate();
+            let foot_world = chain_world(&world, foot).unwrap().0.w_axis.truncate();
+            assert!(
+                ((knee_world - hip_world).length() - 0.5).abs() <= 1e-3
+                    && ((foot_world - knee_world).length() - 0.5).abs() <= 1e-3,
+                "第 {frame} 帧骨长偏离装配值 0.5：位形已失真"
+            );
+            poses.push((knee_world, foot_world));
+        }
+
+        // 剪辑周期 2 s = 120 帧：第 600 帧与第 480 帧同相位（都是 t = 0）
+        let (a_knee_pos, a_foot_pos) = poses[479];
+        let (b_knee_pos, b_foot_pos) = poses[599];
+        assert!(
+            (a_knee_pos - b_knee_pos).length() <= 1e-3
+                && (a_foot_pos - b_foot_pos).length() <= 1e-3,
+            "同相位两帧的关节世界位应一致（不逐循环漂移）：膝差 {} 踝差 {}",
+            (a_knee_pos - b_knee_pos).length(),
+            (a_foot_pos - b_foot_pos).length()
         );
     }
 }

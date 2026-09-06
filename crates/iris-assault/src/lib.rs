@@ -10,9 +10,10 @@
 //! 到极限不同，本作的首要目的是六轮能力的**接线验收**与摩擦清单）：
 //! - **写实材质（R42）**：地面石板 / 砖墙用引擎 `brick_normal_orm`，
 //!   刀身划痕与布料褶皱用本 crate 纯函数生成器（`textures` 模块），
-//!   GLB 材质加载后克隆 + `with_normal/with_orm` 替换；
-//! - **DOF / MB（R43）**：战斗默认开（对焦 = 交战距离，逐帧更新——
-//!   摩擦点）、演出相机运动模糊；
+//!   经 `GltfBuilder::material_textured` **在资产侧**把法线 / ORM 通道
+//!   嵌进 GLB（打磨 VI 摩擦③ 闭合）；运行期只剩敌我配色覆写；
+//! - **DOF / MB（R43）**：战斗默认开（对焦 = 引擎 `focus_target` 解析
+//!   交战目标骨，摩擦⑤ 闭合）、演出相机运动模糊；
 //! - **流式音频（R44）**：pack 内 OGG 氛围循环上音乐总线（+ 混响）、
 //!   战斗音效 `play_spatial`；
 //! - **pack 资产（R45）**：全部 GLB / OGG 打包 `assets/assault.ipak`，
@@ -29,8 +30,8 @@
 //! iris-infiltration 同款分层）：
 //! - [`logic`]：纯逻辑状态机（关卡写死、事件自带世界坐标、逐位确定性；
 //!   含脚本化自动玩家 [`AutoPilot`]）；
-//! - [`skeleton`]：角色骨架节点表（GLB 下标的单一事实来源，资产生成器
-//!   与插件层共用）；
+//! - [`skeleton`]：角色骨架节点表（GLB 节点**下标**（动画通道 / 遮罩）
+//!   与**名**（装配层按名寻骨）的单一事实来源，资产生成器与插件层共用）；
 //! - [`textures`]：程序化写实纹理生成器（划痕金属 / 布料 / 贴花，纯
 //!   函数）；
 //! - [`plugin`]：[`AssaultPlugin`]——三层角色结构 + 双播放器动画 + 手 /
@@ -56,8 +57,12 @@
 //! # 本轮纪律
 //!
 //! 游戏轮不改引擎（dogfooding 纪律）：接入中发现的引擎摩擦全部记入
-//! `ARCHITECTURE.md` §8 摩擦清单（dogfooding VI 条目），绕行写在本
-//! crate 内。
+//! `ARCHITECTURE.md` §8 摩擦清单（dogfooding VI 条目 = **§8.26**），绕行
+//! 写在本 crate 内。**打磨 VI 已闭合 §8.26 全部七条**（引擎侧修复 +
+//! 本 crate 侧绕行删除：IK 回写归一化、prelude 内存加载入口、
+//! `GltfBuilder::material_textured`、Vorbis 编码管线文档化、
+//! `focus_target`、`node_entity_by_name`、example 命名约定），本 crate
+//! 不再保留 R48 的四处绕行代码。
 
 pub mod logic;
 pub mod plugin;

@@ -13,6 +13,11 @@
 //!   索引按顶点数自动选 u16 / u32；
 //! - [`GltfBuilder::material`]：baseColorFactor / metallic / roughness /
 //!   emissive；
+//! - [`GltfBuilder::material_textured`]：在以上之外挂纹理通道
+//!   （baseColor / 法线 / ORM 打包图，打磨 VI 摩擦③）——CPU 端
+//!   [`CpuTexture`] 像素在 build 时 PNG 编码 + base64 写成 `data:` URI
+//!   嵌进 GLB（自包含资产，`spawn_gltf_instance_from_bytes` 的内存路径
+//!   可直接消费）；内容相同的图共享同一 image / texture 条目；
 //! - [`GltfBuilder::node`] + [`GltfBuilder::add_child`]：TRS + 层级；
 //!   **场景顶层自动推断**（未被任何 children 引用的节点）；
 //! - [`GltfBuilder::skin`]：关节节点下标 + 逆绑定矩阵（列主序 MAT4
@@ -48,8 +53,9 @@
 
 use glam::Mat4;
 use iris_render::animation::{AnimationInterpolation, AnimationPath};
-use iris_render::asset::write_glb;
+use iris_render::asset::{base64, write_glb};
 use iris_render::mesh::MeshData;
+use iris_render::texture::CpuTexture;
 use serde_json::{Value, json};
 
 // glTF 规范字面量（componentType）。
@@ -137,12 +143,40 @@ pub struct AnimChannel {
     pub values: Vec<f32>,
 }
 
+/// 材质的纹理通道声明（[`GltfBuilder::material_textured`] 用）：
+/// 每个通道给一张 CPU 端 [`CpuTexture`]（RGBA8 像素），`None` = 该通道
+/// 不写。三张图在 build 时各自 PNG 编码为 `data:image/png;base64,…` URI
+/// 嵌进 GLB（**自包含**：内存加载路径 `spawn_gltf_instance_from_bytes`
+/// 无 base_dir，外部 uri 引用会显式报错）。
+///
+/// 色彩空间由**通道**决定（不由入参的 `srgb` 字段决定——加载器按通道
+/// 语义标注）：baseColor 是颜色数据（sRGB），法线与 ORM 是数据贴图
+/// （线性）。入参里与像素无关的 `srgb` 字段被忽略。
+#[derive(Clone, Debug, Default)]
+pub struct GltfMaterialTextures {
+    /// baseColor 贴图（glTF `pbrMetallicRoughness.baseColorTexture`）。
+    pub base_color: Option<CpuTexture>,
+    /// 切线空间法线贴图（glTF `normalTexture`，线性）。
+    pub normal: Option<CpuTexture>,
+    /// ORM 打包图（R = AO、G = 粗糙度、B = 金属度，线性）：写入 glTF
+    /// `metallicRoughnessTexture` **与** `occlusionTexture` 的同一
+    /// texture 下标——加载器对同下标直接引用、不做 CPU 通道重打包
+    /// （R42 合并策略），登记的像素即最终采样到的 ORM。
+    pub orm: Option<CpuTexture>,
+}
+
 #[derive(Default)]
 struct MaterialDef {
     base_color: [f32; 4],
     metallic: f32,
     roughness: f32,
     emissive: Option<[f32; 3]>,
+    /// 通道 → 文件内 texture 下标（[`GltfBuilder::register_texture`] 分配，
+    /// None = 该通道不写引用）。
+    base_color_texture: Option<usize>,
+    normal_texture: Option<usize>,
+    /// ORM 打包图（同时充当 `occlusionTexture`，见 [`GltfMaterialTextures`]）。
+    orm_texture: Option<usize>,
 }
 
 struct MeshDef {
@@ -217,6 +251,12 @@ pub struct GltfBuilder {
     animations: Vec<AnimationDef>,
     /// 时间轴去重缓存：(times 内容, accessor 下标)。
     times_cache: Vec<(Vec<f32>, usize)>,
+    /// 内嵌图像（RGBA8 像素；build 时 PNG → base64 写成 data URI，
+    /// 下标 = glTF `images` 数组序）。
+    images: Vec<CpuTexture>,
+    /// `textures` 下标 → `images` 下标（同一张图被多通道 / 多材质引用时
+    /// 只嵌一份）。
+    texture_sources: Vec<usize>,
 }
 
 fn component_count(attribute_type: &str) -> usize {
@@ -243,6 +283,17 @@ fn interpolation_name(interpolation: AnimationInterpolation) -> &'static str {
         AnimationInterpolation::Linear => "LINEAR",
         AnimationInterpolation::Step => "STEP",
     }
+}
+
+/// CPU 纹理 → `data:image/png;base64,…` URI（glTF 图像的自包含内嵌形态；
+/// 加载器 `load_image` 的 uri 分支直接解码，不需 base_dir）。
+fn png_data_uri(cpu: &CpuTexture) -> String {
+    let mut png: Vec<u8> = Vec::new();
+    image::RgbaImage::from_raw(cpu.width, cpu.height, cpu.rgba.clone())
+        .expect("GltfBuilder 纹理像素缓冲已在登记时校验（宽 × 高 × 4）")
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("PNG 编码写入内存缓冲，不应失败");
+    format!("data:image/png;base64,{}", base64::encode(&png))
 }
 
 impl GltfBuilder {
@@ -357,6 +408,8 @@ impl GltfBuilder {
 
     /// 声明材质（PBR 金属度 / 粗糙度工作流），返回材质下标。
     /// `emissive` 为 `Some` 时写入 `emissiveFactor`（自发光）。
+    /// 需要纹理通道见 [`GltfBuilder::material_textured`]（本函数 = 其三
+    /// 通道全 None 的特例）。
     pub fn material(
         &mut self,
         base_color: [f32; 4],
@@ -364,13 +417,87 @@ impl GltfBuilder {
         roughness: f32,
         emissive: Option<[f32; 3]>,
     ) -> usize {
+        self.material_textured(
+            base_color,
+            metallic,
+            roughness,
+            emissive,
+            GltfMaterialTextures::default(),
+        )
+    }
+
+    /// 声明**带纹理引用**的材质（打磨 VI 摩擦③），返回材质下标。
+    ///
+    /// 前四参与 [`GltfBuilder::material`] 同款（因子与贴图在 glTF 侧共存：
+    /// 贴图像素与 `baseColorFactor` / `metallicFactor` / `roughnessFactor`
+    /// **相乘**，故挂 ORM 图时通常把两因子留 1.0、挂 baseColor 图时把
+    /// 颜色因子留白——直通语义由加载器决定，builder 不改写）。
+    /// `textures` 声明哪几个通道挂哪张图（像素在 build 时 PNG 编码内嵌）。
+    pub fn material_textured(
+        &mut self,
+        base_color: [f32; 4],
+        metallic: f32,
+        roughness: f32,
+        emissive: Option<[f32; 3]>,
+        textures: GltfMaterialTextures,
+    ) -> usize {
+        let base_color_texture = textures
+            .base_color
+            .as_ref()
+            .map(|texture| self.register_texture(texture));
+        let normal_texture = textures
+            .normal
+            .as_ref()
+            .map(|texture| self.register_texture(texture));
+        let orm_texture = textures
+            .orm
+            .as_ref()
+            .map(|texture| self.register_texture(texture));
         self.materials.push(MaterialDef {
             base_color,
             metallic,
             roughness,
             emissive,
+            base_color_texture,
+            normal_texture,
+            orm_texture,
         });
         self.materials.len() - 1
+    }
+
+    /// 登记一张内嵌图（尺寸与像素缓冲校验 + **内容去重**：同一张图被多
+    /// 通道 / 多材质引用时只嵌一份），返回 `textures` 下标。
+    fn register_texture(&mut self, cpu: &CpuTexture) -> usize {
+        assert!(
+            cpu.width > 0 && cpu.height > 0,
+            "GltfBuilder 纹理尺寸必须非零（实际 {}×{}）",
+            cpu.width,
+            cpu.height
+        );
+        assert_eq!(
+            cpu.rgba.len(),
+            cpu.width as usize * cpu.height as usize * 4,
+            "GltfBuilder 纹理像素缓冲长度应 = 宽 × 高 × 4（RGBA8 行主序）"
+        );
+        let image = self
+            .images
+            .iter()
+            .position(|existing| {
+                existing.width == cpu.width
+                    && existing.height == cpu.height
+                    && existing.rgba == cpu.rgba
+            })
+            .unwrap_or_else(|| {
+                self.images.push(cpu.clone());
+                self.images.len() - 1
+            });
+        self.texture_sources
+            .iter()
+            .position(|&source| source == image)
+            .unwrap_or_else(|| {
+                self.texture_sources.push(image);
+                self.texture_sources.len() - 1
+            })
     }
 
     /// 声明单 primitive 网格，返回网格下标。
@@ -608,8 +735,33 @@ impl GltfBuilder {
                 if let Some(emissive) = material.emissive {
                     value["emissiveFactor"] = json!(emissive);
                 }
+                if let Some(texture) = material.base_color_texture {
+                    value["pbrMetallicRoughness"]["baseColorTexture"] = json!({ "index": texture });
+                }
+                if let Some(texture) = material.normal_texture {
+                    value["normalTexture"] = json!({ "index": texture });
+                }
+                if let Some(texture) = material.orm_texture {
+                    // ORM 打包图同下标充当两通道：加载器据此直接引用
+                    // 像素，不做 CPU 重打包（R42 合并策略）
+                    value["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
+                        json!({ "index": texture });
+                    value["occlusionTexture"] = json!({ "index": texture });
+                }
                 value
             })
+            .collect();
+        // 内嵌图像：PNG → base64 data URI（不走 bufferView——加载器的
+        // 图像读取子集只认 uri，见 `asset::gltf::load_image`）
+        let images: Vec<Value> = self
+            .images
+            .iter()
+            .map(|cpu| json!({ "uri": png_data_uri(cpu) }))
+            .collect();
+        let textures: Vec<Value> = self
+            .texture_sources
+            .iter()
+            .map(|&source| json!({ "source": source }))
             .collect();
         let meshes: Vec<Value> = self
             .meshes
@@ -696,7 +848,7 @@ impl GltfBuilder {
             })
             .collect();
 
-        let document = json!({
+        let mut document = json!({
             "asset": { "version": "2.0", "generator": "iris GltfBuilder" },
             "scene": 0,
             "scenes": [{ "nodes": top_level }],
@@ -709,6 +861,14 @@ impl GltfBuilder {
             "nodes": nodes,
             "animations": animations,
         });
+        // 空表不写键：无纹理资产的 JSON 与既有产物逐字一致（差异只出现在
+        // 真正声明了纹理的材质上）
+        if !images.is_empty() {
+            document["images"] = Value::Array(images);
+        }
+        if !textures.is_empty() {
+            document["textures"] = Value::Array(textures);
+        }
         (
             serde_json::to_string(&document).expect("builder 数据恒为合法 JSON"),
             bin,
@@ -807,6 +967,136 @@ mod tests {
         let angle = 2.0 * rotation.dot(expected).abs().clamp(0.0, 1.0).acos();
         assert!(angle < 1e-4, "0.5 s 应为 yaw 22.5°，实际 {rotation:?}");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 4×4 确定性色板（PNG 无损，往返后可逐字节比对）。
+    fn swatch(seed: u8) -> CpuTexture {
+        let rgba: Vec<u8> = (0..16u8)
+            .flat_map(|i| {
+                [
+                    seed.wrapping_mul(7).wrapping_add(i * 16),
+                    seed,
+                    255u8.wrapping_sub(seed).wrapping_add(i),
+                    255,
+                ]
+            })
+            .collect();
+        CpuTexture {
+            width: 4,
+            height: 4,
+            rgba,
+            srgb: true,
+        }
+    }
+
+    /// 摩擦③ 核心验收：`material_textured` 的三通道声明 → GLB（PNG
+    /// data URI 自包含）→ **内存入口** `spawn_gltf_instance_from_bytes`
+    /// 读回。锁定四件事：
+    /// - 材质三通道句柄有效且**像素逐字节一致**（PNG 无损 + 加载器直通）；
+    /// - 色彩空间由通道决定：baseColor = sRGB、法线 / ORM = 线性；
+    /// - builder 记账去重：同图被两材质引用 ⇒ `images` / `textures`
+    ///   各只多一份，且加载后两材质共享同一 TextureStore 条目；
+    /// - ORM 打包图同下标写进 `metallicRoughnessTexture` 与
+    ///   `occlusionTexture`（加载器据此免重打包）。
+    #[test]
+    fn built_textured_material_roundtrips_through_the_memory_loader() {
+        let (albedo, cloth, pack) = (swatch(10), swatch(200), swatch(80));
+        let mut builder = GltfBuilder::new();
+        let cloth_mat = builder.material_textured(
+            [1.0, 1.0, 1.0, 1.0],
+            1.0,
+            1.0,
+            None,
+            GltfMaterialTextures {
+                base_color: Some(albedo.clone()),
+                normal: Some(cloth.clone()),
+                orm: Some(pack.clone()),
+            },
+        );
+        // 只引用同一张法线图的次材质：图像登记必须命中去重
+        let trim_mat = builder.material_textured(
+            [1.0, 1.0, 1.0, 1.0],
+            1.0,
+            1.0,
+            None,
+            GltfMaterialTextures {
+                normal: Some(cloth.clone()),
+                ..Default::default()
+            },
+        );
+        let body = builder.mesh("Body", &triangle(), cloth_mat);
+        let trim = builder.mesh("Trim", &triangle(), trim_mat);
+        let root = builder.node(GltfNodeDesc::new("Root").with_mesh(body));
+        let trim_node = builder.node(GltfNodeDesc::new("Trim").with_mesh(trim));
+        builder.add_child(root, trim_node);
+        let glb = builder.build_glb();
+
+        // ---- builder 侧记账 ----
+        let (json, _) = builder.build_json_and_bin(None);
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            doc["images"].as_array().expect("有纹理就应写 images").len(),
+            3,
+            "三张不同的图各嵌一份，重复引用不重复嵌图"
+        );
+        assert_eq!(doc["textures"].as_array().expect("应写 textures").len(), 3);
+        let mats = doc["materials"].as_array().unwrap();
+        assert_ne!(
+            mats[0]["pbrMetallicRoughness"]["baseColorTexture"]["index"],
+            mats[0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["index"],
+            "baseColor 与 ORM 是两张不同的图（同值说明通道串位）"
+        );
+        assert_eq!(
+            mats[0]["normalTexture"]["index"], mats[1]["normalTexture"]["index"],
+            "共用同一张法线图的材质应指向同一 texture"
+        );
+        assert_eq!(
+            mats[0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["index"],
+            mats[0]["occlusionTexture"]["index"],
+            "ORM 打包图应同下标充当 metallicRoughness 与 occlusion 两通道"
+        );
+
+        // ---- 加载器侧读回 ----
+        let mut world = World::new();
+        world.insert_resource(iris_render::mesh::MeshStore::new());
+        world.insert_resource(iris_render::material::MaterialStore::new());
+        world.insert_resource(iris_render::texture::TextureStore::new());
+        let instance = iris_render::asset::spawn_gltf_instance_from_bytes(&mut world, glb)
+            .expect("自包含纹理 GLB 应可经内存入口加载");
+        let def_of = |world: &World, node: usize| -> iris_render::material::MaterialDef {
+            let entity = instance.node_entities[node].expect("节点应在场景内");
+            let part = world.children(entity)[0];
+            let handle = *world
+                .get::<iris_render::material::MaterialHandle>(part)
+                .expect("primitive 应挂材质");
+            world
+                .resource::<iris_render::material::MaterialStore>()
+                .get(handle)
+                .expect("材质应在 store 内")
+                .clone()
+        };
+        let def = def_of(&world, 0);
+        let store = world.resource::<iris_render::texture::TextureStore>();
+        let base = store.get(def.texture).expect("baseColor 贴图句柄应有效");
+        assert!(base.srgb, "baseColor 是颜色数据 → sRGB 标注");
+        assert_eq!(base.rgba, albedo.rgba, "baseColor 像素应逐字节一致");
+        let normal_handle = def.normal_texture.expect("法线通道应有纹理");
+        let normal = store.get(normal_handle).expect("法线句柄应有效");
+        assert!(!normal.srgb, "法线是数据贴图 → 线性标注");
+        assert_eq!(normal.rgba, cloth.rgba, "法线像素应逐字节一致");
+        let orm = store
+            .get(def.orm_texture.expect("ORM 通道应有纹理"))
+            .expect("ORM 句柄应有效");
+        assert!(!orm.srgb, "ORM 是数据贴图 → 线性标注");
+        assert_eq!(
+            orm.rgba, pack.rgba,
+            "ORM 像素应逐字节一致（R=AO G=粗糙 B=金属直通）"
+        );
+        assert_eq!(
+            def_of(&world, 1).normal_texture,
+            Some(normal_handle),
+            "同一张法线图在两材质间应共享 store 条目（去重生效）"
+        );
     }
 
     /// 蒙皮声明：builder 产物加载后 Skin 组件挂到 primitive 实体、

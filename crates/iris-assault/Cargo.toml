@@ -14,15 +14,14 @@ authors.workspace = true
 # 刻意 dogfooding：移动就是引擎角色控制器、追击就是引擎 NavGrid、
 # 弹道遮挡就是引擎射线纯函数，headless 与窗口走同一模拟）；插件层只
 # 允许依赖引擎门面 iris-engine。
+#
+# 打磨 VI 摩擦② 闭合：R45 的 GLB 内存加载入口
+# `spawn_gltf_instance_from_bytes` 已进 iris-render prelude（经
+# `iris_engine::prelude` 直达），R48 为它开的 iris-render 直依偏离
+# 随之删除——依赖纪律回归：游戏 crate 全局只剩 glam 这条非引擎依赖线。
 [dependencies]
 iris-core = { workspace = true }
 iris-engine = { workspace = true }
-# 与门面纪律的显式偏离（记入 ARCHITECTURE §8 摩擦清单）：R45 的 GLB
-# 内存加载入口 spawn_gltf_instance_from_bytes 未进 iris-render 的
-# prelude，门面依赖的下游 crate 无法经 iris_engine::prelude 直达——
-# pack 路径是本作的一级载荷，故直依 iris-render 使用该公开 API。
-# 建议修法：把内存入口补进 iris-render prelude（引擎轮闭合）。
-iris-render = { workspace = true }
 glam = { workspace = true }
 # 场景 / 资产加载失败的 log 告警（log 已在全 workspace 依赖树内，无新 crate）
 log = { workspace = true }

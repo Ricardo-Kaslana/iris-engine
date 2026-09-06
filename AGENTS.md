@@ -16,7 +16,7 @@ crate 布局（依赖自上而下）：
 | `iris-audio` | 混音纯函数核心 + cpal 设备薄壳（wasm 无设备自动降级）+ OGG/Vorbis 流式（symphonia）+ 音乐总线 + 混响区 |
 | `iris-render` | wgpu 渲染（PBR/法线 ORM/阴影/粒子/贴花/后处理链 DOF+MB/动画/GLB/RTT） |
 | `iris-engine` | 插件编排（DefaultPlugins）/ App / 场景序列化 / GltfBuilder / SmoothFollow / pack 资产打包 / AssetMount / 异步加载 / UI 菜单 / Settings |
-| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` | 五个 dogfooding 游戏（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
+| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` `iris-assault` | 六个 dogfooding 游戏（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
 
 **架构与特性全景唯一权威是 `ARCHITECTURE.md`**（约 1700 行，§1–§8），改任何子系统前先读对应章节；`§8 已知限制` 是诚实清单，别把已声明的限制当 bug 修。
 
@@ -58,7 +58,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 
 ### 测试计数陷阱
 
-**统计测试总数必须逐二进制明细加总**（当前基线见最近 CHANGELOG 条目；撰写时为 debug 714 / release 713）。两个已知陷阱：
+**统计测试总数必须逐二进制明细加总**（当前基线见最近 CHANGELOG 条目；撰写时为 debug 789 / release 786）。两个已知陷阱：
 - `grep -v "0 passed"` 会把 `10 passed` 也过滤掉（子串匹配）——禁用；
 - 两次独立的 cargo 调用输出无法对齐——二进制名与计数必须来自**同一次调用**的输出。
 

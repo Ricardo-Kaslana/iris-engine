@@ -34,11 +34,11 @@ use iris_core::prelude::{Entity as CoreEntity, Stage};
 use iris_engine::prelude::{
     AnimationPlayer, AnimationPlugin, App, AssetMount, Audio, Camera, CommandsPlugin, Decal,
     DepthOfFieldSettings, DirectionalLight, EnvironmentSettings, FootIk, GlobalTransform, HandIk,
-    HierarchyPlugin, IkTarget, Input, KeyCode, MeshStore, MotionBlurSettings, OffscreenRenderer,
-    PackReader, ParticleEmitter, ParticlePlugin, PhysicsPlugin, Plugin, Time, TimelinePlugin,
-    UiPlugin, UiText, asset_path, is_playing, stop_timeline,
+    HierarchyPlugin, IkTarget, Input, KeyCode, MaterialStore, MeshStore, MotionBlurSettings,
+    OffscreenRenderer, PackReader, ParticleEmitter, ParticlePlugin, PhysicsPlugin, Plugin,
+    TextureStore, Time, TimelinePlugin, Transform, UiPlugin, UiText, asset_path, is_playing,
+    resolve_focus_distance, stop_timeline, view_from_global,
 };
-use iris_render::prelude::{MaterialStore, TextureStore};
 
 /// headless 测试台：世界 + AssaultPlugin 系统链 + 层级 / 动画 / 时间线 /
 /// 物理 / 粒子 / UI / 命令队列插件 + 虚拟时钟（与窗口路径 DefaultPlugins
@@ -244,6 +244,16 @@ fn startup_builds_scene_and_capability_wiring() {
         .expect("玩家模型应挂下半身播放器");
     assert!(locomotion.blend_space_active, "步态混合空间应激活");
     assert!(locomotion.blend_space.is_some());
+    // 打磨 VI 摩擦⑥：加载器把 GLB 节点名带进播放器 ⇒ 装配层可按名寻骨
+    assert_eq!(
+        locomotion.node_entity_by_name(sk::names::CHEST),
+        locomotion.node_entities.get(sk::CHEST).copied().flatten(),
+        "按名与按下标应命中同一骨节点（chest）"
+    );
+    assert!(
+        locomotion.node_entity_by_name("no_such_bone").is_none(),
+        "骨架外的节点名应查不到"
+    );
     assert_eq!(
         harness.app.world.parent(ents.player_action),
         Some(ents.player_root),
@@ -295,6 +305,10 @@ fn startup_builds_scene_and_capability_wiring() {
     // ---- R43：DOF / MB 设置资源在位且启用 ----
     let dof = harness.app.world.resource::<DepthOfFieldSettings>();
     assert!(dof.enabled, "DOF 应默认启用");
+    assert!(
+        dof.focus_target.is_none(),
+        "启动期（开场演出）无焦点实体，对焦走 focus_distance 标量"
+    );
     let mb = harness.app.world.resource::<MotionBlurSettings>();
     assert!(mb.enabled, "MB 应启用（演出相机运动拖影）");
     // ---- R47：开场演出已启动 ----
@@ -360,6 +374,40 @@ fn intro_cinematic_plays_and_hands_over_control() {
         !is_playing(&harness.app.world),
         "开场时间线应已播完（交还相机）"
     );
+    // ---- 打磨 VI 摩擦① 的实弹锁：idle 剪辑**不含腿旋转通道**（R48 补的
+    // 恒值兜底已删），站立即足部 IK 每帧写腿骨——被写的四条骨必须仍是
+    // 单位四元数（未修复时本场景 ~1.9 s 内范数 386 → 5.8e7 → NaN）----
+    let ents = harness.entities();
+    let locomotion = harness
+        .app
+        .world
+        .get::<AnimationPlayer>(ents.player_model)
+        .expect("玩家模型应有下半身播放器");
+    for name in [
+        sk::names::L_THIGH,
+        sk::names::L_SHIN,
+        sk::names::R_THIGH,
+        sk::names::R_SHIN,
+    ] {
+        let bone = locomotion
+            .node_entity_by_name(name)
+            .expect("腿骨节点应按名命中");
+        let rotation = harness
+            .app
+            .world
+            .get::<Transform>(bone)
+            .expect("腿骨应有 Transform")
+            .rotation;
+        assert!(
+            rotation.is_finite(),
+            "{name} 旋转出现非有限分量（平方复合爆炸）：{rotation:?}"
+        );
+        assert!(
+            (rotation.length() - 1.0).abs() <= 1e-3,
+            "{name} 旋转范数偏离单位（IK 回写未归一化？）：{}",
+            rotation.length()
+        );
+    }
 }
 
 /// R46 端到端：ADS 手 IK 吸附——按住瞄准数帧后，右手骨全局位应吸附到
@@ -453,6 +501,7 @@ fn auto_player_full_course_victory_with_ragdoll_decals_and_fx() {
     let max_frames = 60 * 240;
     let mut frames = 0usize;
     let mut focus_samples = Vec::new();
+    let mut focused_by_target = 0usize;
     while frames < max_frames {
         harness.autopilot_frame();
         harness.frame();
@@ -464,8 +513,20 @@ fn auto_player_full_course_victory_with_ragdoll_decals_and_fx() {
                 live += emitter.live_count();
             });
             max_live_particles = max_live_particles.max(live);
-            let dof = harness.app.world.resource::<DepthOfFieldSettings>();
-            focus_samples.push(dof.focus_distance);
+            // 打磨 VI 摩擦⑤：对焦距离由 `focus_target` 经引擎解析
+            // （headless 无渲染器，测试侧调**同一个纯函数**），采样的是
+            // 实际生效值而非资源里的标量回退值
+            let world = &harness.app.world;
+            let dof = world.resource::<DepthOfFieldSettings>();
+            if dof.focus_target.is_some() {
+                focused_by_target += 1;
+            }
+            if let Some(view) = world
+                .get::<GlobalTransform>(ents.camera)
+                .map(|global| view_from_global(&global))
+            {
+                focus_samples.push(resolve_focus_distance(world, &dof, &view));
+            }
         }
         // 首杀断言（ragdoll + 隐藏 + 贴花）
         if !first_kill_seen && harness.state().kills >= 1 {
@@ -554,7 +615,18 @@ fn auto_player_full_course_victory_with_ragdoll_decals_and_fx() {
         max_live_particles > 0,
         "战斗中应有粒子活跃（血雾 / 枪口焰 / 刀光）"
     );
-    // ---- R43：对焦距离随交战几何变化（多样本非恒值）----
+    // ---- R43（打磨 VI 摩擦⑤ 闭合）：对焦由 focus_target 驱动，且
+    // 解析出的实际对焦距离随交战几何变化（多样本非恒值）----
+    assert!(
+        focus_samples.len() > 60,
+        "有效采样应覆盖战斗全程，实际 {} 帧",
+        focus_samples.len()
+    );
+    assert!(
+        focused_by_target * 2 > focus_samples.len(),
+        "采样帧应过半由焦点实体驱动对焦（而非标量回退），实际 {focused_by_target}/{}",
+        focus_samples.len()
+    );
     let min_focus = focus_samples.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_focus = focus_samples.iter().cloned().fold(0.0_f32, f32::max);
     assert!(

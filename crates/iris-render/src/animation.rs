@@ -446,6 +446,17 @@ pub struct AnimationPlayer {
     pub clips: Vec<AnimationClip>,
     /// 节点索引 → 目标实体；未在 active scene 中的节点为 None。
     pub node_entities: Vec<Option<Entity>>,
+    /// 节点索引 → glTF 节点名（与 [`Self::node_entities`] **同下标对齐**，
+    /// 缺席 = 该节点无名）。打磨 VI 摩擦⑥：骨架装配（IK 链、挂点、材质
+    /// 替换）此前只能按裸下标寻骨，「资产生成器 ↔ 骨架表 ↔ 插件层」三方
+    /// 下标契约全靠守护测试兜底——本字段把「按名查实体」变成引擎原语
+    /// （[`Self::node_entity_by_name`]）。
+    ///
+    /// 由 [`crate::asset::GltfInstance::player`] 从 GLB 节点名填入；
+    /// 手写剪辑构造的播放器可留空表（按名查找恒 None）。**名称唯一性由
+    /// 资产侧保证**（glTF 规范不强制节点名唯一）：重名时取先出现的节点
+    /// （向量序确定 ⇒ 结果确定）。
+    pub node_names: Vec<Option<String>>,
     /// 当前播放的剪辑索引。
     pub active: usize,
     /// 当前播放时间（秒）。
@@ -521,6 +532,7 @@ impl Default for AnimationPlayer {
         Self {
             clips: Vec::new(),
             node_entities: Vec::new(),
+            node_names: Vec::new(),
             active: 0,
             time: 0.0,
             speed: 1.0,
@@ -552,6 +564,21 @@ impl AnimationPlayer {
             node_entities,
             ..Default::default()
         }
+    }
+
+    /// 按 glTF **节点名**查映射实体（打磨 VI 摩擦⑥）：骨架装配（IK 链 /
+    /// 武器挂点 / 材质替换寻骨）不再依赖裸下标契约。语义：
+    /// - 命中首个同名节点（[`Self::node_names`] 向量序确定 ⇒ 重名时
+    ///   结果确定；名称唯一性由资产侧保证）；
+    /// - 该名存在但节点不在 active scene（实体为 None）、或本播放器是
+    ///   手写构造（`node_names` 空表）→ [`None`]；
+    /// - 与下标寻址等价可互换：命中项恒等于
+    ///   `node_entities[首个匹配下标]`（单测锁定）。
+    pub fn node_entity_by_name(&self, name: &str) -> Option<Entity> {
+        self.node_names
+            .iter()
+            .position(|slot| slot.as_deref() == Some(name))
+            .and_then(|index| self.node_entities.get(index).copied().flatten())
     }
 
     /// 生效的循环标记：挂了状态机（states 非空且下标合法）时以当前状态
@@ -2988,6 +3015,38 @@ mod tests {
             (leg_cleared.position.z - (-0.5)).abs() < 1e-6,
             "清除遮罩后腿节点恢复覆写：z = −0.5，实际 {}",
             leg_cleared.position.z
+        );
+    }
+
+    /// 按名查骨（打磨 VI 摩擦⑥）的三条边界：重名**取先**（向量序确定 ⇒
+    /// 结果确定）、名在但实体缺席（节点不在 active scene）为 None、
+    /// 手写构造的播放器无名字表 ⇒ 任何查询都是 None。
+    #[test]
+    fn node_entity_by_name_takes_first_and_tolerates_gaps() {
+        let mut world = World::new();
+        let first = world.spawn((Transform::IDENTITY,));
+        let second = world.spawn((Transform::IDENTITY,));
+        let player = AnimationPlayer {
+            node_names: vec![Some("hip".into()), Some("hip".into()), Some("gone".into())],
+            node_entities: vec![Some(first), Some(second), None],
+            ..Default::default()
+        };
+        assert_eq!(
+            player.node_entity_by_name("hip"),
+            Some(first),
+            "重名节点应取先出现者"
+        );
+        assert_eq!(
+            player.node_entity_by_name("gone"),
+            None,
+            "有名但实体缺席应视为查不到"
+        );
+        assert_eq!(player.node_entity_by_name("knee"), None);
+        let handwritten = AnimationPlayer::new(vec![], vec![Some(first)]);
+        assert_eq!(
+            handwritten.node_entity_by_name("hip"),
+            None,
+            "无名字表的手写播放器按名查找恒 None"
         );
     }
 }

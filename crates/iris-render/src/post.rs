@@ -127,13 +127,28 @@ pub struct DepthOfFieldSettings {
     pub enabled: bool,
     /// 聚焦平面距离（米）。v1 取**沿视线方向的线性视距**（view-Z），
     /// 与深度副本的存储口径一致；斜向距离（径向距离）在画面边缘略长，
-    /// 是声明的近似（见 ARCHITECTURE §8）。
+    /// 是声明的近似（见 ARCHITECTURE §8）。挂了 [`Self::focus_target`]
+    /// 且目标有效时本字段退为**回退值**。
     pub focus_distance: f32,
     /// 清晰带半宽（± 此范围内的像素 CoC = 0，逐位透传原色）。
     pub focus_range: f32,
     /// 最大模糊半径（纹素数）：CoC 归一化到 [0, 1] 后乘本值得实际采样
     /// 半径；12-tap 泊松盘在该半径内平均。
     pub max_blur_radius: f32,
+    /// 焦点实体（打磨 VI 摩擦⑤）：`Some` 时对焦距离**每帧由渲染器解析**
+    /// ——目标实体的 `GlobalTransform` 世界位经相机视图矩阵取 view-Z，与
+    /// [`Self::focus_distance`] 同口径。解析点在 `Renderer::draw` 的 DOF
+    /// 参数上传处（相机已解析、链头第一个全分辨率 pass 之前）：本资源是
+    /// **配置而非状态**，解析结果只写进 uniform、不回写资源字段（避免
+    /// 「游戏侧写的值被渲染器覆写」的所有权纠缠）。
+    ///
+    /// **缺席回退**：目标实体失效 / 无 `GlobalTransform` / 自身
+    /// [`Visibility::HIDDEN`](crate::visibility::Visibility) → 回退
+    /// [`Self::focus_distance`] 标量（不隐藏即无操作）。`GlobalTransform`
+    /// 是上一帧层级传播的产物，跟随运动的目标有一帧滞后——对焦是连续
+    /// 平滑量，一帧在清晰带半宽（米级）内不可感知。
+    /// 纯函数解析入口见 [`resolve_focus_distance`]。
+    pub focus_target: Option<iris_core::prelude::Entity>,
 }
 
 impl Default for DepthOfFieldSettings {
@@ -143,7 +158,40 @@ impl Default for DepthOfFieldSettings {
             focus_distance: 10.0,
             focus_range: 2.0,
             max_blur_radius: 8.0,
+            focus_target: None,
         }
+    }
+}
+
+/// [`DepthOfFieldSettings::focus_target`] 的解析（纯函数，渲染器每帧
+/// 调用一次——单测在此锁定语义，无需 GPU）：目标有效时返回其世界位经
+/// `view` 变换后的视深（**view-Z 口径**，相机前方为正、与
+/// `focus_distance` 字段一致）；`None` 目标 / 实体无 `GlobalTransform` /
+/// 目标隐藏一律回退 `settings.focus_distance`。
+///
+/// `view` 取 [`crate::camera::view_from_global`]（与渲染器主相机同源的
+/// 上一帧传播结果）。
+pub fn resolve_focus_distance(
+    world: &iris_core::world::World,
+    settings: &DepthOfFieldSettings,
+    view: &glam::Mat4,
+) -> f32 {
+    let Some(target) = settings.focus_target else {
+        return settings.focus_distance;
+    };
+    let hidden = world
+        .get::<crate::visibility::Visibility>(target)
+        .is_some_and(|visibility| !visibility.visible);
+    let position = match world.get::<iris_core::prelude::GlobalTransform>(target) {
+        Some(global) if !hidden => global.position(),
+        _ => return settings.focus_distance,
+    };
+    // 视空间 -z = 相机前方的线性视距（与透明排序 view_depth 同口径）
+    let view_z = -(view * position.extend(1.0)).z;
+    if view_z.is_finite() {
+        view_z
+    } else {
+        settings.focus_distance
     }
 }
 
@@ -544,6 +592,98 @@ pub(crate) fn full_chain_slots(dof_on: bool, mb_on: bool, vignette_on: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::{Mat4, Vec3};
+    use iris_core::hierarchy::propagate_transforms;
+    use iris_core::prelude::{Entity, GlobalTransform, Transform, World};
+
+    // ---- 焦点实体解析（打磨 VI 摩擦⑤）----
+
+    /// 相机：原点平移 (0, 0, 6)、恒等旋转 ⇒ 注视 −Z（引擎前方），
+    /// view 矩阵与渲染器主相机同源（[`crate::camera::view_from_global`]）。
+    fn camera_view() -> Mat4 {
+        let global = GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, 6.0));
+        crate::camera::view_from_global(&global)
+    }
+
+    /// 焦点目标实体（传播出 GlobalTransform 的常规层级实体）。
+    fn target(world: &mut World, position: Vec3) -> Entity {
+        let entity = world.spawn((Transform {
+            position,
+            ..Transform::IDENTITY
+        },));
+        propagate_transforms(world);
+        entity
+    }
+
+    fn settings(focus_distance: f32, focus_target: Option<Entity>) -> DepthOfFieldSettings {
+        DepthOfFieldSettings {
+            enabled: true,
+            focus_distance,
+            focus_target,
+            ..Default::default()
+        }
+    }
+
+    /// 无焦点实体（None）→ 逐位回退标量：既有语义零改动。
+    #[test]
+    fn focus_distance_without_target_is_the_scalar() {
+        let world = World::new();
+        assert_eq!(
+            resolve_focus_distance(&world, &settings(7.5, None), &camera_view()),
+            7.5
+        );
+    }
+
+    /// 焦点实体移动 → 对焦距离逐值跟随（相机 z = 6、目标 z = 1 ⇒ 5.0；
+    /// 目标移到 z = −4 ⇒ 10.0）。口径是 **view-Z**：偏轴目标 (3, 2, 1)
+    /// 仍解析为 5.0（径向距离会是 √38 ≈ 6.164）——与 `focus_distance`
+    /// 字段文档声明的近似一致。
+    #[test]
+    fn focus_target_distance_follows_entity() {
+        let mut world = World::new();
+        let view = camera_view();
+        let entity = target(&mut world, Vec3::new(0.0, 0.0, 1.0));
+        let resolved = resolve_focus_distance(&world, &settings(1.0, Some(entity)), &view);
+        assert!(
+            (resolved - 5.0).abs() <= 1e-5,
+            "目标在相机前方 5 m，对焦距离应为 5.0，实际 {resolved}"
+        );
+        // 目标移动：写 Transform 后重新传播，解析值即时跟随
+        *world.get_mut::<Transform>(entity).unwrap() = Transform::from_xyz(0.0, 0.0, -4.0);
+        propagate_transforms(&mut world);
+        let moved = resolve_focus_distance(&world, &settings(1.0, Some(entity)), &view);
+        assert!(
+            (moved - 10.0).abs() <= 1e-5,
+            "目标移到 10 m，对焦距离应为 10.0，实际 {moved}"
+        );
+        // view-Z 口径（偏轴不放大）
+        let off_axis = target(&mut world, Vec3::new(3.0, 2.0, 1.0));
+        let depth = resolve_focus_distance(&world, &settings(1.0, Some(off_axis)), &view);
+        assert!(
+            (depth - 5.0).abs() <= 1e-5,
+            "偏轴距只按视轴投影计（径向为 6.164），实际 {depth}"
+        );
+    }
+
+    /// 缺席回退两条：目标实体无 `GlobalTransform`（未入层级的裸实体）、
+    /// 目标自身 `Visibility::HIDDEN` → 一律回退标量。
+    #[test]
+    fn focus_target_absent_or_hidden_falls_back_to_scalar() {
+        let mut world = World::new();
+        let bare = world.spawn((crate::visibility::Visibility::VISIBLE,));
+        assert_eq!(
+            resolve_focus_distance(&world, &settings(4.0, Some(bare)), &camera_view()),
+            4.0,
+            "无 GlobalTransform 的目标应回退标量"
+        );
+        let entity = target(&mut world, Vec3::new(0.0, 0.0, 1.0));
+        world.insert(entity, crate::visibility::Visibility::HIDDEN);
+        assert_eq!(
+            resolve_focus_distance(&world, &settings(4.0, Some(entity)), &camera_view()),
+            4.0,
+            "隐藏的焦点实体应回退标量"
+        );
+    }
 
     #[test]
     fn half_scale_halves_and_clamps_to_one() {

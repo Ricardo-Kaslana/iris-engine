@@ -249,8 +249,13 @@ pub fn update_hand_ik(world: &World) {
             let parent_rot = shoulder_world_rot * shoulder_local_rot.conjugate();
             let shoulder_world_rot_new = arc_shoulder * shoulder_world_rot;
             let elbow_world_rot_new = arc_elbow * elbow_world_rot;
-            let shoulder_local_rot_new = parent_rot.conjugate() * shoulder_world_rot_new;
-            let elbow_local_rot_new = shoulder_world_rot_new.conjugate() * elbow_world_rot_new;
+            // 归一化与足部同源（打磨 VI 摩擦①，推导见
+            // `crate::foot_ik::update_foot_ik` 的注释）：本系统是手部骨的
+            // 唯一写入者，剪辑不逐帧覆写时被写值会作为输入再复合。
+            let shoulder_local_rot_new =
+                (parent_rot.conjugate() * shoulder_world_rot_new).normalize();
+            let elbow_local_rot_new =
+                (shoulder_world_rot_new.conjugate() * elbow_world_rot_new).normalize();
             let Some(shoulder_local) = world.get::<Transform>(shoulder_entity).map(|t| *t) else {
                 return;
             };
@@ -574,5 +579,83 @@ mod tests {
             },
         );
         update_hand_ik(&world);
+    }
+
+    /// 回写四元数归一化的手部侧回归锁（打磨 VI 摩擦①，与
+    /// [`crate::foot_ik`] 的同名测试同源）：剪辑**只写肩的下探平移通道**
+    /// （2 cm / 2 s 循环），肩与肘的旋转无通道覆写 ⇒ IK 写回值每帧作为
+    /// 下一帧复合链的输入；握把固定。跑 600 帧逐帧断言分量有限、
+    /// ‖q‖ − 1 ≤ 1e-3、骨长保持 0.5，末帧与同相位（提前 120 帧）位形
+    /// 一致 ≤ 1e-3。
+    #[test]
+    fn hand_ik_quaternion_norm_stable_without_clip_overwrite() {
+        use crate::animation::{
+            AnimationChannel, AnimationClip, AnimationInterpolation, AnimationPath,
+            update_animations,
+        };
+        use iris_core::prelude::Time;
+        use std::time::Duration;
+
+        let (mut world, root, shoulder, elbow, hand) = arm(Vec3::new(0.0, 1.5, 0.0));
+        let target = grip(&mut world, Vec3::new(0.0, 1.5, -0.6));
+        let clip = AnimationClip {
+            name: "idle".into(),
+            channels: vec![AnimationChannel {
+                node: 0, // shoulder：只写平移，旋转通道缺席 = 本测试的前提
+                path: AnimationPath::Translation,
+                interpolation: AnimationInterpolation::Linear,
+                times: vec![0.0, 1.0, 2.0],
+                values: vec![0.0, 0.0, 0.0, 0.0, -0.02, 0.0, 0.0, 0.0, 0.0],
+            }],
+            duration: 2.0,
+            events: Vec::new(),
+        };
+        world.insert(
+            root,
+            AnimationPlayer::new(vec![clip], vec![Some(shoulder), Some(elbow), Some(hand)]),
+        );
+        world.get_mut::<HandIk>(root).unwrap().target = Some(target);
+        world.insert_resource(Time::default());
+
+        let mut poses: Vec<(Vec3, Vec3)> = Vec::new();
+        let dt = Duration::from_secs_f64(1.0 / 60.0);
+        for frame in 0..600 {
+            world.resource_mut::<Time>().advance(dt);
+            update_animations(&world);
+            update_hand_ik(&world);
+            for &(joint, what) in &[(shoulder, "shoulder"), (elbow, "elbow")] {
+                let rotation = world.get::<Transform>(joint).unwrap().rotation;
+                assert!(
+                    rotation.is_finite(),
+                    "第 {frame} 帧 {what} 旋转出现非有限分量：{rotation:?}"
+                );
+                let norm = rotation.length();
+                assert!(
+                    (norm - 1.0).abs() <= 1e-3,
+                    "第 {frame} 帧 {what} 旋转范数偏离单位超过 1e-3：‖q‖ = {norm}"
+                );
+            }
+            let shoulder_world = chain_world(&world, shoulder).unwrap().0.w_axis.truncate();
+            let elbow_world = chain_world(&world, elbow).unwrap().0.w_axis.truncate();
+            let hand_world = chain_world(&world, hand).unwrap().0.w_axis.truncate();
+            assert!(
+                ((elbow_world - shoulder_world).length() - 0.5).abs() <= 1e-3
+                    && ((hand_world - elbow_world).length() - 0.5).abs() <= 1e-3,
+                "第 {frame} 帧臂骨长偏离装配值 0.5：位形已失真"
+            );
+            poses.push((elbow_world, hand_world));
+        }
+
+        // 剪辑周期 2 s = 120 帧：同相位（第 600 帧 vs 第 480 帧）位形一致
+        // ——twist 不入断言（口径与理由见 foot_ik 同名测试）
+        let (a_elbow_pos, a_hand_pos) = poses[479];
+        let (b_elbow_pos, b_hand_pos) = poses[599];
+        assert!(
+            (a_elbow_pos - b_elbow_pos).length() <= 1e-3
+                && (a_hand_pos - b_hand_pos).length() <= 1e-3,
+            "同相位两帧的关节世界位应一致（不逐循环漂移）：肘差 {} 手差 {}",
+            (a_elbow_pos - b_elbow_pos).length(),
+            (a_hand_pos - b_hand_pos).length()
+        );
     }
 }

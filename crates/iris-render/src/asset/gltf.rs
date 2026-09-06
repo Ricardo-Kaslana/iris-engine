@@ -118,6 +118,12 @@ struct GltfScene {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GltfNode {
+    /// 节点名（打磨 VI 摩擦⑥）：加载期写入
+    /// [`GltfInstance::node_names`]，运行期经
+    /// [`AnimationPlayer::node_entity_by_name`](crate::animation::AnimationPlayer)
+    /// 按名寻骨。glTF 规范不强制唯一——重名时按名查找取先出现者。
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     mesh: Option<usize>,
     /// 本节点网格引用的蒙皮索引（glTF skins）。
@@ -1181,6 +1187,12 @@ pub struct GltfInstance {
     pub roots: Vec<iris_core::prelude::Entity>,
     /// 节点索引 → 实体（仅 active scene 内的节点有值，动画目标解析用）。
     pub node_entities: Vec<Option<iris_core::prelude::Entity>>,
+    /// 节点索引 → glTF 节点名（与 [`Self::node_entities`] **同下标**，
+    /// 无名节点为 None）。打磨 VI 摩擦⑥：随 [`Self::player`] 进入
+    /// [`AnimationPlayer::node_names`]，装配层据此按名寻骨
+    /// （[`AnimationPlayer::node_entity_by_name`]），不再需要外部维护
+    /// 裸下标表。
+    pub node_names: Vec<Option<String>>,
     /// 文件内的全部动画剪辑。
     pub clips: Vec<AnimationClip>,
 }
@@ -1189,7 +1201,10 @@ impl GltfInstance {
     /// 构造默认播放器：循环播放第一个剪辑，原速，自动开始。
     /// 用 `world.insert(root, instance.player())` 挂到根实体上。
     pub fn player(&self) -> crate::animation::AnimationPlayer {
-        crate::animation::AnimationPlayer::new(self.clips.clone(), self.node_entities.clone())
+        crate::animation::AnimationPlayer {
+            node_names: self.node_names.clone(),
+            ..crate::animation::AnimationPlayer::new(self.clips.clone(), self.node_entities.clone())
+        }
     }
 }
 
@@ -1393,9 +1408,19 @@ fn spawn_from_document(
     // 残留会把刚收编的关节再拆出去）
     roots.retain(|root| !reparented.contains(root));
 
+    // 节点名表（打磨 VI 摩擦⑥）：下标 = glTF 节点声明序，与
+    // `node_entities` 逐位对齐（未进 active scene 的节点有名无实体）
+    let names: Vec<Option<String>> = loader
+        .doc
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect();
+
     Ok(GltfInstance {
         roots,
         node_entities: loader.node_entities.into_inner(),
+        node_names: names,
         clips,
     })
 }
@@ -1935,6 +1960,47 @@ mod tests {
             "scene": 0
         }"#;
         (json.to_string(), bin)
+    }
+
+    /// 节点名进播放器（打磨 VI 摩擦⑥）：`node_names` 与 `node_entities`
+    /// 同下标对齐，[`GltfInstance::player`] 携带名字表 ⇒ 装配层
+    /// `node_entity_by_name("hip")` 命中与 `node_entities[i]` 同一个实体；
+    /// 无名节点与未知名一律查不到（不 panic）。
+    #[test]
+    fn node_names_drive_lookup_by_name() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join(format!("iris-gltf-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = skinned_triangle_parts();
+        let path = dir.join("named.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        assert_eq!(
+            instance.node_names.len(),
+            instance.node_entities.len(),
+            "名字表必须与实体表同长（下标对齐）"
+        );
+        assert_eq!(instance.node_names[0], None, "mesh 节点未声明 name");
+        assert_eq!(instance.node_names[1].as_deref(), Some("hip"));
+        assert_eq!(instance.node_names[2].as_deref(), Some("elbow"));
+        let player = instance.player();
+        assert_eq!(
+            player.node_entity_by_name("hip"),
+            instance.node_entities[1],
+            "按名查骨应命中与下标寻址同一实体"
+        );
+        assert_eq!(
+            player.node_entity_by_name("elbow"),
+            instance.node_entities[2]
+        );
+        assert_eq!(
+            player.node_entity_by_name("spine"),
+            None,
+            "文件里没有的节点名应为 None"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
