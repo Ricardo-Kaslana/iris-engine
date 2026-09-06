@@ -102,8 +102,8 @@ use crate::animation::AnimationPlayer;
 const GROUND_EPSILON: f32 = 1e-3;
 
 /// 退化骨长阈值（米）：骨骼世界长度低于此值视为被压扁的退化装配，
-/// 跳过该实体（余弦定理在零长骨上无解）。
-const MIN_BONE_LENGTH: f32 = 1e-6;
+/// 跳过该实体（余弦定理在零长骨上无解）。pub(crate)：手部 IK 同门。
+pub(crate) const MIN_BONE_LENGTH: f32 = 1e-6;
 
 /// 两骨 IK 纯函数：hip-knee-ankle 链，ankle 去往 `target`（可达域内时
 /// 精确到达），返回 `(ankle, knee)` 的世界位。
@@ -284,8 +284,10 @@ fn raycast_statics(
 
 /// 沿 `ChildOf` 链自根向叶累乘局部矩阵与旋转（读的是本帧最新的局部
 /// `Transform`——动画刚写过、传播尚未发生）。链上有实体缺 `Transform`
-/// 时返回 `None`（调用方跳过）。
-fn chain_world(world: &World, entity: Entity) -> Option<(Mat4, Quat)> {
+/// 时返回 `None`（调用方跳过）。pub(crate)：手部 IK（`hand_ik` 模块）
+/// 与足部共用同一链姿势读取（同一帧内两段 IK 先后作用于同一份本帧
+/// 局部姿势，读取语义必须逐位一致）。
+pub(crate) fn chain_world(world: &World, entity: Entity) -> Option<(Mat4, Quat)> {
     let mut matrices = Vec::new();
     let mut rotations = Vec::new();
     let mut current = Some(entity);

@@ -5,6 +5,56 @@
 
 ## [Unreleased]
 
+### Added（R46：动画 v4——附加动画层 + 骨骼遮罩 + 两骨手部 IK）
+
+第三人称写实角色的动画纵深三件套（边走边瞄准、受击不破坏移动循环、
+持枪手位吸附）。既有动画测试零改动全过——`AnimationPlayer` 既有
+路径行为不变（新字段全部中性默认：`additive = None`、`mask = None`
+与 v3 行为逐位一致）：
+
+- **附加动画层**（`iris-render::animation`）：`AnimationPlayer::additive`
+  （`AdditiveLayer { clip, time, speed, weight, looping }`）+
+  `play_additive(clip, weight)` / `stop_additive()`——主姿势（active /
+  blendspace / crossfade 任一现行模式）算完后叠加「剪辑相对参考帧
+  （t = 0 采样值）的增量」：平移 / 缩放 `(v(t) − v(0)) × weight` 加法，
+  旋转相对旋转 `q(t) · q(0)⁻¹` 经 `slerp(I, d, weight)` 压幅后**右乘**
+  主姿势（增量解释进节点局部系——左乘会随身体朝向漂移，数学推导进
+  `additive_delta` 文档）。推进与主时间轴对称（暂停冻结 / 循环取模 /
+  非循环钳末端），采样与落账同式（与分帧方式无关）。**诚实边界**：
+  只在主姿势已覆写的通道上叠加——以当前 Transform 为基会让增量逐帧
+  复合无界漂移（实测捕获：上一帧附加输出被当基值、旋转每帧多转
+  45°），未对齐通道跳过、附加剪辑须与主姿势对齐设计。测试：呼吸
+  剪辑 weight 0.5 半幅解析精确、旋转增量 yaw135° 解析对照（容差
+  2e-3 rad，slerp 复合 f32 精度实测 ~0.00098 rad）、weight = 0 与
+  无附加层逐位一致、与 crossfade 并存叠加在后。
+- **骨骼遮罩**（`iris-render::animation`）：`AnimationMask { nodes:
+  BTreeSet<usize> }` + `set_mask` / `clear_mask`——**覆写过滤器**，
+  不参与姿势计算：目标节点不在集合内的覆写任务整条剔除（腿节点
+  保持移动循环姿势）。与 BlendSpace / crossfade / 状态机 / 附加层
+  全部正交（附加层覆写同样被过滤；`BTreeSet` = 确定性迭代序）；
+  `mask = None` 全覆写照旧。测试：遮罩含上身节点 → 腿节点逐位
+  不动、`clear_mask` 后恢复覆写。
+- **两骨手部 IK**（`iris-render::hand_ik` 新模块）：`HandIk`（肩-肘-手
+  链 + `pole` + `target` + `reach_threshold`）+ `IkTarget` 握把标记 +
+  `update_hand_ik`。复用足部 `solve_two_bone_ik` 纯函数与两阶段回写
+  （`chain_world` 提为 `pub(crate)` 共用）。**与足部 IK 的目标差异**：
+  ① 目标 = `IkTarget` 实体 `GlobalTransform` 全局平移（武器握把，
+  玩法量）而非射线打地面；目标失效 / 无全局位 / `Visibility::HIDDEN`
+  → 本帧放弃；诚实边界：一帧滞后——挂点在手骨子树内会成反馈环
+  （装配禁忌写进模块文档）。② 不可达门带**容差带**：超全臂长但在
+  `reach_threshold` 内仍解算（拉伸贴握把 = 伸臂取枪的正常表现），
+  超带 / 过近才放弃——与足部全域放弃的刻意差异（足部不可达 = 射线
+  采到异常几何必错；手部接近全臂长是玩法 authored 正常输入）。
+  ③ 无平地门（目标逐帧移动、回写幂等）。双臂装配：每臂一条配置
+  实体挂 `(IkRig, HandIk)`（组件存储每实体单槽），两链互不干扰。
+  测试：握把解析解精确（手落握把、肘按余弦定理落位、骨长严格
+  保持）、超域 / 缺席 / 隐藏三类姿势逐位不动、容差带内拉伸贴握把、
+  双臂同时吸附、逐位确定性、debug 链契约断言。
+- **编排**：`AnimationPlugin` 注册序扩展为 `update_animations →
+  update_foot_ik → update_hand_ik`（手 IK 在足 IK 后：持枪手位是
+  比脚落地更高频的视觉焦点，两段 IK 依次作用于同一份本帧局部姿势，
+  注册序确定 ⇒ 结果确定）→ PostUpdate 层级传播。
+
 ### Added（R45：资产打包与流式——PACK1 单文件格式 + mount 挂载 + 异步加载骨架）
 
 「低占用」卖点的规模化兑现：中型游戏资产体量的载入形态。三个新模块

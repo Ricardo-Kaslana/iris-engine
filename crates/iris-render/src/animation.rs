@@ -52,6 +52,26 @@
 //!   见 [`root_motion_delta`]）累积进 [`AnimationPlayer::pending_root_motion`]，
 //!   消费方每帧 [`AnimationPlayer::take_root_motion`] 取走、旋转到角色
 //!   yaw 系后交给角色控制器（消费契约见 [`root_motion_delta`] 文档）。
+//!
+//! v4 扩展（新字段全部带中性默认值，不启用时行为与 v3 完全一致）：
+//! - **附加动画层**：[`AnimationPlayer::additive`] +
+//!   [`AnimationPlayer::play_additive`]——在主姿势（active / blendspace /
+//!   crossfade 任一现行模式）算完后叠加「剪辑相对其参考帧（t=0 采样值）
+//!   的增量」（受击/呼吸类叠加语义）：平移/缩放加法
+//!   `main + (v(t) − v(0)) × weight`，旋转按相对旋转复合
+//!   `main × slerp(I, q(t)·q(0)⁻¹, weight)`（数学推导见
+//!   [`additive_delta`]）；整层权重 [`AdditiveLayer::weight`] 压幅；
+//! - **骨骼遮罩**：[`AnimationMask`] + [`AnimationPlayer::set_mask`]——
+//!   覆写过滤器：主姿势采样产出的「目标实体 → 覆写字段」任务中，目标
+//!   节点在遮罩集合内才覆写，集合外节点保持当前值（上半身瞄准层的
+//!   基础——下半身保持移动姿势）。与 BlendSpace / crossfade / 状态机 /
+//!   附加层**正交**（mask 只是最终的覆写过滤器，不参与任何姿势计算）；
+//! - **手部两骨 IK**：`crate::hand_ik` 模块（[`crate::hand_ik::HandIk`]），
+//!   复用足部的 [`crate::foot_ik::solve_two_bone_ik`] 纯函数与两阶段
+//!   回写模式，落地查询换成「[`crate::hand_ik::IkTarget`] 实体的全局
+//!   平移」（武器握把位）——与足部「射线打地面」的目标差异见其模块文档。
+
+use std::collections::BTreeSet;
 
 use glam::{Quat, Vec2, Vec3};
 use iris_core::prelude::{Entity, Time, Transform};
@@ -366,6 +386,59 @@ pub struct AnimationEdge {
     pub duration: f32,
 }
 
+/// 附加动画层（v4）：在主姿势之上叠加「剪辑相对其参考帧的增量」——
+/// 受击抖动、呼吸起伏这类**叠加语义**的载体（增量叠在移动循环上，
+/// 不破坏步态；与 crossfade 的「两路姿势插值」语义正交）。
+///
+/// 参考帧 = 剪辑 `t = 0` 的采样值（构造时由播放器声明、每帧重采样）：
+/// 增量 `delta = sample(t) − sample(0)`，剪辑静止段（t 处值 = 参考值）
+/// 的增量恰为零——附加层激活但不产生偏移，语义自洽。整层受
+/// `weight`（[0, 1]）压幅。推进语义与主时间轴对称：`playing = false`
+/// 整层冻结、循环按剪辑时长取模、非循环钳制在末端（停在末端后增量
+/// 恒定，不重复推进）。
+///
+/// 组合语义（与各姿势来源正交）：主姿势（active / blendspace /
+/// crossfade 混合结果）算完后叠加，**只在主姿势已覆写的通道上生效**
+/// （主姿势未覆写的通道跳过——以当前 `Transform` 为基会让增量逐帧
+/// 复合漂移，诚实边界见 `apply_additive`）；根运动启用时根节点的
+/// 附加平移增量同样被剔除（根位移是玩法量，见 `update_animations`）；
+/// 遮罩过滤发生在叠加之后——被遮罩节点的附加覆写同样被剔除。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdditiveLayer {
+    /// 附加剪辑索引（播放器 `clips` 下标）。
+    pub clip: usize,
+    /// 附加层播放时间（秒，独立于主时间轴推进）。
+    pub time: f32,
+    /// 附加层播放速度倍率。
+    pub speed: f32,
+    /// 整层权重（[0, 1]）：0 = 恒等（无偏移），1 = 全幅增量。
+    pub weight: f32,
+    /// 到达剪辑末尾后是否循环。
+    pub looping: bool,
+}
+
+/// 节点遮罩（v4）：被遮罩节点集合的姿势覆写只作用于集合内——
+/// **覆写过滤器**，不参与姿势计算。上半身瞄准层的载体：瞄准剪辑
+/// 只覆写脊柱/手臂节点（集合内），腿部节点保持移动循环的姿势
+/// （集合外），两层各自动画互不打架。
+///
+/// 组合语义（正交性承诺）：mask 与 BlendSpace / crossfade / 状态机 /
+/// 附加层全部正交——它只是 `update_animations` 产出「目标实体 →
+/// 覆写字段」任务后的**最后一道过滤器**：目标节点在 [`AnimationMask::nodes`]
+/// 内才允许覆写，集合外节点本帧不写任何变换（`Transform` 保持当前值，
+/// 通常为加载时的 rest 或其它系统的写入）。`mask = None`（默认）=
+/// 全覆写照旧，v1 行为零变化。
+///
+/// 确定性：`BTreeSet` 固定迭代序（确定性是硬文化——需要迭代序的
+/// 数据结构不用哈希容器）；过滤本身按「实体 → 节点下标」反查
+/// `node_entities`，与集合迭代序无关，选 BTreeSet 是让序列化 /
+/// 调试输出同样可复现。
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct AnimationMask {
+    /// 允许覆写的节点下标集合（`node_entities` 下标）。
+    pub nodes: BTreeSet<usize>,
+}
+
 /// 动画播放器组件：挂在任意实体上（通常是 glTF 根实体），
 /// 持有剪辑与「节点索引 → 实体」映射，由 [`update_animations`] 每帧推进。
 #[derive(Clone, Debug, iris_core::Component)]
@@ -432,6 +505,12 @@ pub struct AnimationPlayer {
     /// 累积写入，**消费方 [`AnimationPlayer::take_root_motion`] take**
     /// ——不消费会跨帧累积（照 `pending_events` 的帧内消息模式）。
     pub pending_root_motion: Option<Vec3>,
+    /// 附加动画层（v4）：主姿势算完后叠加增量（语义与组合规则见
+    /// [`AdditiveLayer`]）。默认 None = 不使用。
+    pub additive: Option<AdditiveLayer>,
+    /// 节点遮罩（v4）：覆写过滤器，集合外节点本帧不覆写（语义与
+    /// 正交性见 [`AnimationMask`]）。默认 None = 全覆写照旧。
+    pub mask: Option<AnimationMask>,
 }
 
 impl Default for AnimationPlayer {
@@ -459,6 +538,8 @@ impl Default for AnimationPlayer {
             root_motion_clip: None,
             root_motion_node: None,
             pending_root_motion: None,
+            additive: None,
+            mask: None,
         }
     }
 }
@@ -662,6 +743,53 @@ impl AnimationPlayer {
         self.pending_root_motion.take()
     }
 
+    /// 启动附加动画层（v4）：`clip` 从 0 时起以 `weight` 权重叠加增量
+    /// （速度 1、循环；逐项调整直接改 [`AnimationPlayer::additive`] 的
+    /// 字段）。重复调用以新参数整体重置（时间归零）——换受击剪辑时
+    /// 旧层的相位不留残留。
+    ///
+    /// 边界语义与 `transition` 同款：剪辑越界 `debug_assert!` 后忽略
+    /// （release 静默——调用方传错索引不应让播放器报废）。附加层与
+    /// 所有姿势来源**正交**：激活 / 停用不触碰 active、blend、
+    /// blend_space_active 中的任何一个。
+    pub fn play_additive(&mut self, clip: usize, weight: f32) {
+        if clip >= self.clips.len() {
+            debug_assert!(
+                false,
+                "play_additive 剪辑越界：{clip} / {}",
+                self.clips.len()
+            );
+            return;
+        }
+        self.additive = Some(AdditiveLayer {
+            clip,
+            time: 0.0,
+            speed: 1.0,
+            weight,
+            looping: true,
+        });
+    }
+
+    /// 停用附加动画层（v4）：下一帧起姿势为纯主姿势（无过渡淡出——
+    /// 受击类增量的消失时机由玩法侧控制，需要淡出时逐步调低
+    /// `additive.weight` 后再停用）。
+    pub fn stop_additive(&mut self) {
+        self.additive = None;
+    }
+
+    /// 设置节点遮罩（v4）：只覆写 `nodes` 集合内的节点（语义见
+    /// [`AnimationMask`]）。重复调用整体替换。
+    pub fn set_mask(&mut self, nodes: impl IntoIterator<Item = usize>) {
+        self.mask = Some(AnimationMask {
+            nodes: nodes.into_iter().collect(),
+        });
+    }
+
+    /// 清除节点遮罩：恢复全覆写（v1 语义）。
+    pub fn clear_mask(&mut self) {
+        self.mask = None;
+    }
+
     /// 推进后的时间与播放状态（不修改自身，供系统两阶段处理）。
     pub fn advanced(&self, dt: f32) -> (f32, bool) {
         if !self.playing {
@@ -680,6 +808,24 @@ impl AnimationPlayer {
             (clip.duration, false)
         } else {
             (t, true)
+        }
+    }
+}
+
+impl AdditiveLayer {
+    /// 附加层推进后的时间（纯函数，供系统两阶段处理）：`dt` 已含
+    /// 暂停门（暂停传 0）；循环按 `duration` 取模、非循环钳制在末端。
+    /// `duration <= 0` 的剪辑时间不动（单关键帧剪辑的增量恒为零，
+    /// 推进无意义）。
+    fn advanced_additive_time(&self, dt: f32, duration: f32) -> f32 {
+        if duration <= 0.0 {
+            return self.time;
+        }
+        let raw = self.time + dt * self.speed;
+        if self.looping {
+            raw % duration
+        } else {
+            raw.min(duration)
         }
     }
 }
@@ -903,6 +1049,126 @@ fn weighted_sum3(first: &[f32; 3], rest: &[(AnimatedField, f32)]) -> [f32; 3] {
     acc
 }
 
+/// 附加层的加权增量（v4，纯函数）：剪辑通道在 `time` 处相对参考帧
+/// （`t = 0` 采样值）的增量，乘整层权重 `weight`。
+///
+/// # 增量数学
+///
+/// - **平移 / 缩放（加法群）**：`delta = (v(time) − v(0)) × weight`——
+///   叠加语义是「从参考姿势偏移多少」，加法群下直接做差；
+/// - **旋转（非交换）**：相对旋转 `d = q(time) · q(0)⁻¹`（把参考帧
+///   旋回恒等的左乘增量：`q(0) · d = q(time)`），叠加为主姿势右乘
+///   `main · d`——附加剪辑的关键帧表达的是**节点局部系**内的姿态，
+///   主姿势已把节点带到 `main`，附加偏移发生在主姿势之后的同一局部系，
+///   故右乘（若左乘 `d · main`，增量会被解释进父级系，受击叠加在
+///   移动循环上会随身体朝向漂移）。权重经
+///   `slerp(Identity, d, weight)` 压幅：`weight = 0` 恰为恒等、
+///   `weight = 1` 恰为全幅增量，且 `slerp` 保持单位长度（直接
+///   `d^weight` 幂运算无解析式）。`d` 归一化后与恒等的点积为负时
+///   取反（四元数双覆盖，保证走最短弧）。
+///
+/// 剪辑静止段（`sample(time) == sample(0)`）的增量恰为零——附加层
+/// 激活但不产生偏移。
+pub fn additive_delta(channel: &AnimationChannel, time: f32, weight: f32) -> AnimatedField {
+    match channel.sample(time) {
+        AnimatedField::Translation(v) => {
+            let AnimatedField::Translation(v0) = channel.sample(0.0) else {
+                unreachable!("同一通道路径恒定");
+            };
+            AnimatedField::Translation([
+                (v[0] - v0[0]) * weight,
+                (v[1] - v0[1]) * weight,
+                (v[2] - v0[2]) * weight,
+            ])
+        }
+        AnimatedField::Scale(v) => {
+            let AnimatedField::Scale(v0) = channel.sample(0.0) else {
+                unreachable!("同一通道路径恒定");
+            };
+            AnimatedField::Scale([
+                (v[0] - v0[0]) * weight,
+                (v[1] - v0[1]) * weight,
+                (v[2] - v0[2]) * weight,
+            ])
+        }
+        AnimatedField::Rotation(q) => {
+            let AnimatedField::Rotation(q0) = channel.sample(0.0) else {
+                unreachable!("同一通道路径恒定");
+            };
+            let mut d = (q * q0.conjugate()).normalize();
+            if d.dot(Quat::IDENTITY) < 0.0 {
+                d = -d;
+            }
+            AnimatedField::Rotation(Quat::IDENTITY.slerp(d, weight))
+        }
+    }
+}
+
+/// 附加增量合成（v4）：主姿势（或当前 Transform 基值）+ 附加增量。
+/// 平移 / 缩放分量加法；旋转**右乘**（增量解释进节点局部系，推导见
+/// [`additive_delta`]）。路径不匹配时兜底取基值（调用方按同路径配对，
+/// 与 [`blend_fields`] 同款防御）。
+fn compose_additive(base: &AnimatedField, delta: &AnimatedField) -> AnimatedField {
+    match (base, delta) {
+        (AnimatedField::Translation(a), AnimatedField::Translation(d)) => {
+            AnimatedField::Translation([a[0] + d[0], a[1] + d[1], a[2] + d[2]])
+        }
+        (AnimatedField::Scale(a), AnimatedField::Scale(d)) => {
+            AnimatedField::Scale([a[0] + d[0], a[1] + d[1], a[2] + d[2]])
+        }
+        (AnimatedField::Rotation(q), AnimatedField::Rotation(d)) => {
+            AnimatedField::Rotation(*q * *d)
+        }
+        _ => *base,
+    }
+}
+
+/// 附加层叠加（v4，`update_animations` 阶段一的内联步骤）：把附加剪辑
+/// 全部通道的加权增量合成进主姿势任务表。**只在主姿势已覆写的通道上
+/// 叠加**（按「目标实体 + 路径」配对；crossfade 的「仅源有」淡回通道
+/// 同样在列）——主姿势未覆写的通道跳过。诚实边界：若以目标实体当前
+/// `Transform` 为基，而当前值含附加层上一帧自身的输出，增量会逐帧
+/// 复合、无界漂移（旋转类每帧多转一份），与「受击/呼吸叠加不破坏
+/// 主姿势」的语义相悖——附加剪辑的通道应与主姿势对齐设计，未对齐
+/// 通道的覆写完全交给主姿势（缺席 = 保持当前值，与覆写语义自洽）。
+fn apply_additive(
+    fields: &mut [(Entity, AnimatedField)],
+    clips: &[AnimationClip],
+    node_entities: &[Option<Entity>],
+    layer: &AdditiveLayer,
+    time: f32,
+) {
+    let Some(clip) = clips.get(layer.clip) else {
+        return;
+    };
+    for channel in &clip.channels {
+        let Some(target) = node_entities.get(channel.node).copied().flatten() else {
+            continue;
+        };
+        let delta = additive_delta(channel, time, layer.weight);
+        if let Some((_, field)) = fields
+            .iter_mut()
+            .find(|(entity, field)| *entity == target && animated_path(field) == channel.path)
+        {
+            let combined = compose_additive(field, &delta);
+            *field = combined;
+        }
+    }
+}
+
+/// 遮罩过滤判定（v4）：目标实体对应的节点下标**任一**在遮罩集合内
+/// 即允许覆写（同一实体被多个节点映射的非常规装配按宽松口径放行）。
+fn node_allows_overwrite(
+    node_entities: &[Option<Entity>],
+    nodes: &BTreeSet<usize>,
+    target: Entity,
+) -> bool {
+    node_entities
+        .iter()
+        .enumerate()
+        .any(|(index, slot)| *slot == Some(target) && nodes.contains(&index))
+}
+
 /// 根运动帧增量（v3，纯函数）：平移通道在 `prev_time → raw_time` 间的
 /// 采样位移差。**循环回绕的三段精确累积**——一帧跨 k 次回绕时，
 /// 增量 = 「旧圈余段：v(dur) − v(prev)」+「(k−1) 个整圈位移：v(dur) − v(0)」
@@ -1083,6 +1349,41 @@ pub fn update_animations(world: &iris_core::world::World) {
                 }
             }
         }
+        // 附加层（v4）：主姿势（现行模式的混合结果）算完后叠加增量。
+        // 叠加放在根运动剔除**之前**——根运动启用时根节点的附加平移
+        // 增量同样从覆写列表剔除（根位移是玩法量，附加层不得越权直写）
+        if let Some(add) = player.additive.as_ref() {
+            if player.clips.get(add.clip).is_none() {
+                debug_assert!(
+                    false,
+                    "附加层剪辑越界：{} / {}",
+                    add.clip,
+                    player.clips.len()
+                );
+            } else if add.weight > 0.0 {
+                let add_clip = &player.clips[add.clip];
+                if add_clip.duration > 0.0 {
+                    // 采样用的推进时间与阶段二落账（advanced_additive_time）
+                    // 同式：暂停冻结、循环取模、非循环钳制——与 crossfade
+                    // 的「姿势只由时间决定、与分帧方式无关」同一纪律
+                    let add_dt = if player.playing { dt * add.speed } else { 0.0 };
+                    let t = if add.looping {
+                        (add.time + add_dt) % add_clip.duration
+                    } else {
+                        (add.time + add_dt).min(add_clip.duration)
+                    };
+                    apply_additive(&mut fields, &player.clips, &player.node_entities, add, t);
+                }
+            }
+        }
+        // 遮罩过滤（v4）：覆写过滤器，与姿势来源正交——目标节点不在
+        // 遮罩集合内的任务整条剔除（该节点保持当前值 / 父姿势）。附加层
+        // 产出的覆写同样被过滤（叠加发生在过滤之前，语义见 AnimationMask）
+        if let Some(mask) = &player.mask {
+            fields.retain(|(target, _)| {
+                node_allows_overwrite(&player.node_entities, &mask.nodes, *target)
+            });
+        }
         // 根运动（v3）：启用中的根节点平移从覆写列表剔除（含混合结果），
         // 改为累积本帧位移增量（剪辑空间；crossfade 期间仅取目标剪辑）
         let mut root_delta = None;
@@ -1126,6 +1427,17 @@ pub fn update_animations(world: &iris_core::world::World) {
                     if blend.elapsed >= blend.duration {
                         player.blend = None;
                     }
+                }
+                // 附加层时间推进（与阶段一采样同式，见 update_animations
+                // 阶段一注释）；剪辑越界的层时长按 0 处理 = 时间不动
+                let additive_duration = player
+                    .additive
+                    .as_ref()
+                    .and_then(|add| player.clips.get(add.clip))
+                    .map(|clip| clip.duration)
+                    .unwrap_or(0.0);
+                if let Some(add) = player.additive.as_mut() {
+                    add.time = add.advanced_additive_time(dt, additive_duration);
                 }
             }
         }
@@ -2315,6 +2627,345 @@ mod tests {
                 .pending_root_motion
                 .is_none(),
             "关闭根运动：不应产增量"
+        );
+    }
+
+    // ---- 附加动画层（v4）----
+
+    /// 呼吸剪辑（y 平移 0 → 0.1 → 0 三角关键帧）叠加在静止主姿势上，
+    /// weight 0.5 → 半幅：t = 0.25 处采样 y = 0.05、delta = 0.025，
+    /// 主姿势 y = 1 → 1.025（解析精确）。
+    fn breathing_clip() -> AnimationClip {
+        clip(
+            "breathe",
+            vec![AnimationChannel {
+                node: 0,
+                path: AnimationPath::Translation,
+                interpolation: AnimationInterpolation::Linear,
+                times: vec![0.0, 0.5, 1.0],
+                values: vec![0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0],
+            }],
+            1.0,
+        )
+    }
+
+    #[test]
+    fn additive_breathing_half_weight_exact() {
+        let main = clip("idle", vec![constant_translation(0, [0.0, 1.0, 0.0])], 1.0);
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![main, breathing_clip()], vec![Some(root)]);
+        player.play_additive(1, 0.5);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        let transform = world.get::<Transform>(root).unwrap();
+        assert!(
+            (transform.position.y - 1.025).abs() < 1e-6,
+            "weight 0.5 应得半幅增量：y = 1 + (0.05 − 0) × 0.5 = 1.025，实际 {}",
+            transform.position.y
+        );
+        assert_eq!(
+            [transform.position.x, transform.position.z],
+            [0.0, 0.0],
+            "主姿势的 x / z 无增量，应保持主姿势值"
+        );
+        assert!(
+            (world
+                .get::<AnimationPlayer>(root)
+                .unwrap()
+                .additive
+                .unwrap()
+                .time
+                - 0.25)
+                .abs()
+                < 1e-6,
+            "附加层时间应独立推进到 0.25"
+        );
+    }
+
+    /// 旋转增量解析对照：附加剪辑 yaw 0° → 90°（参考帧 = 恒等），
+    /// t = 0.5 处相对旋转 d = yaw45°，主姿势 yaw90° 右乘 → yaw135°。
+    #[test]
+    fn additive_rotation_delta_analytic() {
+        let main = clip(
+            "aim",
+            vec![constant_rotation(
+                0,
+                Quat::from_rotation_y(90f32.to_radians()),
+            )],
+            1.0,
+        );
+        let additive = clip(
+            "recoil",
+            vec![AnimationChannel {
+                node: 0,
+                path: AnimationPath::Rotation,
+                interpolation: AnimationInterpolation::Linear,
+                times: vec![0.0, 1.0],
+                values: vec![
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
+            }],
+            1.0,
+        );
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![main, additive], vec![Some(root)]);
+        player.play_additive(1, 1.0);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        // max_delta = 0.25s 钳制：分两帧推进 0.5s（附加层 t = 0.5）
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let actual = world.get::<Transform>(root).unwrap().rotation;
+        let expected = Quat::from_rotation_y(135f32.to_radians());
+        let angle = 2.0 * actual.dot(expected).abs().clamp(0.0, 1.0).acos();
+        // 容差 2e-3 rad（≈ 0.11°）：slerp(Identity, d, 1) 与主姿势复合
+        // 经两次三角函数路径，f32 实测角距 ~0.00098 rad，1e-5 是单段
+        // slerp 的精度（crossfade 测试域），叠加复合放宽两个量级
+        assert!(
+            angle < 2e-3,
+            "相对旋转应右乘主姿势：yaw90 × yaw45 = yaw135，角距 {angle} rad，实际 {actual:?}"
+        );
+    }
+
+    /// weight = 0 恒等：附加层存在但零权重 → 与完全无附加层的同配置
+    /// 世界逐位一致（覆写管线零影响）。
+    #[test]
+    fn additive_zero_weight_is_bitwise_identity() {
+        let build = |additive: bool| {
+            let main = clip(
+                "idle",
+                vec![
+                    constant_translation(0, [0.0, 1.0, 0.0]),
+                    constant_rotation(0, Quat::from_rotation_y(30f32.to_radians())),
+                ],
+                1.0,
+            );
+            let mut world = World::new();
+            let root = world.spawn((Transform::default(),));
+            let mut player = AnimationPlayer::new(vec![main, breathing_clip()], vec![Some(root)]);
+            if additive {
+                player.play_additive(1, 0.0);
+            }
+            world.insert(root, player);
+            world.insert_resource(Time::default());
+            (world, root)
+        };
+        let (world_a, root_a) = build(true);
+        let (world_b, root_b) = build(false);
+        for _ in 0..3 {
+            step(&world_a, 0.25);
+            step(&world_b, 0.25);
+            let ta = world_a.get::<Transform>(root_a).unwrap();
+            let tb = world_b.get::<Transform>(root_b).unwrap();
+            assert_eq!(
+                [
+                    ta.position.x.to_bits(),
+                    ta.position.y.to_bits(),
+                    ta.position.z.to_bits()
+                ],
+                [
+                    tb.position.x.to_bits(),
+                    tb.position.y.to_bits(),
+                    tb.position.z.to_bits()
+                ],
+                "weight 0：位置应与无附加层逐位一致"
+            );
+            assert_eq!(
+                [
+                    ta.rotation.x.to_bits(),
+                    ta.rotation.y.to_bits(),
+                    ta.rotation.z.to_bits(),
+                    ta.rotation.w.to_bits()
+                ],
+                [
+                    tb.rotation.x.to_bits(),
+                    tb.rotation.y.to_bits(),
+                    tb.rotation.z.to_bits(),
+                    tb.rotation.w.to_bits()
+                ],
+                "weight 0：旋转应与无附加层逐位一致"
+            );
+        }
+    }
+
+    /// 与 crossfade 并存：叠加发生在 crossfade 混合**之后**——
+    /// x = 混合结果 2·smoothstep(0.5) = 1，y = 附加增量 0.1。
+    #[test]
+    fn additive_applies_after_crossfade() {
+        let a = clip("a", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let b = clip("b", vec![constant_translation(0, [2.0, 0.0, 0.0])], 1.0);
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![a, b, breathing_clip()], vec![Some(root)]);
+        player.transition(1, 1.0);
+        player.play_additive(2, 1.0);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let transform = world.get::<Transform>(root).unwrap();
+        let expected_x = 2.0 * blend_weight(0.5, 1.0);
+        assert!(
+            (transform.position.x - expected_x).abs() < 1e-6,
+            "x 应为 crossfade 混合值 {expected_x}，实际 {}",
+            transform.position.x
+        );
+        assert!(
+            (transform.position.y - 0.1).abs() < 1e-6,
+            "y 应为附加层全幅增量 0.1（叠加在混合结果之后），实际 {}",
+            transform.position.y
+        );
+    }
+
+    /// 诚实边界：主姿势未覆写的通道被附加层**跳过**（以当前 Transform
+    /// 为基会让增量逐帧复合漂移——见 `apply_additive` 文档）：主剪辑
+    /// 只有平移、附加剪辑只有旋转 → 平移照常覆写，旋转逐位不动
+    /// （附加剪辑须与主姿势对齐设计）。
+    #[test]
+    fn additive_skips_channels_absent_in_main_pose() {
+        let main = clip(
+            "trans_only",
+            vec![constant_translation(0, [3.0, 0.0, 0.0])],
+            1.0,
+        );
+        let additive = clip(
+            "rot_only",
+            vec![AnimationChannel {
+                node: 0,
+                path: AnimationPath::Rotation,
+                interpolation: AnimationInterpolation::Linear,
+                times: vec![0.0, 1.0],
+                values: vec![
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
+            }],
+            1.0,
+        );
+        let mut world = World::new();
+        let root = world.spawn((Transform::default(),));
+        let mut player = AnimationPlayer::new(vec![main, additive], vec![Some(root)]);
+        player.play_additive(1, 1.0);
+        world.insert(root, player);
+        world.insert_resource(Time::default());
+        let rotation_before = world.get::<Transform>(root).unwrap().rotation;
+        step(&world, 0.25);
+        step(&world, 0.25);
+        let transform = world.get::<Transform>(root).unwrap();
+        assert_eq!(
+            transform.position.x, 3.0,
+            "主姿势通道照常覆写（不受附加层影响）"
+        );
+        assert_eq!(
+            [
+                transform.rotation.x.to_bits(),
+                transform.rotation.y.to_bits(),
+                transform.rotation.z.to_bits(),
+                transform.rotation.w.to_bits()
+            ],
+            [
+                rotation_before.x.to_bits(),
+                rotation_before.y.to_bits(),
+                rotation_before.z.to_bits(),
+                rotation_before.w.to_bits()
+            ],
+            "主姿势未覆写的旋转通道应被附加层跳过（逐帧复合漂移的病理防线）"
+        );
+    }
+
+    /// 附加层剪辑越界（debug）：`play_additive` 断言，release 静默忽略
+    /// （与 `transition` 同款边界语义）。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "play_additive")]
+    fn play_additive_out_of_range_panics() {
+        let mut player = AnimationPlayer::new(vec![], vec![]);
+        player.play_additive(3, 1.0);
+    }
+
+    // ---- 骨骼遮罩（v4）----
+
+    /// 遮罩含上身节点（0）→ 走位剪辑只覆写上身，腿节点（1）Transform
+    /// 逐位不动；`clear_mask` 后恢复全覆写照旧（v1 语义）。
+    #[test]
+    fn mask_limits_overwrite_to_masked_nodes() {
+        let walk = clip(
+            "walk",
+            vec![
+                AnimationChannel {
+                    node: 0,
+                    path: AnimationPath::Translation,
+                    interpolation: AnimationInterpolation::Linear,
+                    times: vec![0.0, 1.0],
+                    values: vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+                },
+                AnimationChannel {
+                    node: 1,
+                    path: AnimationPath::Translation,
+                    interpolation: AnimationInterpolation::Linear,
+                    times: vec![0.0, 1.0],
+                    values: vec![0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                },
+            ],
+            1.0,
+        );
+        let mut world = World::new();
+        let torso = world.spawn((Transform::default(),));
+        let leg = world.spawn((Transform::default(),));
+        let player = AnimationPlayer::new(vec![walk], vec![Some(torso), Some(leg)]);
+        world.insert(torso, player);
+        world.insert_resource(Time::default());
+        world
+            .get_mut::<AnimationPlayer>(torso)
+            .unwrap()
+            .set_mask(vec![0]);
+        let leg_before = *world.get::<Transform>(leg).unwrap();
+        step(&world, 0.25);
+        assert!(
+            (world.get::<Transform>(torso).unwrap().position.x - 0.25).abs() < 1e-6,
+            "遮罩内节点（上身）照常覆写"
+        );
+        let leg_after = *world.get::<Transform>(leg).unwrap();
+        assert_eq!(
+            [
+                leg_after.position.x.to_bits(),
+                leg_after.position.y.to_bits(),
+                leg_after.position.z.to_bits()
+            ],
+            [
+                leg_before.position.x.to_bits(),
+                leg_before.position.y.to_bits(),
+                leg_before.position.z.to_bits()
+            ],
+            "遮罩外节点（腿）应逐位不动"
+        );
+        // 清除遮罩：恢复全覆写
+        world
+            .get_mut::<AnimationPlayer>(torso)
+            .unwrap()
+            .clear_mask();
+        step(&world, 0.25);
+        let leg_cleared = world.get::<Transform>(leg).unwrap();
+        assert!(
+            (leg_cleared.position.z - (-0.5)).abs() < 1e-6,
+            "清除遮罩后腿节点恢复覆写：z = −0.5，实际 {}",
+            leg_cleared.position.z
         );
     }
 }

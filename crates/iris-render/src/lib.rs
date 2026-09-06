@@ -34,6 +34,7 @@ pub mod decal;
 pub mod environment;
 pub mod foot_ik;
 pub mod frustum;
+pub mod hand_ik;
 pub mod instance;
 pub mod light;
 pub mod material;
@@ -53,9 +54,10 @@ pub mod visibility;
 
 pub mod prelude {
     pub use crate::animation::{
-        AnimatedField, AnimationBlend, AnimationChannel, AnimationClip, AnimationEdge,
-        AnimationEvent, AnimationInterpolation, AnimationPath, AnimationPlayer, AnimationState,
-        BlendSpace, blend_pose, collect_events, root_motion_delta, update_animations,
+        AdditiveLayer, AnimatedField, AnimationBlend, AnimationChannel, AnimationClip,
+        AnimationEdge, AnimationEvent, AnimationInterpolation, AnimationMask, AnimationPath,
+        AnimationPlayer, AnimationState, BlendSpace, additive_delta, blend_pose, collect_events,
+        root_motion_delta, update_animations,
     };
     pub use crate::asset::{
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
@@ -69,6 +71,7 @@ pub mod prelude {
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::foot_ik::{FootIk, IkRig, solve_two_bone_ik, update_foot_ik};
     pub use crate::frustum::Frustum;
+    pub use crate::hand_ik::{HandIk, IkTarget, update_hand_ik};
     pub use crate::instance::InstanceRaw;
     pub use crate::light::{
         DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_FACES, PointLight, cascade_fit,

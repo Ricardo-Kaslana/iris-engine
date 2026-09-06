@@ -131,7 +131,8 @@ impl Plugin for HierarchyPlugin {
 }
 
 /// 动画插件：在 Update 阶段推进所有 [`iris_render::animation::AnimationPlayer`]，
-/// 并在同一阶段执行足部 IK（v3，按 `FootIk` 组件开关）。
+/// 并在同一阶段执行足部 IK（v3，按 `FootIk` 组件开关）与手部 IK
+/// （v4，按 `HandIk` 组件开关）。
 ///
 /// 已包含在 [`DefaultPlugins`] 中。动画在 Update 写局部变换，随后的
 /// PostUpdate（[`HierarchyPlugin`]）当帧即完成全局传播——「动画写入的
@@ -143,14 +144,23 @@ impl Plugin for HierarchyPlugin {
 /// 传播才能让修正当帧全局生效）。两个系统的访问集在写 Transform /
 /// 读写 AnimationPlayer 上重叠 ⇒ 调度器按注册序分批（动画先、IK 后）；
 /// 按 `FootIk` 组件开关，未挂组件的世界空转一次查询即过。
-/// 均注册为**并行系统**（只读世界 + 组件写访问走尝试型锁）。
+///
+/// **手部 IK 的注册序（[`iris_render::hand_ik::update_hand_ik`]，紧跟
+/// 足部 IK）**：持枪手位是比脚落地更高频的视觉焦点，且两段 IK 作用于
+/// 同一份本帧局部姿势依次生效——注册序确定 ⇒ 修正次序确定 ⇒ 结果确定；
+/// 层级传播之前写回局部 `Transform`，当帧传播全局生效。目标差异与
+/// 不可达门语义见 hand_ik 模块文档。均注册为**并行系统**（只读世界 +
+/// 组件写访问走尝试型锁）。
 #[derive(Default)]
 pub struct AnimationPlugin;
 
 impl Plugin for AnimationPlugin {
     fn build(&self, app: &mut App) {
-        use iris_core::prelude::{Access, ChildOf, Collider, RigidBody, Stage, Transform};
-        use iris_render::prelude::{AnimationPlayer, FootIk, IkRig};
+        use iris_core::prelude::{
+            Access, ChildOf, Collider, GlobalTransform, RigidBody, Stage, Transform,
+        };
+        use iris_render::prelude::{AnimationPlayer, FootIk, HandIk, IkRig, IkTarget};
+        use iris_render::visibility::Visibility;
         app.schedule.add_parallel_system(
             Stage::Update,
             Access::new()
@@ -173,6 +183,22 @@ impl Plugin for AnimationPlugin {
                 .read::<Collider>()
                 .read::<RigidBody>(),
             iris_render::foot_ik::update_foot_ik,
+        );
+        // 手部 IK（v4）：足部 IK 之后、层级传播之前（顺序理由见插件文档
+        // 与 hand_ik 模块文档「编排」）。组件无可变状态，只读 HandIk /
+        // IkTarget / GlobalTransform / Visibility
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<Transform>()
+                .read::<HandIk>()
+                .read::<IkTarget>()
+                .read::<IkRig>()
+                .read::<AnimationPlayer>()
+                .read::<ChildOf>()
+                .read::<GlobalTransform>()
+                .read::<Visibility>(),
+            iris_render::hand_ik::update_hand_ik,
         );
     }
 }
