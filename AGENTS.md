@@ -13,10 +13,10 @@ crate 布局（依赖自上而下）：
 | `iris-macros` | Component/Resource derive |
 | `iris-core` | ECS / 调度 / 层级 / 时间 / 物理 / 角色 / 导航 / ragdoll / 事件（零渲染依赖） |
 | `iris-platform` | winit 窗口 + 输入 |
-| `iris-audio` | 混音纯函数核心 + cpal 设备薄壳（wasm 无设备自动降级） |
-| `iris-render` | wgpu 渲染（PBR/阴影/粒子/贴花/后处理链/动画/GLB） |
-| `iris-engine` | 插件编排（DefaultPlugins）/ App / 场景序列化 / GltfBuilder / SmoothFollow |
-| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` | 四个 dogfooding 游戏（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
+| `iris-audio` | 混音纯函数核心 + cpal 设备薄壳（wasm 无设备自动降级）+ OGG/Vorbis 流式（symphonia）+ 音乐总线 + 混响区 |
+| `iris-render` | wgpu 渲染（PBR/法线 ORM/阴影/粒子/贴花/后处理链 DOF+MB/动画/GLB/RTT） |
+| `iris-engine` | 插件编排（DefaultPlugins）/ App / 场景序列化 / GltfBuilder / SmoothFollow / pack 资产打包 / AssetMount / 异步加载 / UI 菜单 / Settings |
+| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` | 五个 dogfooding 游戏（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
 
 **架构与特性全景唯一权威是 `ARCHITECTURE.md`**（约 1700 行，§1–§8），改任何子系统前先读对应章节；`§8 已知限制` 是诚实清单，别把已声明的限制当 bug 修。
 
@@ -39,22 +39,26 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 
 **`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。
 
-### 门禁耗时陷阱（R44 实测教训）
+### 门禁耗时陷阱（R44/R45 实测教训）
 
-- **`RUSTC_WRAPPER=""` 只属于 wasm 那一条门禁**（绕 sccache 的 os error 206）。把它加到
+- **每跑一个门禁前，必须先停止所有的 cargo 进程**（`tasklist | grep -iE "cargo|rustc|sccache"`
+  检查，有则 `taskkill //PID <pid> //F`）。残留进程（超时的子智能体、被中断的后台任务）
+  持着 `target/` 文件锁，新命令会**静默排队等待**（`Blocking waiting for file lock`）——
+  实测出现过「40 分钟无输出」实为排队、进程清理后同任务 50 秒完成的案例。这不是可选项，
+  是每个门禁的前置步骤。
+- **`RUSTC_WRAPPER=""` 只属于 wasm 那两条门禁**（绕 sccache 的 os error 206）。把它加到
   原生命令上 = sccache 全程失效 + 依赖图指纹改变 ⇒ 整条 release 图从源码重编
   （实测同一次测试：**30 分钟 vs 2 分钟**）。
-- **门禁之间不得并行**：多个 cargo 任务共用一个 `target/`，会串行在文件锁上
-  （`Blocking waiting for file lock`）并把 CPU 打满，耗时相乘。想省事请改用
-  `--timings`（见下），不要并发跑。
+- **门禁之间不得并行**：多个 cargo 任务共用一个 `target/`，会串行在文件锁上并把 CPU
+  打满，耗时相乘。串行顺序执行六项即可。
 - **怀疑「测试跑太久」先分清编译与执行**：`cargo test --workspace --release --timings`
   出 HTML 报告（编译并发与锁等待一目了然）；跑完立刻 `sccache --show-stats` 看命中
   （服务器空闲约 600 s 退出、统计清零，隔天看不到）。参考量级：本仓全量 release
-  **测试执行**合计约 32 s，最慢单个二进制是 `iris_core`（≈ 6 s）。
+  **测试执行**合计约 50 s。
 
 ### 测试计数陷阱
 
-**统计测试总数必须逐二进制明细加总**（当前基线见最近 CHANGELOG 条目；撰写时为 debug 695 / release 694）。两个已知陷阱：
+**统计测试总数必须逐二进制明细加总**（当前基线见最近 CHANGELOG 条目；撰写时为 debug 714 / release 713）。两个已知陷阱：
 - `grep -v "0 passed"` 会把 `10 passed` 也过滤掉（子串匹配）——禁用；
 - 两次独立的 cargo 调用输出无法对齐——二进制名与计数必须来自**同一次调用**的输出。
 
