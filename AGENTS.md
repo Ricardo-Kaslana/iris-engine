@@ -39,9 +39,22 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 
 **`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。
 
+### 门禁耗时陷阱（R44 实测教训）
+
+- **`RUSTC_WRAPPER=""` 只属于 wasm 那一条门禁**（绕 sccache 的 os error 206）。把它加到
+  原生命令上 = sccache 全程失效 + 依赖图指纹改变 ⇒ 整条 release 图从源码重编
+  （实测同一次测试：**30 分钟 vs 2 分钟**）。
+- **门禁之间不得并行**：多个 cargo 任务共用一个 `target/`，会串行在文件锁上
+  （`Blocking waiting for file lock`）并把 CPU 打满，耗时相乘。想省事请改用
+  `--timings`（见下），不要并发跑。
+- **怀疑「测试跑太久」先分清编译与执行**：`cargo test --workspace --release --timings`
+  出 HTML 报告（编译并发与锁等待一目了然）；跑完立刻 `sccache --show-stats` 看命中
+  （服务器空闲约 600 s 退出、统计清零，隔天看不到）。参考量级：本仓全量 release
+  **测试执行**合计约 32 s，最慢单个二进制是 `iris_core`（≈ 6 s）。
+
 ### 测试计数陷阱
 
-**统计测试总数必须逐二进制明细加总**（当前基线见最近 CHANGELOG 条目；撰写时为 debug 636 / release 635）。两个已知陷阱：
+**统计测试总数必须逐二进制明细加总**（当前基线见最近 CHANGELOG 条目；撰写时为 debug 695 / release 694）。两个已知陷阱：
 - `grep -v "0 passed"` 会把 `10 passed` 也过滤掉（子串匹配）——禁用；
 - 两次独立的 cargo 调用输出无法对齐——二进制名与计数必须来自**同一次调用**的输出。
 
