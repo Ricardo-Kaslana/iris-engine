@@ -16,14 +16,17 @@
 
 pub mod app;
 pub mod assets;
+pub mod async_loading;
 pub mod audio;
 pub mod camera_rig;
 pub mod gltf_builder;
+pub mod pack;
 pub mod plugin;
 pub mod scene;
 pub mod settings;
 pub mod spatial;
 pub mod ui;
+pub mod vfs;
 
 // 纯音频库随门面一并可用：`iris_engine::iris_audio::...` 全路径直达
 pub use iris_audio;
@@ -36,14 +39,21 @@ pub mod prelude {
     pub use iris_render::prelude::*;
     // 资产路径解析：默认资产在 cargo run / cargo test 两种 cwd 下都能命中
     pub use crate::assets::asset_path;
+    // 资产打包与挂载（R45）：PACK1 单文件格式 + 多源顺序查找挂载 +
+    // 异步加载骨架（线程 / inline 双后端）
+    pub use crate::async_loading::{AssetKind, AssetLoadError, AssetLoader, LoadRequest};
+    pub use crate::pack::{PackError, PackReader, PackWriter};
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, CommandsPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin,
         ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin, Viewport,
         WindowPlugin,
     };
-    // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记
+    pub use crate::vfs::{AssetError, AssetMount, AssetSource};
+    // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记；
+    // R45 追加挂载变体 load_scene_from（pack / 嵌入来源）
     pub use crate::scene::{
-        GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError, load_scene, save_scene,
+        GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError, load_scene,
+        load_scene_from, save_scene,
     };
     // 编程式 glTF / GLB 构造器（打磨 IV）：记账归 builder，人只声明
     // 几何 / 层级 / 关键帧

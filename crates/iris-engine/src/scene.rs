@@ -71,9 +71,9 @@
 //! - `RigidBody.velocity` 与 `DirectionalLight.shadow_range` 不写入文件
 //!   （物体从静止开始、阴影覆盖半径取默认）；
 //! - 热重载：场景文件为手工编写，加载后与文件的关联即断开；
-//! - wasm32 注意：场景 / glTF / HDR / 贴图读取走 `std::fs`——native 可用，
-//!   **web 上不可用**（与引擎既有资产管线的平台约定一致），web 场景需自行
-//!   经 fetch 取字节后走内存解析入口（v1 未提供）。
+//! - wasm32 注意：`load_scene` 的场景 / glTF / HDR / 贴图读取走
+//!   `std::fs`——native 可用，**web 上不可用**；web 场景用 [`load_scene_from`]
+//!   + 嵌入源（R45，文本类场景 JSON + 自包含 GLB 走挂载通路）。
 //!
 //! # 用法
 //!
@@ -83,15 +83,22 @@
 //! // 加载：插入缺失的资源兜底 → 写环境 → 逐实体 spawn
 //! let entities = load_scene(&mut world, "assets/arena.scene.json")?;
 //!
+//! // 挂载变体（R45）：场景与子资产从 mount 顺序查找读取（pack / 嵌入）
+//! let entities = load_scene_from(&mut world, &mount, "scenes/arena.scene.json")?;
+//!
 //! // 保存：内置组件集 + 登记的资产来源全量写出，返回实体数
 //! let count = save_scene(&mut world, "assets/arena_out.json")?;
 //! ```
 
+use crate::vfs::AssetMount;
 use iris_core::name::Name;
 use iris_core::physics::{BodyType, Collider, ColliderShape, RigidBody};
 use iris_core::prelude::{Entity, Quat, Transform, Vec3, World};
 use iris_core::{Component, Resource};
-use iris_render::asset::{GltfError, HdrError, load_hdr, spawn_gltf_instance};
+use iris_render::asset::{
+    GltfError, GltfInstance, HdrError, HdrImage, load_hdr, parse_hdr, spawn_gltf_instance,
+    spawn_gltf_instance_from_bytes,
+};
 use iris_render::prelude::{
     AlphaMode, CpuTexture, DirectionalLight, MaterialDef, MaterialHandle, MaterialStore, MeshData,
     MeshHandle, MeshStore, PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore,
@@ -100,7 +107,7 @@ use iris_render::prelude::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // 错误
@@ -119,6 +126,9 @@ pub enum SceneError {
     Unsupported(String),
     /// 参数越界（如球体分段数过低会触底图元生成器的断言，提前拦截为错误）。
     OutOfRange(String),
+    /// 子资产（glTF / 贴图 / HDR / 场景本体）经挂载（[`AssetMount`]）
+    /// 读取失败：未命中或源内损坏（R45）。
+    Asset(String),
 }
 
 impl fmt::Display for SceneError {
@@ -129,6 +139,7 @@ impl fmt::Display for SceneError {
             Self::Missing(what) => write!(f, "场景缺少必需字段：{what}"),
             Self::Unsupported(what) => write!(f, "暂不支持的场景特性或资产：{what}"),
             Self::OutOfRange(what) => write!(f, "场景参数越界：{what}"),
+            Self::Asset(what) => write!(f, "挂载子资产读取失败：{what}"),
         }
     }
 }
@@ -621,6 +632,50 @@ impl Default for RigidBodySection {
 // load
 // ---------------------------------------------------------------------------
 
+/// 子资产解析策略（内部）：场景 JSON 本体之外的引用（glTF / 贴图 /
+/// HDR 天空）都经它解析。`Fs` = [`load_scene`] 的既有 base_dir 文件
+/// 系统语义；`Mount` = [`load_scene_from`] 的挂载顺序查找。
+enum SubAssets<'a> {
+    Fs(PathBuf),
+    Mount(&'a AssetMount),
+}
+
+impl SubAssets<'_> {
+    /// 读子资产字节。
+    fn read(&self, rel: &str) -> Result<Vec<u8>, SceneError> {
+        match self {
+            Self::Fs(dir) => std::fs::read(dir.join(rel)).map_err(SceneError::Io),
+            Self::Mount(mount) => mount
+                .read(rel)
+                .map_err(|e| SceneError::Asset(format!("「{rel}」：{e}"))),
+        }
+    }
+
+    /// glTF 段：路径入口（外部 uri 相对 base_dir 解析）或内存入口
+    /// （须自包含 GLB / data URI——内存来源没有 base_dir，外部 uri
+    /// 引用显式报错，见 `spawn_gltf_instance_from_bytes`）。
+    fn spawn_gltf(&self, world: &mut World, rel: &str) -> Result<GltfInstance, SceneError> {
+        match self {
+            Self::Fs(dir) => spawn_gltf_instance(world, dir.join(rel)).map_err(SceneError::from),
+            Self::Mount(_) => {
+                let bytes = self.read(rel)?;
+                spawn_gltf_instance_from_bytes(world, bytes).map_err(SceneError::from)
+            }
+        }
+    }
+
+    /// HDR 天空源。
+    fn load_sky(&self, rel: &str) -> Result<HdrImage, SceneError> {
+        match self {
+            Self::Fs(dir) => load_hdr(dir.join(rel)).map_err(SceneError::from),
+            Self::Mount(_) => {
+                let bytes = self.read(rel)?;
+                parse_hdr(&bytes).map_err(SceneError::from)
+            }
+        }
+    }
+}
+
 /// 从 JSON 场景文件加载实体：插入缺失的资源兜底（`MeshStore` /
 /// `MaterialStore` / `TextureStore` / [`SceneAssetRegistry`]，已存在不覆盖，
 /// 照 `RenderPlugin` 的资源模式）→ 写环境段资源（缺席不改）→ 逐实体 spawn。
@@ -631,23 +686,60 @@ impl Default for RigidBodySection {
 ///
 /// # 平台注意
 /// 文件读取走 `std::fs`：native 可用，web（wasm32）上不可用（见模块文档）。
+/// 挂载来源（pack / 嵌入）请用 [`load_scene_from`]。
 pub fn load_scene(world: &mut World, path: impl AsRef<Path>) -> Result<Vec<Entity>, SceneError> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
-    let doc: SceneDoc = serde_json::from_slice(&bytes)?;
+    load_scene_bytes(
+        world,
+        &bytes,
+        SubAssets::Fs(path.parent().unwrap_or(Path::new(".")).to_path_buf()),
+    )
+}
+
+/// 挂载变体（R45）：场景 JSON 与其引用的全部子资产（glTF / 贴图 /
+/// HDR 天空）都经 [`AssetMount`] 顺序查找读取——pack 单文件或嵌入文本
+/// 的场景加载入口。[`load_scene`]（文件路径语义）保持零变化，两者共用
+/// 同一加载主体，实体生成逻辑逐位一致。
+///
+/// 相对路径按**挂载内的路径约定**解析（pack 内即打包时写入的路径，
+/// 无 base_dir 概念）；glTF 须自包含（GLB 容器或 data URI——内存来源
+/// 不支持外部 uri 引用，显式报 [`SceneError`]）。
+///
+/// # 平台注意
+/// 配合 `Embedded` 源可在 wasm32 上加载场景（文件系统语义在 web 不可用，
+/// 这是该平台下场景加载的替代通路）。
+pub fn load_scene_from(
+    world: &mut World,
+    mount: &AssetMount,
+    path: impl AsRef<str>,
+) -> Result<Vec<Entity>, SceneError> {
+    let path = path.as_ref();
+    let bytes = mount
+        .read(path)
+        .map_err(|e| SceneError::Asset(format!("「{path}」：{e}")))?;
+    load_scene_bytes(world, &bytes, SubAssets::Mount(mount))
+}
+
+/// 两入口共用的加载主体：解析 JSON → 兜底资源 → 环境 → 逐实体 spawn。
+fn load_scene_bytes(
+    world: &mut World,
+    bytes: &[u8],
+    sub: SubAssets<'_>,
+) -> Result<Vec<Entity>, SceneError> {
+    let doc: SceneDoc = serde_json::from_slice(bytes)?;
     let defs = doc
         .entities
         .ok_or_else(|| SceneError::Missing("entities".into()))?;
-    let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     ensure_resources(world);
     if let Some(environment) = doc.environment {
-        apply_environment(world, &base_dir, environment)?;
+        apply_environment(world, &sub, environment)?;
     }
 
     let mut spawned = Vec::with_capacity(defs.len());
     for section in defs {
-        spawned.push(spawn_section(world, &base_dir, section)?);
+        spawned.push(spawn_section(world, &sub, section)?);
     }
     Ok(spawned)
 }
@@ -671,14 +763,14 @@ fn ensure_resources(world: &mut World) {
 /// 应用环境段：方向光与天空源均为「存在才写」——缺席时不动既有资源。
 fn apply_environment(
     world: &mut World,
-    base_dir: &Path,
+    sub: &SubAssets<'_>,
     environment: EnvironmentSection,
 ) -> Result<(), SceneError> {
     if let Some(light) = environment.directional_light {
         world.insert_resource(light.to_light());
     }
     if let Some(rel) = environment.sky_source {
-        let image = load_hdr(base_dir.join(&rel))?;
+        let image = sub.load_sky(&rel)?;
         world.insert_resource(SkySource::equirect_hdr(image));
         // 登记原始路径字符串：save 时原样写出（roundtrip 稳定）
         world.resource_mut::<SceneAssetRegistry>().sky_source = Some(rel);
@@ -689,7 +781,7 @@ fn apply_environment(
 /// 生成单个实体：Transform 先行 spawn，其余组件按段逐一插入。
 fn spawn_section(
     world: &mut World,
-    base_dir: &Path,
+    sub: &SubAssets<'_>,
     section: EntitySection,
 ) -> Result<Entity, SceneError> {
     let transform = section
@@ -726,7 +818,7 @@ fn spawn_section(
             MeshSection::Gltf(rel) => {
                 // glTF 整实例挂载：实例顶层实体作为本实体的子实体，
                 // 本实体的 transform 作用于整棵子树。
-                let instance = spawn_gltf_instance(world, base_dir.join(rel))?;
+                let instance = sub.spawn_gltf(world, rel)?;
                 for root in instance.roots {
                     mark_gltf_tree(world, root);
                     world.add_child(entity, root);
@@ -741,7 +833,7 @@ fn spawn_section(
 
     if let Some(material) = &section.material {
         let texture = match &material.texture {
-            Some(rel) => Some(load_texture(world, base_dir, rel)?),
+            Some(rel) => Some(load_texture(world, sub, rel)?),
             None => None,
         };
         let handle = world
@@ -810,10 +902,10 @@ fn mark_gltf_tree(world: &mut World, entity: Entity) {
 /// 读取并解码贴图文件（PNG / JPEG，复用依赖树内的 image crate）。
 fn load_texture(
     world: &mut World,
-    base_dir: &Path,
+    sub: &SubAssets<'_>,
     rel: &str,
 ) -> Result<TextureHandle, SceneError> {
-    let bytes = std::fs::read(base_dir.join(rel))?;
+    let bytes = sub.read(rel)?;
     let decoded = image::load_from_memory(&bytes)
         .map_err(|e| SceneError::Unsupported(format!("贴图解码失败（支持 PNG / JPEG）：{e}")))?;
     let rgba = decoded.to_rgba8();
@@ -2058,5 +2150,167 @@ mod tests {
             1,
             "GLB 顶层节点应挂为子实体"
         );
+    }
+
+    // ---- 挂载（R45：pack / mount 通路） ----
+
+    /// 场景经 pack 挂载加载 == 直读加载：≥3 文件演示资产集（GltfBuilder
+    /// 生成的自包含 GLB + 场景 JSON + OGG）打包 → AssetMount(Pack) 读回
+    /// 加载，两世界的实体 / 组件 / glTF 子树 / 网格逐项一致，JSON 字节
+    /// 逐位一致；OGG 字节经 mount 读回可走 iris-audio 内存入口。
+    #[test]
+    fn scene_loads_from_pack_mount_identically_to_fs() {
+        use crate::pack::{PackReader, PackWriter};
+        use crate::vfs::{AssetMount, AssetSource};
+        use iris_audio::OggVorbisStream;
+
+        let dir = test_dir();
+
+        // ① 演示资产集三件：GLB（GltfBuilder 自包含）、场景 JSON、OGG
+        let mut builder = crate::gltf_builder::GltfBuilder::new();
+        let material = builder.material([0.9, 0.2, 0.1, 1.0], 0.0, 0.6, None);
+        let mesh = builder.mesh("crate", &MeshData::cube(), material);
+        builder.node(crate::gltf_builder::GltfNodeDesc::new("crate").with_mesh(mesh));
+        let glb = builder.build_glb();
+        std::fs::write(dir.join("pack_demo.glb"), &glb).unwrap();
+
+        let scene_json = r#"{
+            "entities": [{
+                "name": "crate",
+                "transform": { "position": [1.0, 0.5, 0.0] },
+                "mesh": { "gltf": "pack_demo.glb" }
+            }]
+        }"#;
+        std::fs::write(dir.join("pack_demo.scene.json"), scene_json).unwrap();
+
+        // OGG fixture（iris-audio 测试资产；存在性由仓库布局保证）
+        let ogg_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../iris-audio/tests/fixtures/tone_2s.ogg");
+        let ogg = std::fs::read(&ogg_path).expect("读 iris-audio OGG fixture");
+
+        // ② 打包（mount 内路径约定 = 打包时写入的路径）
+        let mut writer = PackWriter::new();
+        writer
+            .add("pack_demo.scene.json", scene_json.as_bytes().to_vec())
+            .unwrap();
+        writer.add("pack_demo.glb", glb.clone()).unwrap();
+        writer.add("audio/ambient.ogg", ogg.clone()).unwrap();
+        let pack_path = dir.join(format!("pack_roundtrip_{}.ipak", std::process::id()));
+        writer.write_file(&pack_path).expect("写 pack");
+
+        let mut mount = AssetMount::new();
+        mount.push(AssetSource::Pack(
+            PackReader::open(&pack_path).expect("打开 pack"),
+        ));
+        // ③ JSON 字节逐位一致；场景经 pack 加载 == 直读加载
+        assert_eq!(
+            mount.read("pack_demo.scene.json").unwrap(),
+            scene_json.as_bytes(),
+            "挂载读回的 JSON 应与源逐位一致"
+        );
+
+        let mut world_fs = fresh_world();
+        let entities_fs =
+            load_scene(&mut world_fs, dir.join("pack_demo.scene.json")).expect("文件系统直读加载");
+        let mut world_mount = fresh_world();
+        let entities_mount = load_scene_from(&mut world_mount, &mount, "pack_demo.scene.json")
+            .expect("pack 挂载加载");
+        assert_eq!(entities_fs.len(), entities_mount.len(), "实体数一致");
+
+        let (a, b) = (entities_fs[0], entities_mount[0]);
+        assert_eq!(
+            world_fs.get::<Name>(a).unwrap().0,
+            world_mount.get::<Name>(b).unwrap().0
+        );
+        assert_eq!(
+            *world_fs.get::<Transform>(a).unwrap(),
+            *world_mount.get::<Transform>(b).unwrap()
+        );
+        // glTF 子树经 from_bytes 通路整体重建
+        assert_eq!(world_fs.children(a).len(), 1, "直读：glTF 子树");
+        assert_eq!(
+            world_mount.children(b).len(),
+            1,
+            "挂载：glTF 子树（from_bytes）"
+        );
+        let mesh_of = |world: &World, parent: Entity| {
+            // 层级：场景实体 → glTF 节点实体 → primitive 实体（持 MeshHandle）
+            let node = world.children(parent)[0];
+            let primitive = world.children(node)[0];
+            let handle = *world.get::<MeshHandle>(primitive).unwrap();
+            let data = world.resource::<MeshStore>().get(handle).unwrap().clone();
+            data.vertices
+                .iter()
+                .map(|v| (v.position, v.normal, v.uv))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mesh_of(&world_fs, a),
+            mesh_of(&world_mount, b),
+            "两入口网格顶点应逐位一致"
+        );
+
+        // ④ OGG 经 mount 读回 → iris-audio 内存入口（mount 抽象覆盖音频
+        // 文件 IO 的接缝验证）
+        let stream = OggVorbisStream::from_bytes(mount.read("audio/ambient.ogg").unwrap())
+            .expect("OGG 内存入口");
+        assert_eq!(iris_audio::AudioStream::channels(&stream), 2);
+        assert_eq!(iris_audio::AudioStream::sample_rate(&stream), 48_000);
+
+        std::fs::remove_file(&pack_path).ok();
+    }
+
+    /// 未挂载默认语义零变化：`load_scene` 走文件系统（全量既有测试的
+    /// 覆盖之外，这里显式断言挂载资源默认不进 World——缺席 = 旧语义）。
+    #[test]
+    fn load_scene_without_mount_keeps_fs_semantics() {
+        use crate::vfs::AssetMount;
+        let mut world = fresh_world();
+        let (entities, _) = load_str(&mut world, "no_mount.scene.json", r#"{"entities": [{}]}"#);
+        assert_eq!(entities.len(), 1);
+        assert!(
+            !world.contains_resource::<AssetMount>(),
+            "默认不注册挂载资源（缺席 = asset_path 文件系统语义零变化）"
+        );
+
+        // mount 里的资产对默认 load_scene 不可见：路径语义不混用
+        static EMBEDDED: &[(&str, &str)] = &[("mount_only.scene.json", r#"{ "entities": [] }"#)];
+        let mut mount = AssetMount::new();
+        mount.push(crate::vfs::AssetSource::Embedded(EMBEDDED));
+        let err = load_scene(&mut world, test_dir().join("mount_only.scene.json")).unwrap_err();
+        assert!(
+            matches!(err, SceneError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "未挂载时挂载内资产不可达（文件系统语义），实际 {err:?}"
+        );
+        let _ = mount; // 挂载仅存在于调用方，未入 World
+    }
+
+    /// 挂载内未命中 / 损坏 → SceneError::Asset（不与 Io / Missing 混淆）。
+    #[test]
+    fn mount_miss_and_corruption_report_asset_error() {
+        use crate::pack::{PackReader, PackWriter};
+        use crate::vfs::{AssetMount, AssetSource};
+
+        // 空 pack：场景未命中
+        let mut writer = PackWriter::new();
+        writer.add("placeholder.bin", vec![1]).unwrap();
+        let mut pack_bytes = Vec::new();
+        writer.write_to(&mut pack_bytes).unwrap();
+        let dir = std::env::temp_dir().join("iris-scene-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pack_path = dir.join(format!("mount_miss_{}.ipak", std::process::id()));
+        std::fs::write(&pack_path, &pack_bytes).unwrap();
+
+        let mut mount = AssetMount::new();
+        mount.push(AssetSource::Pack(
+            PackReader::open(&pack_path).expect("打开 pack"),
+        ));
+        let mut world = fresh_world();
+        let err = load_scene_from(&mut world, &mount, "missing.scene.json").unwrap_err();
+        assert!(
+            matches!(err, SceneError::Asset(ref what) if what.contains("未命中")),
+            "未命中应报 Asset：{err}"
+        );
+        std::fs::remove_file(&pack_path).ok();
     }
 }

@@ -317,10 +317,9 @@ struct GltfDocument {
     bin: Option<Vec<u8>>,
 }
 
-/// 按内容嗅探加载 .gltf（JSON 文本）或 .glb（二进制容器）。
-fn load_document(path: &Path) -> Result<GltfDocument, GltfError> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() >= 4 && &bytes[0..4] == GLB_MAGIC {
+/// 按内容嗅探解析 glTF 文档（.gltf JSON 文本或 .glb 二进制容器）。
+fn parse_document(bytes: Vec<u8>) -> Result<GltfDocument, GltfError> {
+    if bytes.len() >= 4 && bytes[0..4] == *GLB_MAGIC {
         parse_glb(&bytes)
     } else {
         Ok(GltfDocument {
@@ -328,6 +327,11 @@ fn load_document(path: &Path) -> Result<GltfDocument, GltfError> {
             bin: None,
         })
     }
+}
+
+/// 按内容嗅探加载 .gltf（JSON 文本）或 .glb（二进制容器）。
+fn load_document(path: &Path) -> Result<GltfDocument, GltfError> {
+    parse_document(std::fs::read(path)?)
 }
 
 /// 解析 GLB 容器：12 字节文件头 + 若干 chunk（长度 u32 + 类型 u32 + 数据）。
@@ -387,7 +391,10 @@ struct GltfLoader {
     doc: GltfJson,
     /// GLB 容器的 BIN chunk（buffer 0 无 uri 时的数据来源）。
     bin: Option<Vec<u8>>,
-    base_dir: PathBuf,
+    /// 外部 uri（buffer / 图片的相对路径文件）的解析目录；`None` =
+    /// 内存来源（`spawn_gltf_instance_from_bytes`），外部 uri 显式报错
+    /// 而非落回磁盘（静默读 cwd 是错误语义）。
+    base_dir: Option<PathBuf>,
     buffers: RefCell<HashMap<usize, Vec<u8>>>,
     mesh_handles: RefCell<HashMap<usize, MeshHandle>>,
     material_handles: RefCell<HashMap<usize, MaterialHandle>>,
@@ -435,7 +442,15 @@ impl GltfLoader {
                 base64::decode(payload)
                     .ok_or_else(|| GltfError::OutOfRange("buffer 的 base64 数据非法".into()))?
             }
-            Some(uri) => std::fs::read(self.base_dir.join(uri))?,
+            Some(uri) => {
+                let dir = self.base_dir.as_ref().ok_or_else(|| {
+                    GltfError::Unsupported(format!(
+                        "内存来源的 glTF 不支持外部 uri 引用「{uri}」\
+                         （自包含 GLB / data URI 资产不受影响）"
+                    ))
+                })?;
+                std::fs::read(dir.join(uri))?
+            }
         };
         self.buffers.borrow_mut().insert(index, data.clone());
         Ok(data)
@@ -750,7 +765,15 @@ impl GltfLoader {
                 base64::decode(payload)
                     .ok_or_else(|| GltfError::OutOfRange("图片的 base64 数据非法".into()))?
             }
-            Some(uri) => std::fs::read(self.base_dir.join(uri))?,
+            Some(uri) => {
+                let dir = self.base_dir.as_ref().ok_or_else(|| {
+                    GltfError::Unsupported(format!(
+                        "内存来源的 glTF 不支持外部 uri 引用「{uri}」\
+                         （自包含 GLB / data URI 资产不受影响）"
+                    ))
+                })?;
+                std::fs::read(dir.join(uri))?
+            }
         };
         let decoded = image::load_from_memory(&bytes)?;
         let rgba = decoded.to_rgba8();
@@ -1202,6 +1225,35 @@ pub fn spawn_gltf_instance(
 ) -> Result<GltfInstance, GltfError> {
     let path = path.as_ref();
     let doc = load_document(path)?;
+    spawn_from_document(
+        world,
+        doc,
+        Some(path.parent().unwrap_or(Path::new(".")).to_path_buf()),
+    )
+}
+
+/// 从内存字节生成 glTF / GLB 实例树（R45：pack / 挂载等内存来源的
+/// 入口），返回完整场景实例。
+///
+/// 外部 uri 引用（buffer / 图片的相对路径文件）**不支持**——内存来源
+/// 没有 base_dir 可解析，显式报 [`GltfError::Unsupported`] 而非落回
+/// 磁盘；请使用自包含 GLB 或 data URI 资产。需要相对文件引用语义时
+/// 走 [`spawn_gltf_instance`]（路径入口）。
+pub fn spawn_gltf_instance_from_bytes(
+    world: &mut World,
+    bytes: Vec<u8>,
+) -> Result<GltfInstance, GltfError> {
+    let doc = parse_document(bytes)?;
+    spawn_from_document(world, doc, None)
+}
+
+/// 文档 → 实体树的公共主体（路径 / 内存两入口汇合处）。
+/// `base_dir = None` 即内存语义（外部 uri 显式报错，见 loader 字段）。
+fn spawn_from_document(
+    world: &mut World,
+    doc: GltfDocument,
+    base_dir: Option<PathBuf>,
+) -> Result<GltfInstance, GltfError> {
     let json = doc.json;
     if !json.scenes.is_empty() && json.scene >= json.scenes.len() {
         return Err(GltfError::OutOfRange(format!(
@@ -1215,7 +1267,7 @@ pub fn spawn_gltf_instance(
         node_parts: RefCell::new(vec![Vec::new(); json.nodes.len()]),
         doc: json,
         bin: doc.bin,
-        base_dir: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        base_dir,
         buffers: RefCell::new(HashMap::new()),
         mesh_handles: RefCell::new(HashMap::new()),
         material_handles: RefCell::new(HashMap::new()),
@@ -2079,6 +2131,85 @@ mod tests {
             world.children(mesh_root).len(),
             3,
             "mesh 根应有 3 个子实体：primitive + 两个关节根"
+        );
+        Ok(())
+    }
+
+    /// 内存字节入口（R45）：自包含 GLB 的 `from_bytes` 与文件路径入口
+    /// 同语义（实体树 / 网格逐位一致）；外部 uri 引用在内存语义下显式
+    /// 报 Unsupported（不落回磁盘静默解析）。
+    #[test]
+    fn from_bytes_matches_path_and_rejects_external_uris() -> Result<(), GltfError> {
+        // 自包含 GLB：buffer 无 uri（GLB 容器的 buffer 0）
+        let mut buffer: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            buffer.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        buffer.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "buffers": [{"byteLength": 36}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+            "nodes": [{"mesh": 0}],
+            "scenes": [{"nodes": [0]}],
+            "scene": 0
+        }"#;
+        let glb = write_glb(json, &buffer);
+
+        let dir = std::env::temp_dir().join("iris-gltf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("from_bytes_probe_{}.glb", std::process::id()));
+        std::fs::write(&path, &glb).unwrap();
+
+        let mut world_file = world_with_stores();
+        let from_file = spawn_gltf_instance(&mut world_file, &path)?;
+        let mut world_memory = world_with_stores();
+        let from_memory = spawn_gltf_instance_from_bytes(&mut world_memory, glb)?;
+        assert_eq!(from_file.roots.len(), 1);
+        assert_eq!(from_memory.roots.len(), from_file.roots.len(), "同语义顶层");
+        let mesh_file = world_file
+            .resource::<MeshStore>()
+            .get(MeshHandle(0))
+            .expect("路径入口网格")
+            .clone();
+        let mesh_memory = world_memory
+            .resource::<MeshStore>()
+            .get(MeshHandle(0))
+            .expect("内存入口网格")
+            .clone();
+        let vertices = |data: &crate::mesh::MeshData| {
+            data.vertices
+                .iter()
+                .map(|v| (v.position, v.normal, v.uv))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            vertices(&mesh_file),
+            vertices(&mesh_memory),
+            "两入口网格顶点应逐位一致"
+        );
+
+        // 外部 uri：.gltf 文本引用相对路径 buffer → 内存入口显式报错
+        // （无 format! 插值需求：纯静态 JSON，花括号不翻倍）
+        let external = r#"
+            {
+                "asset": {"version": "2.0"},
+                "buffers": [{ "uri": "external.bin", "byteLength": 36 }],
+                "bufferViews": [{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }],
+                "accessors": [{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }],
+                "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 } }] }],
+                "nodes": [{ "mesh": 0 }],
+                "scenes": [{ "nodes": [0] }],
+                "scene": 0
+            }
+        "#;
+        let mut world_external = world_with_stores();
+        let err = spawn_gltf_instance_from_bytes(&mut world_external, external.as_bytes().to_vec());
+        assert!(
+            matches!(err, Err(GltfError::Unsupported(ref what)) if what.contains("外部 uri")),
+            "内存入口对外部 uri 应显式报错：{err:?}"
         );
         Ok(())
     }

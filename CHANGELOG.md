@@ -5,6 +5,72 @@
 
 ## [Unreleased]
 
+### Added（R45：资产打包与流式——PACK1 单文件格式 + mount 挂载 + 异步加载骨架）
+
+「低占用」卖点的规模化兑现：中型游戏资产体量的载入形态。三个新模块
+全部在 iris-engine、纯 std、零 unsafe、零第三方依赖（确定性优先于压缩率）：
+
+- **PACK1 单文件格式**（`pack.rs`）：`PackWriter`（`add` 收集 →
+  `write_to` 全量产出）+ `PackReader`（`open` / `read` / `exists` /
+  `iter`）。格式＝`"IPAK"` 魔数 + 版本 u32 + 条目数 u32 → 条目表（路径
+  长度 + 路径 + 绝对偏移 u64 + 长度 u64 + 校验和 u64）→ 数据区连续无
+  填充；条目表按路径**字典序**（BTreeMap），同输入两次打包**逐位同
+  输出**。校验和选型＝**CRC-32（IEEE 802.3）以 u64 字段存储**：定位是
+  防损坏而非防篡改，纯 Rust 表驱动（const fn 编译期建表）可审计，
+  XXH3 需引入实现/依赖不划算；u64 字段宽 + 版本号给升级强校验留位
+  （升级只动算法不动布局，旧 reader 拒读高版本而非误读）。**大文件
+  语义是结构性保证**：open 只读头 + 条目表（两次有界读取），`read` 对
+  目标条目 `seek + read_exact` 后验 CRC；`PackReader` 泛型源（默认
+  `File`，`from_source` 注入任意 `Read + Seek`），计数源测试锁定
+  「open 读 < 1 KB、读小条目全程 < 1 KB」——12 MB 邻居条目全程不进
+  内存。读取错误三态可辨：`NotFound` / `ChecksumMismatch`（含期望与
+  实际值）/ 结构 `Corrupt`；路径非法 UTF-8 / 偏移越界 / 条目重叠 /
+  重复条目全部 open 期拦截。
+- **多源挂载**（`vfs.rs`）：`AssetMount`（可入 World 的 `Resource`，
+  **默认不注册**——缺席 = 既有 `asset_path` + `std::fs` 语义零变化）+
+  `AssetSource` 三态：`Fs`（目录根拼接，现有语义的目录化形态）、
+  `Pack`（PACK1 归档）、`Embedded`（编译期文本表，wasm 友好；v1 仅
+  文本类）。**顺序语义**：先挂先命中（同路径多源 = 用挂载顺序做补丁
+  覆盖）；源内未命中走下一源；命中但读取失败（CRC 不符 / IO 错误）
+  **立即报错不回退**——损坏数据被静默跳过是 bug 温床。wasm 姿态＝
+  **运行时降级**而非 cfg 删变体：`Fs` 在 wasm 上读取恒失败（`std::fs`
+  为桩），枚举形状跨平台一致、调用方零 cfg 分叉；wasm 布局只挂
+  `Embedded`（fetch 网络源在路线图）。
+- **异步加载骨架**（`async_loading.rs`）：`AssetLoader::spawn` 起专用
+  线程 `iris-asset-loader`（命令通道入队 + 结果信箱出队，照 iris-audio
+  流式解码线程模式），**主线程零阻塞契约**——`request` 只入队、
+  `poll` 非阻塞 `try_recv`。与音频流「后台错误不可回传」相反，这里
+  错误**保真回传**（加载无实时回调约束）；`AssetKind::Scene` 在加载
+  线程上做 JSON 结构校验（坏文件在后台报错，主线程拿到的字节保证可
+  解析），`RawBytes` 原样透传。wasm 无线程 → `spawn` 自动退化为
+  `inline` 同步后端（同 API 同语义，结果按请求序 FIFO；唯一契约差异
+  是读取耗时计入 request 调用）；native 线程创建失败同样回退不丢源。
+- **场景挂载入口**：`load_scene_from(world, &mount, path)`——场景
+  JSON 与子资产（glTF / 贴图 / HDR 天空）全走挂载顺序查找；`load_scene`
+  文件路径语义保持逐位不变（两者共用同一加载主体）。配套 iris-render
+  新增 `spawn_gltf_instance_from_bytes`（内存字节入口；`GltfLoader` 的
+  base_dir 改 `Option`，内存来源对外部 uri 引用显式报错而非落回磁盘
+  静默解析——pack 内的 glTF 须自包含 GLB / data URI）。OGG 的 mount
+  通路复用既有 `OggVorbisStream::from_bytes`（mount 读字节 → 内存入口，
+  iris-audio 零改动）。
+- **验收示例**（`examples/pack_demo.rs`，实测数字进 ARCHITECTURE
+  §7.3）：场景 JSON + GLB + OGG 三资产打包——磁盘开销 34 639 B →
+  34 785 B（**+0.4%**，头 + 条目表 146 B）；随机读 100 次实测 pack
+  **≈ 25 µs/次** vs `std::fs::read` 直读 **≈ 47 µs/次**——pack 快约
+  2 倍（文件句柄常驻省掉每次 open 系统调用），「海量小资产」场景下
+  单文件归档的结构性收益。
+
+新增测试 19 项（`iris-engine` lib 54 → 72：pack 往返 / 字典序确定性 /
+损坏三态 / 空 pack / 大文件 IO 记账 +7；mount 顺序查找 / 覆盖 / 损坏
+不回退 / read_text / 降级源 +4；加载线程往返 / 非阻塞 / inline 等价 /
+pack 接缝 +4；场景 pack 往返 / 默认语义零变化 / Asset 错误 +3；另
+`iris-render` glTF 内存入口等价 +1），测试总数 **695 → 714**（debug）/
+**694 → 713**（release）。诚实限制清单见 ARCHITECTURE **§8.24**
+（PACK1 无压缩 / 无去重 / 无加密、条目整读不分段、挂载无写入与热重载、
+Embedded 仅文本、pack 内 glTF 须自包含、异步只覆盖字节读取两类、无
+进度 / 取消 / join）；设计与实测细节见 **§7.3**。既有 iris-engine
+测试全部原样通过（`load_scene` 行为零变化）。
+
 ### Added（R44：OGG/Vorbis 流式解码 + 音乐总线 + 混响——音频 v2）
 
 音频侧补上「体积」这块短板：此前只支持 WAV 全量内存（60 s 立体声 48 kHz
