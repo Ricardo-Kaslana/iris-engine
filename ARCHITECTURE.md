@@ -1931,6 +1931,81 @@ pass，「后画者在上」由 pass 内顺序统一裁决（小地图底图应�
 绘制缺省白矩形（否则盖住图片，集成测试 `ui_image_draws_texture_pixels`
 实测抓出）。
 
+### 4.22 演出时间线 Sequencer-lite（iris-engine/timeline，R47）
+
+写实动作游戏剧情演出的最小骨架：轨道时间线 + 播放器，模块在 iris-engine
+门面层（演出驱动相机与 UI，跨渲染边界；数据纯结构、采样纯函数，零 unsafe）。
+
+**轨道模型**（`Timeline` 纯数据）：
+- **相机轨道** `CameraTrack`：`(time, eye, target)` 关键帧（≥ 2），
+  眼点与注视点**各过一条 Catmull-Rom spline** 的「锁定注视」相机路径。
+  `ease = true` 走标准 Catmull-Rom（张力固定 0.5，过全部关键帧、段间
+  C1 连续，首尾端点重复端点夹持 = 零切向缓入缓出不外推；`t = i` 恰过
+  第 i 个控制点——u=0/1 处多项式 f32 求值不精确对消，端点做精确早退）；
+  `ease = false` 线性。时间→段映射按关键帧 time 非均匀分段、段内归一化
+  参数 u 求值（C1 在 spline 参数空间成立——不按弦长/向心重参数化是 v1
+  简化，关键帧间距由人工调校）；`sample_camera` 的 t 越界钳制到
+  `[0, 末关键帧 time]`；单关键帧/空轨道采样恒定不 panic（坏数据不报废演出）。
+- **事件轨道** `TimelineEvent { time, name }`：跨过即发，跨界检测复用
+  动画事件轨道的公共数学——`iris-render::animation` 的
+  **`collect_crossings`（R47 从 `collect_events` 中抽出为独立纯函数，
+  动画与时间线共享的单一来源**：回绕 / multi-fire / 末端不重复语义必须
+  逐位一致，分叉必然漂移；`collect_events` 退化为薄接线层，既有测试
+  零改动全过）。命中事件经 `Events<TimelineEvent>` 产出：Update 产出 →
+  同帧更晚系统与下一帧全程可读 → 消费方 `drain`（事件双代契约，
+  §3.10）。恰在 t=0 的事件永不触发（命中区间 `(prev, new]` 左开右闭）。
+- **对话轨道** `DialogueEntry { time, end_time, text }`：`[time, end_time)`
+  活动窗口（左闭右开——同刻「结束」与「下一条开始」不闪帧）；多条目
+  活动时**声明序后者胜**（确定性取舍）。
+- **黑边条**（letterbox）：`TimelinePlayer::letterbox` + `letterbox_ratio`
+  （单条高度占视口高比例，0.12 ≈ 2.35:1）。
+
+**播放器形态 = Resource（每世界至多一个）**：v1 定位「剧情演出独占主
+相机与对话 UI」，并发多条时间线需要多个相机/黑边写入方、语义必然互斥，
+Component 形态要引入「谁说了算」仲裁——v1 明确不支持并发演出，选
+Resource 让约定成为文档 + `start_timeline` 直接可用。字段：`timeline /
+time / playing / looped / previous_time`（跨界检测基）/ `letterbox /
+letterbox_ratio` + 私有快照（快照/恢复只经托管入口成对出现）。
+
+**相机接管与恢复**：`start_timeline` 快照主相机原姿态——**优先
+`ActiveCamera` 实体的局部 `Transform`（查询序第一个，与渲染器相机解析
+一致）、回落 `Camera` 资源的 `eye/target`**，都没有则相机不动（事件/
+对话照常播）；播放期间每帧以轨道采样值覆写（实体模式写
+`Transform.position` + 注视旋转 `look_at_quat`——局部 -Z 指向 eye→target、
+与 `view_from_global` 口径一致，前向与 +Y 平行时改以 +Z 为上参考正交化
+不产 NaN；资源模式写 `eye/target`）；`stop_timeline` 或播完时快照
+**逐位写回**（f32 值拷贝无舍入；快照实体已 despawn 静默跳过）。已有
+演出在播时再次 start：先恢复旧快照、隐藏演出 UI，再快照**恢复后**姿态
+（先还旧债再借新债）。播完 `playing = false`、timeline 保留可读/重播。
+
+**对话与黑边的 UI 手段**（复用既有 UI 矩形管线，不新增渲染路径）：三类
+**固定 `Name` 的实体显隐**——对话框 `iris/timeline_dialogue`（`UiRect +
+UiText + UiColor + Visibility`，窗口内有条目则写文本 + 水平居中显示在
+下黑边上方，否则隐藏）、黑边 `iris/timeline_letterbox_top` / `_bottom`
+（全宽黑色矩形，播放中随视口重排）。缺席时**惰性生成**（独占系统可
+spawn；按 `entity_named` 查找不缓存句柄，despawn 后自动重建）。
+**位图字体仅 ASCII**（既有 `UiText` 语义），中文对白 v1 不渲染。
+
+**编排**：`TimelinePlugin` 注册 `TimelinePlayer` 资源 + `TimelineEvent`
+事件（游戏侧不注册即得）+ **Update 阶段独占系统 `update_timeline`**
+（动画之后、物理之前）。独占（`&mut World`）而非并行的理由：① 对话/
+黑边实体可能需要惰性 spawn（结构性修改）；② 演出独占语义 + 屏障让
+本帧写入对其后系统立即可见。必须早于 PostUpdate 层级传播与渲染收集
+（实体相机 `GlobalTransform` 当帧新鲜）；用户系统在 DefaultPlugins 之后
+注册、因此在其后执行——**演出期间游戏侧不要在 Update 后段改主相机**
+（相机跟随应暂停，后写的赢），**不自动拦截游戏输入**（是否忽略由游戏
+侧决定）。
+
+**测试**（timeline.rs 14 项）：catmull-rom 过点精确 / C1 数值连续 /
+端点钳制 / 单点与两点退化；事件接线与排序（回绕 / multi-fire 全覆盖在
+动画侧既有测试）；对话窗口左闭右开 / 声明序取舍；实体与资源两种相机的
+接管恢复逐位一致（播完 + 中途 stop）；播放中实体相机位置 == 采样值
+（±1e-5）且注视点投影回视图中心；无相机轨道两种相机逐位不动；黑边
+随开关与视口尺寸；事件产出可 drain；同 timeline 两次播放逐位一致。
+视觉验收 `examples/timeline_snapshot.rs` → `docs/timeline.png`（12 s
+演出：广角→特写 spline、第 3 s `door_open` 事件消费后开门、第 5–9 s
+对话、全程黑边，三时刻拼图）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -2574,6 +2649,16 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     **结果无完成顺序保证**（native 并行乱序到达），且丢弃 `AssetLoader`
     不等待在途请求（无 join 语义）；**glTF 加载器只有内存入口不支持
     外部 uri**，路径入口行为不变。
+25. **演出时间线为 Sequencer-lite**（§4.22，R47）：**单播放器**
+    （`TimelinePlayer` = Resource，并发多条时间线不支持）；相机轨道
+    **段内均匀参数化**（不按弦长 / 向心重参数化——非均匀关键帧间距的
+    速度感靠人工调校）；**对话无打字机 / 无发言人头像**，位图字体仅
+    ASCII（中文对白不渲染）；黑边无圆角 / 无进出动画；**不自动拦截
+    游戏输入**、不暂停相机跟随（游戏侧自理）；**不嵌套**（播放中再次
+    start 直接替换并恢复旧快照）；look_at 前向与 +Y 平行的竖直机位以
+    +Z 为上参考（滚转自由度不由脚本控制）；演出实体（对话框 / 黑边）
+    按 `entity_named` 每帧线性查找（O(n)，每帧三条实体可接受，高频
+    场景应缓存句柄）。
 
 ## 9. 关键设计取舍记录
 

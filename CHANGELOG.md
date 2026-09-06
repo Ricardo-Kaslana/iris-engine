@@ -5,6 +5,62 @@
 
 ## [Unreleased]
 
+### Added（R47：演出时间线 Sequencer-lite——相机 spline 轨道 + 事件轨道 + 对话 + 黑边条）
+
+写实动作游戏剧情演出的最小骨架（`iris_engine::timeline` 新模块，
+iris-engine 门面层——演出驱动相机与 UI，跨渲染边界；数据纯结构 +
+采样纯函数，零 unsafe、零新依赖）：
+
+- **轨道时间线**（`Timeline`）：**相机轨道** `CameraTrack`——
+  `(time, eye, target)` 关键帧（≥ 2），眼点与注视点**各过一条
+  Catmull-Rom spline** 的锁定注视相机路径（`sample_catmull_rom` /
+  `sample_camera` 纯函数：张力固定 0.5、过全部关键帧——u=0/1 处多项式
+  f32 求值不精确对消故端点精确早退、段间 C1 连续性数值单测、首尾端点
+  **重复端点夹持**（零切向缓入缓出不外推）、单关键帧/空轨道恒定不
+  panic、t 越界钳制到 [0, 末关键帧 time]；ease=false 线性；时间→段按
+  关键帧 time 非均匀分段、段内归一化参数）。**事件轨道**
+  `TimelineEvent { time, name }`——跨过即发，跨界检测**复用从
+  `iris-render::animation::collect_events` 中抽出的公共纯函数
+  `collect_crossings`**（动画与时间线共享跨界语义单一来源：回绕 /
+  multi-fire / 末端不重复与动画逐位一致，collect_events 退化为薄接线
+  层、既有测试零改动全过）；命中经 `Events<TimelineEvent>` 产出（插件
+  注册、游戏侧不注册即得），Update 产出 → 同帧更晚系统与下一帧全程可读
+  → 消费方 `drain`（事件双代契约，§3.10）。**对话轨道**
+  `DialogueEntry`——`[time, end_time)` 活动窗口（左闭右开，同刻结束与
+  开始不闪帧），多条目活动时声明序后者胜（确定性）。
+- **播放器 `TimelinePlayer` = Resource（每世界至多一个）**：并发多条
+  时间线 v1 不支持（多个相机/黑边写入方语义互斥，诚实声明），选
+  Resource 让「每世界一个」成文档约定 + 托管入口直接可用。字段含
+  `looped`（循环回绕重播、事件 multi-fire）与 `previous_time`（跨界
+  检测基）；`start_timeline` / `stop_timeline` / `is_playing` 托管
+  入口 + `update_timeline` 每帧系统——**Update 阶段独占系统**（动画后、
+  物理前；独占理由：对话/黑边实体可能惰性 spawn + 演出独占屏障语义；
+  必须早于层级传播与渲染收集，实体相机 GlobalTransform 当帧新鲜）。
+- **相机接管与恢复**：start 快照主相机原姿态——**优先 ActiveCamera
+  实体局部 Transform（查询序第一个，与渲染器相机解析一致）、回落
+  Camera 资源 eye/target**；播放中逐帧覆写（实体模式写位置 + 注视旋转
+  `look_at_quat`——局部 -Z 指向 eye→target、与 view_from_global 口径
+  一致，前向与 +Y 平行时改以 +Z 为上参考不产 NaN）；stop / 播完快照
+  **逐位写回**（f32 拷贝无舍入，演出后无缝回游戏；快照实体 despawn
+  静默跳过）。播放中再次 start：先恢复旧快照再快照恢复后姿态（演出
+  不嵌套）。**不自动拦截游戏输入**、不暂停相机跟随（游戏侧自理，
+  演出期间 Update 后段别改主相机——后写的赢）。
+- **对话与黑边 UI**：复用既有 UI 矩形管线，不新增渲染路径——固定
+  `Name` 的实体显隐（对话框 `iris/timeline_dialogue`：UiText 写文本 +
+  水平居中于下黑边上方；黑边 `iris/timeline_letterbox_top/_bottom`：
+  全宽黑色矩形、高度 = 视口高 × `letterbox_ratio`（0.12 ≈ 2.35:1）、
+  随视口重排）；三类实体**缺席惰性生成**（按 entity_named 查找不缓存
+  句柄）。位图字体仅 ASCII（中文对白 v1 不渲染，诚实限制）。
+- **测试 14 项**（catmull 过点精确 / C1 数值连续 / 端点钳制 / 单点
+  两点退化；事件接线与排序；对话窗口与取舍；实体 + 资源两种相机接管
+  恢复逐位一致（播完 + 中途 stop）；播放中实体相机位置 == 采样值
+  ±1e-5 且注视点投影回视图中心；无相机轨道逐位不动；黑边随开关与
+  视口；事件可 drain；同 timeline 两次播放逐位一致）；视觉验收
+  `examples/timeline_snapshot.rs` → `docs/timeline.png`（12 s 演出三
+  时刻拼图：spline 广角→特写推镜、第 3 s `door_open` 事件消费后开门
+  （Visibility 翻转示范）、第 5–9 s 对话、全程黑边）。设计见
+  ARCHITECTURE §4.22，诚实限制见 §8.25。
+
 ### Added（R46：动画 v4——附加动画层 + 骨骼遮罩 + 两骨手部 IK）
 
 第三人称写实角色的动画纵深三件套（边走边瞄准、受击不破坏移动循环、

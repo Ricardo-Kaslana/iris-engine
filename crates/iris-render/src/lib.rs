@@ -56,8 +56,8 @@ pub mod prelude {
     pub use crate::animation::{
         AdditiveLayer, AnimatedField, AnimationBlend, AnimationChannel, AnimationClip,
         AnimationEdge, AnimationEvent, AnimationInterpolation, AnimationMask, AnimationPath,
-        AnimationPlayer, AnimationState, BlendSpace, additive_delta, blend_pose, collect_events,
-        root_motion_delta, update_animations,
+        AnimationPlayer, AnimationState, BlendSpace, additive_delta, blend_pose, collect_crossings,
+        collect_events, root_motion_delta, update_animations,
     };
     pub use crate::asset::{
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,

@@ -25,6 +25,7 @@ pub mod plugin;
 pub mod scene;
 pub mod settings;
 pub mod spatial;
+pub mod timeline;
 pub mod ui;
 pub mod vfs;
 
@@ -45,8 +46,8 @@ pub mod prelude {
     pub use crate::pack::{PackError, PackReader, PackWriter};
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, CommandsPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin,
-        ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin, Viewport,
-        WindowPlugin,
+        ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin,
+        TimelinePlugin, Viewport, WindowPlugin,
     };
     pub use crate::vfs::{AssetError, AssetMount, AssetSource};
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记；
@@ -62,6 +63,12 @@ pub mod prelude {
     pub use crate::camera_rig::{SmoothFollow, update_smooth_follow};
     // 空间音频 v1（听者 / 声源组件与每帧同步系统）
     pub use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
+    // 演出时间线（R47）：轨道数据 + 采样纯函数 + 播放器与托管入口
+    pub use crate::timeline::{
+        CameraKey, CameraTrack, DialogueEntry, Timeline, TimelineEvent, TimelinePlayer,
+        active_dialogue_entry, collect_timeline_events, is_playing, sample_camera,
+        sample_catmull_rom, start_timeline, stop_timeline, update_timeline,
+    };
     // UI 编排（R41）：锚定布局系统 + 注册 UI 资源 / 事件 / 三系统的插件
     pub use crate::ui::{UiPlugin, update_ui_layout};
     // 设置持久化（R41）：加载 / 保存全局设置

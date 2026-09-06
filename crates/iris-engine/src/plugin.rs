@@ -203,6 +203,34 @@ impl Plugin for AnimationPlugin {
     }
 }
 
+/// 演出时间线插件（R47）：注册 [`crate::timeline::TimelinePlayer`] 资源与
+/// [`crate::timeline::TimelineEvent`] 事件（游戏侧不注册即得），并把独占
+/// 系统 [`crate::timeline::update_timeline`] 注册到 **Update 阶段**
+/// （动画之后、物理之前）。
+///
+/// 编排语义（详见 `crate::timeline` 模块文档）：时间线在 Update 写相机
+/// 局部 `Transform` / 对话与黑边的 UI 组件，必须早于 PostUpdate 的层级
+/// 传播（实体相机 `GlobalTransform` 当帧新鲜）与渲染收集；注册在动画
+/// 之后（演出相机覆写不与动画姿势写入冲突——动画写角色骨架、时间线写
+/// 相机，两者访问集不相交但独占系统的屏障语义要求确定位置）；用户系统
+/// 在 `DefaultPlugins` 之后注册、因此在时间线之后执行——**演出期间
+/// 游戏侧不要在 Update 后段改主相机**（相机跟随应暂停，否则后写的赢），
+/// 输入拦截同样由游戏侧自行决定（时间线不自动拦输入）。时间线产出
+/// `TimelineEvent` 于 Update：同帧更晚系统与下一帧全程可读，消费方
+/// `drain`（事件双代契约，见 `iris_core::event` 模块文档）。
+#[derive(Default)]
+pub struct TimelinePlugin;
+
+impl Plugin for TimelinePlugin {
+    fn build(&self, app: &mut App) {
+        use crate::timeline::{TimelineEvent, TimelinePlayer, update_timeline};
+        use iris_core::prelude::Stage;
+        app.world.insert_resource(TimelinePlayer::default());
+        app.world.register_event::<TimelineEvent>();
+        app.schedule.add_system(Stage::Update, update_timeline);
+    }
+}
+
 /// 物理插件：在 Update 阶段推进刚体物理（积分 → 检测 → 响应 → 迭代松弛，
 /// 见 `iris_core::physics::step_physics`），并注册接触事件资源
 /// （`Events<CollisionStarted>` / `Events<CollisionEnded>` /
@@ -365,6 +393,9 @@ impl Plugin for DefaultPlugins {
         RenderPlugin.build(app);
         AudioPlugin.build(app);
         AnimationPlugin.build(app);
+        // 演出时间线（R47）：动画之后、物理之前（编排理由见 TimelinePlugin
+        // 文档）——相机 / UI 写入当帧传播与渲染前生效
+        TimelinePlugin.build(app);
         PhysicsPlugin.build(app);
         HierarchyPlugin.build(app);
         // 粒子在层级传播之后推进（发射原点取当帧全局位置）

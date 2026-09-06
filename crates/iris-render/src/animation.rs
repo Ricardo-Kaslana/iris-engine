@@ -830,9 +830,14 @@ impl AdditiveLayer {
     }
 }
 
-/// 事件跨界检测（纯函数）：播放时间从 `prev_time` 推进到 `new_time`，
-/// 返回本帧命中的事件下标（按触发时刻升序；一事件多次触发则下标重复
-/// 出现多次）。
+/// 事件时刻跨界检测公共数学（纯函数）：时刻表 `times` 中落在跨界区间内
+/// 的下标（按触发时刻升序；一时刻多次跨越则下标重复出现多次）。
+///
+/// **动画事件轨道（[`collect_events`]）与演出时间线事件轨道
+/// （`iris_engine::timeline::collect_timeline_events`）共享的单一来源**——
+/// 两类轨道的「跨过即发」语义必须逐位一致（同一套回绕 / multi-fire /
+/// 末端不重复语义），故把数学从 `collect_events` 中抽出为独立纯函数，
+/// 两者各自接线。
 ///
 /// 时间语义（调用方务必区分）：
 /// - **非循环**：`new_time` 为钳制后的播放时间，命中区间 `(prev_time, new_time]`。
@@ -843,6 +848,52 @@ impl AdditiveLayer {
 ///   单圈内的回绕 `(prev, dur] ∪ [0, new]` 是跨圈不足一圈时的特例。
 ///   `duration <= 0` 恒返回空。
 ///
+/// 两阶段数据流注意：`prev_time` 必须取推进前的播放时间
+/// （先取再推进，见 [`update_animations`]）。
+pub fn collect_crossings(
+    times: &[f32],
+    prev_time: f32,
+    new_time: f32,
+    duration: f32,
+    looping: bool,
+) -> Vec<usize> {
+    if duration <= 0.0 || times.is_empty() {
+        return Vec::new();
+    }
+    // (触发时刻, 事件下标)：触发时刻用于输出排序（时刻表本身可乱序）
+    let mut hits: Vec<(f32, usize)> = Vec::new();
+    if looping {
+        for (i, &time) in times.iter().enumerate() {
+            // 跨越次数 = 满足 prev < e.time + m·dur <= new 的整数 m 的个数
+            //            = floor((new - e.time)/dur) - floor((prev - e.time)/dur)
+            // 下界取严格大于：恰在 prev 处的跨越上一帧已触发，不重复
+            let lower = ((prev_time - time) / duration).floor() as i64;
+            let upper = ((new_time - time) / duration).floor() as i64;
+            for m in lower + 1..=upper {
+                hits.push((time + m as f32 * duration, i));
+            }
+        }
+    } else {
+        let new_time = new_time.min(duration);
+        for (i, &time) in times.iter().enumerate() {
+            if time > prev_time && time <= new_time {
+                hits.push((time, i));
+            }
+        }
+    }
+    // 按触发时刻升序；同刻按下标（确定性）
+    hits.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    hits.into_iter().map(|(_, i)| i).collect()
+}
+
+/// 事件跨界检测（纯函数）：播放时间从 `prev_time` 推进到 `new_time`，
+/// 返回本帧命中的事件下标（按触发时刻升序；一事件多次触发则下标重复
+/// 出现多次）。跨界数学见 [`collect_crossings`]（本函数是其薄接线层）。
+///
 /// 两阶段数据流注意：`prev_time` 必须取推进前的 `player.time`
 /// （阶段一先取再推进）。
 pub fn collect_events(
@@ -852,37 +903,8 @@ pub fn collect_events(
     duration: f32,
     looping: bool,
 ) -> Vec<usize> {
-    if duration <= 0.0 || events.is_empty() {
-        return Vec::new();
-    }
-    // (触发时刻, 事件下标)：触发时刻用于输出排序（事件表本身可乱序）
-    let mut hits: Vec<(f32, usize)> = Vec::new();
-    if looping {
-        for (i, event) in events.iter().enumerate() {
-            // 跨越次数 = 满足 prev < e.time + m·dur <= new 的整数 m 的个数
-            //            = floor((new - e.time)/dur) - floor((prev - e.time)/dur)
-            // 下界取严格大于：恰在 prev 处的跨越上一帧已触发，不重复
-            let lower = ((prev_time - event.time) / duration).floor() as i64;
-            let upper = ((new_time - event.time) / duration).floor() as i64;
-            for m in lower + 1..=upper {
-                hits.push((event.time + m as f32 * duration, i));
-            }
-        }
-    } else {
-        let new_time = new_time.min(duration);
-        for (i, event) in events.iter().enumerate() {
-            if event.time > prev_time && event.time <= new_time {
-                hits.push((event.time, i));
-            }
-        }
-    }
-    // 按触发时刻升序；同刻按事件下标（确定性）
-    hits.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
-    hits.into_iter().map(|(_, i)| i).collect()
+    let times: Vec<f32> = events.iter().map(|event| event.time).collect();
+    collect_crossings(&times, prev_time, new_time, duration, looping)
 }
 
 /// crossfade 权重（目标剪辑占比）：`smoothstep(elapsed / duration)`。
