@@ -219,7 +219,8 @@ iris-engine/
 │   ├── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
 │   ├── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
 │   ├── iris-ascent/     # 引擎下游示范游戏 IV：3D 平台跳跃 Iris Ascent（同上）
-│   └── iris-infiltration/ # 引擎下游示范游戏 V：第三人称潜入 Iris Infiltration（同上）
+│   ├── iris-infiltration/ # 引擎下游示范游戏 V：第三人称潜入 Iris Infiltration（同上）
+│   └── iris-assault/    # 引擎下游示范游戏 VI：写实战斗庭院 Iris Assault（同上）
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -695,10 +696,105 @@ cargo run -p iris-infiltration --release                  # 玩游戏（WASD 移
 cargo run -p iris-infiltration --example infiltration_snapshot --release   # 中段战局离屏验收帧
 ```
 
+### VI. Iris Assault（`crates/iris-assault`）——写实战斗庭院
+
+**Dogfooding VI（写实路线垂直切片）**——20×14 m 战斗庭院：黄昏斜阳下的
+砖围墙、四角石柱与中央喷泉（圆障碍），持刀 + 步枪的玩家与 4 名持刀敌人
+死斗。刀剑三连段（每段 = 前摇 / 55° 扇形判定窗 / 后摇，第三段击退 +
+更长硬直；横扫 / 后摇期按攻击键预约下一段）、步枪（0.16 s 射速 / 12 发
+弹匣 / 1.6 s 换弹 / `ray_vs_shape` 弹道遮挡——被墙挡住的敌人不中弹、
+命中墙面贴弹孔）、全歼胜利、HP 归零败北；开场绕庭相机演出与终局推近
+结算。与前五作把单轮新能力压榨到极限不同，本作首要目的是把
+**R42–R47 六轮新能力当载荷全量实弹**（接线验收 + 摩擦清单）：
+
+- **写实材质（R42）**——地面石板 / 砖墙用引擎 `brick_normal_orm`
+  程序化法线 + ORM 对；刀身拉丝划痕（`scratched_metal_normal_orm`）与
+  布料褶皱（`cloth_normal_orm`）为本 crate 纯函数生成器（splitmix64
+  哈希、确定性单测锁定）；GLB 材质加载后克隆 + `with_normal/with_orm`
+  替换（GltfBuilder 不支持纹理引用的绕行，见 §8.26）；
+- **DOF / MB（R43）**——战斗默认开：`DepthOfFieldSettings` **逐帧对焦**
+  在交战距离（相机到最近活敌），焦外敌人虚化即距离感；`MotionBlur`
+  覆盖演出相机的 spline 运动；
+- **流式音频（R44）**——pack 内 OGG 氛围循环上音乐总线（`play_music`
+  后台线程分块解码 + `set_reverb` 庭院混响，v1 只作用于音乐总线）；
+  挥砍 / 枪声 / 命中 / 换弹 / 胜负共 8 种程序化音效走 `play_spatial`
+  （听者跟随主相机）；
+- **pack 资产（R45）**——角色 GLB + 氛围 OGG 打包 `assets/assault.ipak`
+  单文件，`AssetMount(Pack)` 挂载；GLB 走 `spawn_gltf_instance_from_bytes`
+  内存入口（自包含约束实弹验证）；pack 缺失时诚实降级文件路径；
+- **动画 v4（R46）**——上下身**双 `AnimationPlayer`** 组合姿势：下半身
+  `BlendSpace`（idle/walk/run，参数 = 速度）+ 上半身动作剪辑
+  （guard / sword1..3 / aim / reload）+ `AnimationMask`（节点集 = 上身
+  12+2 骨）——两层写入集不相交 ⇒ 跑动中挥砍 / 瞄准不打断腿；受击 =
+  `AdditiveLayer` flinch 增量叠加（不破坏步态）；**手 IK**：ADS 时双臂
+  `HandIk` 吸附枪身握把 / 护木挂点（`IkTarget` 挂胸节点子树——不在手骨
+  链内，无反馈环；headless 断言右手吸附握把 ±12 cm）；
+- **演出时间线（R47）**——开场 6.5 s 绕庭 Catmull-Rom 相机 + 两段字幕 +
+  2.35:1 黑边，`intro_end` 事件触发 `begin_battle` 交还控制权；胜利 /
+  败北推近主角结算（`OutroLatch` 每局一次）。
+  老能力照用：ragdoll 死亡（六球人形 + 受击方向轻踢）、贴花战痕
+  （血渍 / 弹孔盒投影贴花）、粒子 FX 池（32 槽启动预热零运行期 spawn：
+  血雾 / 枪口焰 / 刀光 / 火花四组）、NavGrid 绕喷泉追击（敌人 AI）。
+
+**脚本化自动玩家**（接近最近敌人 → 扇区内三连段 → 中距步枪补射 → 弹尽
+换弹 → HP < 30 拉距射击）：headless 经**真实键盘注入**通关——
+**用时 6.4 s（382 帧）全歼 4 敌、玩家 HP 100、开枪 16 发**；纯核心
+19 项单测覆盖扇形越界不伤、同代次防重复命中、换弹时序、弹道遮挡解析解
+（喷泉球体命中点 x ≈ −1.587）、硬直重置语义、击退位移解析（1.2 m）与
+逐位确定性。
+
+![战斗中段验收](docs/assault.png)
+
+实测（`docs/assault.png`，640×360 两帧横拼）：左帧刀剑横扫判定窗中
+（上身动作剪辑 + DOF 对焦交战距离、远处敌人焦外虚化）；右帧枪口焰当帧
+（FX 池 additive 粒子 + 喷泉水花 + ragdoll 尸体可见）。帧 A
+FrameStats：`draw_calls = 72` / `instances = 230` /
+`culled_instances = 19` / `triangles = 3150`。
+
+本轮 R48（游戏六）的**摩擦清单**（现象 → 绕行 → 建议修法，全文见
+ARCHITECTURE.md §8.26；本轮为游戏轮，全部只绕行不改引擎）：
+
+1. **足部 IK 回写四元数不归一化 → 逐帧平方复合爆炸**（本轮最重）——
+   `update_foot_ik` 旋转回写（旋转弧复合 + 共轭反推）产出**未归一化**
+   四元数；当下帧无剪辑通道覆写该骨（idle 只有骨盆 bob、无腿通道）时
+   幅度逐帧平方复合，实测 1.9 s 内 386 → 5.8e7 → NaN（骨长 NaN →
+   `solve_two_bone_ik` 断言 panic；infiltration 未炸纯属其 walk 剪辑
+   恰好每帧覆写双腿）→ 绕行：idle 剪辑补恒值腿通道（每帧重置骨旋转）
+   → **建议**：两处 IK 回写前 `normalize()` + 单测锁定 ‖q‖−1 ≤ ε；
+2. **GLB 内存加载入口不在 prelude**——`spawn_gltf_instance_from_bytes`
+   （R45 pack 路径的刚需）未进 `iris-render` prelude，门面下游拿不到
+   → 绕行：iris-assault 显式直依 iris-render（依赖纪律偏离，Cargo.toml
+   注明）→ **建议**：补进 prelude；
+3. **GltfBuilder 不支持纹理引用**——R42 法线 / ORM 无法在资产生成端
+   表达 → 绕行：加载后克隆材质 + `with_normal/with_orm` 替换 →
+   **建议**：builder 增加 `material_textured`（GLB 内嵌图片）；
+4. **无 Vorbis 编码器**（R44 只有解码）——氛围 OGG 无法程序化生成
+   → 绕行：复用引擎音频测试 fixture（2 s 正弦循环）→ **建议**：
+   `procedural` 增加直写 OGG 编码或接受外部资产管线；
+5. **DOF 动态对焦无引擎辅助**——对焦距离是交战几何的函数，静态值在
+   快速接近时把敌人糊成一团；游戏侧每帧写 `DepthOfFieldSettings` 可用
+   但无「对焦目标实体」原语 → 绕行：插件层每帧算相机→最近敌距离写资源
+   → **建议**：`FocusTarget(Entity)` 组件 + 渲染器自动对焦；
+6. **上下身分离剪辑的骨架契约全手工**——加载器不带节点名，22 节点下标
+   契约（skeleton.rs）与资产生成器 / 插件层三方对齐只能靠 headless
+   守护测试（第一版把网格做成独立子节点 → 42 节点错位立刻爆出）
+   → 绕行：`skeleton` 模块单一事实来源 + 节点数守护断言 → **建议**：
+   `GltfInstance` 携带节点名（`node_named` API）；
+7. **example 跨 crate 同名冲突**——iris-assault 的 `gen_asset` 与
+   iris-engine 的同名 example 输出文件互相覆盖（cargo 警告 future hard
+   error）→ 绕行：改名 `gen_assault_assets` → **建议**：无引擎修法，
+   记录命名约定（游戏 crate example 加游戏前缀）。
+
+```sh
+cargo run -p iris-assault --release                  # 玩游戏（WASD 移动 / 空格·左键挥刀 / F 开火 / Q·右键瞄准 / R 换弹）
+cargo run -p iris-assault --example assault_snapshot --release   # 战斗中段两帧离屏验收
+cargo run -p iris-assault --example gen_assault_assets --release # 重新生成 GLB + pack
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 648 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 779 个测试：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

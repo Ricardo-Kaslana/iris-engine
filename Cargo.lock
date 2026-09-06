@@ -1031,6 +1031,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-assault"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
+ "iris-render",
+ "log",
+]
+
+[[package]]
 name = "iris-audio"
 version = "0.1.0"
 dependencies = [

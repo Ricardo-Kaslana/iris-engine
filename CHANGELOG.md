@@ -5,6 +5,71 @@
 
 ## [Unreleased]
 
+### Added（R48：iris-assault 写实战斗庭院——R42–R47 六轮能力全量实弹的垂直切片）
+
+新 crate `crates/iris-assault`（下游示范游戏 VI，dogfooding VI）：20×14 m
+战斗庭院中持刀 + 步枪的玩家与 4 名持刀敌人死斗，全歼胜利 / HP 归零败北。
+与往作把单轮新能力压榨到极限不同，本作首要目的是**六轮新能力的接线验收
+与摩擦清单**（游戏轮纪律：只绕行不改引擎，摩擦全文见 ARCHITECTURE
+§8.26）：
+
+- **纯逻辑核心**（`logic.rs`，只依 glam + iris-core 纯函数，逐位确定性）：
+  刀剑三连段状态机（每段 = 前摇 / 55° 扇形判定窗 / 后摇；`sweep_id`
+  代次防同次横扫重复命中；第三段击退——线性衰减冲量 + 更长硬直；横扫 /
+  后摇期按键预约下一段）、步枪（0.16 s 射速 / 12 发弹匣 / 1.6 s 换弹 +
+  手动换弹边沿；弹道 = 引擎 `ray_vs_shape` 静态遮挡 + XZ 线段-圆扫掠，
+  被墙挡住的敌人不中弹）、敌人 AI（NavGrid `find_path` 追击 + 前摇转向
+  + 窗中点一次性扇形判定 + **重置型**硬直——不叠加）、喷泉球体碰撞元 +
+  四角石柱 AABB（NavGrid 绕行价值有折点断言）、移动 = 引擎
+  `move_and_slide_statics`（动作减速倍率分层）。19 项单测含扇形越界
+  不伤、弹道遮挡解析解（喷泉命中 x ≈ −1.587）、硬直重置、击退位移
+  解析（1.2 m）与两遍模拟 `to_bits` 逐位一致。
+- **写实材质（R42 载荷）**：`textures` 模块纯函数生成器——刀身拉丝
+  划痕 `scratched_metal_normal_orm`（锻面 + 哈希划痕 → 法线 + ORM，
+  金属度恒 1）、布料褶皱 `cloth_normal_orm`、血渍 / 弹孔贴花（RGBA
+  sRGB）；庭院石板 / 砖墙复用引擎 `brick_normal_orm`；GLB 材质加载后
+  克隆 + `with_normal/with_orm` 替换（敌人上身暗红重着色）。
+- **DOF / MB（R43 载荷）**：战斗默认开，`DepthOfFieldSettings` 逐帧
+  对焦在交战距离（相机→最近活敌，focus_range 4 / max_blur 5）；演出
+  期间 `MotionBlurSettings` 覆盖 spline 相机运动。
+- **流式音频（R44 载荷）**：pack 内 OGG 经 `OggVorbisStream::from_bytes`
+  上音乐总线（0.4 音量 / 1.5 s 淡入 / 循环）+ `set_reverb` 庭院混响
+  （v1 只作用于音乐总线——诚实限制）；8 种程序化音效 `play_spatial`
+  （挥砍 / 刀命中 / 枪声 / 换弹 / 受击 / 死亡 / 胜负），听者跟随主相机。
+- **pack 资产（R45 载荷）**：角色 GLB + 氛围 OGG 打包
+  `assets/assault.ipak`（`PackWriter`，CRC 条目表），`AssetMount(Pack)`
+  挂载，GLB 经 `spawn_gltf_instance_from_bytes` 内存入口加载（自包含
+  约束实弹验证）；pack 缺失时诚实告警并降级文件路径。
+- **动画 v4（R46 载荷）**：上下身**双 `AnimationPlayer`** 组合姿势——
+  下半身（挂模型根）`BlendSpace` idle/walk/run（参数 = 速度 0..1）+
+  上半身（挂空子实体）guard / sword1..3 / aim / reload / flinch +
+  `AnimationMask`（节点集 = 上身 14 骨），两层写入集不相交 ⇒ 跑动中
+  挥砍 / 瞄准不打断腿；受击 = `AdditiveLayer`（flinch 相对 t=0 的增量
+  压幅叠加，不破坏步态）；**手 IK**：程序化 22 节点人形 GLB
+  （`GltfBuilder`，骨架下标契约 = `skeleton` 模块单一事实来源），ADS
+  时双臂 `HandIk` 吸附枪身握把 / 护木 `IkTarget`（挂点在胸节点子树、
+  不在手骨链内——无反馈环），headless 断言右手吸附 ±12 cm；足部 IK
+  双腿链 5 角色 × 2。
+- **演出时间线（R47 载荷）**：开场 6.5 s——绕庭 Catmull-Rom 相机轨道
+  （5 关键帧）+ 两段 ASCII 字幕 + 2.35:1 黑边，`intro_end` 事件触发
+  `begin_battle` 交还控制权；胜利 / 败北推近主角 4.5 s 结束演出
+  （`OutroLatch` 每局一次、命令队列延迟启动）。老能力：ragdoll 死亡
+  （六球人形 + 受击方向轻踢 + 逐肢体挂网格材质）、贴花战痕（血渍 /
+  弹孔盒投影）、粒子 FX 池（32 槽四组启动预热、运行期零 spawn、组内
+  帧计数轮转）、NavGrid 敌人追击。
+- **headless 集成测试**（8 项）：六能力接线静态断言、开场演出端到端
+  （字幕 / 黑边 / 事件交权）、ADS 手 IK 吸附量化、自动玩家真实键盘
+  注入全歼通关（**6.4 s / 4 杀 / HP 100 / 16 发**，含首杀 ragdoll 六
+  肢体 + 敌模型隐藏 + 贴花 + FX 粒子 + DOF 对焦变化断言）、战斗音效
+  入混音器、双 Harness 逐位一致、写实材质槽位断言、离屏 smoke。
+- **离屏快照**：`examples/assault_snapshot.rs` 自动玩家推进到战斗中段
+  定格两帧（挥砍判定窗 + 枪口焰当帧）→ `docs/assault.png`（640×360
+  横拼，FrameStats 打印 + 视锥剔除断言）。
+- **摩擦清单（一级交付物）**：七条（现象 → 绕行 → 建议修法）记入
+  ARCHITECTURE §8.26，头条为**足部 IK 回写四元数不归一化的逐帧平方
+  复合爆炸**（引擎真 bug 级，建议引擎轮闭合：两处 IK 回写前
+  `normalize()`）。
+
 ### Added（R47：演出时间线 Sequencer-lite——相机 spline 轨道 + 事件轨道 + 对话 + 黑边条）
 
 写实动作游戏剧情演出的最小骨架（`iris_engine::timeline` 新模块，

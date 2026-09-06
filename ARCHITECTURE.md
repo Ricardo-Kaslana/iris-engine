@@ -26,6 +26,7 @@ iris-engine（门面，用户唯一入口）────┘
 iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
           └── iris-bastion（下游示范游戏 III）── iris-ascent（下游示范游戏 IV）
                               └── iris-infiltration（下游示范游戏 V）
+                                  └── iris-assault（下游示范游戏 VI）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -109,6 +110,33 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   清空 / FootIk 与 AnimationPlayer 强耦合 / ragdoll 需要 &mut World /
   节点 scale 污染 IK 链长 / 无隐藏子树原语 / 运动学角色无物理碰撞体）
   见 §8.22。
+- **iris-assault**：与五作同层的第六作（示范游戏 Iris Assault，写实
+  战斗庭院，写实路线垂直切片）——同一依赖纪律（iris-engine 门面 +
+  glam；**一处显式偏离**：R45 的 GLB 内存加载入口
+  `spawn_gltf_instance_from_bytes` 未进 iris-render prelude，pack 路径
+  是一级载荷，故直依 iris-render，见 §8.26②），把 **R42–R47 六轮新
+  能力当载荷全量实弹**：**写实材质（R42）**（地面石板 / 砖墙用引擎
+  `brick_normal_orm`，刀身拉丝划痕 / 布料褶皱为本 crate 纯函数生成器
+  ——splitmix64 无状态哈希 + 确定性单测；GLB 材质加载后克隆 +
+  `with_normal/with_orm` 替换）、**DOF / MB（R43）**（战斗逐帧对焦在
+  交战距离——焦外敌人虚化即距离感；MB 覆盖演出相机 spline 运动）、
+  **流式音频（R44）**（pack 内 OGG 上音乐总线循环 + 混响；8 种程序化
+  音效 `play_spatial`）、**pack（R45）**（GLB + OGG 打包
+  `assets/assault.ipak` 单文件、`AssetMount(Pack)` 挂载、GLB 走内存
+  入口——自包含约束实弹验证）、**动画 v4（R46）**（上下身**双
+  `AnimationPlayer`** 组合姿势：下半身 `BlendSpace` 步态 + 上半身动作
+  剪辑 + `AnimationMask`——两层写入集不相交 ⇒ 跑动中挥砍不打断腿；
+  受击 `AdditiveLayer` 抖动；ADS 双臂 `HandIk` 吸附枪身挂点，headless
+  断言右手吸附 ±12 cm）、**演出时间线（R47）**（开场绕庭 Catmull-Rom
+  相机 + 字幕 + 黑边，`intro_end` 事件开战；胜利 / 败北推近结算）。
+  玩法：刀剑三连段（前摇 / 扇形判定窗 / 后摇 + 第三段击退）、步枪
+  （射速 / 弹匣 / 换弹 / `ray_vs_shape` 弹道遮挡）、ragdoll 死亡、
+  贴花战痕、粒子 FX 池（32 槽预热零运行期 spawn）、NavGrid 绕喷泉
+  追击。headless 经真实键盘注入全歼通关（6.4 s / 4 杀 / HP 100）。
+  第六轮撞到的摩擦（**足部 IK 回写四元数不归一化逐帧平方复合爆炸**
+  / 内存加载入口不在 prelude / GltfBuilder 无纹理 / 无 Vorbis 编码器 /
+  DOF 动态对焦无辅助 / 骨架下标契约全手工 / example 跨 crate 同名
+  冲突）见 §8.26。
 
 ## 3. ECS 设计（iris-core）
 
@@ -2659,6 +2687,54 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     +Z 为上参考（滚转自由度不由脚本控制）；演出实体（对话框 / 黑边）
     按 `entity_named` 每帧线性查找（O(n)，每帧三条实体可接受，高频
     场景应缓存句柄）。
+
+26. **dogfooding VI 发现的引擎摩擦（iris-assault 实践反馈）**——第六轮
+    （写实垂直切片，六轮新能力全量实弹）。游戏轮纪律：只绕行不改引擎，
+    各条绕行实现写在 iris-assault 内。
+    - **①足部 IK 回写四元数不归一化 → 逐帧平方复合爆炸（本轮最重，
+      引擎真 bug 级）**：`update_foot_ik` 的旋转回写（世界系旋转弧
+      `from_rotation_arc` 复合 + 父共轭反推局部）**不做归一化**，四元数
+      范数逐帧漂移；当下帧没有动画通道覆写被 IK 写过的骨（如 idle 剪辑
+      只有骨盆 bob、无腿通道），回写值被下一帧 IK 读回再复合——范数
+      **平方级爆炸**（实测 idle 角色 ~1.9 s 内 thigh 旋转范数
+      386 → 5.8e7 → NaN，随后骨长 NaN 撞 `solve_two_bone_ik` 的正值
+      断言 panic）。iris-infiltration 未触发纯属侥幸（其 walk 剪辑每帧
+      覆写双腿旋转，覆写即重置）。→ 绕行：资产侧给 idle 剪辑补恒值腿
+      通道（每帧以单位四元数重置被 IK 写的骨）→ **建议修法**：
+      `update_foot_ik` / `update_hand_ik` 回写前 `normalize()`（引擎轮
+      闭合 + 单测锁定 ‖q‖−1 ≤ 1e-5）；
+    - **②GLB 内存加载入口不在 prelude**：R45 的
+      `spawn_gltf_instance_from_bytes`（pack / mount 路径的刚需入口）
+      未列入 `iris-render` prelude——依赖纪律「游戏 crate 只依门面」
+      的下游拿不到它 → 绕行：iris-assault 显式直依 iris-render
+      （Cargo.toml 注明偏离）→ **建议**：补进 prelude；
+    - **③GltfBuilder 不支持纹理引用**：R42 材质通道（法线 / ORM）无法
+      在资产生成端表达，程序化写实资产断链 → 绕行：加载后克隆
+      `MaterialDef` + `with_normal/with_orm` 替换（游戏侧二次处理）
+      → **建议**：builder 增加 `material_textured`（GLB 内嵌图片或
+      data URI）；
+    - **④无 Vorbis 编码器**（R44 只有解码）：程序化生成的音效 /
+      氛围无法编码进 OGG，pack 的音频条目只能取外部资产 → 绕行：复用
+      引擎音频测试 fixture（2 s 正弦）作占位氛围 → **建议**：
+      `procedural` 增加直写 OGG 编码，或明文接受外部资产管线；
+    - **⑤DOF 动态对焦无引擎辅助**：`DepthOfFieldSettings` 是静态资源，
+      而「战斗中对焦交战目标」要求逐帧更新对焦距离（静态值在快速接近
+      时把敌人糊成一团——本轮实测确认需逐帧更新，资源形态下游戏侧每帧
+      写可用但无原语）→ 绕行：插件层每帧算相机→最近敌距离写资源
+      → **建议**：`FocusTarget(Entity)` 组件 + 渲染器读
+      `GlobalTransform` 自动对焦；
+    - **⑥骨架下标契约全手工**：glTF 加载器不带节点名，
+      「资产生成器 ↔ 骨架表 ↔ 插件层」三方的 22 节点下标契约只能靠
+      headless 守护测试（节点数 + 腿链父子形状）兜底；且**网格必须
+      直挂骨节点**——若做成骨的独立子节点，加载器拆 primitive 子实体
+      会引入额外节点使 `node_entities` 错位（本轮第一版 42 ≠ 22 立刻
+      爆出）→ 绕行：`skeleton` 模块单一事实来源 + `NODE_COUNT` 守护
+      断言 → **建议**：`GltfInstance` 携带节点名（`node_named` API）；
+    - **⑦example 跨 crate 同名冲突**：iris-assault 的 `gen_asset`
+      example 与 iris-engine 的同名 example 输出文件互相覆盖
+      （cargo 警告 "may become a hard error"）→ 绕行：改名
+      `gen_assault_assets` → **建议**：无引擎侧修法，记录命名约定
+      （游戏 crate 的 example 加游戏前缀）。
 
 ## 9. 关键设计取舍记录
 
