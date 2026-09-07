@@ -1,67 +1,123 @@
-//! 导航网格与寻路 v1：静态场景的 2.5D 导航图（[`NavGrid`]）+ A* 寻路
-//! （8 邻域、防穿角、确定性 tie-break）+ string pulling 路径平滑。
+//! 导航网格与寻路 v1（R35 2.5D → R49 高度场语义）：静态场景的
+//! **3D 地形导航图**（[`NavGrid`]）+ A* 寻路（8 邻域、防穿角、攀爬
+//! 惩罚、确定性 tie-break）+ string pulling 路径平滑（3D 视线）。
 //!
 //! 「硬编码航点敌人」时代终结：游戏侧把场景静态体喂给 [`NavGrid::build`]
 //! （入参 `&[(Vec3, ColliderShape)]` 与 [`crate::physics::
 //! resolve_against_statics`] 的静态体收集语义**同源**），得到一张逐 cell
-//! 标记「可站 / 不可站」的导航图；之后 [`NavGrid::find_path`] 回答「从
-//! 这里到那里怎么走」。纯 CPU、零 unsafe、同输入两次构建与寻路结果逐位
-//! 一致（确定性论证见「寻路」章节，单测守护）。AI 行为结构（巡逻 /
-//! 状态机 / 行为树）不在本模块职责内——游戏侧按需消费路径航点即可。
+//! 标记「可站表面高度 + 可站 / 不可站」的导航图；之后
+//! [`NavGrid::find_path`] 回答「从这里到那里怎么走」（航点自带表面
+//! 高度 y）。纯 CPU、零 unsafe、同输入两次构建与寻路结果逐位一致
+//! （确定性论证见「寻路」章节，单测守护）。AI 行为结构（巡逻 / 状态机
+//! / 行为树）不在本模块职责内——游戏侧按需消费路径航点即可。
 //!
-//! # 2.5D 语义（地面平面导航）
+//! # 高度场语义（R49 升级主线）
 //!
-//! 导航图是 **2.5D** 的：只在地面 XZ 平面上导航，**完全忽略 y 与高度
-//! 语义**——无跳跃、无高层平台、无桥上桥下。具体体现：
+//! 每个 cell 有一个**可站立表面高度**（[`NavGrid::surface_height`]）：
+//! build 时对该 cell 中心（XZ 点）做**覆盖体顶面解析**，规则（文档即
+//! 规范，单测锁定）：
 //!
-//! - 静态体的阻挡判定取其 **XZ 投影**（竖直方向无限延伸的柱体语义，
-//!   与俯视 arena 的语义一致）：高处的台面 / 悬浮物同样阻挡其正下方
-//!   的地面；
-//! - [`ColliderShape::Capsule`]（恒竖直，见 physics）的 XZ 投影 =
-//!   圆（半径 `radius`——竖直圆柱俯视即圆，`half_height` 不参与）；
-//! - 路径航点 y 恒为 0（[`NavGrid::cell_center`]）——游戏侧按地面
-//!   高度自行覆写 y（v1 不做高度采样）。
+//! - **Box**：cell 中心落在盒 XZ 投影内 → 表面高 = 盒顶 y（顶面平坦，
+//!   坡度恒 0，任何 [`NavGridParams::max_slope_radians`] 下都可站立）；
+//! - **Sphere / Capsule**：cell 中心落在 XZ 投影圆内（半径 `radius`；
+//!   胶囊恒竖直、只取其**上端帽**——帽心在中心上方
+//!   `half_height − radius` 处）→ 表面高 = 球面 / 帽面上该点的 y，且该
+//!   点**法线坡度 ≤ `max_slope_radians` 才可站立**（法线 = 径向：解析
+//!   几何上，球心到表面点方向与竖直的夹角即坡度；等价判定
+//!   `ρ ≤ radius·sin(max_slope)`，ρ = 中心到投影轴的水平距；capsule 的
+//!   `half_height` 只抬高帽心、圆柱段侧壁不可站立）；
+//! - **多静态体重叠取最高表面**：解析候选 = 覆盖该点的全部静态体顶面
+//!   中**最高**者（高度相同取遍历序先者——对高度结果无影响，此规则
+//!   只保证确定性，见「确定性」）；最高者不可站立（坡度超限）→ 该点
+//!   **无表面**（不回落解析更低的重叠体——被上覆几何压住的可站面属于
+//!   多层语义，见 v1 限制）；
+//! - **埋没体不覆盖**：顶面低于隐式地面（y < 0）的体在该点视同不存在
+//!   ——地面 0 胜出。这正是「大埋深球 = 露出地面的丘」的语义：球面冒
+//!   出地面（顶面 ≥ 0）的坡段参与解析，埋在地下的部分既不覆盖也不
+//!   侧挡（侧挡判定见「光栅化判定」）；
+//! - **无任何覆盖 → 隐式地面 y = 0**：导航域架设在 y = 0 平面上
+//!   （R35 平地世界语义的延续——旧世界没有任何几何充当「地板」而全部
+//!   地面 cell 可走，正是此隐式面；场景地板不在 y = 0 时，请用 Box
+//!   静态体把地板顶面显式喂进来，或平移世界使地板顶面 = 0）。**覆盖
+//!   情形不回落隐式地面**（浮空台面下方、陡面下方的地面不可走——桥上
+//!   桥下不分层，v1 限制）。
 //!
-//! # 光栅化判定（cell 何时 blocked）
+//! # 光栅化判定（cell 何时 blocked——地面 / 顶面双层 + 可达顶面雕刻）
 //!
-//! 逐 cell 检查其**中心点**到每个静态体 XZ 投影的**最近点距离**：
-//! 距离 ≤ `agent_radius` → 该 cell blocked。语义要点（实现与文档一一
-//! 对应，单测锁定）：
+//! blocked 由**两阶段**决定：
 //!
-//! - **最近点判定而非中心点包含**：cell 中心在投影外、但投影与 cell
-//!   面积相交（最近距离 ≤ `agent_radius`）时同样 blocked——对 agent
-//!   保守（多阻的代价只是绕行，漏阻的代价是穿墙）；
-//! - **投影形状**：Sphere → 圆（`radius`）；Box → AABB 矩形（角点区域
-//!   按真实最近点距离判定，等价圆角膨胀）；Capsule → 圆（`radius`，
-//!   竖直轴俯视即圆）；
-//! - **相切算 blocked**（`≤` 判定）：恰在 `agent_radius` 处的 cell 一并
-//!   阻挡——同上，保守优先；
-//! - **经验规则：`cell_size` 应 ≤ `agent_radius`**。cell 中心采样是
-//!   离散判定，XZ 任一方向窄于 `cell_size` 的障碍经 `agent_radius` 膨胀
-//!   后仍可能与全部邻近 cell 中心相距更远而整条漏阻（单测
-//!   `narrow_obstacle_miss_is_documented_semantics` 锁定该走样语义）——
-//!   经验规则能覆盖常规障碍但**非数学保证**；要严格闭合需每 cell 多点
-//!   采样或距离场，v1 不做（见 v1 限制）。
+//! **① 表面解析与侧挡（双层判定）**：
 //!
-//! # 寻路（A*，8 邻域，防穿角）
+//! - **覆盖格**（中心落在某静态体 XZ 投影内、且该体顶面在隐式地面
+//!   之上）：按「高度场语义」的 winner 规则给出 offered（可站立顶面）
+//!   或被阻（顶面坡度超限——被覆坡挡死，不回落地面）。顶面低于地面
+//!   的埋没体不覆盖该点（地面 0 胜出——大埋深球只冒出一个「丘」）；
+//! - **地面格**（无上覆可站面）：被阻 ⇔ 到某静态体 XZ 投影的**最近点
+//!   距离 ≤ `agent_radius`** 且该体在 agent 圆盘最内缘的**侧障高度 >
+//!   `step_height`**（> step 的立面是绕不过的墙；≤ step 的矮体 / 缓丘
+//!   可迈可不设防）。最近点判定而非中心点包含（投影与 cell 面积相交
+//!   即阻，对 agent 保守——多阻只绕行、漏阻即穿墙）；相切算阻（`≤`）；
+//!   Sphere / Capsule → 圆、Box → 矩形（角点按真实最近点距离 = 圆角
+//!   膨胀）。悬浮于空中的体的侧挡按 R35 柱体语义保留（桥下行走属
+//!   多层，见 v1 限制）。**经验规则 `cell_size` 应 ≤ `agent_radius`**
+//!   （中心采样的离散判定，窄于 cell 的障碍可能整条漏阻——单测锁定该
+//!   走样语义，非数学保证）。
+//!
+//! **兼容性论证**：既有测试与两个游戏的全部场景里，几何都是「底贴 /
+//! 埋入地面、顶面离地 > `step_height`」的立墙形态（盒顶 ≥ 1 m、球 /
+//! 胶囊的帽与环都在地面或以上），上述双层判定与 R35 的纯柱体位图
+//! **逐位一致**；可站立顶面全是离地 > `step_height` 的孤岛（见 ②），
+//! 雕刻结果为空集 ⇒ 高度场在可走格上恒 0 ⇒ 边权与路径完全不变——
+//! 既有测试零改动全过即验收（单测守护）。
+//!
+//! **② 可达顶面雕刻（R49 新增）**：中心落在**可站立顶面**上的被阻 cell
+//! （如台阶顶、平台面），若经「|Δh| ≤ `step_height` 的 8 邻域边链」
+//! 与任一地面 cell 连通 → 从 blocked 中**释放**（可站于表面高度）。若
+//! 顶面与四周地面高差超过 `step_height`（孤立高台）→ 保持被阻（孤岛
+//! 不可达）。实现 = 确定性 BFS 泛滥：种子 = 全部非被阻地面格（隐式
+//! 地面 0），沿 8 邻域边（对角步进要求两正交邻同为「有可站表面的潜在
+//! 可走格」且高度与两端点互差 ≤ `step_height`——防穿角规则的高度化
+//! 版本）释放顶面格。
+//!
+//! # 连通性与攀爬
+//!
+//! 相邻（8 邻域）两个可走 cell 的**边可走**条件 = 两 cell 都可站
+//! （非 blocked）且 **|Δh| ≤ `step_height`**——低→高是迈台阶、高→低是
+//! 自然小落差（`step_height` 默认 0.3，与角色控制器
+//! [`crate::character::CharacterParams::step_height`] 同值同语义：
+//! 「角色一步能迈的坎」）；落差更大 = 跳 / 坠落语义，v1 不做（见限制）。
+//! 对角步进沿用 R35 防穿角规则：**两正交邻必须可走**（原语义保留）。
+//!
+//! # 寻路（A*，8 邻域，防穿角，攀爬惩罚）
 //!
 //! [`NavGrid::find_path`] 的五步语义（文档即规范）：
 //!
 //! 1. **越界即 `None`**：from / to 任一超出覆盖域 → `None`（覆盖域即
 //!    导航域，不做外扩修正——游戏侧应让覆盖域包住全部活动区）；
 //! 2. **极近直达**：from 与 to 的水平距离 < 1e-6 → `Some(vec![to])`
-//!    （同一点无需网格路径）；
+//!    （同一点无需网格路径；短路分支保持入参原样——v1 兼容）；
 //! 3. **就近可达性修正**：from / to 所在 cell 被阻（典型：出生点贴墙、
 //!    目标点在障碍膨胀区内）→ 从被阻 cell 出发做 8 邻域 BFS（**穿过
 //!    被阻格也在所不辞**——找的是几何最近的 free cell，可达性交给后续
 //!    A* 裁决），半径 ≤ 2 cell 内按 BFS 发现序取第一个 free cell；半径
-//!    内无 free cell → `None`。修正让游戏侧不必自己兜底「端点被阻」；
-//!    修正只保证「cell 本身可站」，不保证两侧可达——不可达仍 `None`；
-//! 4. **A\***：8 邻域，直线代价 1.0、对角 √2 且**两正交邻必须 free**
-//!    （防穿角：贴着阻档格角点斜穿在连续世界里就是擦墙——cell 图上一致
-//!    地禁止，单测锁定）；启发 = octile 距离（对 8 邻域代价**可采纳且
-//!    一致**——首次弹出 goal 即 cell 图最优）；
-//! 5. **平滑**：string pulling 贪心视线，见下节。
+//!    内无 free cell → `None`。修正只保证「cell 本身可站」，不保证两侧
+//!    可达——不可达仍 `None`；
+//! 4. **A\***：直线代价 1.0、对角 √2；**攀爬惩罚**——上坡边
+//!    （Δh > 0）代价 ×(1 + `2·Δh / step_height`)（Δh = 0.28 ≈ 台阶上限
+//!    时 ×2.87：爬台阶贵于绕平路，语义上「能不爬就不爬」；代价公式与
+//!    理由写入本文档即规范）。对角步进要求两正交邻 free（防穿角）且
+//!    两端 |Δh| ≤ `step_height`。**启发 = octile 距离（cell 单位），
+//!    可采纳且一致**：惩罚使每条边实际代价 ≥ 纯步距（1 或 √2），而
+//!    octile 距离正是「按纯步距计算的最短距离」= 任意路径水平代价的
+//!    下界，故 h ≤ 真实剩余代价（可采纳）；且 octile 是步距度量
+//!    （三角不等式 ⇒ 相邻两点 h 差 ≤ 步距 ≤ 边代价）——一致 ⇒ 首次
+//!    弹出 goal 即加权图最优，closed 集无二次松弛（与 R35 相同的证明
+//!    骨架，惩罚不破坏它）；
+//! 5. **平滑**：string pulling 贪心 3D 视线，见下节。
+//!
+//! **航点带 y**：A* 输出的逐 cell 航点 y = 该 cell 的**表面高度**（非
+//! R35 的恒 0——游戏侧无需再覆写）；末航点 = 目标点精确 XZ + 目标 cell
+//! 的表面高度 y。
 //!
 //! **确定性 tie-break（本模块确定性的核心论证）**：open 集 =
 //! `BinaryHeap<Reverse<(排序键, 节点序号)>>`，排序键 = (f, h)——f32 无
@@ -71,29 +127,39 @@
 //! 更优**时写入（并列保留先到者）——弹出序由该全序唯一决定；堆内可能
 //! 出现完全相等的重复条目（同节点同 f 同 h 的重复入堆），但重复条目
 //! 携带的状态转移完全相同（closed 检查与严格更优检查使第二次处理幂等），
-//! 弹出先后不影响结果。故同输入两次 find_path 的航点序列逐位一致
-//! （单测 `find_path_is_bitwise_deterministic` 守护）。
+//! 弹出先后不影响结果。故同输入两次 find_path 的航点序列逐位一致。
+//! 高度解析 / 雕刻 BFS 同样无迭代序敏感（雕刻边的门条件只读静态的
+//! 解析结果与位图，不依赖发现序；等值顶面取遍历序先者）——同输入
+//! 两次 build 的位图与高度场逐位一致（单测守护）。
 //!
-//! # 路径平滑（string pulling + DDA 视线）
+//! # 路径平滑（string pulling + 3D 视线）
 //!
-//! A* 输出的逐 cell 折线首先转成世界航点（各 cell 中心，末航点用精确
-//! 目标点替代其 cell 中心），再做 string pulling：从锚点起尽量远地找
-//! **视线畅通**的最后一个航点作为下个折点，贪心前进——平滑后点数与
-//! 总长均 ≤ 平滑前（欧氏下界，单测锁定）。
+//! A* 输出的逐 cell 折线首先转成世界航点（各 cell 中心的表面高度，
+//! 末航点用精确目标点替代其 cell 中心），再做 string pulling：从锚点起
+//! 尽量远地找**视线畅通**的最后一个航点作为下个折点，贪心前进——平滑
+//! 后点数与总长均 ≤ 平滑前（欧氏下界）。
 //!
-//! 视线测试 = **cell 光栅 DDA**（Amanatides–Woo 网格遍历）：线段经过的
-//! 每个 cell（含两端所在 cell）逐一查 `blocked`，任一被阻即挡。**选
-//! 光栅而非几何线段-膨胀体求交的理由**：与 blocked 判定**同源**（同一
-//! 张位图）——不存在「光栅化说能走、几何求交说撞墙」的二次膨胀不一致
-//! 问题；O(穿越 cell 数) 廉价；整数 / 定点步进天然逐位确定。代价是
-//! 走样：斜线恰好穿过格角时 t 并列，**两轴同步步进**——角点相邻的两格
-//! 都检查（宁保守不放行），平滑因此可能少合并几段，正确性不受影响。
+//! 视线测试 = **cell 光栅 DDA（Amanatides–Woo，R35 原样）+ 高度场逐格
+//! 校验**：线段经过的每个 cell（含两端所在 cell）逐一查 blocked（任一
+//! 被阻即无视线）；再对该 cell 在**线段进入点**处的插值 y 做
+//! `|y − 表面高度| ≤ step_height` 校验（任一点不满足 → 挡）。**选光栅 +
+//! 边界点采样的理由**（对比「投影到 2D 检测」）：XZ 可走性与 blocked
+//! 判定**同源**（同一张位图，无二次膨胀不一致——R35 论证原样成立）；
+//! 高度场逐 cell 恒定、线段 y 线性 ⇒ |y − h| 在 cell 内部的最大值必在
+//! 进入 / 离开边界点上——按 DDA 步进点采样是**数学等价**的完备采样
+//! （不会像固定大步长均匀采样那样漏掉窄高台，也无「采样相位」这类
+//! 逐位不确定因素），且 DDA 本身逐位确定、O(穿越 cell 数)。DDA 走样
+//! 语义保留：斜线恰穿格角时 t 并列 → 两轴同步步进、角点两格都查（宁
+//! 保守不放行）。容差 ≤ `step_height` 的含义：直线航段贴着地表差 ≤ 一
+//! 步坎的起伏（含 ≤ step 的台阶、浅坡、自然下落）都算视线畅通——消费
+//! 侧角色控制器本身就能迈 ≤ step 的坎（两参数同源对齐）；更大的穿台 /
+//! 悬空会被挡下，折点因此保留。
 //!
 //! # 动态障碍策略（v1：纯静态 + 便宜重建）
 //!
 //! `build` 一次成图，**不做增量更新 / 单元标记**（v1 限制）。`build`
-//! 是毫秒级纯函数（逐 cell 中心到逐静态体的最近点距离，无哈希、无
-//! 随机），动态障碍的推荐姿势是**便宜重建**：场景布局变化时（门开合、
+//! 是毫秒级纯函数（逐 cell 中心到逐静态体的解析与最近点距离，无哈希、
+//! 无随机），动态障碍的推荐姿势是**便宜重建**：场景布局变化时（门开合、
 //! 箱子推动后）或按固定节拍（如每 0.5~1 s）重新 `build` 一张整图换入
 //! （[`NavGrid`] 是 [`Resource`]，`insert_resource` 整图替换原子生效）
 //! ——正在执行的航点由游戏侧自行决定何时重算（AI 行为结构属游戏侧
@@ -101,18 +167,23 @@
 //!
 //! # v1 限制（诚实清单）
 //!
-//! - **无高度 / 跳跃语义**：2.5D 地面平面，静态体按 XZ 投影作无限高
-//!   柱阻挡——高架平台 / 悬浮物阻挡其正下方地面，桥上桥下不分层；
+//! - **多层导航留白（桥洞 / 上下叠层）**：高度场是「每 XZ 点一个可站
+//!   面」的单层模型——被上覆几何压住的面不可解析、悬浮物下方地面不可
+//!   走（一律按被阻）；「桥上走 / 桥下钻」的跨层语义 v1 不做（R49
+//!   只覆盖单层地形的坡面 / 台阶 / 丘）；`|Δh| > step_height` 的落差
+//!   不可跨越（无跳跃 / 无自由落体下落语义）；浮空台面若顶面可站且
+//!   经台阶链可达则可上（顶面是同一层），但其下方的地面不可走；
+//! - **隐式地面 y = 0**：无覆盖点的可站面 = 0 平面（见「高度场语义」），
+//!   与场景真实地板不符时需显式喂 Box 或平移场景；
 //! - **无动态障碍增量更新**：`blocked` 位图构建后只读；动态物要么整图
-//!   重建（推荐，见上节）、要么游戏侧在消费航点时自行避让（如配合
-//!   物理推离查询）；
-//! - **窄障碍可能漏阻**：cell 中心采样的离散性，宽 < `cell_size` 的
-//!   障碍可能整条漏阻（见「光栅化判定」的经验规则与诚实边界）；
+//!   重建（推荐，见上节）、要么游戏侧在消费航点时自行避让；
+//! - **窄障碍可能漏阻**：cell 中心采样的离散性（见「光栅化判定」）；
 //! - **修正半径 ≤ 2 cell**：被阻端点在 2 cell 邻域内找不到 free cell
-//!   即 `None`——更深的坑请游戏侧自行挪动端点；
-//! - **最优性是 cell 图上的**：A* 在 8 邻域栅格图上最优（octile 一致
-//!   启发），连续平面上的最短折线可以更短——平滑输出是栅格最优解的
-//!   贪心视线近似，不保证全局最短。
+//!   即 `None`；
+//! - **最优性是 cell 图上的**：A* 在 8 邻域栅格图上最优（加权代价 +
+//!   octile 一致启发），连续空间的最短折线可以更短——平滑输出是栅格
+//!   最优解的贪心视线近似，不保证全局最短；攀爬惩罚只改变边权、不改变
+//!   图结构，最优性论证不因惩罚失效。
 //!
 //! # 用法
 //!
@@ -120,11 +191,19 @@
 //! use iris_core::prelude::*;
 //!
 //! // 收集场景静态体（与 resolve_against_statics 的收集语义同源：
-//! // is_static 或只有 Collider 无 RigidBody 的实体）
-//! let statics: Vec<(Vec3, ColliderShape)> = vec![(
-//!     Vec3::new(0.0, 0.0, 0.0),
-//!     ColliderShape::Box { half_extents: Vec3::new(2.0, 1.0, 0.5) },
-//! )];
+//! // is_static 或只有 Collider 无 RigidBody 的实体）。例：平地 + 一级
+//! // 0.28 m 台阶（≤ step_height 0.3，可迈上）——R49 斜坡地形接入示例：
+//! // 台阶 / 坡面只要把「地表几何」按真实高度喂进来，导航图自动解析
+//! // 表面高度并允许 ≤ step_height 的逐级攀升（台阶每级 ≤ 0.3、坡面
+//! // 每 cell 落差 ≤ 0.3 且表面坡度 ≤ max_slope 45° 时畅通；更陡的段
+//! // 会按不可站处理，路径绕行）。
+//! let statics: Vec<(Vec3, ColliderShape)> = vec![
+//!     // 0.28 m 台阶（x∈[0,1]、z∈[-0.5,0.5]，顶面 y = 0.28）
+//!     (
+//!         Vec3::new(0.5, 0.14, 0.0),
+//!         ColliderShape::Box { half_extents: Vec3::new(0.5, 0.14, 0.5) },
+//!     ),
+//! ];
 //!
 //! let nav = NavGrid::build(
 //!     NavGridParams::new(Vec3::new(-20.0, 0.0, -20.0), Vec3::new(20.0, 0.0, 20.0)),
@@ -133,8 +212,9 @@
 //! // 可作资源存入 World（NavGrid 实现 Resource）：
 //! // world.insert_resource(nav);
 //! if let Some(path) = nav.find_path(enemy_pos, player_pos) {
-//!     // 逐航点走向：path[0] 为起点 cell 中心、path[末] = 目标点精确坐标
-//!     // （y 恒 0，游戏侧按地面高度覆写）
+//!     // 逐航点走向：path[0] 为起点 cell 中心、path[末] = 目标点精确
+//!     // XZ + 目标 cell 表面高；各航点 y = 对应 cell 的表面高度
+//!     //（台阶顶上的航点 y = 0.28，游戏侧无需再覆写）
 //! }
 //! ```
 
@@ -166,10 +246,13 @@ const NEIGHBOR_ORDER: [(isize, isize); 8] = [
 ];
 
 /// 导航图参数。`cell_size` 默认 0.5、`agent_radius` 默认 0.4（经验值：
-/// cell 采样间距不超过 agent 半径，见模块文档「光栅化判定」的经验规则）。
+/// cell 采样间距不超过 agent 半径，见模块文档「光栅化判定」的经验规则）、
+/// `step_height` 默认 0.3 与 `max_slope_radians` 默认 45°（与角色控制器
+/// [`crate::character::CharacterParams`] 同值对齐，见模块文档「连通性与
+/// 攀爬」）。
 #[derive(Clone, Copy, Debug)]
 pub struct NavGridParams {
-    /// 覆盖域 XZ 下角（y 忽略）。
+    /// 覆盖域 XZ 下角（y 忽略——高度由静态体解析，见模块文档）。
     pub bounds_min: Vec3,
     /// 覆盖域 XZ 上角（y 忽略）。
     pub bounds_max: Vec3,
@@ -177,24 +260,38 @@ pub struct NavGridParams {
     pub cell_size: f32,
     /// agent 膨胀半径（米），必须非负有限。
     pub agent_radius: f32,
+    /// **可迈台阶高（米）**：相邻可站 cell 的 |Δh| 不超过它才可连通
+    /// （低→高是迈台阶、高→低是自然小落差；上坡边另有攀爬代价惩罚，
+    /// 见模块文档「连通性与攀爬」/「寻路」）。必须为非负有限；取 0 =
+    /// 只允许绝对平地的边。默认 0.3，与角色控制器
+    /// [`crate::character::CharacterParams::step_height`] 语义对齐
+    /// （导航允许的落差 = 角色一步能迈的坎，两参数同源）。
+    pub step_height: f32,
+    /// **可站立表面最大坡度（弧度）**：Sphere / Capsule 顶面的表面点
+    /// 法线与竖直的夹角超过它 → 该点不可站立（cell 被阻）；Box 顶面
+    /// 恒平坦不受限。必须为有限且 ∈ [0, π/2]。默认 45°（
+    /// [`std::f32::consts::FRAC_PI_4`]）。
+    pub max_slope_radians: f32,
 }
 
 impl NavGridParams {
-    /// 覆盖域参数：`cell_size` 0.5 / `agent_radius` 0.4 默认值，其余
-    /// 两项按需改写。
+    /// 覆盖域参数：`cell_size` 0.5 / `agent_radius` 0.4 / `step_height`
+    /// 0.3 / `max_slope_radians` 45° 默认值，其余两项按需改写。
     pub fn new(bounds_min: Vec3, bounds_max: Vec3) -> Self {
         Self {
             bounds_min,
             bounds_max,
             cell_size: 0.5,
             agent_radius: 0.4,
+            step_height: 0.3,
+            max_slope_radians: std::f32::consts::FRAC_PI_4,
         }
     }
 }
 
-/// 静态场景的 2.5D 导航图（语义见模块文档）：参数 + 行主序 blocked
-/// 位图。纯数据结构（无系统、不进 `DefaultPlugins`），实现
-/// [`Resource`] 可整图存入 World 按需换入。
+/// 静态场景的 3D 地形导航图（语义见模块文档）：参数 + 行主序 blocked
+/// 位图 + 每 cell 的可站立表面高度场。纯数据结构（无系统、不进
+/// `DefaultPlugins`），实现 [`Resource`] 可整图存入 World 按需换入。
 #[derive(Clone, Debug, Resource)]
 pub struct NavGrid {
     params: NavGridParams,
@@ -202,8 +299,13 @@ pub struct NavGrid {
     cols: usize,
     /// Z 方向 cell 数。
     rows: usize,
-    /// blocked 位图，行主序 `[row * cols + col]`。
+    /// blocked 位图，行主序 `[row * cols + col]`（R35 柱体语义 +
+    /// 可达顶面雕刻后的最终可走位图）。
     blocked: Vec<bool>,
+    /// 每 cell 的可站立表面高度，行主序：无覆盖的隐式地面 0、可站立
+    /// 覆盖体顶面的解析高度；被阻格也携带解析值（仅供查询 / 调试，
+    /// 不构成通行语义——模块文档「高度场语义」）。
+    heights: Vec<f32>,
 }
 
 /// A* open 集条目的排序键 (f, h) 的全序封装：f32 无 `Ord`，用
@@ -234,11 +336,20 @@ impl PartialOrd for OpenKey {
 }
 
 impl NavGrid {
-    /// 构建导航图：逐 cell 中心判「到任一静态体 XZ 投影的最近点距离
-    /// ≤ `agent_radius`」（语义见模块文档「光栅化判定」）。`statics`
-    /// 的判定与遍历序无关（逐 cell 独立的任一命中），同输入恒同位图。
+    /// 构建导航图，三阶段（语义见模块文档）：
+    ///
+    /// 1. **表面解析 + 侧挡判定**：逐 cell 解析覆盖体顶面最高可站面 /
+    ///    隐式地面 0，并对地面格判侧挡（R35 柱体判定在平地场景的逐位
+    ///    等价形态，细节见模块文档「高度场语义」/「光栅化判定」）；
+    /// 2. **可达顶面雕刻**：|Δh| ≤ `step_height` 边链与地面连通的顶面
+    ///    cell 从 blocked 释放（确定性 BFS，见模块文档「光栅化判定」）；
+    /// 3. 位图与高度场定型。
+    ///
+    /// 同输入恒同位图与高度场（遍历序无关的逐 cell 判定 + 雕刻边的门
+    /// 条件只读静态数据；等值顶面取遍历序先者，见模块文档「确定性」）。
     ///
     /// 断言（中文消息）：`cell_size` 正有限、`agent_radius` 非负有限、
+    /// `step_height` 非负有限、`max_slope_radians` 有限且 ∈ [0, π/2]、
     /// bounds 在 XZ 上严格 min < max。`cols` / `rows` = 跨度除以
     /// `cell_size` **向上取整**（至少 1）——覆盖域完整包住 bounds，
     /// 有效域的 max 侧可能略超出 `bounds_max`（ceiling 的外沿余量）。
@@ -252,6 +363,17 @@ impl NavGrid {
             params.agent_radius.is_finite() && params.agent_radius >= 0.0,
             "NavGrid 的 agent_radius 必须为非负有限数，实际 {}",
             params.agent_radius
+        );
+        assert!(
+            params.step_height.is_finite() && params.step_height >= 0.0,
+            "NavGrid 的 step_height 必须为非负有限数，实际 {}",
+            params.step_height
+        );
+        assert!(
+            params.max_slope_radians.is_finite()
+                && (0.0..=std::f32::consts::FRAC_PI_2).contains(&params.max_slope_radians),
+            "NavGrid 的 max_slope_radians 必须为有限且 ∈ [0, π/2]，实际 {}",
+            params.max_slope_radians
         );
         assert!(
             params.bounds_min.x < params.bounds_max.x && params.bounds_min.z < params.bounds_max.z,
@@ -271,25 +393,139 @@ impl NavGrid {
             cols,
             rows
         );
-        let mut blocked = Vec::with_capacity(cols * rows);
+        // 阶段 1：表面解析 + 侧挡判定（逐 cell 逐体扫描）。
+        //
+        // 覆盖解析：候选 = XZ 投影含中心的体、且其**顶面在隐式地面 y = 0
+        // 之上**（顶面 ≤ 0 = 体被地面埋住——不覆盖该点，地面 0 胜出，这
+        // 是大埋深球的「丘」语义：只有冒出地面的坡段参与解析）。候选取
+        // 顶面**最高**者（等值保留遍历序先者——确定性）；最高者可站立 →
+        // offered（表面高度 = 其顶面）；最高者不可站立（坡度超限）→ 该点
+        // **无表面**（被覆坡度挡住，不回落地面——模块文档「高度场语义」）。
+        // 地面格（无 offered 覆盖）的侧挡：到某体 XZ 投影最近点距离 ≤
+        // agent_radius 且该体在 agent 圆盘内的**侧障高度** > step_height
+        // → 被阻（> step 的立面是墙；≤ step 的矮体 / 缓坡可迈可不设防，
+        // 与 R35 在平地场景的位图逐位一致——旧场景全部立面都 > step）。
+        let sin_slope = params.max_slope_radians.sin();
+        let step = params.step_height;
+        let n = cols * rows;
+        let mut blocked35 = vec![false; n];
+        let mut heights = vec![0.0f32; n];
+        // offered：该点存在「可站立覆盖体顶面」（≠ 隐式地面）——雕刻阶段
+        // 只释放 offered 格，隐式地面永不产出新格。
+        let mut offered = vec![false; n];
         for row in 0..rows {
             for col in 0..cols {
+                let idx = row * cols + col;
                 let center = cell_center_of(&params, col, row);
-                let mut hit = false;
+                let mut floor_block = false;
+                // best：覆盖候选里顶面最高者（surface, 是否可站立）
+                let mut best: Option<(f32, bool)> = None;
                 for (pos, shape) in statics {
-                    if xz_clearance(center, *pos, shape) <= params.agent_radius {
-                        hit = true;
-                        break;
+                    if let Some(surface) = covering_surface(center, *pos, shape) {
+                        // 覆盖候选只收顶面 ≥ 0 的体（低于隐式地面 → 埋没）
+                        if surface >= 0.0 {
+                            let standable = surface_standable(center, *pos, shape, sin_slope);
+                            let higher = match best {
+                                None => true,
+                                Some((h, _)) => surface > h,
+                            };
+                            if higher {
+                                best = Some((surface, standable));
+                            }
+                        }
+                    }
+                    if xz_clearance(center, *pos, shape) <= params.agent_radius
+                        && side_obstacle_height(center, *pos, shape, params.agent_radius) > step
+                    {
+                        floor_block = true;
                     }
                 }
-                blocked.push(hit);
+                match best {
+                    // 覆盖：可站立 → offered（blocked35 由雕刻前位图承担：
+                    // 覆盖格 clearance = 0 恒命中）；不可站立 → 无表面。
+                    Some((surface, true)) => {
+                        blocked35[idx] = true;
+                        heights[idx] = surface;
+                        offered[idx] = true;
+                    }
+                    Some((_, false)) => {
+                        blocked35[idx] = true;
+                    }
+                    None => {
+                        // 地面格：侧挡决定被阻与否
+                        blocked35[idx] = floor_block;
+                    }
+                }
             }
         }
+        // 阶段 2：可达顶面雕刻（确定性 BFS）。种子 = 全部非被阻地面格
+        //（隐式地面，高度 0）；释放 = 被阻但 offered 且与已走区域存在
+        // |Δh| ≤ step_height 边（对角边另须两正交邻为潜在可走格且高度
+        // 与两端互差 ≤ step_height——防穿角规则的高度化，门条件全静态，
+        // 结果与发现序无关）。孤岛顶面（如 2 m 高台顶）保持被阻。
+        let mut walkable = blocked35.iter().map(|&b| !b).collect::<Vec<bool>>();
+        let mut queue = VecDeque::with_capacity(n);
+        for (idx, &w) in walkable.iter().enumerate() {
+            if w {
+                queue.push_back(idx);
+            }
+        }
+        while let Some(idx) = queue.pop_front() {
+            let (col, row) = (idx % cols, idx / cols);
+            let h_cur = heights[idx];
+            for &(dc, dr) in &NEIGHBOR_ORDER {
+                let (ncol, nrow) = (col as isize + dc, row as isize + dr);
+                if ncol < 0 || nrow < 0 || ncol >= cols as isize || nrow >= rows as isize {
+                    continue;
+                }
+                let nidx = nrow as usize * cols + ncol as usize;
+                if walkable[nidx] {
+                    continue; // 地面种子或已雕刻
+                }
+                if !offered[nidx] {
+                    continue; // 无覆盖或顶面不可站立 → 永不释放
+                }
+                let h_n = heights[nidx];
+                if (h_n - h_cur).abs() > step {
+                    continue; // 落差超过一步坎
+                }
+                if dc != 0 && dr != 0 {
+                    // 防穿角（高度化）：两正交邻须为潜在可走格（地面
+                    // free 或 offered），且其高度与对角两端互差 ≤ step
+                    let mut ok = true;
+                    for &(oc, or) in &[(dc, 0), (0, dr)] {
+                        let (ocol, orow) = (col as isize + oc, row as isize + or);
+                        if ocol < 0 || orow < 0 || ocol >= cols as isize || orow >= rows as isize {
+                            ok = false;
+                            break;
+                        }
+                        let oidx = orow as usize * cols + ocol as usize;
+                        let potential = !blocked35[oidx] || offered[oidx];
+                        if !potential {
+                            ok = false;
+                            break;
+                        }
+                        let h_o = heights[oidx];
+                        if (h_o - h_n).abs() > step || (h_o - h_cur).abs() > step {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                }
+                walkable[nidx] = true;
+                queue.push_back(nidx);
+            }
+        }
+        let blocked = walkable.into_iter().map(|w| !w).collect::<Vec<bool>>();
         Self {
             params,
             cols,
             rows,
             blocked,
+            heights,
         }
     }
 
@@ -332,8 +568,9 @@ impl NavGrid {
         Some((col, row))
     }
 
-    /// cell 中心的世界坐标（**y 恒 0**——2.5D 地面平面，游戏侧按地面
-    /// 高度覆写）。越界断言 panic（中文消息）。
+    /// cell 中心的世界坐标（**XZ 中心，y 恒 0**——R35 兼容的几何查询；
+    /// 高度语义请用 [`NavGrid::surface_height`] / 寻路输出的航点 y）。
+    /// 越界断言 panic（中文消息）。
     pub fn cell_center(&self, col: usize, row: usize) -> Vec3 {
         assert!(
             col < self.cols && row < self.rows,
@@ -344,14 +581,32 @@ impl NavGrid {
         cell_center_of(&self.params, col, row)
     }
 
+    /// cell 中心的可站立表面高度（米）：无覆盖 → 隐式地面 0；覆盖体顶面
+    /// 可站立 → 顶面在该点的 y（模块文档「高度场语义」）。**被阻 cell 也
+    /// 返回其解析值**（孤岛高台顶、坡度过滤面等——仅供查询 / 调试，不
+    /// 构成通行语义；可走性一律看 [`NavGrid::is_blocked`]）。越界断言
+    /// panic（中文消息）。
+    pub fn surface_height(&self, col: usize, row: usize) -> f32 {
+        assert!(
+            col < self.cols && row < self.rows,
+            "cell ({col}, {row}) 越界：网格 {}×{}",
+            self.cols,
+            self.rows
+        );
+        self.heights[row * self.cols + col]
+    }
+
     /// 寻路：from → to 的平滑航点序列（首点 = 起点 cell 中心、末点 =
-    /// `to` 精确坐标，y 恒 0）；不可达 / 端点越界 / 端点被阻且 2 cell
+    /// 目标点精确 XZ + 目标 cell 表面高度；各航点 y = 所在 cell 的表面
+    /// 高度——模块文档「寻路」）；不可达 / 端点越界 / 端点被阻且 2 cell
     /// 内无 free cell → `None`。五步语义与确定性论证见模块文档「寻路」。
+    /// 极近直达 / 修正后同 cell 的短路分支返回 `Some(vec![to])`（入参
+    /// 原样保留——R35 兼容语义）。
     pub fn find_path(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
         // ① 越界 → None（覆盖域即导航域，不做外扩修正）
         let start = self.world_to_cell(from)?;
         let goal = self.world_to_cell(to)?;
-        // ② 极近两点：直接到达（水平距离判定，y 无关——2.5D）
+        // ② 极近两点：直接到达（水平距离判定，y 无关）
         if Vec3::new(to.x - from.x, 0.0, to.z - from.z).length_squared()
             <= SAME_POINT_EPSILON * SAME_POINT_EPSILON
         {
@@ -368,10 +623,15 @@ impl NavGrid {
         let cells = self.astar(start, goal)?;
         let mut waypoints: Vec<Vec3> = Vec::with_capacity(cells.len() + 1);
         for &(col, row) in &cells {
-            waypoints.push(self.cell_center(col, row));
+            waypoints.push(self.cell_waypoint(col, row));
         }
-        // 末航点用精确目标点替代其 cell 中心（平滑的落点是调用方要去的点）
-        waypoints.push(to);
+        // 末航点用精确目标点替代其 cell 中心（平滑的落点是调用方要去的
+        // 点）：XZ 取入参、y 校正为目标 cell 的表面高度
+        waypoints.push(Vec3::new(
+            to.x,
+            self.heights[goal.1 * self.cols + goal.0],
+            to.z,
+        ));
         Some(self.smooth(&waypoints))
     }
 
@@ -438,11 +698,28 @@ impl NavGrid {
         self.blocked[row as usize * self.cols + col as usize]
     }
 
-    /// 从 (col, row) 步进到 (ncol, nrow) 是否被禁止：目标格越界 / 被阻，
-    /// 或对角步进时**两正交邻任一被阻**（防穿角，见模块文档「寻路」）。
+    /// 可走 cell 的航点世界坐标：XZ 中心 + **表面高度 y**（寻路航点的
+    /// 唯一来源）。调用方保证 cell 可走（越界 / 被阻格无航点语义）。
+    fn cell_waypoint(&self, col: usize, row: usize) -> Vec3 {
+        let mut p = cell_center_of(&self.params, col, row);
+        p.y = self.heights[row * self.cols + col];
+        p
+    }
+
+    /// 从 (col, row) 步进到 (ncol, nrow) 是否被禁止：目标格越界 / 被阻、
+    /// **两端 |Δh| > `step_height`**（落差超过一步坎，见模块文档「连通性
+    /// 与攀爬」），或对角步进时**两正交邻任一被阻**（防穿角，原语义
+    /// 保留，见模块文档「寻路」）。调用方保证 (col, row) 界内可走。
     fn step_blocked(&self, col: isize, row: isize, ncol: isize, nrow: isize) -> bool {
         if self.blocked_isize(ncol, nrow) {
             return true;
+        }
+        if ncol >= 0 && nrow >= 0 && ncol < self.cols as isize && nrow < self.rows as isize {
+            let h_cur = self.heights[row as usize * self.cols + col as usize];
+            let h_nxt = self.heights[nrow as usize * self.cols + ncol as usize];
+            if (h_nxt - h_cur).abs() > self.params.step_height {
+                return true;
+            }
         }
         let diagonal = ncol != col && nrow != row;
         if diagonal && (self.blocked_isize(ncol, row) || self.blocked_isize(col, nrow)) {
@@ -489,10 +766,11 @@ impl NavGrid {
         None
     }
 
-    /// A*（8 邻域、防穿角、octile 启发、确定性 tie-break——论证见模块
-    /// 文档「寻路」）。返回 cell 路径（含起终点；起终点必 free）。
-    /// octile 启发对该边集**一致**（每步 h 的下降量 ≤ 步代价），首次
-    /// 弹出 goal 即最优，无需二次松弛。
+    /// A*（8 邻域、防穿角、攀爬惩罚边权、octile 启发、确定性 tie-break
+    /// ——论证见模块文档「寻路」）。返回 cell 路径（含起终点；起终点必
+    /// free）。octile 启发对**加权边集**一致（攀爬惩罚因子 ≥ 1 ⇒ 边代价
+    /// ≥ 纯步距；octile 距离相对相邻 cell 的步距满足三角不等式 ⇒ 每步
+    /// h 的下降量 ≤ 边代价），首次弹出 goal 即加权图最优，无需二次松弛。
     fn astar(&self, start: (usize, usize), goal: (usize, usize)) -> Option<Vec<(usize, usize)>> {
         let goal_idx = goal.1 * self.cols + goal.0;
         // octile 距离：(max(dx, dz) − min) · 1 + min · √2
@@ -546,12 +824,23 @@ impl NavGrid {
                 if closed[nidx] {
                     continue;
                 }
-                let cost = if dc != 0 && dr != 0 {
+                // 边代价 = 纯步距（直线 1.0 / 对角 √2）× 攀爬惩罚因子
+                // （上坡 Δh > 0 时 ×(1 + 2·Δh/step_height)；平地 / 下坡
+                // 因子恰 1.0——平地上与 R35 代价逐位一致；可采纳性论证
+                // 见模块文档「寻路」）。step_height == 0 时上坡边被
+                // step_blocked 的 |Δh| ≤ 0 挡下，此处 Δh > 0 不出现。
+                let base = if dc != 0 && dr != 0 {
                     std::f32::consts::SQRT_2
                 } else {
                     1.0
                 };
-                let new_g = g_cur + cost;
+                let climb = (self.heights[nidx] - self.heights[node]).max(0.0);
+                let factor = if climb > 0.0 {
+                    1.0 + 2.0 * climb / self.params.step_height
+                } else {
+                    1.0
+                };
+                let new_g = g_cur + base * factor;
                 // 严格更优才写入（并列保留先到者——确定性的一部分）
                 if new_g < g[nidx] {
                     g[nidx] = new_g;
@@ -592,10 +881,14 @@ impl NavGrid {
         out
     }
 
-    /// 线段视线判定（cell 光栅 DDA，选择理由见模块文档「路径平滑」）：
-    /// Amanatides–Woo 网格遍历，逐一检查线段经过的 cell（含两端所在
-    /// cell）；t 并列（斜线恰穿格角）时两轴同步步进——角点相邻的两格
-    /// 都检查（确定性 + 保守）。任一被阻 cell（含越界）→ 无视线。
+    /// 线段视线判定（cell 光栅 DDA + 高度场逐格校验，选择理由见模块
+    /// 文档「路径平滑」）：Amanatides–Woo 网格遍历，逐一检查线段经过的
+    /// cell（含两端所在 cell）；t 并列（斜线恰穿格角）时两轴同步步进——
+    /// 角点相邻的两格都检查（确定性 + 保守）。任一被阻 cell（含越界）
+    /// → 无视线；**3D 高度校验**：线段在各 cell 进入点的插值 y（起点 =
+    /// 起点本身、终点另加末点 b）距该 cell 表面高度超过 `step_height`
+    /// → 无视线（cell 内 |y − h| 的最大值必在进入 / 离开边界上——按
+    /// DDA 步进点采样是完备采样，不会漏掉窄高台）。
     fn line_of_sight(&self, a: Vec3, b: Vec3) -> bool {
         let to_cell_f = |v: f32, min: f32| (v - min) / self.params.cell_size;
         let (ac, ar) = (
@@ -610,6 +903,10 @@ impl NavGrid {
         let (end_col, end_row) = (bc.floor() as isize, br.floor() as isize);
         // 起点所在 cell 被阻（或越界）→ 无视线
         if self.blocked_isize(col, row) {
+            return false;
+        }
+        // 起点 y 校验：a 须贴近其所在 cell 的表面（差 ≤ step_height）
+        if !self.los_height_ok(col as usize, row as usize, a.y) {
             return false;
         }
         let dcol = bc - ac;
@@ -657,8 +954,13 @@ impl NavGrid {
         let limit = self.cols + self.rows + 2;
         for _ in 0..limit {
             if col == end_col && row == end_row {
-                return true; // 终点 cell 已在进入时（下方 blocked_isize）检查
+                // 末点 b 的 y 校验（其所在 cell 的表面差 ≤ step_height；
+                // 进入点校验在下方跨入时完成）
+                return self.los_height_ok(col as usize, row as usize, b.y);
             }
+            // 本次跨格线的 t（并列时两轴同刻，取同一 t）
+            let t_cross = t_max_col.min(t_max_row);
+            let y_cross = a.y + (b.y - a.y) * t_cross;
             if t_max_col < t_max_row {
                 col += step_col;
                 t_max_col += t_delta_col;
@@ -676,13 +978,25 @@ impl NavGrid {
             if self.blocked_isize(col, row) {
                 return false;
             }
+            // 3D 高度校验：线段在进入该 cell 处的 y 距表面 > step_height
+            // → 挡（起点已校验；末点由上方返回分支校验）
+            if !self.los_height_ok(col as usize, row as usize, y_cross) {
+                return false;
+            }
         }
         false
+    }
+
+    /// 3D 视线高度校验：点 y 距 (col, row) 表面高度 ≤ `step_height` 才
+    /// 放行（调用方保证 cell 界内可走——被阻格在进入前已被挡下）。
+    fn los_height_ok(&self, col: usize, row: usize, y: f32) -> bool {
+        (y - self.heights[row * self.cols + col]).abs() <= self.params.step_height
     }
 }
 
 /// cell 中心的世界坐标（自由函数，[`NavGrid::build`] 与
-/// [`NavGrid::cell_center`] 共用；y 恒 0，见模块文档「2.5D 语义」）。
+/// [`NavGrid::cell_center`] 共用；y 恒 0——XZ 中心查询，高度语义见
+/// [`NavGrid::surface_height`]）。
 fn cell_center_of(params: &NavGridParams, col: usize, row: usize) -> Vec3 {
     Vec3::new(
         params.bounds_min.x + (col as f32 + 0.5) * params.cell_size,
@@ -691,11 +1005,102 @@ fn cell_center_of(params: &NavGridParams, col: usize, row: usize) -> Vec3 {
     )
 }
 
-/// 点（按 XZ 平面点处理，y 忽略）到静态体 XZ 投影的最近点距离（2.5D
-/// 投影语义，见模块文档「光栅化判定」）：Sphere / Capsule → 圆（竖直
-/// 胶囊俯视即圆，y 与 `half_height` 不参与）；Box → 矩形（角点按真实
-/// 最近点距离，等价圆角膨胀）。投影内部距离 0。sqrt 为 IEEE 精确舍入
-/// （跨平台逐位一致，不用 hypot——libm 实现无跨平台位级保证）。
+/// 覆盖体顶面解析（自由函数，build 逐 cell 调用）：cell 中心（XZ 点，
+/// y 忽略）落在静态体 XZ 投影内 → 返回 `顶面在该点的表面高`；不覆盖 →
+/// `None`。Box：矩形投影，顶面 = pos.y + half_extents.y；Sphere /
+/// Capsule（恒竖直）：圆投影 + 上端帽球面（帽心 = 中心 +
+/// `(half_height − radius)·Y`，球取 `half_height == radius`），表面高 =
+/// 帽心 y + √(r²−ρ²)（先比平方后开方——无 NaN）。返回的高度**可低于
+/// 隐式地面 0**（体被地面埋没的部分）——是否参与解析由调用方按
+/// 「≥ 0」过滤（模块文档「高度场语义」）。
+fn covering_surface(point: Vec3, pos: Vec3, shape: &ColliderShape) -> Option<f32> {
+    let dx = point.x - pos.x;
+    let dz = point.z - pos.z;
+    match *shape {
+        ColliderShape::Box { half_extents } => {
+            if dx.abs() <= half_extents.x && dz.abs() <= half_extents.z {
+                Some(pos.y + half_extents.y)
+            } else {
+                None
+            }
+        }
+        ColliderShape::Sphere { radius } => sphere_cap_surface(dx, dz, pos.y, radius, 0.0),
+        ColliderShape::Capsule {
+            radius,
+            half_height,
+        } => sphere_cap_surface(dx, dz, pos.y, radius, half_height - radius),
+    }
+}
+
+/// 球帽顶面高度（Sphere 与 Capsule 上端帽共用）：半径 `radius`、帽心
+/// y = `pos_y + cap_offset`（球取 0、胶囊取 `half_height − radius`）。
+/// 水平距平方 `dx²+dz² ≤ r²` 才覆盖；`(r² − ρ²).sqrt()` 恒为 sqrt(≥0)
+/// （先比平方后开方——无 NaN）。
+fn sphere_cap_surface(dx: f32, dz: f32, pos_y: f32, radius: f32, cap_offset: f32) -> Option<f32> {
+    let rho_sq = dx * dx + dz * dz;
+    let r_sq = radius * radius;
+    if rho_sq > r_sq {
+        return None;
+    }
+    Some(pos_y + cap_offset + (r_sq - rho_sq).sqrt())
+}
+
+/// 覆盖点处表面是否可站立（坡度 ≤ max_slope）：Box 顶面平坦恒可站立；
+/// Sphere / Capsule 的帽面法线 = 径向，坡度 = 法线与竖直的夹角，判定
+/// 用平方形式 `ρ² ≤ (r·sin(max_slope))²`（`sin_slope` 为 build 预计算
+/// 的 `max_slope_radians.sin()`，避免逐 cell 三角函数；先比平方后比较
+/// ——无开方边界）。模块文档「高度场语义」。
+fn surface_standable(point: Vec3, pos: Vec3, shape: &ColliderShape, sin_slope: f32) -> bool {
+    let dx = point.x - pos.x;
+    let dz = point.z - pos.z;
+    match *shape {
+        ColliderShape::Box { .. } => true,
+        ColliderShape::Sphere { radius } => {
+            let rho_sq = dx * dx + dz * dz;
+            let limit = radius * sin_slope;
+            rho_sq <= limit * limit
+        }
+        ColliderShape::Capsule { radius, .. } => {
+            let rho_sq = dx * dx + dz * dz;
+            let limit = radius * sin_slope;
+            rho_sq <= limit * limit
+        }
+    }
+}
+
+/// 侧障高度（自由函数，地面格侧挡判定用）：站在地面（y = 0）的 agent
+/// 以 `agent_radius` 为圆盘半径逼近某静态体时，该体在圆盘最内缘上方
+/// 的实体高度（≥ 0 才有实体冒出地面）。Box：顶面高（pos.y +
+/// half_extents.y——立面是竖直墙，最内缘即顶面）；Sphere / Capsule：
+/// 帽面在半径 `max(0, 距轴水平距 − agent_radius)` 处的高度（最内缘
+/// 恰是帽面坡——圆盘切入球体多深，冒出的坡就有多高）。判定与 R35 的
+/// 「中心距 ≤ agent_radius 即阻」在**平地场景逐位等价**（旧场景里全部
+/// 侧障都 > step_height，见模块文档「光栅化判定」的兼容性论证）。
+fn side_obstacle_height(point: Vec3, pos: Vec3, shape: &ColliderShape, agent_radius: f32) -> f32 {
+    let dx = point.x - pos.x;
+    let dz = point.z - pos.z;
+    let rho_sq = dx * dx + dz * dz;
+    match *shape {
+        ColliderShape::Box { half_extents } => pos.y + half_extents.y,
+        ColliderShape::Sphere { radius } => {
+            let rho_inner = (rho_sq.sqrt() - agent_radius).max(0.0);
+            sphere_cap_surface(rho_inner, 0.0, pos.y, radius, 0.0).unwrap_or(0.0)
+        }
+        ColliderShape::Capsule {
+            radius,
+            half_height,
+        } => {
+            let rho_inner = (rho_sq.sqrt() - agent_radius).max(0.0);
+            sphere_cap_surface(rho_inner, 0.0, pos.y, radius, half_height - radius).unwrap_or(0.0)
+        }
+    }
+}
+
+/// 点（按 XZ 平面点处理，y 忽略）到静态体 XZ 投影的最近点距离（R35
+/// 柱体阶段判定的投影语义，见模块文档「光栅化判定」）：Sphere / Capsule
+/// → 圆（竖直胶囊俯视即圆，y 与 `half_height` 不参与）；Box → 矩形（角
+/// 点按真实最近点距离，等价圆角膨胀）。投影内部距离 0。sqrt 为 IEEE
+/// 精确舍入（跨平台逐位一致，不用 hypot——libm 实现无跨平台位级保证）。
 fn xz_clearance(point: Vec3, pos: Vec3, shape: &ColliderShape) -> f32 {
     let dx = point.x - pos.x;
     let dz = point.z - pos.z;
@@ -1170,6 +1575,10 @@ mod tests {
                     bounds_max: Vec3::new(10.0, 0.0, 10.0),
                     cell_size: 1.0,
                     agent_radius: 0.5,
+                    // R49 新字段（默认值——平地世界语义与 R35 逐位一致，
+                    // 见模块文档「光栅化判定」的兼容性论证）
+                    step_height: 0.3,
+                    max_slope_radians: std::f32::consts::FRAC_PI_4,
                 },
                 &statics,
             )
@@ -1243,5 +1652,554 @@ mod tests {
     fn inverted_bounds_panics() {
         let params = NavGridParams::new(Vec3::new(1.0, 0.0, -1.0), Vec3::new(-1.0, 0.0, 1.0));
         let _ = NavGrid::build(params, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "step_height 必须为非负")]
+    fn negative_step_height_panics() {
+        let mut params = NavGridParams::new(Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0));
+        params.step_height = -0.1;
+        let _ = NavGrid::build(params, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_slope_radians 必须为有限")]
+    fn out_of_range_max_slope_panics() {
+        let mut params = NavGridParams::new(Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0));
+        params.max_slope_radians = 2.0; // > π/2
+        let _ = NavGrid::build(params, &[]);
+    }
+
+    // ---- R49 高度场：台阶 / 丘（测试组 8）----
+
+    /// 三段式矮台阶丘（R49 台阶语义的构造事实）：五列盒顶从 0.28 逐列
+    /// 抬到 0.84 再降回 0.28（每列顶面离地 = 中心 y + 半高 y，底贴
+    /// 隐式地面；每列盒顶差 0.28 ≤ step_height 0.3）。列 x 域按 1.0 cell
+    /// 错位 0.1（半宽 0.5 的盒从 cell 中心错开）——相邻列盒顶在列边界
+    /// 附近重叠成无地缝的连续台阶，而西 / 东端头盒面离邻近地面格中心
+    /// > agent_radius（不被 R35 侧挡吞掉入口）。
+    fn stair_mound() -> Vec<(Vec3, ColliderShape)> {
+        let tier = |cx: f32, top: f32| {
+            let (center_y, half_y) = (top * 0.5, top * 0.5);
+            (
+                Vec3::new(cx, center_y, 0.0),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(0.5, half_y, 9.5),
+                },
+            )
+        };
+        vec![
+            tier(-4.1, 0.28),
+            tier(-3.1, 0.56),
+            tier(-2.1, 0.84),
+            tier(-1.1, 0.56),
+            tier(-0.1, 0.28),
+        ]
+    }
+
+    /// 台阶丘横穿：顶面 cell 被雕刻释放（is_blocked false、表面高度 =
+    /// 盒顶 y），A* 逐列攀升且每条边 |Δh| ≤ step_height，平滑路径保留
+    /// 丘顶折点且逐段 3D 视线畅通、末航点 y = 目标 cell 表面高。
+    #[test]
+    fn stair_mound_climbs_tier_by_tier_with_surface_heights() {
+        let grid = test_grid(&stair_mound());
+        // 雕刻释放 + 高度解析（五列、任意行同高——z 向整列覆盖）
+        let expected_col_h = |col: usize| -> f32 {
+            match col {
+                5 => 0.28,
+                6 => 0.56,
+                7 => 0.84,
+                8 => 0.56,
+                9 => 0.28,
+                _ => 0.0,
+            }
+        };
+        for row in 0..20 {
+            for col in 0..20 {
+                let expected = expected_col_h(col);
+                if expected > 0.0 {
+                    assert!(
+                        !grid.is_blocked(col, row),
+                        "台阶顶 cell ({col}, {row}) 应被雕刻释放"
+                    );
+                }
+                assert!(
+                    (grid.surface_height(col, row) - expected).abs() <= 1e-6,
+                    "cell ({col}, {row}) 表面高度应 ≈ {expected}，实际 {}",
+                    grid.surface_height(col, row)
+                );
+            }
+        }
+        // A* 逐列攀升：raw 路径每格高度对得上列预期、逐边 |Δh| ≤ 0.3
+        let cells = grid.astar((2, 10), (11, 10)).expect("台阶丘横穿必有路");
+        let mut max_h = 0.0f32;
+        for &(col, row) in &cells {
+            let h = grid.surface_height(col, row);
+            assert!(
+                (h - expected_col_h(col)).abs() <= 1e-6,
+                "raw 路径格 ({col}, {row}) 高度应匹配所在列台阶"
+            );
+            max_h = max_h.max(h);
+        }
+        assert!(
+            (max_h - 0.84).abs() <= 1e-6,
+            "raw 路径应爬到丘顶 0.84，实际 {max_h}"
+        );
+        for pair in cells.windows(2) {
+            let dh = (grid.surface_height(pair[1].0, pair[1].1)
+                - grid.surface_height(pair[0].0, pair[0].1))
+            .abs();
+            assert!(
+                dh <= 0.3 + 1e-6,
+                "raw 路径逐边 |Δh| = {dh} 应 ≤ step_height"
+            );
+        }
+        // 全链路：平滑路径的逐段 3D 视线复验 + 保留丘体中段折点（丘顶
+        // 0.84 与两侧 0.56 的弦差 ≤ 0.3 时顶格可被合法合并——贴丘弦仍在
+        // 一步容差内；但任何 ≤ 0.3 高度的两端弦穿过 0.56/0.84 中段都会
+        // 超出容差 → 平滑后必保留 ≥ 0.56 的折点），末航点 y = 目标面
+        let from = center(2, 10);
+        let to = center(11, 10);
+        let path = grid.find_path(from, to).expect("find_path 必有路");
+        assert!(!grid.line_of_sight(from, to), "跨丘直线弦应无视线（穿台）");
+        assert!(path.len() >= 3, "平滑路径应保留中间折点，实际 {:#?}", path);
+        let max_y = path.iter().map(|w| w.y).fold(f32::MIN, f32::max);
+        assert!(
+            (0.56 - 1e-6..=0.84 + 1e-6).contains(&max_y),
+            "平滑路径应保留丘体中段航点（y ∈ {{0.56, 0.84}}），实际 {max_y}"
+        );
+        for window in path.windows(2) {
+            assert!(
+                grid.line_of_sight(window[0], window[1]),
+                "平滑段 {:?} → {:?} 应 3D 视线畅通",
+                window[0],
+                window[1]
+            );
+        }
+        assert_eq!(*path.last().expect("非空"), to, "末航点 = 目标 XZ + 表面高");
+    }
+
+    /// 超 step_height 的单级高台（1.0 m、z 向全跨）：顶面离地面
+    /// 1.0 > step_height 0.3 → 孤岛不雕刻，整列被阻 → 横穿 None、
+    /// is_reachable false（「None 或绕行」的 None 支）。
+    #[test]
+    fn single_high_step_above_step_height_blocks_column() {
+        let high = (
+            Vec3::new(-4.5, 0.5, 0.0),
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.5, 0.5, 9.5),
+            },
+        );
+        let grid = test_grid(&[high]);
+        // 顶面 cell 全部保持被阻（孤岛不雕刻），但高度解析仍在（供查询）
+        for row in 0..20 {
+            assert!(grid.is_blocked(5, row), "高台列 (5, {row}) 应被阻");
+            assert!(
+                (grid.surface_height(5, row) - 1.0).abs() <= 1e-6,
+                "高台顶解析高度应 = 1.0"
+            );
+        }
+        assert!(
+            grid.find_path(center(2, 10), center(8, 10)).is_none(),
+            "全跨高台不可翻越 → None"
+        );
+        assert!(
+            !grid.is_reachable(center(2, 10), center(8, 10)),
+            "is_reachable 同语义 false"
+        );
+    }
+
+    /// 高台只占一段 z（1.0 m 顶、z ∈ [−2, 2]）：路径绕行不翻越——全部
+    /// 航点 y = 0 且存在 |z| ≥ 3.4 的绕行段（高台列被阻到 |z| ≤ 3.0，
+    /// 见侧挡 / 顶面孤岛语义）。
+    #[test]
+    fn high_step_short_band_detours_on_ground() {
+        let high = (
+            Vec3::new(-4.5, 0.5, 0.0),
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.5, 0.5, 2.0),
+            },
+        );
+        let grid = test_grid(&[high]);
+        let path = grid
+            .find_path(center(2, 10), center(8, 10))
+            .expect("高台只挡一段 z，绕行必有路");
+        let mut detoured = false;
+        for w in &path {
+            assert_eq!(w.y, 0.0, "绕行航点 y 恒 0（不翻越）");
+            if w.z.abs() >= 3.4 {
+                detoured = true;
+            }
+        }
+        assert!(detoured, "路径应绕到 |z| ≥ 3.4 的通道穿越");
+    }
+
+    /// 大埋深球 = 缓丘（R = 60、中心 y = −58.5：露出地面 1.5 m 的浅帽，
+    /// 冒出环半径 ≈ 13.33 < 网格 16，环外是隐式地面）：环边顶面
+    /// (≈ 0.2 起坡、每 cell 落差 ≤ 0.3) 与地面连通 → 全丘可走，路径
+    /// 沿球面（航点 y 与解析球面逐位贴合），最高点 ≈ 1.5。
+    #[test]
+    fn buried_ball_dome_path_follows_surface() {
+        let mut params =
+            NavGridParams::new(Vec3::new(-16.0, 0.0, -16.0), Vec3::new(16.0, 0.0, 16.0));
+        params.cell_size = 1.0;
+        params.agent_radius = 0.5;
+        let ball = (
+            Vec3::new(0.0, -58.5, 0.0),
+            ColliderShape::Sphere { radius: 60.0 },
+        );
+        let grid = NavGrid::build(params, &[ball]);
+        // 丘顶 cell 已雕刻：中心 cell 可走、高度 ≈ 解析值 1.4958
+        assert!(!grid.is_blocked(16, 15), "丘顶 cell 应可走");
+        let surface = |w: Vec3| {
+            let rho_sq = w.x * w.x + w.z * w.z;
+            -58.5 + (3600.0 - rho_sq).sqrt()
+        };
+        let top_expected = surface(center_w(-16.0, 16, 15));
+        assert!(
+            (grid.surface_height(16, 15) - top_expected).abs() <= 1e-6,
+            "丘顶高度应 = 解析球面"
+        );
+        // 横穿浅丘：全部航点 y 贴合球面（覆盖区）或 = 0（环外地面）
+        let from = center_w(-16.0, 1, 15); // x = -14.5（环外地面）
+        let to = center_w(-16.0, 26, 15); // x = 10.5（丘上）
+        let path = grid.find_path(from, to).expect("缓丘横穿必有路");
+        let mut max_y = 0.0f32;
+        for w in &path {
+            max_y = max_y.max(w.y);
+            let rho_sq = w.x * w.x + w.z * w.z;
+            if rho_sq <= 177.75 {
+                assert!(
+                    (w.y - surface(*w)).abs() <= 1e-6,
+                    "丘上航点 {w:?} 应贴合球面（差 {}）",
+                    (w.y - surface(*w)).abs()
+                );
+            } else {
+                assert_eq!(w.y, 0.0, "环外航点 {w:?} y 应 = 0");
+            }
+        }
+        assert!(max_y >= 1.4, "路径应翻过丘顶附近（最高 {max_y}）");
+        for window in path.windows(2) {
+            assert!(
+                grid.line_of_sight(window[0], window[1]),
+                "平滑段应 3D 视线畅通"
+            );
+        }
+    }
+
+    /// 网格坐标辅助（自由起点 bounds 的 cell 中心世界坐标；y = 0）。
+    fn center_w(bounds_min: f32, col: isize, row: isize) -> Vec3 {
+        Vec3::new(
+            bounds_min + col as f32 + 0.5,
+            0.0,
+            bounds_min + row as f32 + 0.5,
+        )
+    }
+
+    /// 陡球（R = 2.2、中心 y = −1.4：坡度 ≤ 45° 的顶帽高悬成孤岛，
+    /// 帽外环坡度 > 45° 全阻）——横穿路径绕行不翻越：全部航点 y = 0
+    /// 且离球心 ≥ 2.05（绕出被阻带）；帽顶孤岛 cell 保持被阻、高度
+    /// 仍解析 ≈ 0.6833。
+    #[test]
+    fn steep_ball_detours_and_cap_stays_island() {
+        let ball = (
+            Vec3::new(0.0, -1.4, 0.0),
+            ColliderShape::Sphere { radius: 2.2 },
+        );
+        let grid = test_grid(&[ball]);
+        // 帽顶孤岛：cell (10,10)（中心 (0.5, 0.5)，ρ = 0.707 ≤
+        // 2.2·sin45 ≈ 1.556 可站）→ offered 但四面高差 > step → 被阻
+        assert!(grid.is_blocked(10, 10), "帽顶 cell 应为孤岛被阻");
+        let expected = -1.4_f32 + (4.84_f32 - 0.5).sqrt();
+        assert!(
+            (grid.surface_height(10, 10) - expected).abs() <= 1e-6,
+            "帽顶解析高度应 ≈ {expected}"
+        );
+        // 坡度过滤带（ρ ≈ 1.58 > 1.556，坡度 > 45°）无表面
+        assert!(grid.is_blocked(11, 10), "陡坡带 cell 应被阻");
+        assert_eq!(grid.surface_height(11, 10), 0.0, "陡坡带无表面（高度 0）");
+        // 绕行：y 恒 0、不进入被阻带（cell 中心离球心 ≥ 2.05）
+        let path = grid
+            .find_path(center(2, 10), center(17, 10))
+            .expect("绕行必有路");
+        for w in &path {
+            assert_eq!(w.y, 0.0, "绕行航点 y 恒 0（不翻越球面）");
+            let dist_sq = w.x * w.x + w.z * w.z;
+            assert!(dist_sq >= 2.05 * 2.05, "航点 {w:?} 不应进入球被阻带");
+        }
+    }
+
+    // ---- R49 高度场：攀爬惩罚与 3D 视线（测试组 9）----
+
+    /// 矮台阶跨步（b1/b2/b3 是 penalty 与平滑测试共用的构造事实）：
+    /// (9,10) 顶 0.28、(10,10) 顶 0.56、(11,10) 顶 0.28——三级台阶
+    /// （≤ step_height 逐级可迈，0.56 顶的下行只能经两侧 0.28 级）。
+    /// 盒 z ∈ [0.1, 0.9]（半宽 0.4，中心 z = 0.5 = row 10 中心）：只盖
+    /// row 10，row 9/11（z = −0.5 / 1.5）离侧障 ≥ 0.6 保持畅通的平路
+    /// 绕行带。
+    fn penalty_steps() -> Vec<(Vec3, ColliderShape)> {
+        let step = |cx: f32, top: f32| {
+            (
+                Vec3::new(cx, top * 0.5, 0.5),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(0.5, top * 0.5, 0.4),
+                },
+            )
+        };
+        vec![step(-0.5, 0.28), step(0.5, 0.56), step(1.5, 0.28)]
+    }
+
+    /// 攀爬惩罚锁定：三级短台阶（直穿 15 格中爬 0.28/0.56/0.28）vs
+    /// 平路绕行（多 2 格对角）——无惩罚时直穿最优（15.0 < 15.83），
+    /// 带惩罚（上坡 ×(1 + 2·Δh/step)）时绕行胜出（15.83 < 18.73）：
+    /// A* 选平路（raw 全格高度 0）、平滑路径 y 恒 0；对照组把
+    /// step_height 调到 10.0（惩罚因子 ≈ 1）→ A* 改选直穿台阶（raw
+    /// 含 0.56 顶格）——惩罚正是选择翻转的唯一原因。
+    #[test]
+    fn climb_penalty_prefers_flat_detour() {
+        let statics = penalty_steps();
+        let mut params =
+            NavGridParams::new(Vec3::new(-10.0, 0.0, -10.0), Vec3::new(10.0, 0.0, 10.0));
+        params.cell_size = 1.0;
+        params.agent_radius = 0.5;
+        let grid = NavGrid::build(params, &statics);
+        // 台阶顶被雕刻释放、高度正确（可达顶面）
+        assert!(!grid.is_blocked(9, 10) && !grid.is_blocked(10, 10) && !grid.is_blocked(11, 10));
+        assert!(
+            (grid.surface_height(9, 10) - 0.28).abs() <= 1e-6
+                && (grid.surface_height(10, 10) - 0.56).abs() <= 1e-6
+        );
+        let from = center(2, 10);
+        let to = center(17, 10);
+        let cells = grid.astar((2, 10), (17, 10)).expect("必有路");
+        for &(col, row) in &cells {
+            assert_eq!(
+                grid.surface_height(col, row),
+                0.0,
+                "带惩罚时 A* 应选平路绕行（raw 格 ({col}, {row}) 高度 0），不爬台阶"
+            );
+        }
+        let path = grid.find_path(from, to).expect("必有路");
+        for w in &path {
+            assert_eq!(w.y, 0.0, "绕行平滑路径航点 y 恒 0");
+        }
+        // 对照组：step_height 10.0 → 惩罚因子 ≈ 1，直穿（15 格）优于
+        // 绕行（≈ 15.83）→ A* 爬台阶（含 0.56 顶格）——翻转锁定惩罚
+        let mut lax = params;
+        lax.step_height = 10.0;
+        let lax_grid = NavGrid::build(lax, &statics);
+        let lax_cells = lax_grid.astar((2, 10), (17, 10)).expect("对照组必有路");
+        assert!(
+            lax_cells
+                .iter()
+                .any(|&(c, r)| (lax_grid.surface_height(c, r) - 0.56).abs() <= 1e-6),
+            "无惩罚时 A* 应直穿 0.56 级台阶"
+        );
+    }
+
+    /// 无平路替代时的必要攀爬：走廊（两道 2.5 m 全宽墙 + 切线侧挡把
+    /// 活动域夹成 row 10..11 两行）中央横一条 0.28 m 平台（cols
+    /// 6..12 全盖两行）——绕行无门，A* 必须爬平台（raw 路径含 0.28
+    /// 顶格）且逐边 |Δh| ≤ step_height。
+    #[test]
+    fn climb_used_when_no_flat_alternative() {
+        let statics = vec![
+            // 两道横墙：z∈[−2,−1.25] 与 z∈[1.25,2]（顶 2.5 m > step）
+            (
+                Vec3::new(0.0, 1.25, -1.625),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(10.5, 1.25, 0.375),
+                },
+            ),
+            (
+                Vec3::new(0.0, 1.25, 1.625),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(10.5, 1.25, 0.375),
+                },
+            ),
+            // 0.28 m 平台：x∈[−4,3]、z∈[−1,1]（row 10..11 全盖）
+            (
+                Vec3::new(-0.5, 0.14, 0.0),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(3.5, 0.14, 1.0),
+                },
+            ),
+        ];
+        let grid = test_grid(&statics);
+        let cells = grid.astar((2, 10), (17, 10)).expect("走廊内横穿必有路");
+        assert!(
+            cells
+                .iter()
+                .any(|&(c, r)| (grid.surface_height(c, r) - 0.28).abs() <= 1e-6),
+            "无平路替代时必须爬 0.28 平台"
+        );
+        for pair in cells.windows(2) {
+            let dh = (grid.surface_height(pair[1].0, pair[1].1)
+                - grid.surface_height(pair[0].0, pair[0].1))
+            .abs();
+            assert!(dh <= 0.3 + 1e-6, "raw 逐边 |Δh| = {dh} 应 ≤ step_height");
+        }
+        assert!(
+            grid.is_reachable(center(2, 10), center(17, 10)),
+            "is_reachable 同语义"
+        );
+    }
+
+    /// 3D 视线平滑（跨台阶不穿台）：台阶丘两侧地面的直线弦穿过丘体
+    /// 中段时与表面差超 step_height → 无视线（直穿被挡）；string
+    /// pulling 结果逐航点 DDA 复验畅通且必保留 ≥ 0.56 的中段折点
+    /// （≤ step 的贴丘弦可合法合并顶格——角色可一步迈过；更大的穿台
+    /// 弦一律被高度校验挡下）。
+    #[test]
+    fn smoothing_rechecks_3d_los_on_stair_worlds() {
+        let grid = test_grid(&stair_mound());
+        let from = center(2, 10);
+        let to = center(11, 10);
+        assert!(!grid.line_of_sight(from, to), "跨丘地面弦应被高度校验挡下");
+        let path = grid.find_path(from, to).expect("必有路");
+        assert!(path.len() >= 3, "平滑不得退化成跨台直线");
+        let max_y = path.iter().map(|w| w.y).fold(f32::MIN, f32::max);
+        assert!(
+            (0.56 - 1e-6..=0.84 + 1e-6).contains(&max_y),
+            "平滑应保留丘体中段折点，实际 max y = {max_y}"
+        );
+        for window in path.windows(2) {
+            assert!(
+                grid.line_of_sight(window[0], window[1]),
+                "逐航点 DDA 复验：{:?} → {:?} 应畅通",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    // ---- R49 高度场：混合地形确定性与表面解析（测试组 10）----
+
+    /// 复杂地形（五级台阶丘 + 陡球 + 0.75 m 高台）两次 build +
+    /// find_path / is_reachable：位图、高度场、航点逐位一致（高度场
+    /// 的确定性由解析遍历序 + 雕刻静态门条件保证，见模块文档）。
+    #[test]
+    fn height_field_deterministic_on_mixed_terrain() {
+        let mut statics = stair_mound();
+        statics.push((
+            Vec3::new(6.0, -1.4, 0.0),
+            ColliderShape::Sphere { radius: 2.2 },
+        ));
+        statics.push((
+            Vec3::new(6.0, 0.375, -6.5),
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.5, 0.375, 0.5),
+            },
+        ));
+        let build = || {
+            NavGrid::build(
+                NavGridParams {
+                    bounds_min: Vec3::new(-10.0, 0.0, -10.0),
+                    bounds_max: Vec3::new(10.0, 0.0, 10.0),
+                    cell_size: 1.0,
+                    agent_radius: 0.5,
+                    step_height: 0.3,
+                    max_slope_radians: std::f32::consts::FRAC_PI_4,
+                },
+                &statics,
+            )
+        };
+        let (a, b) = (build(), build());
+        assert_eq!(a.blocked, b.blocked, "两次 build 位图逐位一致");
+        assert_eq!(a.heights, b.heights, "两次 build 高度场逐位一致");
+        let queries = [
+            (center(2, 10), center(11, 10)), // 横穿台阶丘
+            (center(2, 10), center(17, 10)), // 横穿全场（陡球绕行）
+            (center(8, 10), center(12, 3)),  // 北绕陡球 + 高台区
+            (center(7, 14), center(13, 14)), // 贴高台行（y = 0.75 孤岛）
+        ];
+        for (from, to) in queries {
+            let (pa, pb) = (a.find_path(from, to), b.find_path(from, to));
+            assert_eq!(pa, pb, "两次 find_path({from:?} → {to:?}) 逐位一致");
+            assert_eq!(
+                a.is_reachable(from, to),
+                b.is_reachable(from, to),
+                "两次 is_reachable 一致"
+            );
+        }
+    }
+
+    /// 表面解析单测（对照解析解）：盒顶 / 球面 / 重叠取最高 / 坡度
+    /// 过滤 / 胶囊上端帽——高度值与解析表达式逐位一致（同一浮点运算
+    /// 序）、陡坡与孤岛 cell 的被阻语义正确。
+    #[test]
+    fn surface_resolution_box_sphere_overlap_and_slope() {
+        // (a) 盒顶：覆盖格表面高 = pos.y + half_extents.y（恒可站立）
+        let box_grid = test_grid(&[(
+            Vec3::new(-4.5, 0.5, 0.0),
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.5, 0.5, 9.5),
+            },
+        )]);
+        assert_eq!(box_grid.surface_height(5, 10), 1.0, "盒顶高应 = 1.0");
+        assert!(box_grid.is_blocked(5, 10), "1.0 m 孤岛顶应被阻");
+        // (b) 球面：球心 (0, 1, 0) r = 2，cell (10,10)（ρ² = 0.5）表面
+        // 高 = pos.y + √(r²−ρ²) = 1 + √3.5；坡度 ≤ 45°（ρ ≤ r·sin45）
+        // 可站 → offered（孤岛被阻）；坡度 > 45° 的带（ρ ≈ 1.58）无表面
+        let sphere_grid = test_grid(&[(
+            Vec3::new(0.0, 1.0, 0.0),
+            ColliderShape::Sphere { radius: 2.0 },
+        )]);
+        let sphere_h = 1.0_f32 + (4.0_f32 - 0.5).sqrt();
+        assert!(
+            (sphere_grid.surface_height(10, 10) - sphere_h).abs() <= 1e-6,
+            "球面解析高应 = 1 + √3.5"
+        );
+        assert!(sphere_grid.is_blocked(10, 10), "高悬球顶孤岛应被阻");
+        assert_eq!(
+            sphere_grid.surface_height(11, 10),
+            0.0,
+            "坡度 > max_slope 处无表面（高度 0）"
+        );
+        assert!(sphere_grid.is_blocked(11, 10), "陡坡带应被阻");
+        // (c) 重叠取最高：两盒同 footprint 叠放（顶 0.5 与 1.0）→ 表面
+        // 高取 1.0（最高顶面胜出；0.5 m 盒子的侧挡 / 覆盖不参与）
+        let stack_grid = test_grid(&[
+            (
+                Vec3::new(-6.5, 0.25, 0.0),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(0.5, 0.25, 9.5),
+                },
+            ),
+            (
+                Vec3::new(-6.5, 0.75, 0.0),
+                ColliderShape::Box {
+                    half_extents: Vec3::new(0.5, 0.25, 9.5),
+                },
+            ),
+        ]);
+        assert_eq!(stack_grid.surface_height(3, 10), 1.0, "重叠应取最高表面");
+        assert_eq!(stack_grid.surface_height(4, 10), 0.0, "盒外地面高 0");
+        assert!(stack_grid.is_blocked(3, 10), "1.0 m 叠顶孤岛应被阻");
+        // (d) 胶囊上端帽：帽心 = pos.y + (half_height − radius)，表面高 =
+        // 帽心 y + √(r²−ρ²)；坡度 ≤ 45° 的中央帽区可站（细网格采样）
+        let mut fine = NavGridParams::new(Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 0.0, 4.0));
+        fine.cell_size = 0.25;
+        fine.agent_radius = 0.5;
+        let capsule_grid = NavGrid::build(
+            fine,
+            &[(
+                Vec3::new(0.0, 1.5, 0.0),
+                ColliderShape::Capsule {
+                    radius: 1.0,
+                    half_height: 3.0,
+                },
+            )],
+        );
+        // cell (16,16) 中心 (0.125, 0.125)：ρ² = 0.03125 ≤ 1
+        let cap_h = 3.5_f32 + (1.0_f32 - 0.03125).sqrt();
+        assert!(
+            (capsule_grid.surface_height(16, 16) - cap_h).abs() <= 1e-6,
+            "胶囊帽面解析高应 = 3.5 + √0.96875"
+        );
+        assert!(
+            capsule_grid.is_blocked(16, 16),
+            "胶囊（立柱）顶帽孤岛应被阻"
+        );
     }
 }

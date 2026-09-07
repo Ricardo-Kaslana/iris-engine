@@ -779,13 +779,18 @@ impl InfiltrationState {
     }
 }
 
-/// 导航图参数（构建与重建同参——见 [`NAV_BOUNDS_MIN`] 等常量）。
+/// 导航图参数（构建与重建同参——见 [`NAV_BOUNDS_MIN`] 等常量）。R49
+/// 新增 `step_height` / `max_slope_radians`（与角色控制器同值 0.3 / 45°）；
+/// 本作全平地世界（一切立面顶离地 > step_height 的孤岛）→ 位图与行为
+/// 与 R35 逐位一致。
 fn nav_params() -> NavGridParams {
     NavGridParams {
         bounds_min: NAV_BOUNDS_MIN,
         bounds_max: NAV_BOUNDS_MAX,
         cell_size: NAV_CELL_SIZE,
         agent_radius: NAV_AGENT_RADIUS,
+        step_height: 0.3,
+        max_slope_radians: std::f32::consts::FRAC_PI_4,
     }
 }
 

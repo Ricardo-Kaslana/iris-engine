@@ -279,13 +279,18 @@ pub fn level_statics() -> Vec<(Vec3, ColliderShape)> {
     statics
 }
 
-/// 导航图参数（构建一次、全程复用——庭院无开门类动态障碍）。
+/// 导航图参数（构建一次、全程复用——庭院无开门类动态障碍）。R49 新增
+/// `step_height` / `max_slope_radians`（与角色控制器同值 0.3 / 45°）；
+/// 本作全平地世界（墙 / 柱 / 喷泉顶面全是离地 > step_height 的孤岛）→
+/// 位图与行为与 R35 逐位一致。
 pub fn nav_params() -> NavGridParams {
     NavGridParams {
         bounds_min: NAV_BOUNDS_MIN,
         bounds_max: NAV_BOUNDS_MAX,
         cell_size: NAV_CELL_SIZE,
         agent_radius: NAV_AGENT_RADIUS,
+        step_height: 0.3,
+        max_slope_radians: std::f32::consts::FRAC_PI_4,
     }
 }
 
