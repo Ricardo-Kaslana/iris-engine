@@ -47,6 +47,7 @@ pub mod renderer;
 pub mod rendertarget;
 pub mod skin;
 pub mod surface;
+pub mod terrain;
 pub mod texture;
 pub mod texture_bcn;
 pub mod ui;
@@ -97,6 +98,11 @@ pub mod prelude {
     };
     pub use crate::skin::{Skin, skin_vertex};
     pub use crate::surface::SurfaceKit;
+    pub use crate::terrain::{
+        COLLIDER_DEPTH_MARGIN, GrassTextures, Heightmap, LodMesh3, TERRAIN_LOD_LEVELS,
+        TERRAIN_LOD_STRIDES, Terrain, TerrainBuild, TerrainOptions, build_terrain, chunk_mesh,
+        generate_hills, grass_textures, terrain_statics,
+    };
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
     pub use crate::texture_bcn::{
         BC1_BLOCK_BYTES, bc1_eligible, encode_bc1, encoded_len, padded_extent,

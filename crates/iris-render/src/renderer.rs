@@ -5,8 +5,9 @@
 //! World 资源（MeshStore / MaterialStore / TextureStore，CPU 目录）
 //!     -> Renderer 内 GPU 缓存（HashMap<句柄, GPU 资源>，按需懒上传；
 //!        纹理按 BC1 决策树压缩上传，见 texture_bcn）
-//!     -> 查询 (Transform, MaterialHandle, MeshHandle|LodMesh) 收集实例
-//!        （LodMesh 按实体-相机距离选 high/low，见 mesh.rs）
+//!     -> 查询 (Transform, MaterialHandle, MeshHandle|LodMesh|LodMesh3) 收集实例
+//!        （LodMesh 按实体-相机距离选 high/low，见 mesh.rs；LodMesh3 三级
+//!        同口径，地形 chunk 用，见 terrain.rs）
 //!     -> 按 (网格, 材质) 排序合并为批次 -> 一个批次一个 draw call
 //!     -> 另查 (GlobalTransform, Decal) 收集贴花实例，按纹理分批在独立
 //!        pass 绘制（蒙皮之后、透明之前，见 decal.rs）
@@ -769,20 +770,24 @@ fn alpha_of(materials: &MaterialStore, handle: MaterialHandle) -> AlphaMode {
         .unwrap_or(AlphaMode::Opaque)
 }
 
-/// LOD 网格解析（R30）：挂 [`LodMesh`] 的实体按距离选 high / low（距离 =
-/// 实体原点到相机 eye 的欧氏距离，v1 不用包围球中心，取舍见组件文档）；
-/// 未挂载回退 `MeshHandle` 旧语义；两者皆无返回 `None`（收集跳过该实体
-/// ——查询带两个 `Option` 后「无任何网格句柄」成为合法查询命中）。
+/// LOD 网格解析（R30 / R51）：挂 [`LodMesh3`](crate::terrain::LodMesh3) 的实体按距离在 3 级间
+/// 选（地形 chunk，见 `terrain.rs`）；否则挂 [`LodMesh`] 的实体按距离
+/// 选 high / low（距离 = 实体原点到相机 eye 的欧氏距离，v1 不用包围球
+/// 中心，取舍见组件文档）；未挂载回退 `MeshHandle` 旧语义；皆无返回
+/// `None`（收集跳过该实体——查询带多个 `Option` 后「无任何网格句柄」
+/// 成为合法查询命中）。
 fn resolve_mesh_handle(
     lod: Option<&LodMesh>,
+    lod3: Option<&crate::terrain::LodMesh3>,
     mesh: Option<&MeshHandle>,
     eye: Vec3,
     origin: Vec3,
 ) -> Option<MeshHandle> {
-    match (lod, mesh) {
-        (Some(lod), _) => Some(lod.select(eye, origin)),
-        (None, Some(mesh)) => Some(*mesh),
-        (None, None) => None,
+    match (lod3, lod, mesh) {
+        (Some(lod3), ..) => Some(lod3.select(eye, origin)),
+        (None, Some(lod), _) => Some(lod.select(eye, origin)),
+        (None, None, Some(mesh)) => Some(*mesh),
+        (None, None, None) => None,
     }
 }
 
@@ -856,11 +861,13 @@ fn skin_world_aabb(
 /// `skin_world_aabb`）。视锥剔除与剔除计数对透明同样生效。返回可见 /
 /// 被剔除的实例数（日志与 `FrameStats` 用）；排序由调用方完成。
 ///
-/// **距离 LOD（R30）**：网格句柄经 `resolve_mesh_handle` 解析——挂
-/// [`LodMesh`] 的实体按「实体原点到 `eye` 的欧氏距离」选 high / low，
-/// 未挂载用 `MeshHandle` 旧语义；选中的句柄决定合批键 / 剔除包围体 /
-/// 三角形统计（蒙皮路径同口径，LOD 高低模各自带蒙皮属性）。`eye` 由
-/// 调用方从解析后的相机传入（资源相机 / 实体挂载相机同源）。
+/// **距离 LOD（R30 / R51）**：网格句柄经 `resolve_mesh_handle` 解析——挂
+/// [`LodMesh3`](crate::terrain::LodMesh3) 的实体按距离在 3 级间选（地形 chunk，仅普通网格路径，
+/// 见 `terrain.rs`），挂 [`LodMesh`] 的实体按「实体原点到 `eye` 的欧氏
+/// 距离」选 high / low，未挂载用 `MeshHandle` 旧语义；选中的句柄决定
+/// 合批键 / 剔除包围体 / 三角形统计（蒙皮路径同口径，LOD 高低模各自
+/// 带蒙皮属性）。`eye` 由调用方从解析后的相机传入（资源相机 / 实体挂载
+/// 相机同源）。
 // 四个输出列表各自类型不同、语义独立（跨帧复用的 scratch 缓冲逐个传入），
 // 收拢成结构体反而多一层拆装；参数多但全为引用/裸缓冲，与 scene.rs
 // `build_entity_section` 同理豁免。
@@ -906,8 +913,9 @@ fn collect_instances(
             return;
         }
         // LOD 距离选择：挂 LodMesh 按距离选 high / low，否则 MeshHandle；
-        // 两者皆无（纯 Skin 实体，合法但不可渲染）静默跳过
-        let Some(m) = resolve_mesh_handle(lod, mesh, eye, gt.position()) else {
+        // 两者皆无（纯 Skin 实体，合法但不可渲染）静默跳过。
+        // 蒙皮路径不参与 LodMesh3（地形 chunk 恒非蒙皮，R51）
+        let Some(m) = resolve_mesh_handle(lod, None, mesh, eye, gt.position()) else {
             return;
         };
         skinned_entities.insert(e.to_bits());
@@ -944,8 +952,9 @@ fn collect_instances(
         &MaterialHandle,
         Option<&MeshHandle>,
         Option<&LodMesh>,
+        Option<&crate::terrain::LodMesh3>,
         Option<&Visibility>,
-    )>(|(e, gt, mat, mesh, lod, visibility)| {
+    )>(|(e, gt, mat, mesh, lod, lod3, visibility)| {
         // 自身 HIDDEN 跳过 + 祖先链级联（与蒙皮路径同语义）
         if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
@@ -954,9 +963,9 @@ fn collect_instances(
         if skinned_entities.contains(&e.to_bits()) {
             return;
         }
-        // LOD 距离选择（组件缺席 = MeshHandle 旧语义；两者皆无跳过——
+        // LOD 距离选择（组件缺席 = MeshHandle 旧语义；皆无跳过——
         // 挂了材质却没有任何网格句柄的实体不可渲染）
-        let Some(m) = resolve_mesh_handle(lod, mesh, eye, gt.position()) else {
+        let Some(m) = resolve_mesh_handle(lod, lod3, mesh, eye, gt.position()) else {
             return;
         };
         let model = gt.matrix();

@@ -5,6 +5,74 @@
 
 ## [Unreleased]
 
+### Added（R51：Heightmap 地形——分块 3 级 LOD 渲染 + 碰撞拼块 + 导航 / 角色零扩展集成）
+
+写实路线「复杂地形」的正式解（第 51 轮迭代；语义规范全文 =
+`iris-render/src/terrain.rs` 模块文档 + ARCHITECTURE §4.23 新节 /
+§3.8、§3.9 集成说明，设计与偏离理由见提交 body）。范围按决策执行：
+渲染走标准管线**零新 shader**；碰撞 = 自动生成粗 AABB 拼块静态体
+（复用既有物理 / nav 管线**零 API 扩展**）；地形高度查询纯函数供游戏
+调用。
+
+- **数据与生成**：`Heightmap{width, depth, cell_size, heights}` 行主序
+  顶点高度场；`generate_hills` 三组方向正弦叠加（波长 48/24/12 m、
+  权重 1:0.5:0.25，方向 / 相位由 seed 经 splitmix64 派生——**无 RNG
+  无依赖**，同 seed 逐位一致 `to_bits` 锁定；值域闭区间
+  `[base−amplitude, base+amplitude]` 与「单 cell 抬升 ≤
+  amplitude×0.112」的方向导数界写入文档并测试断言）。查询：
+  `height_at` 双线性（域外 / NaN `None`，格点处逐位等于数组元素）、
+  `normal_at` 中心差分（边界单边，平面场解析对照）；`Terrain` 组件
+  （根实体）持高度场 + `origin` + chunk / 拼块清单，
+  `height_at_world` 纯函数供游戏贴地（投射物 / 放置物 / 音效）。
+- **分块 + 3 级距离 LOD**：`chunk_cells`（默认 32）切块，每块预烘焙
+  三级网格（LOD0 全分辨率 / LOD1 抽 ½ / LOD2 抽 ¼，n=32 实测
+  1089/353/177 顶点、2048/576/224 三角形，逐级递减断言 + n=8 手推
+  计数精确锁定）。chunk 实体挂 **`LodMesh3`**（`LodMesh` 三级一般化：
+  `levels[3] + switch_distances[2]`），渲染**收集期**按「chunk 原点到
+  相机 eye 欧氏距离」选级（与 R30 同落点 / 同边界归近侧 / 同无滞回；
+  `resolve_mesh_handle` 优先级 LodMesh3 > LodMesh > MeshHandle，蒙皮
+  路径不参与 = 地形 chunk 恒非蒙皮）。选中句柄决定合批键 / 剔除包围
+  体 / `FrameStats::triangles_drawn`——GPU 测试对混合级（LOD0+LOD1+
+  LOD2 各一）精确断言三角形总和。
+- **无 skirt 的接缝不变量（对规范的强化）**：每级 LOD 的 chunk 边界线
+  恒全分辨率采样、内部抽行抽列 ⇒ 任意两级相邻块的共享边折线顶点集
+  一致；顶点 y 直接烘焙世界高度（实体 y = 0 ⇒ 无平移舍入）、法线 /
+  UV 由全局格点索引推导 ⇒ **逐位一致**（cell 为 2 的幂时 x/z 同样
+  逐位，否则 ≤ 1 ULP 亚毫米且不涉裂缝垂直轴——单测对全部 9 种
+  LOD 组合断言）。行带间「拉链」条带三角化统一处理全采样边界行与
+  抽行内部行（朝向按几何法线 y 现场裁决，退化序保留 = 确定性规则）。
+  该不变量吸收规范的「相邻 LOD 差 ≤ 1」条件（更强，见偏离 ①）。
+- **碰撞 = 自动粗 AABB 拼块（零 API 扩展）**：每 `collider_stride²`
+  cell 一个 `Collider::static_box`（顶面 = 块内最高角点、底 = 全场
+  最低 − `COLLIDER_DEPTH_MARGIN` 0.25 ⇒ 平地不退化零厚度、立面有
+  高度）；只有 Collider 无 RigidBody = 静态体，无网格 / 材质句柄 ⇒
+  天然不进渲染收集（**偏离规范字面**：未挂 `Visibility`，见偏离 ②）。
+  集成证据：角色 `move_and_slide` 迈 0.28 台阶 / 撞 0.9 陡差（既有
+  五步管线零改动）；`terrain_statics` 喂 `NavGrid::build` 翻丘——
+  航点贴盒顶 ±1e-3、相邻高差 ≤ step；**衔接域实测教训入文档**：
+  nav 边界须外扩地形域（R49 雕刻 BFS 种子 = 未被盒覆盖的隐式地面格，
+  全覆盖无种子 ⇒ 整图不可走）。规模口径：拼块数 = cell 数 / stride²，
+  64×64 stride 1 = 4096 盒为线性扫掠典型上限。
+- **材质**：`grass_textures` 程序化草地三件套（周期值噪声 → 基色
+  sRGB / 细节法线 / ORM，同输入逐位、金属度恒 0、法线 z ≥ 0.5，
+  口径照 `brick_normal_orm`）；UV = 世界 XZ ÷ `uv_tile`（Repeat 寻址
+  跨 chunk 平铺无缝，接缝 uv 逐位一致随不变量测试锁定）。
+- **兼容**：纯增量——新组件不注册时收集查询走 `Option` 缺席语义
+  （未注册 = 空，零开销），既有渲染 / 物理 / nav 测试**零改动全过**
+  （`world_without_terrain_renders_unchanged` 守护旧语义基线）。
+- **测试与验收**：新增 16 项（terrain.rs 13 + terrain_render.rs 3）：
+  生成器逐位确定性 / 值域 / 高差上界、双线性与差分解析对照、n=8
+  精确拓扑、9 组合接缝逐位、build 铺世界逐盒、角色台阶双向、NavGrid
+  翻丘、GPU 混合级 triangles 精确 + 贴坡 ±2 cm + 旧语义回归。总数
+  debug **832 → 848**、release **829 → 845**。视觉验收
+  `examples/terrain_snapshot.rs` → `docs/terrain.png`（左 = 第三人称
+  贴坡近景（LOD0/1 混合）、右 = 高空拉远全 LOD2；triangles_drawn
+  6112 → 1760 = LOD 生效的统计证据；headless 断言脚底贴合
+  `height_at_world` ≤ 0.1 m 且终态 grounded）。
+- **诚实限制（v1，§8.28）**：碰撞是台阶不是光滑坡面；无 skirt（防水密
+  靠接缝不变量，掠射角 T 型接点有轻微法线插值差）；无滞回 / 无地形
+  流式装卸 / 无坡度材质混合；LOD 级数固定 3；拼块线性扫掠无空间索引。
+
 ### Changed（R50：角速度物理 + 旋转感知胶囊 + SwingJoint + 真人形 ragdoll v2）
 
 写实死亡表现的最后一块物理拼图（第 50 轮迭代；语义规范全文 =
