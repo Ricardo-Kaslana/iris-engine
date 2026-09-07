@@ -244,15 +244,16 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 
 ### 3.8 物理子系统（iris-core/physics + iris-core/character）
 
-轻量刚体物理 v1（Sphere / AABB / 竖直 Capsule）：与变换层级同款的
-「组件 + 单一系统」模型，零新依赖（全部数学基于 glam 手写）。
+轻量刚体物理 v1（Sphere / AABB / **旋转感知** Capsule + **角速度**，R50）：
+与变换层级同款的「组件 + 单一系统」模型，零新依赖（全部数学基于 glam
+手写）。
 
-- **组件模型**：`Collider`（形状 Sphere / AABB / **竖直 Capsule** +
-  `is_static` + `restitution`）与 `RigidBody`（速度 / `gravity_scale` /
-  摩擦 / 线性阻尼 / `body_type`）。**组件缺席语义**：只有 `Collider`
-  （无 `RigidBody`）= 静态体（与 `is_static` 取或）——不积分不移动，只作
-  碰撞对象；只有 `RigidBody`（无 `Collider`）= 仅受力积分，不参与碰撞；
-  两者都有且非静态 = 完整刚体。**运动学刚体（`BodyType::Kinematic`，
+- **组件模型**：`Collider`（形状 Sphere / AABB / **旋转感知 Capsule** +
+  `is_static` + `restitution`）与 `RigidBody`（速度 / **角速度** / 重力
+  缩放 / 摩擦 / 线性 + **角**阻尼 / `body_type`）。**组件缺席语义**：只有
+  `Collider`（无 `RigidBody`）= 静态体（与 `is_static` 取或）——不积分不
+  移动，只作碰撞对象；只有 `RigidBody`（无 `Collider`）= 仅受力积分，不
+  参与碰撞；两者都有且非静态 = 完整刚体。**运动学刚体（`BodyType::Kinematic`，
   打磨 V）**：游戏驱动位移（跳过重力 / 阻尼积分与速度写回，
   `Transform` 归游戏写）但参与碰撞——动体撞它按「静态方」路径被全额
   推离（inv_mass = 0），它自己不被物理挪动；与静态体（含 sensor）的
@@ -263,45 +264,73 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   的世界收集，统一走 `effective_static`）把它按静态障碍处理。
   **口径例外**：foot_ik 的落地查询只收**真静态体**——运动学角色胶囊常
   与自身腿链重叠，命中自身会毁掉落地语义（foot_ik.rs 文档明文）。
-  **竖直 Capsule**（R31）：轴段恒沿世界 ±Y（端点 = 中心 ±
-  (half_height − radius)·Y，`half_height ≥ radius` 构造断言）——角色
-  控制器的标准形状；因为放进 `ColliderShape` 成为一等形状，broadphase
-  （网格 AABB：中心 ± (radius, half_height, radius)）、detect_pair 配对、
-  射线（圆柱 slab + 端帽球解析）、扫掠**全部自动获得胶囊支持**。
+  **旋转感知 Capsule（R50）**：轴 = `Transform.rotation` 旋转后的本地
+  ±Y（端点 = 中心 ± (half_height − radius)·(rotation·Y)，`half_height ≥
+  radius` 构造断言）——检测（`detect_pair_rotated`）、射线
+  （`ray_capsule_rotated`：局部系变换 + 复用竖直解析解）、扫掠
+  （`shape_sweep_rotated`）、推离（`resolve_static_push_rotated`）、
+  broadphase AABB（`|rotation·Y|·轴半长 + radius` 的精确包络）**全链
+  跟随**；恒等旋转与 R31 逐位一致（`rotation·Y` 在 glam 展开下逐位等于
+  `Y`，单测 `identity_rotation_matches_upright_api_bitwise` 锁定六类 API）。
+  **Box 仍是世界轴对齐 AABB**：`rotation` 对 Box 无语义（OBB/SAT 留后续
+  轮）——旋转体的碰撞请用胶囊。
 - **求解管线**（`step_physics`，系统只做编排，数值逻辑全在纯函数中）：
   两阶段收集（读 `Time.delta`，缺席视为 0；照 `update_animations` 的
-  「收集 → 写回」两段式，迭代期间不持组件借用）→ 半隐式欧拉积分
-  （`v += g·scale·dt`；`v ×= exp(-damping·dt)`；`pos += v·dt`）→
+  「收集 → 写回」两段式，迭代期间不持组件借用；收集**位置 + 旋转**两份
+  快照）→ 半隐式欧拉积分（`v += g·scale·dt`；`v ×= exp(-damping·dt)`；
+  `pos += v·dt`；**角通道（R50）**：`ω ×= exp(-angular_damping·dt)`、
+  `q ← normalize(q + ½·(ω,0)·q·dt)`——四元数微分式，归一化每步防漂移
+  （打磨 VI 的 IK 范数教训），**与平移不耦合**且 `ω == 0` 时整段跳过 ⇒
+  既有场景的 `rotation` 逐位不被触碰）→
   **均匀网格 broadphase 候选筛选**（`BroadphaseGrid`，iris-core/broadphase：
-  按「积分后、求解前」的 AABB 快照一次建网格，cell 尺寸取全部**非静态**体
-  的最大轴向跨度钳制 [1.0, 50.0]——静态大地面不参与定尺寸，防 cell 撑到
-  场景尺度使网格退化；无动体回退全体最大。**配对遍历序等价性**：候选
-  升序 + `j > i` 过滤 ⇒ 与朴素 O(n²) 双层循环完全一致，既有 bit 级确定性
-  测试无需改动即守护等价性。**必须 BTreeMap 而非 HashMap**——键字典序
-  迭代与哈希种子 / 插入序 / 平台无关，是 bit 级确定性的选型前提）→
-  逐对 `detect_pair` 精检（跳过静-静对）→ 响应（穿透沿法线分离，静态体不动、
-  动体按动体数均分——等质量近似；法向速度按 restitution 反弹
-  `v_n' = -e·v_n`，仅当朝向穿透，e 取双方 max；切向乘 `max(0, 1-friction)`，
-  friction 取参与响应的动体均值——近似库仑）→ 2 次迭代位置松弛
-  （`SOLVER_ITERATIONS`，速度响应只在首轮施加——重复施加会把摩擦/反弹
-  多次结算）→ 写回 `Transform` / `RigidBody`。
-- **约束与关节 v1（R36，位置约束集）**：`DistanceJoint`（距离约束——
-  `stiffness = 1` 硬约束刚杆 / `(0,1)` 弹簧 + 轴向相对速度 `damping`）
-  与 `TargetJoint`（目标点约束——把实体拉向世界固定点，`rest_distance`
-  到达半径）两个组件，机关门 / 吊灯 / 弹簧板的地基。求解嵌入 `step_physics`
-  松弛大循环**每轮接触之后**（顺序理由：约束优先级高于接触——先把实体
-  投影回关节语义位置保结构完整，再让接触分离穿透；反过来接触推离会
-  持续对抗约束、结构撕裂），速度响应只在首轮（与接触同轮同理由）；
-  位置修正照常走既有写回阶段（零额外写回代码）。收集序 = 组件存储序、
-  求解顺序固定（距离先、目标点后）⇒ bit 级确定性不破坏（关节场景
-  单测守护）。诚实边界：位置松弛投影**无能量守恒**（弹簧是视觉弹跳
-  语义，非力积分，无势能 / 共振）、双向刚杆（非「只拉不推」的绳）、
-  挂载体须为碰撞体动体、target 无效（despawn）或两端重合 → 约束跳过
-  不 panic（与实体世代语义一致）；**旋转约束（铰链）需角速度支持，
-  见路线图**——R37 的 ragdoll 以「球肢近似 + 距离关节」绕开旋转语义
-  落地（见下），旋转肢体重建仍待角速度扩展。纯函数 `solve_distance_joint` /
-  `solve_target_joint` 与 `solve_contact` 同款返回 `ContactResponse`
-  四通道，可脱离世界单测。
+  按「积分后、求解前」的 AABB 快照一次建网格（旋转胶囊用精确包络），cell
+  尺寸取全部**非静态**体的最大轴向跨度钳制 [1.0, 50.0]——静态大地面不参与
+  定尺寸，防 cell 撑到场景尺度使网格退化；无动体回退全体最大。**配对遍历序
+  等价性**：候选升序 + `j > i` 过滤 ⇒ 与朴素 O(n²) 双层循环完全一致，既有
+  bit 级确定性测试无需改动即守护等价性。**必须 BTreeMap 而非 HashMap**
+  ——键字典序迭代与哈希种子 / 插入序 / 平台无关，是 bit 级确定性的选型
+  前提）→ 逐对 `detect_pair_rotated` 精检（跳过静-静对）→ 响应（穿透沿
+  法线分离，静态体不动、动体按动体数均分——等质量近似；法向速度按
+  restitution 反弹 `v_n' = -e·v_n`，仅当朝向穿透，e 取双方 max；切向乘
+  `max(0, 1-friction)`，friction 取参与响应的动体均值——近似库仑；**接触
+  不产生角冲量**，见诚实清单）→ 2 次迭代位置松弛（`SOLVER_ITERATIONS`，
+  速度响应只在首轮施加——重复施加会把摩擦/反弹多次结算；每轮接触后追加
+  约束轮：**距离 → 摆动 → 目标点**）→ 写回 `Transform.position` /
+  **`Transform.rotation`** / `RigidBody.velocity` /
+  **`RigidBody.angular_velocity`**（静态体与运动学体不写）。
+- **约束与关节（R36 距离 / 目标点 + **R50 摆动**，位置约束集）**：
+  `DistanceJoint`（距离约束——`stiffness = 1` 硬约束刚杆 / `(0,1)` 弹簧 +
+  轴向相对速度 `damping`）、`TargetJoint`（目标点约束——把实体拉向世界
+  固定点，`rest_distance` 到达半径）与 **`SwingJoint`（摆动关节，R50）**
+  ——机关门 / 吊灯 / 弹簧板与**真人形 ragdoll** 的地基。R50 之前 v1 是纯
+  位置物理，旋转铰链无法诚实实现；角速度 + 旋转感知胶囊落地后旋转约束
+  随之解锁（仍**没有** hinge / twist 两自由度铰链，「只能单向弯」留后续轮，
+  v1 用锥近似）。`SwingJoint` 三段求解：① 本地锚点（随各自实体旋转）的
+  距离投影（双向刚杆，同 `DistanceJoint` 算式）；② **摆动锥限位**——
+  `∠(a锚→b锚, 锥轴) > swing_limit` 时把 b 锚拉回锥面（目标点 = a 锚 + 锥面
+  最近方向 × 当前长度；**锥轴 = `rot_b · rest_offset.normalize()`**，随父端
+  旋转 ⇒ 解剖学口径：躯干翻倒时限位跟着翻，肢体不被钉回出生朝向）；
+  ③ **肢体轴方向修正**——子端本地 +Y 以最小弧（`from_rotation_arc`，无
+  三角超越）对齐到限位内的 a锚→b锚 方向（胶囊肢的朝向由此跟随链的姿态；
+  没有这段，倒地的肢体只会保持出生朝向——接触不产生角冲量）。三段的位置
+  修正**全给子端**（层级投影：父端不被子端拽动，躯干靠自身接触承托）——
+  实测均分会让链上约束互相扰动、稳态残差达 rest 的 35% / 限位外 22°，
+  层级投影在**根先叶后**的求解序下每轮末尾全部约束精确满足（残差 1e-7 =
+  f32 舍入量级）；速度响应 = 两条轴（锚点连线 + 锥面修正方向）的相对速度
+  阻尼（锥面是切向位置修正，速度不跟着衰减会变成能量泵：实测肢体 4 s 后
+  仍以 5 m/s 沿锥面滑行）。求解嵌入 `step_physics` 松弛大循环**每轮接触
+  之后**（顺序理由：约束优先级高于接触——先把实体投影回关节语义位置保
+  结构完整，再让接触分离穿透；反过来接触推离会持续对抗约束、结构撕裂），
+  轮内顺序固定**距离 → 摆动 → 目标点**，速度响应只在首轮（与接触同轮同
+  理由）；位置 / 旋转修正照常走既有写回阶段（零额外写回代码）。收集序 =
+  组件存储序 ⇒ bit 级确定性不破坏（关节场景单测守护）。诚实边界：位置
+  松弛投影**无能量守恒**（弹簧是视觉弹跳语义，非力积分，无势能 / 共振）、
+  距离关节双向刚杆（非「只拉不推」的绳）、锥限位不区分弯曲平面、链须根
+  先叶后（乱序退回 Gauss-Seidel 残差，不 panic）、挂载体须为碰撞体动体、
+  target 无效（despawn）/ 两端重合 / `rest_offset` 零长 → 约束跳过不 panic
+  （与实体世代语义一致）。纯函数 `solve_distance_joint` / `solve_swing_joint`
+  / `solve_target_joint` 与 `solve_contact` 同款返回四通道响应（摆动另加
+  旋转通道），可脱离世界单测。
 - **碰撞过滤掩码（R37）**：`Collider` 增 `groups`（所属位组）/ `mask`
   （碰撞白名单）两个 `u32` 位字段，**默认全 1**（全部构造辅助零变化，
   引入前行为逐位一致）。配对判定**对称**：`(a.groups & b.mask) != 0 &&
@@ -313,32 +342,53 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   保持（既有确定性测试零改动守护）。与 `is_static` / `is_sensor` / 关节
   正交：关节不看掩码（约束是显式拓扑，ragdoll 肢体链靠它连通），sensor
   照常报事件的前提是配对未被过滤。
-- **布娃娃与死亡混合（iris-core/ragdoll，R37）**：「死亡混合」v1 =
-  **运动学窗口两阶段**：① `spawn_ragdoll_kinematic`（`&mut World`——
-  实体分配是结构性修改，分配器非内部可变）按 `RagdollDesc`（肢体球
-  `RagdollLimbDef { offset, radius, restitution }` + `links` 相邻对）
-  生成**静态**肢体（动画接管期——静态体挡玩家 / 弹道，游戏侧照常驱动
-  `Transform` 定格死亡姿势；关节此期被跳过——挂载体须为动体）；肢体
-  全部挂 `RAGDOLL_GROUP`（bit 0）组位、`mask` 排除该位 → **自碰撞免抖**
-  （生成时相邻球刻意相切 / 微重叠，互相求解会被挤开炸裂；与场景照常碰
-  ——世界侧默认全 1 双向认可）。② `release_ragdoll`（只需 `&World`，
-  组件写锁翻转、实体失效静默跳过）把 `is_static` 翻转为 `false` +
-  写入继承速度 + 可选冲量 `(方向, 强度)` 踢飞（物理接管期——关节自动
-  生效，链拓扑保持）。**球肢近似（诚实声明）**：v1 纯位置物理无角速度，
-  旋转铰链无法诚实实现——肢体 = 半径各异的球 + 既有 `DistanceJoint`
-  硬约束（rest = 生成时实际距离，`stiffness = 1`）；球各向同性，翻滚 /
-  拖拽 / 堆叠语义正确且不需要旋转；**堆叠靠地面 / 场景**（无肢体间挤压
-  ——全部 ragdoll 共用组位，两具 ragdoll 也互不碰撞）；速度无钳制
-  （无 CCD，冲量过大可穿墙）。确定性：生成序 = 定义序、无随机源——
-  同 desc 两次全流程逐位一致；240 步倒地链不散架（链距 rest ± 容差、
-  质心收敛、速度有界，单测守护）；视觉验收 `examples/ragdoll_snapshot.rs`
-  → `docs/ragdoll.png`（左 = kinematic 站立定格、右 = 侧向冲量踢倒
-  180 步后塌地不散架）。
-- **纯函数与确定性**：检测（`detect_pair`：球-球 / 球-AABB 含盒内最近面
-  退出 / AABB-AABB 最小穿透轴 / **胶囊三对**——capsule-球用轴段最近点
+- **布娃娃与死亡混合（iris-core/ragdoll，R37 v1 / **R50 v2**）**：
+  「死亡混合」= **运动学窗口两阶段**：① `spawn_ragdoll_kinematic`
+  （`&mut World`——实体分配是结构性修改，分配器非内部可变）按
+  `RagdollDesc` 生成**静态**肢体（动画接管期——静态体挡玩家 / 弹道，
+  游戏侧照常驱动 `Transform` 定格死亡姿势；关节此期被跳过——挂载体须为
+  动体）；肢体全部挂 `RAGDOLL_GROUP`（bit 0）组位、`mask` 排除该位 →
+  **自碰撞免抖**（生成时相邻肢体刻意相切 / 微重叠，互相求解会被挤开炸裂；
+  与场景照常碰——世界侧默认全 1 双向认可）。② `release_ragdoll`（只需
+  `&World`，组件写锁翻转、实体失效静默跳过）把 `is_static` 翻转为 `false`
+  + 写入继承速度 + 可选冲量 `(方向, 强度)` 踢飞（物理接管期——关节自动
+  生效，链拓扑保持）。两条路线：
+  - **v1 球肢（R37，逐位不变）**：`RagdollDesc::humanoid`（六球）+
+    `links` 相邻对 → `DistanceJoint` 硬约束（rest = 生成时两端中心实际
+    距离）。球各向同性：翻滚 / 拖拽 / 堆叠语义正确且不需要旋转；iris-assault
+    / iris-infiltration 照旧消费；
+  - **v2 胶囊肢（R50）**：`RagdollDesc::humanoid_v2`（十肢：躯干胶囊 +
+    头球 + 上臂 / 前臂 / 大腿 / 小腿各二）。`RagdollLimbDef` 增
+    `half_length`（`≤ radius` ⇒ 球肢 = v1 分支；`> radius` ⇒ 胶囊肢）与
+    `axis`（近端方向 = 本地 +Y 的世界朝向，生成时写进 `rotation`——胶囊
+    轴不能从 offset 推：手臂挂在躯干侧面时「中心 → 父中心」是水平的，与
+    竖直的臂轴正交）；`links` 升级为 `RagdollLink { a, b, swing_limit }`
+    （`None` ⇒ v1 距离关节；`Some(limit)` ⇒ 自动接线 `SwingJoint`：关节点 =
+    子端近端帽中心、`anchor_a = 0`、`anchor_b` = 关节点在父端本地系、
+    `rest_offset` = 关节点 − 子端中心（父端本地系）⇒ 长度给距离 rest、方向
+    给锥轴；**links 须父先子后**）。释放时另注入角速度 `ω = topple_axis ×
+    强度 × RAGDOLL_SPIN_FACTOR`：转轴**优先绕链根肩线**（前扑 / 后仰）
+    而非 `Y × 冲量`（侧倒）——实测侧倒时靠地一侧肩窝落到地面以下、被钉在
+    肩窝上的手臂转不出来（接触不产生角冲量）、稳态埋进土里 0.15–0.37 m，
+    绕肩线翻倒同一场景埋深 0.028 m；`RAGDOLL_SPIN_FACTOR = 0.8` 按
+    「渐近总转角 = ω₀/λ ≈ 92°」取值让躯干恰好躺平。
+  共同诚实限制：**堆叠靠地面 / 场景**（无肢体间挤压）、速度无钳制（无
+  CCD）、**接触不产生角冲量**（落地不自转，翻滚全靠注入的 ω + 关节方向
+  修正）、侧躺仍可能埋臂（上限 ≈ 肩偏 − 躯干半径 + 臂半径；根治需多胶囊
+  躯干 / OBB 或角冲量）。确定性：生成序 = 定义序、无随机源——同 desc 两次
+  全流程（位置 + 旋转）逐位一致；240 步倒地链不散架、摆角不超限位（v2
+  实测残差 1e-7）、质心收敛、速度有界（单测守护）。视觉验收：v1
+  `examples/ragdoll_snapshot.rs` → `docs/ragdoll.png`；v2
+  `examples/ragdoll_v2_snapshot.rs` → `docs/ragdoll_v2.png`（左 = 台阶跌落
+  腾空帧、右 = 摊倒帧，headless 断言关节 / 穿地 / 悬空）。
+- **纯函数与确定性**：检测（`detect_pair_rotated`：球-球 / 球-AABB 含盒内
+  最近面退出 / AABB-AABB 最小穿透轴 / **胶囊三对**——capsule-球用轴段最近点
   （解析投影 clamp）退化到球-球、capsule-AABB 用轴段-盒**交替投影 4 轮
   收敛**（迭代近似，竖直段 × 轴对齐盒 2 轮内收敛，盒内照球-盒最浅轴
-  退出）、capsule-capsule 用段-段钳制交替解法 4 轮（竖直轴恒平行））
+  退出）、capsule-capsule 用段-段钳制交替解法 4 轮）**旋转感知零数学
+  改动**：三个 capsule 分支的算法入参从来只是「段的两个端点」，把竖直
+  端点换成 `rotation·Y` 旋转后的端点即得旋转感知（斜段 × 盒 / 斜段 ×
+  斜段不可分解，4 轮是确定性裕度，残差单测锁定 < 1e-3）
   与求解（`solve_contact`：分离 + 反弹 + 摩擦）均为不触碰世界的纯函数，
   「穿透量 / 法线 / 反弹量」可脱离 ECS 单测。系统内部严格单线程、固定
   遍历序（收集序 = 组件存储序），同一输入两次模拟逐采样 bit 级一致
@@ -367,7 +417,11 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   `ray_vs_shape`（分发 + `t ≤ max_t` 裁剪）→ `segment_hits_shape`（线段
   便捷封装：`dir = to − from`、`max_t = 距离`——高速离散体每帧位移可大于
   目标直径，当帧点判定会穿模漏检，线段扫掠判定是修法；iris-arena 的弹道
-  命中即此语义的 XZ 本地实现）。世界级 `raycast` / `raycast_filtered`：
+  命中即此语义的 XZ 本地实现）。**R50 旋转感知变体**
+  `ray_capsule_rotated`（局部系变换 + 复用竖直解析解）/
+  `ray_vs_shape_rotated` / `segment_hits_shape_rotated`：胶囊轴随实体旋转
+  （恒等旋转走快路径，逐位不变）；世界级 `raycast` / `raycast_filtered`
+  已带 `Transform.rotation`。世界级 `raycast` / `raycast_filtered`：
   遍历全部 `(Transform, Collider)`（静态动态都命中）取最小 `t`，`t` 相等
   取先遍历者（组件存储序——确定性）；`filter` 闭包只收 `Entity`（迭代期间
   持有读借用，不得访问世界）。纯查询：不写任何组件。
@@ -378,8 +432,13 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   （1e-6，静置贴合面的 f32 舍入名义穿透 ~1e-8）不算重叠——否则贴地角色
   会被误判「起点已重叠」原地卡死）与 `sphere_sweep_statics`（世界静态体
   收集封装，缺席语义同 `resolve_against_statics`）。任意形状泛化
-  `shape_sweep`（R31）同款算法供胶囊扫掠。检出范围的诚实边界（起点与
-  终点都自由的完全贯穿返回 `None`，调用方按需分步）写在函数文档。
+  `shape_sweep`（R31）同款算法供胶囊扫掠；**R50 旋转感知变体**
+  `shape_sweep_rotated` / `resolve_static_push_rotated` 的静态障碍快照
+  升级为 [`StaticObstacle`] 三元组（位置 + 旋转 + 形状）——世界封装
+  （`resolve_against_statics` / `sphere_sweep_statics` / `move_and_slide` /
+  foot_ik 落地射线）已全部走旋转感知路径（倒地的斜置胶囊尸体照实阻挡 /
+  承托）。检出范围的诚实边界（起点与终点都自由的完全贯穿返回 `None`，
+  调用方按需分步）写在函数文档。
 - **接触事件与触发器（R34）**：`step_physics` 帧末把本帧接触对与
   `ContactTracker` 资源的上一帧集合差分，产出 `CollisionStarted` /
   `CollisionEnded` 事件（压力板 / 警报区 / 着地回调免逐帧轮询）。语义
@@ -420,23 +479,39 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   由调用方写回组件。诚实边界：起点嵌入不去穿（出生点须合法）、一步一台
   阶、全贯穿不检出。
 - **v1 限制（诚实清单）**：
-  1. **AABB 不随实体旋转**：`ColliderShape::Box` 是世界轴对齐包围盒，
-     旋转实体的碰撞盒不跟着转（物理体应使用不旋转的实体，或把旋转只给
-     表现子实体）；**胶囊同理恒竖直**：`ColliderShape::Capsule` 轴段固定
-     沿世界 ±Y、不随实体倒下——斜置胶囊（横倒圆柱）请用球串或 AABB
-     近似；
-  2. **物理体须为根实体**：`step_physics` 把 `Transform.position` 当世界
-     坐标读写，与层级并用时须自行保证物理体无父级（或父级变换恒等）；
+  1. **AABB 不随实体旋转（OBB 留后续轮）**：`ColliderShape::Box` 是世界
+     轴对齐包围盒，`rotation` 对它无语义——旋转实体的碰撞盒不跟着转
+     （物理体应使用不旋转的实体，或把旋转只给表现子实体）；**旋转体的
+     碰撞请用胶囊**：`ColliderShape::Capsule` 自 R50 起轴随实体旋转
+     （检测 / 射线 / 扫掠 / 推离全链），恒等旋转与 R31 逐位一致；
+  2. **物理体须为根实体**：`step_physics` 把 `Transform.position` /
+     `rotation` 当世界坐标读写，与层级并用时须自行保证物理体无父级
+     （或父级变换恒等）；
   3. **非迭代完整求解器**：等质量冲量 + 2 次位置松弛，重堆叠会松弛不
      彻底（残余穿透 / 缓慢滑移），不是完整 LCP 求解器；
   4. **粗检测为 AABB 网格快照**：均匀网格按「积分后、求解前」的 AABB 一次
-     构建，求解期位置修正（穿透量级）不重建——常规场景修正量远小于 cell
-     尺寸、候选为保守超集（LCG 生成 ~200 AABB 的单测守护）；极端穿透
+     构建，求解期位置 / 旋转修正（穿透量级）不重建——常规场景修正量远小于
+     cell 尺寸、候选为保守超集（LCG 生成 ~200 AABB 的单测守护）；极端穿透
      （接近 cell 尺寸）理论上可能漏对；
   5. **胶囊最近点为迭代近似**：capsule-AABB / capsule-capsule 的最近点
-     用交替投影 4 轮收敛（竖直轴配对下 2 轮内即精确），非解析解但同输入
-     恒同结果；角色控制器的台阶前跳（不可站立阻挡时前向 ≥ radius）带来
-     单帧至多一个 radius 的水平速度红利。
+     用交替投影 4 轮收敛（竖直 / 平行轴配对下 2 轮内即精确；**斜段 × 盒 /
+     斜段 × 斜段不可分解**，4 轮是确定性裕度，残差 < 1e-3 由单测锁定），
+     非解析解但同输入恒同结果；角色控制器的台阶前跳（不可站立阻挡时前向
+     ≥ radius）带来单帧至多一个 radius 的水平速度红利；
+  6. **接触不产生角冲量（R50）**：碰撞只改位置与线速度——落地不会自动
+     「滚起来」、偏心撞击不会让物体打转；角动量只由 ω 初值 + 角阻尼 +
+     约束（`SwingJoint` 方向修正）演化。ragdoll 的翻滚因此是「注入的 ω +
+     关节方向修正 + 接触推离」的组合，不是真实转动动力学（需要惯性张量
+     与接触点臂，留后续轮）；
+  7. **无 hinge / twist 两自由度铰链（R50）**：`SwingJoint` 的限位是**锥**
+     ——不区分弯曲平面（肘 / 膝的「只能单向弯」做不到，超限方向一律拉回
+     锥面）；摆动关节是层级投影（子端被投影到父端），链必须根先叶后
+     （乱序退回 Gauss-Seidel 残差，不 panic）；
+  8. **ragdoll 侧躺仍可能埋臂（R50）**：单胶囊躯干的肩窝在轴外 0.25 m
+     （> 躯干半径 0.18），躯干**侧躺**时靠地一侧肩窝低于地面 ⇒ 被钉在肩窝
+     上的手臂转不出来（见第 6 条）、埋进土里 ≤ 肩偏 − 躯干半径 + 臂半径。
+     释放时的翻倒转轴已绕链根肩线（前扑 / 后仰）规避主路径；根治需多胶囊
+     / OBB 躯干或角冲量。
 
 ### 3.9 导航网格与寻路（iris-core/nav，R35 → R49 高度场语义）
 
@@ -2857,6 +2932,17 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
       （cargo 警告 "may become a hard error"）→ 绕行：改名
       `gen_assault_assets` → **闭合（打磨 VI，工程约定）**：命名约定
       写入 §7.2（example 名跨 crate 唯一，游戏 crate 带游戏前缀）。
+
+27. **角速度物理 / 旋转感知胶囊 / SwingJoint 的诚实限制（R50）**——完整
+    清单在 §3.8「v1 限制（诚实清单）」第 6–8 条，此处索引：①**接触不产生
+    角冲量**（碰撞只改位置与线速度；落地不自转、偏心撞击不打转；角动量只
+    由 ω 初值 + 角阻尼 + 约束方向修正演化——ragdoll 的翻滚是注入 ω 的表现
+    而非转动动力学）；②**无 hinge / twist 两自由度铰链**（`SwingJoint` 的
+    锥限位不区分弯曲平面；摆动关节是层级投影，链须根先叶后）；③**ragdoll
+    侧躺仍可能埋臂**（单胶囊躯干的肩窝在轴外 > 躯干半径；释放转轴已绕肩线
+    规避主路径，实测埋深 0.028 m；根治需多胶囊 / OBB 躯干或角冲量）。
+    另：**Box 仍世界轴对齐 AABB**（`rotation` 无语义，OBB/SAT 留后续轮；
+    旋转体的碰撞用胶囊）。
 
 ## 9. 关键设计取舍记录
 

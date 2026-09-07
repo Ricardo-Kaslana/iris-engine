@@ -5,6 +5,93 @@
 
 ## [Unreleased]
 
+### Changed（R50：角速度物理 + 旋转感知胶囊 + SwingJoint + 真人形 ragdoll v2）
+
+写实死亡表现的最后一块物理拼图（第 50 轮迭代；语义规范全文 =
+`iris-core::physics` / `iris-core::ragdoll` 模块文档重写版 + ARCHITECTURE
+§3.8 更新，设计与偏离理由见提交 body）。范围明确四块：①角速度积分
+②旋转感知胶囊 ③SwingJoint 摆动限位 ④ragdoll v2 胶囊肢人形；**Box 保持
+世界轴对齐 AABB**（OBB/SAT 留后续轮，诚实清单写明「旋转体用胶囊」）。
+
+- **① 角速度积分**：`RigidBody` 增 `angular_velocity`（rad/s 轴角式）与
+  `angular_damping`（默认 0 ⇒ 既有字面量机械补齐、行为零变化）。纯函数
+  `integrate_rotation`：`ω ×= exp(−λ·dt)` 后四元数微分式
+  `q ← normalize(q + ½·(ω,0)q·dt)`——推导与「每步归一化防漂移」理由写入
+  函数文档（打磨 VI 的 IK 范数教训提前内化）。**与平移不耦合**（位置积分
+  不含 ω 项）且 **`ω == 0` 时整段跳过** ⇒ 既有场景的 `Transform.rotation`
+  逐位不被触碰（单测 `zero_angular_velocity_leaves_rotation_bit_identical`
+  锁定）。测试：单步对照解析轴角（容差 1e-5，依据 O((ω·dt)³) 残差）、长时
+  积分范数稳定 + 累计转角对照离散解析解 `N·2·atan(ω·dt/2)`、角阻尼经管线
+  对照 `ω₀·e^(−λt)`（1e-4）、角/平移不耦合逐位、确定性逐位。
+- **② 旋转感知胶囊**：`ColliderShape::Capsule` 的轴 = `rotation` 旋转后的
+  本地 ±Y。新增旋转感知入口 `detect_pair_rotated` / `ray_capsule_rotated`
+  （局部系变换 + 复用竖直解析解 + 恒等快路径）/ `ray_vs_shape_rotated` /
+  `segment_hits_shape_rotated` / `shape_sweep_rotated` /
+  `resolve_static_push_rotated`（静态障碍快照升级 `StaticObstacle` 三元组）；
+  既有 4/5 参入口保留为恒等特化。**线段最近点算法零数学改动**：三个
+  capsule 分支的入参从来只是「段的两个端点」，把竖直端点换成旋转后的端点
+  即得旋转感知（交替投影对斜段的收敛性论证写入 `CAPSULE_PROJECTION_ROUNDS`）；
+  broadphase AABB 改「|rotation·Y|·轴半长 + radius」精确包络。**兼容锁**：
+  单测 `identity_rotation_matches_upright_api_bitwise` 对六类 API（检测 9 种
+  配对 × 16 组位置、射线三入口、推离、扫掠、角色控制器）逐位断言恒等旋转
+  = 既有 API ⇒ R31 胶囊测试零改动全过。世界封装（`resolve_against_statics` /
+  `sphere_sweep_statics` / `move_and_slide` / `raycast` / foot_ik 落地射线）
+  全部改走旋转感知路径（倒地的斜置胶囊尸体照实阻挡 / 承托）。
+- **③ SwingJoint 摆动限位**：`{ target, anchor_a, anchor_b, rest_offset,
+  swing_limit_radians, stiffness, damping }`——本地锚随各自实体旋转；
+  `rest_offset`（**父端本地系**的「b 锚 − a 锚」静止偏移）长度给距离 rest、
+  方向给**锥轴**（`rot_b·rest_offset.normalize()`，随父端旋转 ⇒ 解剖学口径：
+  躯干翻倒时限位跟着翻）。三段求解：锚点距离投影（`DistanceJoint` 同构算式）
+  → 锥面拉回（`d̂·â < cos L` 判超限，目标点 = a 锚 + (â·cos L + p̂·sin L)·|d|，
+  免 `acos`）→ 子端肢体轴最小弧方向修正（`from_rotation_arc`，无三角超越；
+  没有这段倒地的肢体只会保持出生朝向）。**修正全给子端（层级投影）**：
+  实测均分让链上约束互相扰动、稳态残差达 rest 的 35% / 限位外 22°（肢体视觉
+  脱位），层级投影 + 根先叶后求解序下每轮末尾全部约束精确满足（实测 1e-7 =
+  f32 舍入量级）。**两轴速度阻尼**（锚点连线 + 锥面修正方向）：锥面是切向
+  位置修正，速度不跟着衰减会变成能量泵（实测被限位夹住的肢体 4 s 后仍以
+  5 m/s 沿锥面滑行）。求解在约束轮内「距离 → 摆动 → 目标点」，速度响应只
+  在首轮。测试：限位内逐位零修正（幂等）、锚距投影解析对照（静态端 / 双动 /
+  弹簧）、锥面拉回解析对照（修正后夹角恰为限位、长度保持、肢体轴对准锥面）、
+  锥轴随父端旋转（帧无关性 + 只翻父端即超限）、退化三支（锚点重合 / rest 零长
+  pin / 反平行任意垂直向）、两轴阻尼解析对照、单摆管线（rest 保持 + 摆角不超
+  限）、despawn 跳过与无关节对照逐位、两级链确定性（位置 + 旋转逐位）。
+- **④ ragdoll v2 胶囊肢人形**：`RagdollLimbDef` 增 `half_length`
+  （`≤ radius` ⇒ 球肢 = v1 分支，形状 / rest 算式 / 挂载方向与 R37 逐位一致）
+  与 `axis`（近端方向 = 本地 +Y 的世界朝向；**不能从 offset 推**：手臂挂在
+  躯干侧面时「中心 → 父中心」是水平的，与竖直臂轴正交）；`links` 升级
+  `RagdollLink { a, b, swing_limit }`（`None` ⇒ v1 距离关节；`Some` ⇒ 自动接线
+  SwingJoint：关节点 = 子端近端帽中心、`anchor_a = 0`、`anchor_b` = 关节点在
+  父端本地系、`rest_offset` = 关节点 − 子端中心 ⇒ 直立人形每段都是
+  `(0, 轴半长, 0)`；**links 须父先子后**）。新预设 `humanoid_v2`（十肢：躯干
+  胶囊 + 头球 + 上臂 / 前臂 / 大腿 / 小腿各二，肩 109° / 肘 120° / 胯 80° /
+  膝 126° 限位，脚底贴地、总高 1.64 m）。`release_ragdoll` 注入冲量相关角速度
+  `ω = topple_axis × 强度 × RAGDOLL_SPIN_FACTOR`：转轴**优先绕链根肩线**
+  （前扑 / 后仰）而非 `Y × 冲量`（侧倒）——实测侧倒时靠地一侧肩窝落到地面
+  以下、被钉在肩窝上的手臂转不出来（接触不产生角冲量）、稳态埋进土里
+  0.15–0.37 m，绕肩线翻倒同一场景埋深 0.028 m；`RAGDOLL_SPIN_FACTOR = 0.8`
+  按「渐近总转角 = ω₀/λ ≈ 92°」取值让躯干恰好躺平。v1 六球预设与
+  iris-assault / iris-infiltration 的消费**一字未改**（v2 不切换游戏：切换需
+  换胶囊视觉网格 + 改六肢断言，超出本轮范围，汇报说明）。测试：v2 拓扑与
+  自动接线逐位对照、骨架相连性（每对肢体真实重叠 + 脚底贴地 + 头顶高度）、
+  非竖直 axis 接线（T 姿势 ⇒ 锥轴 = 肢体自身方向）、释放注入同式逐位 +
+  `topple_axis` 纯函数四条规则、240 步翻滚塌倒（锚距 ≤ 1e-4、摆角超限
+  ≤ 1e-4、不穿地 5e-2、质心塌落、速度收敛、9/9 肢体水平、躯干躺平）、
+  v2 全流程确定性（位置 + 旋转逐位）。
+- **验收图**：`examples/ragdoll_v2_snapshot.rs` → `docs/ragdoll_v2.png`
+  （台阶跌落：左 = 腾空帧（前扑离台、四肢沿肢体方向）、右 = 摊倒帧（躯干
+  躺平、四肢摊开、无竖直悬空 / 反折 / 穿地），headless 断言与渲染同一世界
+  状态；胶囊视觉 = 圆柱 + 两端帽子实体，刻意不加渲染端新原语）。
+- **测试总数**：debug **801 → 832**、release **798 → 829**（新增 physics 22
+  项 + ragdoll 9 项 = 31；既有测试零改动全过——含 R31 胶囊全套与六游戏
+  headless，v1 兼容的硬验收）。
+- **偏离与理由**：① `detect_pair` 保留 4 参签名、旋转感知走新增
+  `detect_pair_rotated`——规格自身把「既有物理测试零改动」列为硬验收，改
+  签名会强制改 30+ 处调用；② `SwingJoint` 增 `damping` 字段且修正全给子端
+  （规格字段表无 damping、未指定 share 规则）——两者都是实测出来的稳定性
+  必需品（能量泵 / 35% 残差），论证见上；③ `RagdollLimbDef` 增 `axis`
+  （规格字段表无）——肢体朝向无法从 offset 推导；④ 翻倒转轴绕肩线而非
+  `Y × 冲量`（规格只说「impulse 方向相关 ω」）——侧倒埋臂实测 0.37 m。
+
 ### Changed（R49：NavGrid 高度场语义——台阶 / 坡面 / 丘的 3D 导航 v1）
 
 R35 的 2.5D 导航图升级为**带高度语义的地形导航**（第 49 轮迭代；语义

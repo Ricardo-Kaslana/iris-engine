@@ -810,6 +810,8 @@ fn build_machinery(world: &mut World) -> (Entity, Entity, Entity) {
             gravity_scale: 0.0,
             friction: 0.6,
             linear_damping: 3.0,
+            angular_velocity: Vec3::ZERO,
+            angular_damping: 0.0,
             body_type: BodyType::Dynamic,
         },
         DistanceJoint {

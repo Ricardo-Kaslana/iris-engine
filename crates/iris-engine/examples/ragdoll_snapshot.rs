@@ -29,7 +29,7 @@ use image::GenericImage;
 
 use iris_core::physics::{ColliderShape, detect_pair};
 use iris_core::prelude::{Entity, Stage, Time, Transform, Vec3};
-use iris_core::ragdoll::{RagdollDesc, release_ragdoll, spawn_ragdoll_kinematic};
+use iris_core::ragdoll::{RagdollDesc, RagdollLink, release_ragdoll, spawn_ragdoll_kinematic};
 use iris_engine::prelude::{
     App, Camera, Collider, DirectionalLight, HierarchyPlugin, MaterialDef, MaterialStore, MeshData,
     MeshStore, OffscreenRenderer, PhysicsPlugin, Plugin, PointLight, RigidBody, TextureStore,
@@ -238,7 +238,7 @@ fn main() {
     let (positions, velocities): (Vec<Vec3>, Vec<Vec3>) = states.into_iter().unzip();
 
     // 链未散架：相邻肢体距离保持 rest ± 容差（DistanceJoint 硬约束生效）
-    for &(a, b) in &harness.desc.links {
+    for &RagdollLink { a, b, .. } in &harness.desc.links {
         let rest = (harness.origin + harness.desc.limbs[b].offset)
             .distance(harness.origin + harness.desc.limbs[a].offset);
         let dist = positions[a].distance(positions[b]);

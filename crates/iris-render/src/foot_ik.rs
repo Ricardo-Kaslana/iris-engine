@@ -16,11 +16,15 @@
 //! 从脚踝当前世界位置上抬 [`FootIk::ray_up_offset`] 处竖直向下射线
 //! （[`raycast_statics`]），收集语义与 `iris_core::physics` 的
 //! `resolve_against_statics` 一致：`Collider::is_static` 或仅 Collider 无
-//! `RigidBody`（组件缺席 = 静态）。**动态体不参与 IK 落地**——脚踝踩的
-//! 「地面」必须是稳定的支撑面，跟随动态体会把运动物体的表面抖动喂进
-//! 关节链；命中范围 = `ray_up_offset + max_ground_drop`（脚下探超出容差
-//! 视为腾空，不修正）。命中点即脚踝目标：竖直射线 ⇒ 命中点 = 脚踝正下方
-//! 的地面点，脚踝低于地面（插地）时目标在上方 → 上拉，悬空时 → 下探。
+//! `RigidBody`（组件缺席 = 静态）。**R50 旋转感知**：快照带
+//! `Transform.rotation`（[`StaticObstacle`]），射线走
+//! `ray_vs_shape_rotated`——动画接管期的斜置胶囊尸体照实作为支撑面 /
+//! 阻挡（旧口径当成直立胶囊，脚会踩在幻影上）。**动态体不参与 IK 落地**
+//! ——脚踝踩的「地面」必须是稳定的支撑面，跟随动态体会把运动物体的表面
+//! 抖动喂进关节链；命中范围 = `ray_up_offset + max_ground_drop`（脚下探
+//! 超出容差视为腾空，不修正）。命中点即脚踝目标：竖直射线 ⇒ 命中点 =
+//! 脚踝正下方的地面点，脚踝低于地面（插地）时目标在上方 → 上拉，悬空时
+//! → 下探。
 //!
 //! # 不可达回退（为何要放弃而非钳制）
 //!
@@ -107,7 +111,7 @@
 //! ```
 
 use glam::{Mat4, Quat, Vec3};
-use iris_core::physics::{Collider, ColliderShape, RayHit, RigidBody, ray_vs_shape};
+use iris_core::physics::{Collider, RayHit, RigidBody, StaticObstacle, ray_vs_shape_rotated};
 use iris_core::prelude::{Entity, Transform};
 use iris_core::world::World;
 
@@ -281,14 +285,14 @@ impl FootIk {
 /// `resolve_against_statics` 的推离/角色口径不同）。`dir` 须为单位方向。
 /// 纯查询。
 fn raycast_statics(
-    statics: &[(Vec3, ColliderShape)],
+    statics: &[StaticObstacle],
     origin: Vec3,
     dir: Vec3,
     max_t: f32,
 ) -> Option<RayHit> {
     let mut best: Option<RayHit> = None;
-    for (pos, shape) in statics {
-        if let Some(hit) = ray_vs_shape(origin, dir, max_t, *pos, shape) {
+    for &(pos, rotation, shape) in statics {
+        if let Some(hit) = ray_vs_shape_rotated(origin, dir, max_t, pos, rotation, &shape) {
             // 严格小于才替换：t 并列保留先遍历者（存储序，确定性）
             if best.is_none_or(|current| hit.t < current.t) {
                 best = Some(hit);
@@ -337,13 +341,13 @@ pub fn update_foot_ik(world: &World) {
     // 静态体一次收集（**真静态体**：运动学体不参与 IK 落地——常与自身
     // 链的角色碰撞体重叠，见 raycast_statics 文档；sensor 是事件域、
     // 碰撞组/掩码清零是标记失效，两者同样不是地面）
-    let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
+    let mut statics: Vec<StaticObstacle> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
         if collider.is_static || rigid.is_none() {
             if collider.is_sensor || collider.groups == 0 || collider.mask == 0 {
                 return;
             }
-            statics.push((transform.position, collider.shape));
+            statics.push((transform.position, transform.rotation, collider.shape));
         }
     });
 

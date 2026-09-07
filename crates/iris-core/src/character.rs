@@ -10,6 +10,18 @@
 //! 的组件缺席语义），不积分、不写任何组件。调用方（游戏逻辑）保留输入
 //! 与状态所有权：每帧传入位置 / 速度，拿回结果自行写回。
 //!
+//! # 旋转（R50）
+//!
+//! - **角色胶囊自身恒竖直**：直立人体是控制器的语义前提（台阶 / 坡面 /
+//!   吸附全部按「脚底 = 中心 − half_height」推导），需要「会倒下的胶囊」
+//!   请用物理刚体（[`crate::physics`]）而不是角色控制器；
+//! - **静态障碍旋转感知**：世界封装收集 [`StaticObstacle`]（位置 + 旋转 +
+//!   形状）并走 [`move_and_slide_statics_rotated`]——动画接管期的 ragdoll
+//!   肢体是「静态 + 斜置胶囊」，照实按其倒下的朝向阻挡 / 承托（旧口径当成
+//!   直立胶囊，会出现「踩空气」与「被隐形柱挡住」两类错觉）；纯函数核心
+//!   因此有两个入口：二元组静态体列表（胶囊恒竖直，R31 口径逐位不变）与
+//!   三元组（旋转感知），共用同一份五步管线实现（无行为分岔）。
+//!
 //! # 管线（每次调用五步，顺序即文档）
 //!
 //! 1. **重力**：`vel.y += 重力 × gravity_scale × dt`（[`PHYSICS_GRAVITY`]）；
@@ -116,9 +128,12 @@
 //! if out.grounded { /* HUD 落地标记；out.ground_normal 可用于坡面音效 */ }
 //! ```
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 
-use crate::physics::{Collider, ColliderShape, PHYSICS_GRAVITY, RigidBody, shape_sweep};
+use crate::physics::{
+    Collider, ColliderShape, PHYSICS_GRAVITY, RigidBody, StaticObstacle, shape_sweep,
+    shape_sweep_rotated,
+};
 use crate::transform::Transform;
 use crate::world::World;
 
@@ -188,10 +203,14 @@ pub struct CharacterOutput {
     pub ground_normal: Vec3,
 }
 
-/// 运动学角色控制器（纯函数核心）：竖直胶囊从 `pos` 以 `velocity` 推进
-/// 一帧 `dt`，对一组静态体做「重力 → 水平滑行 → 台阶 → 斜坡限 → 贴地
-/// 吸附」五步管线（见模块文档）。不触碰世界、无随机源——同输入两次
-/// 调用逐位一致。
+/// 运动学角色控制器（纯函数核心，**胶囊恒竖直 + 静态障碍恒竖直**）：
+/// 竖直胶囊从 `pos` 以 `velocity` 推进一帧 `dt`，对一组静态体做「重力 →
+/// 水平滑行 → 台阶 → 斜坡限 → 贴地吸附」五步管线（见模块文档）。不触碰
+/// 世界、无随机源——同输入两次调用逐位一致。
+///
+/// 静态障碍带旋转（倒地尸体的斜置胶囊）时用
+/// [`move_and_slide_statics_rotated`]；世界封装 [`move_and_slide`] 已是
+/// 旋转感知（从 `Transform` 收集）。
 ///
 /// # Panics
 /// `half_height < radius`（非竖直胶囊语义）或 `dt < 0` 时断言失败
@@ -203,6 +222,56 @@ pub fn move_and_slide_statics(
     params: &CharacterParams,
     statics: &[(Vec3, ColliderShape)],
 ) -> CharacterOutput {
+    let shape = ColliderShape::Capsule {
+        radius: params.radius,
+        half_height: params.half_height,
+    };
+    move_and_slide_core(pos, velocity, dt, params, |from, delta| {
+        shape_sweep(from, delta, &shape, statics)
+    })
+}
+
+/// 运动学角色控制器（纯函数核心，**旋转感知**，R50）：与
+/// [`move_and_slide_statics`] 同一五步管线、同一断言，差别只在静态障碍
+/// 快照带旋转（[`StaticObstacle`]）——动画接管期的 ragdoll 肢体是「静态 +
+/// 斜置胶囊」，角色走到尸体上会被照实挡住 / 踩住（旧口径会把它当成直立
+/// 胶囊，出现「踩空气」与「被隐形柱挡住」两类错觉）。
+///
+/// **角色胶囊自身恒竖直**（直立人体是控制器的语义前提，见模块文档）：
+/// 扫掠以 `Quat::IDENTITY` 发起；需要「会倒下的胶囊」请用物理刚体
+/// （[`crate::physics`]）而非角色控制器。
+///
+/// # Panics
+/// 同 [`move_and_slide_statics`]。
+pub fn move_and_slide_statics_rotated(
+    pos: Vec3,
+    velocity: Vec3,
+    dt: f32,
+    params: &CharacterParams,
+    statics: &[StaticObstacle],
+) -> CharacterOutput {
+    let shape = ColliderShape::Capsule {
+        radius: params.radius,
+        half_height: params.half_height,
+    };
+    move_and_slide_core(pos, velocity, dt, params, |from, delta| {
+        shape_sweep_rotated(from, delta, Quat::IDENTITY, &shape, statics)
+    })
+}
+
+/// 五步管线核心（两个公开入口共用）：`sweep(from, delta)` 回答「该位移的
+/// 首次碰撞分数与阻挡法线」，管线本身与静态体列表形态无关（旋转感知与否
+/// 只由闭包决定 ⇒ 无重复实现、无行为分岔）。
+fn move_and_slide_core<S>(
+    pos: Vec3,
+    velocity: Vec3,
+    dt: f32,
+    params: &CharacterParams,
+    sweep: S,
+) -> CharacterOutput
+where
+    S: Fn(Vec3, Vec3) -> Option<(f32, Vec3)>,
+{
     assert!(
         params.half_height >= params.radius,
         "胶囊 half_height {} 须 ≥ radius {}（半高小于半径退化为非胶囊形状）",
@@ -210,10 +279,6 @@ pub fn move_and_slide_statics(
         params.radius
     );
     assert!(dt >= 0.0, "步长 dt {dt} 须 ≥ 0（负步长无物理语义）");
-    let shape = ColliderShape::Capsule {
-        radius: params.radius,
-        half_height: params.half_height,
-    };
     let walkable = params.slope_limit_radians.cos();
 
     let mut vel = velocity;
@@ -227,7 +292,7 @@ pub fn move_and_slide_statics(
         if remaining.length_squared() <= SLIDE_RESIDUAL_SQ {
             break;
         }
-        let Some((t, normal)) = shape_sweep(position, remaining, &shape, statics) else {
+        let Some((t, normal)) = sweep(position, remaining) else {
             position += remaining; // 无阻挡：走完
             break;
         };
@@ -235,8 +300,7 @@ pub fn move_and_slide_statics(
         remaining -= remaining * t;
         // 台阶：贴地且非上升时尝试抬起重试（缓坡上坡与低台阶同一机制）
         if vel.y <= 0.0 {
-            if let Some(stepped) = try_step_up(position, remaining, normal, &shape, params, statics)
-            {
+            if let Some(stepped) = try_step_up(position, remaining, normal, params, &sweep) {
                 position = stepped;
                 break;
             }
@@ -273,7 +337,7 @@ pub fn move_and_slide_statics(
     if vel.y > 0.0 {
         // 上升（跳跃）：不吸附、不判定着地；向上扫掠命中天花板则贴住
         let up = Vec3::new(0.0, vel.y * dt, 0.0);
-        if let Some((t, _)) = shape_sweep(position, up, &shape, statics) {
+        if let Some((t, _)) = sweep(position, up) {
             position += up * t;
             vel.y = 0.0;
         } else {
@@ -284,7 +348,7 @@ pub fn move_and_slide_statics(
         // 吸附语义：贴地行走 / 下小坡时重力位移极小也能探到近处地面贴下去
         let probe = vel.y * dt; // ≤ 0
         let down = Vec3::new(0.0, -probe.abs().max(params.snap_distance), 0.0);
-        match shape_sweep(position, down, &shape, statics) {
+        match sweep(position, down) {
             None => {
                 position.y += probe; // 腾空：只走本帧重力位移
                 ground_normal = Vec3::Y;
@@ -320,7 +384,11 @@ pub fn move_and_slide_statics(
 /// RigidBody 的组件缺席语义，或 `body_type == Kinematic` 的运动学体
 /// ——运动学体按静态障碍处理：游戏驱动位移的碰撞体挡住角色是合理
 /// 语义，与 [`crate::physics::resolve_against_statics`] 一致）后调用
-/// 纯函数核心 [`move_and_slide_statics`]。纯查询：不写任何组件。
+/// 纯函数核心 [`move_and_slide_statics_rotated`]。纯查询：不写任何组件。
+///
+/// **旋转感知（R50）**：收集带 `Transform.rotation`——动画接管期的
+/// ragdoll 肢体是「静态 + 斜置胶囊」，照实按其倒下的朝向阻挡 / 承托
+/// （旧口径当成直立胶囊，会出现「踩空气」与「被隐形柱挡住」）。
 pub fn move_and_slide(
     world: &World,
     pos: Vec3,
@@ -328,13 +396,13 @@ pub fn move_and_slide(
     dt: f32,
     params: &CharacterParams,
 ) -> CharacterOutput {
-    let mut statics: Vec<(Vec3, ColliderShape)> = Vec::new();
+    let mut statics: Vec<StaticObstacle> = Vec::new();
     world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
         if crate::physics::effective_static(collider, rigid) {
-            statics.push((transform.position, collider.shape));
+            statics.push((transform.position, transform.rotation, collider.shape));
         }
     });
-    move_and_slide_statics(pos, velocity, dt, params, &statics)
+    move_and_slide_statics_rotated(pos, velocity, dt, params, &statics)
 }
 
 /// 台阶尝试（水平被阻挡时调用）：抬起 `step_height` 重试水平位移，成功
@@ -348,24 +416,21 @@ pub fn move_and_slide(
 /// 贴边落在台缘角点上的法线倾斜、不可站立，会永远迈不上去；**可站立
 /// 坡面**按剩余位移原样重试——缓坡上坡靠逐帧小步，radius 前跳会让
 /// 坡面移动快过输入速度。
-fn try_step_up(
+fn try_step_up<S>(
     position: Vec3,
     remaining: Vec3,
     blocker_normal: Vec3,
-    shape: &ColliderShape,
     params: &CharacterParams,
-    statics: &[(Vec3, ColliderShape)],
-) -> Option<Vec3> {
+    sweep: &S,
+) -> Option<Vec3>
+where
+    S: Fn(Vec3, Vec3) -> Option<(f32, Vec3)>,
+{
     // 门 1：脚下 snap_distance 内必须有地面（贴地才迈，防空中跨步）
-    shape_sweep(
-        position,
-        Vec3::new(0.0, -params.snap_distance, 0.0),
-        shape,
-        statics,
-    )?;
+    sweep(position, Vec3::new(0.0, -params.snap_distance, 0.0))?;
     // 门 2：正上方 step_height 内畅通（有天花板压顶不迈，保守）
     let lift = Vec3::new(0.0, params.step_height, 0.0);
-    if shape_sweep(position, lift, shape, statics).is_some() {
+    if sweep(position, lift).is_some() {
         return None;
     }
     // 前向距离：不可站立阻挡至少 radius（方向与剩余位移一致）
@@ -382,14 +447,14 @@ fn try_step_up(
     };
     let lifted = position + lift;
     // 门 3：抬起后前向位移必须完整走完（否则视为不可整体迈上）
-    if shape_sweep(lifted, forward_vec, shape, statics).is_some() {
+    if sweep(lifted, forward_vec).is_some() {
         return None;
     }
     let moved = lifted + forward_vec;
     // 门 4：向下扫掠 step_height + snap_distance 必须落回地面
     //（落不回 = 台阶另一侧悬空 / 是坑，不迈）
     let down = Vec3::new(0.0, -(params.step_height + params.snap_distance), 0.0);
-    let (t, normal) = shape_sweep(moved, down, shape, statics)?;
+    let (t, normal) = sweep(moved, down)?;
     let landed = moved + down * t;
     // 校验：脚底高差 ≤ step_height（抬升量即 step_height 时恒成立，
     // 防御性保留）且落点法线可站立（陡坡坡面 / 台缘角点不算站稳）

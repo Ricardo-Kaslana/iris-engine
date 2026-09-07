@@ -43,6 +43,7 @@ pub mod prelude {
     // `use iris_core::prelude::*;` 后即可直接 `#[derive(Component)]`
     pub use crate::character::{
         CharacterOutput, CharacterParams, move_and_slide, move_and_slide_statics,
+        move_and_slide_statics_rotated,
     };
     pub use crate::commands::{Command, CommandQueue, apply_commands};
     pub use crate::component::Component;
@@ -55,11 +56,13 @@ pub mod prelude {
     pub use crate::nav::{NavGrid, NavGridParams};
     pub use crate::physics::{
         BodyType, Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker,
-        DistanceJoint, PHYSICS_GRAVITY, RigidBody, TargetJoint, effective_static, step_physics,
+        DistanceJoint, PHYSICS_GRAVITY, RigidBody, StaticObstacle, SwingJoint, TargetJoint,
+        effective_static, step_physics,
     };
     pub use crate::query::QueryPart;
     pub use crate::ragdoll::{
-        RAGDOLL_GROUP, RagdollDesc, RagdollLimbDef, release_ragdoll, spawn_ragdoll_kinematic,
+        RAGDOLL_GROUP, RagdollDesc, RagdollLimbDef, RagdollLink, release_ragdoll,
+        spawn_ragdoll_kinematic,
     };
     pub use crate::resource::Resource;
     pub use crate::schedule::{Access, Schedule, Stage, System};

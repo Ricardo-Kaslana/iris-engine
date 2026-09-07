@@ -875,7 +875,7 @@ fn spawn_section(
     }
 
     if let Some(body) = section.rigidbody {
-        // velocity v1 不序列化：物体从静止开始（模块文档 v1 清单）
+        // velocity / 角速度 v1 不序列化：物体从静止、不旋转开始（模块文档 v1 清单）
         world.insert(
             entity,
             RigidBody {
@@ -883,6 +883,8 @@ fn spawn_section(
                 gravity_scale: body.gravity_scale,
                 friction: body.friction,
                 linear_damping: body.linear_damping,
+                angular_velocity: Vec3::ZERO,
+                angular_damping: 0.0,
                 body_type: BodyType::Dynamic,
             },
         );
