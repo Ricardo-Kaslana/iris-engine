@@ -27,6 +27,7 @@ use crate::decal::{Decal, DecalInstanceRaw, PROXY_INDEX_COUNT, PROXY_INDICES, PR
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
 use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight, cascade_fit, cascade_splits};
+use crate::lightmap::{LightmapBinding, LightmapHandle, LightmapStore, NO_LIGHTMAP};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
 use crate::mesh::{LodMesh, MeshHandle, MeshStore, upload_mesh};
 use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
@@ -131,7 +132,8 @@ const POINT_SHADOW_BIAS: f32 = 0.03;
 struct MaterialRaw {
     base_color: [f32; 4],
     emissive: [f32; 4],
-    surface: [f32; 4], // metallic, roughness, reflectance(F0), 保留
+    // metallic, roughness, reflectance(F0), 光照贴图掩码（R52c，0/1）
+    surface: [f32; 4],
 }
 
 struct GpuMesh {
@@ -143,6 +145,19 @@ struct GpuMesh {
     /// 顶点切线缓冲（R42；网格无切线为 None——绑定常驻零垫缓冲，
     /// 零向量 = 「无顶点切线」标记，片元走屏幕空间 TBN 路径）。
     tangent_buf: Option<wgpu::Buffer>,
+    /// 光照贴图 UV2 缓冲（R52c；网格无 UV2 为 None——绑定常驻零垫，
+    /// 配合材质掩码 0，采样结果被 `select` 丢弃）。
+    uv2_buf: Option<wgpu::Buffer>,
+}
+
+/// 一张光照贴图图集的 GPU 资源（R52c）：Rgba16Float 线性 HDR 纹理 +
+/// 视图。采样器全图集共用一份常驻（双线性 + ClampToEdge，与尺寸无关，
+/// 照 `rt_blit_sampler` 的做法）。按句柄懒上传、跨帧持有（照 `GpuTexture`）。
+struct GpuLightmap {
+    /// 纹理本体保活（视图的有效性依赖它）。
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 /// 每具蒙皮的 GPU 资源：关节矩阵 storage 缓冲与对应绑定组。
@@ -160,6 +175,8 @@ struct SkinnedItem {
     skin_entity: u64,
     mesh: u32,
     material: u32,
+    /// 光照贴图图集句柄值（[`NO_LIGHTMAP`] = 缺席；R52c）。
+    lightmap: u32,
     instance: InstanceRaw,
     /// 关节矩阵（列主序平铺后直接上传）。
     joint_matrices: Vec<glam::Mat4>,
@@ -244,12 +261,22 @@ struct RtCameraPrep {
     height: u32,
 }
 
-/// 排序键 + 实例数据一体存储，可直接整体上传 GPU。
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+/// 一帧内收集到的不透明绘制项：批键 + 实例数据 + 图集槽位。
+///
+/// 只是 CPU 侧的收集 / 排序单元：上传走 `draw` 里另建的
+/// `Vec<InstanceRaw>`（紧凑 112 B/实例），本结构不整体 cast 到 GPU
+/// （`lightmap` 字段会引入尾部填充，bytemuck 的 Pod 契约不允许）。
+#[derive(Clone, Copy)]
 struct DrawItem {
     key: u64,
     instance: InstanceRaw,
+    /// 光照贴图图集句柄值（[`NO_LIGHTMAP`] = 缺席；R52c）。
+    ///
+    /// **不进排序键**：排序仍只按 `key`（网格, 材质）⇒ 无光照贴图场景的
+    /// 排序结果与批划分与 R52b **逐位一致**（兼容硬约束）；本字段只在
+    /// 段划分（`run_length`）与材质绑定键里参与，同批内图集交替时切成
+    /// 多段（段数 = draw call 数，v1 取舍见 `lightmap.rs` 诚实清单）。
+    lightmap: u32,
 }
 
 /// 渲染器：可同时服务窗口表面与离屏目标。
@@ -272,7 +299,10 @@ pub struct Renderer {
     last_instances: Vec<InstanceRaw>,
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
-    material_gpu: HashMap<u32, GpuMaterial>,
+    /// 材质绑定组缓存（R52c 起键为 [`material_key`] 的复合值 =
+    /// `(材质句柄 << 32) | 图集槽位`——同一材质配不同图集时掩码与图集
+    /// 纹理都不同，必须分组；无光照贴图槽位恒 0，与旧键一一对应）。
+    material_gpu: HashMap<u64, GpuMaterial>,
     /// 中性法线纹理（R42，常驻）：1×1 `Rgba16Float`，值 (0.5, 0.5, 1)。
     /// 材质缺法线槽位时绑定它——16-bit float 精确表示 0.5/1.0，采样
     /// *2−1 后恰为 (0,0,1)，扰动恒等（8-bit unorm 做不到，见
@@ -284,6 +314,21 @@ pub struct Renderer {
     /// × 16 B；顶点数超出垫容量的网格在 `ensure_mesh` 单独分配零缓冲）。
     /// 内容全零 = 顶点切线路径的「缺席」标记。
     tangent_dummy_buf: wgpu::Buffer,
+    /// 常驻零填充 UV2 垫缓冲（R52c）：无光照贴图 UV 的网格共用
+    /// （512 KiB = 65536 顶点 × 8 B；顶点数超出垫容量的网格在
+    /// `ensure_mesh` 单独分配零缓冲）。内容全零，配合材质掩码 0。
+    uv2_dummy_buf: wgpu::Buffer,
+    /// 光照贴图图集 GPU 缓存（R52c）：句柄值 → Rgba16Float 纹理 + 采样器，
+    /// 按句柄懒上传、跨帧持有（照 `texture_gpu`）。
+    lightmap_gpu: HashMap<u32, GpuLightmap>,
+    /// 常驻 1×1 黑光照贴图（R52c）：无图集的材质绑定它（创建即零初始化
+    /// ⇒ 全零辐照，无需写入）。纹理本体保活以维持 view 有效。
+    #[allow(dead_code)]
+    lightmap_dummy_tex: wgpu::Texture,
+    lightmap_dummy_view: wgpu::TextureView,
+    /// 光照贴图采样器（R52c，双线性 + ClampToEdge）：兜底黑纹理与全部
+    /// 真实图集共用一份（寻址 / 过滤参数与图集尺寸无关）。
+    lightmap_sampler: wgpu::Sampler,
     /// 渲染目标（R40）GPU 缓存：句柄 → 颜色 / 深度 / HDR / 绑定组 /
     /// 专用全局与实例缓冲。按句柄惰性创建、跨帧持有（尺寸不变时零重建）。
     render_target_gpu: HashMap<u32, GpuRenderTarget>,
@@ -868,6 +913,14 @@ fn skin_world_aabb(
 /// 合批键 / 剔除包围体 / 三角形统计（蒙皮路径同口径，LOD 高低模各自
 /// 带蒙皮属性）。`eye` 由调用方从解析后的相机传入（资源相机 / 实体挂载
 /// 相机同源）。
+/// **光照贴图解析（R52c）**：挂 [`LightmapBinding`] 的实体取其图集句柄，
+/// 但只在三个条件齐备时生效——世界有 [`LightmapStore`] 资源、句柄在目录内、
+/// 解析出的网格带 UV2（[`MeshData::uv2`](crate::mesh::MeshData)）；任一不
+/// 满足即退回 [`NO_LIGHTMAP`]（材质掩码 0 = 原 IBL 路径）并告警。查询元组
+/// 已满 7 项（`iris_core::query` 上限），故绑定表用独立一遍查询收集成
+/// `BTreeMap`，主查询闭包按实体位查表（捕获 `&BTreeMap`，不借 World 存储
+/// ——AGENTS.md 的两阶段规约）。透明项不解析（透明路径不采样光照贴图，
+/// v1 限制见 `lightmap.rs` 模块文档）。
 // 四个输出列表各自类型不同、语义独立（跨帧复用的 scratch 缓冲逐个传入），
 // 收拢成结构体反而多一层拆装；参数多但全为引用/裸缓冲，与 scene.rs
 // `build_entity_section` 同理豁免。
@@ -889,6 +942,32 @@ fn collect_instances(
     transparent.clear();
     transparent_skinned.clear();
     let mut culled = 0u32;
+    // 光照贴图绑定表（实体位 → 图集句柄值）+ 解析闭包（口径见函数文档）
+    let lightmaps = world.try_resource::<LightmapStore>();
+    let mut bindings: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+    world.query::<(Entity, &LightmapBinding)>(|(e, binding)| {
+        bindings.insert(e.to_bits(), binding.lightmap.0);
+    });
+    let resolve_lightmap = |entity: u64, mesh: MeshHandle| -> u32 {
+        let Some(&handle) = bindings.get(&entity) else {
+            return NO_LIGHTMAP;
+        };
+        let Some(store) = lightmaps.as_deref() else {
+            log::warn!(
+                "实体 {entity:#x} 挂了光照贴图绑定但世界缺 LightmapStore 资源，按无光照贴图处理"
+            );
+            return NO_LIGHTMAP;
+        };
+        if store.get(LightmapHandle(handle)).is_none() {
+            log::warn!("光照贴图句柄 {handle} 不在 LightmapStore，按无光照贴图处理");
+            return NO_LIGHTMAP;
+        }
+        if !mesh_store.get(mesh).is_some_and(|data| data.uv2.is_some()) {
+            log::warn!("网格 {mesh:?} 无 UV2（光照贴图 UV 未注入），按无光照贴图处理");
+            return NO_LIGHTMAP;
+        }
+        handle
+    };
     // 全部蒙皮实体位标识（含被剔除的）：普通路径据此跳过，避免同实体
     // 被两条路径重复处理（剔除计数 / 绘制都只算一次）
     let mut skinned_entities: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -931,6 +1010,7 @@ fn collect_instances(
             skin_entity: e.to_bits(),
             mesh: m.0,
             material: mat.0,
+            lightmap: resolve_lightmap(e.to_bits(), m),
             instance: InstanceRaw::from_matrix(model),
             joint_matrices,
         };
@@ -994,6 +1074,7 @@ fn collect_instances(
         }
         let key = ((m.0 as u64) << 32) | mat.0 as u64;
         if alpha_of(material_store, *mat) == AlphaMode::Blend {
+            // 透明项不解析光照贴图（v1 限制，见 lightmap.rs 模块文档）
             transparent.push(TransparentItem {
                 key,
                 depth: view_depth(view, mesh_store, m, model),
@@ -1004,6 +1085,7 @@ fn collect_instances(
             items.push(DrawItem {
                 key,
                 instance: InstanceRaw::from_matrix(model),
+                lightmap: resolve_lightmap(e.to_bits(), m),
             });
         }
     });
@@ -1011,6 +1093,35 @@ fn collect_instances(
         visible: items.len() + skinned.len() + transparent.len() + transparent_skinned.len(),
         culled,
     }
+}
+
+/// 材质绑定组的复合缓存键（R52c）：`(材质句柄 << 32) | 图集槽位`。
+///
+/// 图集槽位 = 句柄值 + 1（回绕），故 [`NO_LIGHTMAP`] 映射到槽位 0——
+/// 无光照贴图时键的高 32 位是材质、低 32 位恒 0，与 R52b 的 `u32` 材质键
+/// 一一对应（同一材质配多张图集时各占一条，绑定组内含掩码与图集纹理）。
+fn material_key(material: u32, lightmap: u32) -> u64 {
+    ((material as u64) << 32) | lightmap.wrapping_add(1) as u64
+}
+
+/// 批段长度（R52c）：从 `start` 起「同 (网格, 材质) 键**且**同图集」的
+/// 连续实例数。
+///
+/// 排序键只含 (网格, 材质)——不含图集，故无光照贴图场景的排序结果与批
+/// 划分与 R52b 逐位一致（兼容硬约束）；同批内图集交替时切成多段（每段
+/// 一次 draw + 一次组 1 绑定）。段区间在实例缓冲里天然连续（排序后同键
+/// 相邻），`first..last` 直接可用。
+fn run_length(items: &[DrawItem], start: usize) -> usize {
+    let key = items[start].key;
+    let lightmap = items[start].lightmap;
+    let mut count = 1;
+    while start + count < items.len()
+        && items[start + count].key == key
+        && items[start + count].lightmap == lightmap
+    {
+        count += 1;
+    }
+    count
 }
 
 /// [`CpuCollector::collect`] 的结果（与内部 `CollectCounts` 同口径）。
@@ -1483,6 +1594,43 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
             mapped_at_creation: false,
         });
+        // 常驻零填充 UV2 垫（R52c）：无光照贴图 UV 的网格共用，
+        // 512 KiB = 65536 顶点 × 8 B（与切线垫同容量口径）。
+        let uv2_dummy_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.mesh.uv2_dummy"),
+            size: 65536 * 8,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        // 常驻 1×1 黑光照贴图（R52c）：wgpu 纹理创建即零初始化 ⇒ 无需
+        // write_texture（全零辐照；掩码 0 时 select 直接丢弃采样结果）。
+        let lightmap_dummy_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.lightmap.dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let lightmap_dummy_view =
+            lightmap_dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // 光照贴图采样器：双线性（低频信号，比最近邻平滑）+ ClampToEdge
+        // （图集坐标恒在 [0,1]，Repeat 会让边缘 chart 采到对侧）。
+        let lightmap_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.lightmap.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
         // UI 字形图集：初始化时一次性构建并上传。单一纹理同时服务矩形
         // （0 号格纯白块）与文本（字形 texel，白色 + alpha=行位码），
         // 使 UI 全部内容共享单管线单纹理单 draw。采样器 Nearest：
@@ -1634,6 +1782,11 @@ impl Renderer {
             neutral_normal_tex,
             neutral_normal_view,
             tangent_dummy_buf,
+            uv2_dummy_buf,
+            lightmap_gpu: HashMap::new(),
+            lightmap_dummy_tex,
+            lightmap_dummy_view,
+            lightmap_sampler,
             render_target_gpu: HashMap::new(),
             rt_blit_sampler,
             rt_post_params_buf,
@@ -2048,6 +2201,9 @@ impl Renderer {
             return;
         };
         let texture_store = world.try_resource::<TextureStore>();
+        // 光照贴图目录（R52c）：资源缺席 = 场景没有烘焙产物，材质绑定组
+        // 恒绑常驻黑图集 + 掩码 0（与引入本槽位前逐位一致）。
+        let lightmap_store = world.try_resource::<LightmapStore>();
         // 运动模糊的重投影基准（R43）：上一帧主相机视图投影；首帧用当前
         // 帧矩阵补位（速度恒 0 → 原色透传）。保存时机在全部早退路径之后
         // （被跳过的帧不产生「上一帧」）。
@@ -2381,18 +2537,24 @@ impl Renderer {
             self.instance_scratch = instances;
         }
 
-        // 4. 预先完成 GPU 资源懒上传（避免与渲染通道编码的借用冲突）
+        // 4. 预先完成 GPU 资源懒上传（避免与渲染通道编码的借用冲突）。
+        // 段划分与绘制段同源（run_length：同键且同图集），保证绘制时
+        // material_gpu 恒命中。
         let mut index = 0;
         while index < total {
             let key = items[index].key;
-            let mut count = 1;
-            while index + count < total && items[index + count].key == key {
-                count += 1;
-            }
+            let lightmap = items[index].lightmap;
+            let count = run_length(&items, index);
             let mesh = MeshHandle((key >> 32) as u32);
             let material = MaterialHandle(key as u32);
             self.ensure_mesh(&mesh_store, mesh);
-            self.ensure_material(&material_store, texture_store.as_deref(), material);
+            self.ensure_material(
+                &material_store,
+                texture_store.as_deref(),
+                lightmap_store.as_deref(),
+                material,
+                lightmap,
+            );
             index += count;
         }
         // 4a. 蒙皮资源：网格 / 材质 + 关节矩阵缓冲（动画驱动下每帧覆写）。
@@ -2405,7 +2567,9 @@ impl Renderer {
             self.ensure_material(
                 &material_store,
                 texture_store.as_deref(),
+                lightmap_store.as_deref(),
                 MaterialHandle(item.material),
+                item.lightmap,
             );
         }
         let mut joint_bytes: Vec<u8> = Vec::new();
@@ -2427,12 +2591,15 @@ impl Renderer {
                 .write_buffer(&skin.joint_buf, 0, &joint_bytes);
         }
         // 4b. 透明普通项的网格 / 材质懒上传（透明蒙皮已在 4a 覆盖）。
+        // 透明路径不采样光照贴图（v1 限制）⇒ 图集槽位恒 NO_LIGHTMAP。
         for item in &transparent {
             self.ensure_mesh(&mesh_store, MeshHandle((item.key >> 32) as u32));
             self.ensure_material(
                 &material_store,
                 texture_store.as_deref(),
+                lightmap_store.as_deref(),
                 MaterialHandle(item.key as u32),
+                NO_LIGHTMAP,
             );
         }
         // 4d. 贴花资源（R39）：纹理懒上传 + 组 1 绑定组按纹理缓存构建 +
@@ -2709,6 +2876,7 @@ impl Renderer {
                 &mesh_store,
                 &material_store,
                 texture_store.as_deref(),
+                lightmap_store.as_deref(),
                 &globals,
                 prep,
             );
@@ -2779,16 +2947,17 @@ impl Renderer {
             index = 0;
             while index < total {
                 let key = items[index].key;
-                let mut count = 1;
-                while index + count < total && items[index + count].key == key {
-                    count += 1;
-                }
+                let lightmap = items[index].lightmap;
+                // 段划分与懒上传同源（run_length）：同键同图集才并成一段
+                let count = run_length(&items, index);
                 let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
-                let material = &self.material_gpu[&(key as u32)];
+                let material = &self.material_gpu[&material_key(key as u32, lightmap)];
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
                 pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+                // 光照贴图 UV2（R52c，槽 3）：缺席网格同样绑零垫
+                pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 let first = index as u32;
                 let last = (index + count) as u32;
@@ -2812,13 +2981,15 @@ impl Renderer {
                 pass.set_vertex_buffer(2, instance_buf.slice(..));
                 for (i, item) in skinned.iter().enumerate() {
                     let mesh = &self.mesh_gpu[&item.mesh];
-                    let material = &self.material_gpu[&item.material];
+                    let material = &self.material_gpu[&material_key(item.material, item.lightmap)];
                     let skin = &self.skin_gpu[&item.skin_entity];
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                     pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+                    // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
+                    pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
                     pass.set_vertex_buffer(
                         1,
                         mesh.skin_buf
@@ -2954,11 +3125,15 @@ impl Renderer {
                     count += 1;
                 }
                 let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
-                let material = &self.material_gpu[&(key as u32)];
+                // 透明普通项不采样光照贴图（v1 限制，见 lightmap.rs）⇒
+                // 图集槽位恒 NO_LIGHTMAP，与 4b 的懒上传键一致
+                let material = &self.material_gpu[&material_key(key as u32, NO_LIGHTMAP)];
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
                 pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+                // UV2（R52c，槽 3）：缺席绑零垫（掩码 0 ⇒ 采样结果被丢弃）
+                pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(
                     0..mesh.num_indices,
@@ -2983,13 +3158,17 @@ impl Renderer {
                 for (i, t) in transparent_skinned.iter().enumerate() {
                     let item = &t.skinned;
                     let mesh = &self.mesh_gpu[&item.mesh];
-                    let material = &self.material_gpu[&item.material];
+                    // 蒙皮路径（含透明蒙皮）解析出的图集照用：每实体一次
+                    // draw，不存在分批冲突（与 4a 的懒上传键一致）
+                    let material = &self.material_gpu[&material_key(item.material, item.lightmap)];
                     let skin = &self.skin_gpu[&item.skin_entity];
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                     pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+                    // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
+                    pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
                     pass.set_vertex_buffer(
                         1,
                         mesh.skin_buf
@@ -3811,6 +3990,7 @@ impl Renderer {
         mesh_store: &MeshStore,
         material_store: &MaterialStore,
         texture_store: Option<&TextureStore>,
+        lightmap_store: Option<&LightmapStore>,
         globals: &GlobalsRaw,
         prep: &RtCameraPrep,
     ) {
@@ -3852,17 +4032,22 @@ impl Renderer {
         let opaque_total = total + skinned.len();
         let instance_total = opaque_total + transparent.len() + transparent_skinned.len();
 
-        // GPU 资源预上传：网格 / 材质 / 蒙皮关节缓冲（与主 pass 懒上传同款；
-        // 同一网格/材质/蒙皮实体若主 pass 已上传则缓存命中零开销）。
+        // GPU 资源预上传：网格 / 材质 / 光照贴图 / 蒙皮关节缓冲（与主 pass
+        // 懒上传同款；同一网格/材质/图集/蒙皮实体若主 pass 已上传则缓存命中
+        // 零开销）。段划分与绘制段同源（run_length）。
         let mut idx = 0;
         while idx < total {
             let key = items[idx].key;
-            let mut count = 1;
-            while idx + count < total && items[idx + count].key == key {
-                count += 1;
-            }
+            let lightmap = items[idx].lightmap;
+            let count = run_length(&items, idx);
             self.ensure_mesh(mesh_store, MeshHandle((key >> 32) as u32));
-            self.ensure_material(material_store, texture_store, MaterialHandle(key as u32));
+            self.ensure_material(
+                material_store,
+                texture_store,
+                lightmap_store,
+                MaterialHandle(key as u32),
+                lightmap,
+            );
             idx += count;
         }
         for item in skinned
@@ -3870,7 +4055,13 @@ impl Renderer {
             .chain(transparent_skinned.iter().map(|t| &t.skinned))
         {
             self.ensure_mesh(mesh_store, MeshHandle(item.mesh));
-            self.ensure_material(material_store, texture_store, MaterialHandle(item.material));
+            self.ensure_material(
+                material_store,
+                texture_store,
+                lightmap_store,
+                MaterialHandle(item.material),
+                item.lightmap,
+            );
             self.ensure_skin(item.skin_entity, item.joint_matrices.len());
         }
         for item in &transparent {
@@ -3878,7 +4069,9 @@ impl Renderer {
             self.ensure_material(
                 material_store,
                 texture_store,
+                lightmap_store,
                 MaterialHandle(item.key as u32),
+                NO_LIGHTMAP,
             );
         }
 
@@ -3967,16 +4160,16 @@ impl Renderer {
                 idx = 0;
                 while idx < total {
                     let key = items[idx].key;
-                    let mut count = 1;
-                    while idx + count < total && items[idx + count].key == key {
-                        count += 1;
-                    }
+                    let lightmap = items[idx].lightmap;
+                    let count = run_length(&items, idx);
                     let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
-                    let material = &self.material_gpu[&(key as u32)];
+                    let material = &self.material_gpu[&material_key(key as u32, lightmap)];
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
                     pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+                    // 光照贴图 UV2（R52c，槽 3）：缺席网格同样绑零垫
+                    pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.num_indices, 0, idx as u32..(idx + count) as u32);
                     idx += count;
@@ -3987,13 +4180,16 @@ impl Renderer {
                     pass.set_vertex_buffer(2, instance_buf.slice(..));
                     for (i, item) in skinned.iter().enumerate() {
                         let mesh = &self.mesh_gpu[&item.mesh];
-                        let material = &self.material_gpu[&item.material];
+                        let material =
+                            &self.material_gpu[&material_key(item.material, item.lightmap)];
                         let skin = &self.skin_gpu[&item.skin_entity];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                         // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                         pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+                        // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
+                        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
                         pass.set_vertex_buffer(
                             1,
                             mesh.skin_buf
@@ -4019,11 +4215,14 @@ impl Renderer {
                             count += 1;
                         }
                         let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
-                        let material = &self.material_gpu[&(key as u32)];
+                        // 透明普通项不采样光照贴图（与主 pass 同口径）
+                        let material = &self.material_gpu[&material_key(key as u32, NO_LIGHTMAP)];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                         // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
                         pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+                        // UV2（R52c，槽 3）：缺席绑零垫
+                        pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(
                             0..mesh.num_indices,
@@ -4039,13 +4238,16 @@ impl Renderer {
                         for (i, t) in transparent_skinned.iter().enumerate() {
                             let item = &t.skinned;
                             let mesh = &self.mesh_gpu[&item.mesh];
-                            let material = &self.material_gpu[&item.material];
+                            let material =
+                                &self.material_gpu[&material_key(item.material, item.lightmap)];
                             let skin = &self.skin_gpu[&item.skin_entity];
                             pass.set_bind_group(1, &material.bind_group, &[]);
                             pass.set_bind_group(2, &skin.bind_group, &[]);
                             pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                             // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                             pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+                            // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
+                            pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
                             pass.set_vertex_buffer(
                                 1,
                                 mesh.skin_buf
@@ -4099,15 +4301,27 @@ impl Renderer {
             log::warn!("网格句柄 {handle:?} 不存在");
             return;
         };
-        let (vertex_buf, index_buf, num_indices, skin_buf, tangent_buf) =
+        let (vertex_buf, index_buf, num_indices, skin_buf, tangent_buf, uv2_buf) =
             upload_mesh(&self.gpu, data);
-        // 无切线且顶点数超出零垫容量（65536）的网格：单独分配零缓冲兜底
-        // （wgpu 缓冲创建即零初始化）。常规网格恒走常驻零垫，零逐网格开销。
+        // 无切线 / 无 UV2 且顶点数超出常驻零垫容量（65536）的网格：单独
+        // 分配零缓冲兜底（wgpu 缓冲创建即零初始化）。常规网格恒走常驻零垫，
+        // 零逐网格开销。
+        let oversized = data.vertices.len() > Self::TANGENT_DUMMY_VERTICES;
         let tangent_buf = tangent_buf.or_else(|| {
-            (data.vertices.len() > Self::TANGENT_DUMMY_VERTICES).then(|| {
+            oversized.then(|| {
                 self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("iris.mesh.tangent_zero"),
                     size: (data.vertices.len() * 16) as u64,
+                    usage: wgpu::BufferUsages::VERTEX,
+                    mapped_at_creation: false,
+                })
+            })
+        });
+        let uv2_buf = uv2_buf.or_else(|| {
+            oversized.then(|| {
+                self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.mesh.uv2_zero"),
+                    size: (data.vertices.len() * 8) as u64,
                     usage: wgpu::BufferUsages::VERTEX,
                     mapped_at_creation: false,
                 })
@@ -4121,11 +4335,13 @@ impl Renderer {
                 num_indices,
                 skin_buf,
                 tangent_buf,
+                uv2_buf,
             },
         );
     }
 
-    /// 常驻零填充切线垫容量（R42）：65536 顶点 × 16 B = 1 MiB。
+    /// 常驻零填充切线 / UV2 垫容量（R42 / R52c）：65536 顶点
+    /// （切线 1 MiB = ×16 B、UV2 512 KiB = ×8 B）。
     const TANGENT_DUMMY_VERTICES: usize = 65536;
 
     /// 该网格应绑定的切线顶点缓冲（R42）：网格自带切线用自有缓冲；
@@ -4133,6 +4349,12 @@ impl Renderer {
     /// `ensure_mesh` 单独分配零缓冲兜底，此处的 `unwrap_or` 恒安全。
     fn tangent_buf<'a>(&'a self, mesh: &'a GpuMesh) -> &'a wgpu::Buffer {
         mesh.tangent_buf.as_ref().unwrap_or(&self.tangent_dummy_buf)
+    }
+
+    /// 该网格应绑定的 UV2 顶点缓冲（R52c，口径同 [`Self::tangent_buf`]）：
+    /// 缺席绑常驻零垫（全零 + 材质掩码 0 ⇒ 光照贴图路径不生效）。
+    fn uv2_buf<'a>(&'a self, mesh: &'a GpuMesh) -> &'a wgpu::Buffer {
+        mesh.uv2_buf.as_ref().unwrap_or(&self.uv2_dummy_buf)
     }
 
     /// 蒙皮的关节矩阵缓冲：按关节数上限分配，不足以时整体重建。
@@ -4279,13 +4501,83 @@ impl Renderer {
         self.texture_gpu.get(&handle.0).is_some_and(|t| t.bc1)
     }
 
+    /// 光照贴图图集的懒上传（R52c）：`Rgba16Float` 线性 HDR 纹理，数据源
+    /// = [`LightmapItem::half_bytes`]（已 dilation 填充，见 `lightmap.rs`）。
+    ///
+    /// [`NO_LIGHTMAP`] 与已上传句柄直接返回；句柄悬垂只告警不上传——
+    /// 调用方（`ensure_material`）据此把掩码留在 0，间接光退回 IBL 路径
+    /// （比绑黑纹理把间接光抹掉更合理）。
+    fn ensure_lightmap(&mut self, store: Option<&LightmapStore>, handle: u32) {
+        if handle == NO_LIGHTMAP || self.lightmap_gpu.contains_key(&handle) {
+            return;
+        }
+        let Some(item) = store.and_then(|s| s.get(LightmapHandle(handle))) else {
+            log::warn!("光照贴图句柄 {handle} 不存在，该材质退回 IBL 间接光");
+            return;
+        };
+        let size = item.size().max(1);
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.lightmap.atlas"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // queue.write_texture 无 256 字节行对齐要求（那是 copy_buffer_to_texture
+        // 的规则），行步长直接给 size × 8 B（与既有 RGBA8 上传同款做法）。
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &item.half_bytes(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 8),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.lightmap_gpu
+            .insert(handle, GpuLightmap { texture, view });
+    }
+
+    /// 该光照贴图句柄的 GPU 上传是否完成（R52c）。测试与调试观测口径：
+    /// 未上传（懒上传未触发）/ 悬垂句柄 / [`NO_LIGHTMAP`] 均为 `false`。
+    pub fn lightmap_is_uploaded(&self, handle: LightmapHandle) -> bool {
+        self.lightmap_gpu.contains_key(&handle.0)
+    }
+
+    /// 材质绑定组（组 1）的懒构建：材质参数 uniform + base / 法线 / ORM
+    /// 纹理 + **光照贴图图集**（R52c，binding 5/6）。
+    ///
+    /// 缓存键 = [`material_key`]`(材质, 图集)`：同一材质配不同图集时掩码
+    /// （`surface.w`）与图集纹理都不同，必须各建一组；无光照贴图时槽位
+    /// 恒 0，与 R52b 的按材质缓存一一对应。
     fn ensure_material(
         &mut self,
         materials: &MaterialStore,
         textures: Option<&TextureStore>,
+        lightmaps: Option<&LightmapStore>,
         handle: MaterialHandle,
+        lightmap: u32,
     ) {
-        if self.material_gpu.contains_key(&handle.0) {
+        let key = material_key(handle.0, lightmap);
+        if self.material_gpu.contains_key(&key) {
             return;
         }
         let Some(def) = materials.get(handle) else {
@@ -4304,6 +4596,9 @@ impl Renderer {
         if let Some(tex) = orm_handle {
             self.ensure_texture(textures, tex);
         }
+        // 光照贴图（R52c）：懒上传后取真实图集视图；缺席 / 悬垂绑常驻
+        // 1×1 黑纹理。采样器全图集共用一份常驻。
+        self.ensure_lightmap(lightmaps, lightmap);
         let texture = &self.texture_gpu[&def.texture.0];
         let normal_view = match normal_handle {
             Some(tex) => &self.texture_gpu[&tex.0].view,
@@ -4313,6 +4608,13 @@ impl Renderer {
             Some(tex) => &self.texture_gpu[&tex.0].view,
             None => &self.texture_gpu[&0].view,
         };
+        let lightmap_view = match self.lightmap_gpu.get(&lightmap) {
+            Some(gpu_lightmap) => &gpu_lightmap.view,
+            None => &self.lightmap_dummy_view,
+        };
+        // 掩码只在图集**确实已上传**时置 1：悬垂句柄（ensure_lightmap 只
+        // 告警）保持 0 ⇒ 间接光退回 IBL，而不是被黑纹理抹成零。
+        let mask = f32::from(self.lightmap_gpu.contains_key(&lightmap));
         let raw = MaterialRaw {
             base_color: def.base_color,
             emissive: def.emissive,
@@ -4320,7 +4622,7 @@ impl Renderer {
                 def.metallic.clamp(0.0, 1.0),
                 def.roughness.clamp(0.0, 1.0),
                 0.04, // 绝缘体反射率基准（glTF 规范约定值）
-                0.0,
+                mask,
             ],
         };
         let params_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -4359,10 +4661,17 @@ impl Renderer {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(orm_view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(lightmap_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(&self.lightmap_sampler),
+                    },
                 ],
             });
-        self.material_gpu
-            .insert(handle.0, GpuMaterial { bind_group });
+        self.material_gpu.insert(key, GpuMaterial { bind_group });
     }
 }
 

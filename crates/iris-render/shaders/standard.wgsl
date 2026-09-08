@@ -51,7 +51,8 @@ struct CsmParams {
 struct MaterialParams {
     base_color: vec4<f32>,
     emissive: vec4<f32>,
-    // x: metallic, y: roughness, z: 绝缘体反射率基准 F0，w: 保留
+    // x: metallic, y: roughness, z: 绝缘体反射率基准 F0,
+    // w: 光照贴图掩码（R52c，1 = 间接光取光照贴图、0 = 取 IBL 环境）
     surface: vec4<f32>,
 };
 
@@ -82,6 +83,14 @@ struct MaterialParams {
 // 论证链见 material.rs 模块文档。
 @group(1) @binding(3) var normal_texture: texture_2d<f32>;
 @group(1) @binding(4) var orm_texture: texture_2d<f32>;
+// 光照贴图图集（R52c）：Rgba16Float 线性 HDR **间接**辐照度（天空 AO +
+// 一次反弹色溢，不含烘焙直接光——直接光由下面的动态光提供，混合语义见
+// lightmap.rs 模块文档）。UV2 顶点属性（loc13）直接是图集归一化坐标 ⇒
+// 采样零常量变换，同一图集的全部实体共用一份绑定组。
+// 无光照贴图的材质绑渲染器常驻的 1×1 黑纹理，且 material.surface.w = 0
+// ⇒ 间接项走 select 的 IBL 分支（不做任何算术，逐位等于 R52b）。
+@group(1) @binding(5) var lightmap_texture: texture_2d<f32>;
+@group(1) @binding(6) var lightmap_sampler: sampler;
 // 蒙皮：关节矩阵（vs_skinned 专用；vs_main 静态不使用，
 // 因此常规管线的 layout 无需 group 2）
 @group(2) @binding(0) var<storage, read> joint_mats: array<mat4x4<f32>>;
@@ -100,6 +109,9 @@ struct VertexInput {
     // 顶点切线（loc12，独立顶点缓冲；网格无切线时渲染器绑定零填充垫，
     // 片元据此走屏幕空间 TBN 路径——xyz 全零即「无顶点切线」标记）
     @location(12) tangent: vec4<f32>,
+    // 光照贴图 UV（loc13，独立顶点缓冲；网格无 UV2 时绑零填充垫，配合
+    // material.surface.w = 0 的掩码，采样结果被 select 丢弃）
+    @location(13) uv2: vec2<f32>,
 };
 
 // 阴影投影改在片元做（按 view 深度选级联后乘该级联矩阵），
@@ -112,6 +124,9 @@ struct VertexOutput {
     // 世界空间切线：xyz = 法线矩阵变换后的切线方向（未归一化，片元
     // 正交化），w = 手性符号（±1，插值保号——凸组合不越过 0）
     @location(3) tangent: vec4<f32>,
+    // 光照贴图图集坐标（R52c，插值后直接采样——图集坐标是仿射量，
+    // 透视正确插值由硬件的 1/w 校正照常处理）
+    @location(4) uv2: vec2<f32>,
 };
 
 @vertex
@@ -125,6 +140,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.world_normal = normal_mat * in.normal;
     out.uv = in.uv;
     out.tangent = vec4<f32>(normal_mat * in.tangent.xyz, in.tangent.w);
+    out.uv2 = in.uv2;
     return out;
 }
 
@@ -141,6 +157,7 @@ struct SkinnedVertexInput {
     @location(8) normal1: vec4<f32>,
     @location(9) normal2: vec4<f32>,
     @location(12) tangent: vec4<f32>,
+    @location(13) uv2: vec2<f32>,
     @location(10) joints: vec4<u32>,
     @location(11) weights: vec4<f32>,
 };
@@ -166,10 +183,15 @@ fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     out.world_normal = normal_mat * (skin_nrm * in.normal);
     out.uv = in.uv;
     out.tangent = vec4<f32>(normal_mat * (skin_nrm * in.tangent.xyz), in.tangent.w);
+    out.uv2 = in.uv2;
     return out;
 }
 
 // ---- Cook-Torrance 项 ----
+
+// 1/π 的 f32 最近值（0x3EA2F983 = 0.3183098733425140380859375）：光照
+// 贴图存辐照度 E，Lambert 出射 = albedo/π × E（R52c，见 fs_main）。
+const INV_PI: f32 = 0.3183098862;
 
 // 法线分布：GGX / Trowbridge-Reitz
 fn distribution_ggx(noh: f32, roughness: f32) -> f32 {
@@ -392,8 +414,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let env_spec = textureSampleLevel(env_map, env_sampler, reflect(-v, n),
                                       roughness * globals.env_params.x).rgb;
     let brdf = textureSample(brdf_lut, env_sampler, vec2<f32>(nov, roughness)).rg;
-    let ibl = (kd_amb * albedo * irradiance + env_spec * (f_amb * brdf.x + brdf.y))
+    let ibl_env = (kd_amb * albedo * irradiance + env_spec * (f_amb * brdf.x + brdf.y))
             * globals.env_params.y * ao;
+
+    // 光照贴图间接项（R52c）：图集存**辐照度** E（天空 AO + 一次反弹
+    // 色溢，不含烘焙直接光），Lambert 出射 = albedo/π × E ⇒ 乘 INV_PI 后
+    // 与 IBL 的 `irradiance` 同口径（后者存的就是 E/π，见 environment.wgsl
+    // 的 fs_irradiance），两项可直接互换。**不再乘 ao**：遮蔽已烘进天空项，
+    // 再乘一次是双重 AO（角落会黑过头）。
+    let lm = textureSample(lightmap_texture, lightmap_sampler, in.uv2).rgb;
+    let ibl_lightmap = kd_amb * albedo * (lm * INV_PI);
+    // 掩码 = 材质常量（material.surface.w，0/1，随 (材质, 图集) 绑定组
+    // 缓存）：`select` 是纯值选择、不做任何算术 ⇒ mask = 0 时 `ibl` 与
+    // 引入光照贴图前是**同一串位**（`ibl_env × 1.0 + x × 0.0` 那种写法
+    // 虽然数学恒等，但把逐位不变交给浮点恒等式不如交给语言语义）。这是
+    // 「未挂光照贴图的场景渲染逐位不变」硬约束的实现根据，由
+    // tests/lightmap_render.rs 的 FNV-1a 全帧基线锁看门。
+    let ibl = select(ibl_env, ibl_lightmap, material.surface.w > 0.5);
     // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
     color = color + ibl

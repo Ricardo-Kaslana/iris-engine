@@ -747,6 +747,8 @@ impl GltfLoader {
             indices,
             skin,
             tangents,
+            // 光照贴图 UV 是烘焙产物、不进 glTF（R52c，见 MeshData::uv2 文档）
+            uv2: None,
         })
     }
 

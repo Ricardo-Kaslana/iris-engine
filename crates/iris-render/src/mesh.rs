@@ -126,12 +126,31 @@ pub const TANGENT_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBuffer
     }],
 };
 
-/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线属性）。
+/// 光照贴图 UV（UV2）顶点缓冲布局（R52c）：每顶点 8 字节 `vec2`，值是
+/// **图集归一化坐标**（0..1，v 与 texel 行序一致——行 0 = v 0，与
+/// [`bake_uv`](crate::bake_uv) 的 `uv_rect` 同口径），着色器直接采样、
+/// 零常量变换。独立顶点缓冲（与蒙皮 / 切线同理）：无光照贴图的网格不为
+/// UV2 付出 8 B/顶点，渲染器垫常驻零缓冲（全零 = 「无光照贴图 UV」，
+/// 材质侧的 `lightmap_mask` 恒 0 ⇒ 采样结果被丢弃，见 `standard.wgsl`）。
+/// shader_location 取 13：0–2 主顶点、3–9 实例、10–11 蒙皮、12 切线。
+pub const UV2_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: 8,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[wgpu::VertexAttribute {
+        offset: 0,
+        shader_location: 13,
+        format: wgpu::VertexFormat::Float32x2,
+    }],
+};
+
+/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线 / 光照贴图 UV 属性）。
 ///
 /// 组件缺席语义：`skin` 缺席 = 非蒙皮网格；`tangents` 缺席 = 网格无
 /// 顶点切线——法线贴图扰动所需的 TBN 由着色器在屏幕空间用
 /// `dpdx/dpdy` 推导（`standard.wgsl`），两种路径对无切线消费的材质
-/// （法线槽位缺省）渲染结果零影响。
+/// （法线槽位缺省）渲染结果零影响；`uv2` 缺席 = 网格无光照贴图 UV——
+/// 渲染器绑常驻零垫，配合材质侧 `lightmap_mask = 0`，间接光走原 IBL
+/// 路径**逐位不变**（R52c 硬约束，论证见 `lightmap.rs` 模块文档）。
 #[derive(Clone, Debug, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
@@ -142,6 +161,12 @@ pub struct MeshData {
     /// 空间，着色器用法线矩阵变换到世界空间），w = 手性符号（±1，
     /// 副切线 = cross(N, T)·w）；Some 时长度必须与 `vertices` 一致。
     pub tangents: Option<Vec<[f32; 4]>>,
+    /// 光照贴图 UV（R52c，图集归一化坐标 0..1）；Some 时长度必须与
+    /// `vertices` 一致。**烘焙产物、不进 glTF / 场景序列化**：运行时由
+    /// [`install_lightmap`](crate::lightmap::install_lightmap) 按实体注入
+    /// （每实体一份网格副本——UV2 是逐实体的图集坐标，共享网格必须分裂，
+    /// 见该函数文档）。
+    pub uv2: Option<Vec<[f32; 2]>>,
 }
 
 impl MeshData {
@@ -431,10 +456,11 @@ impl MeshStore {
     }
 
     /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 ×
-    /// 32B + 切线 × 16B）（不含 Vec 分配器开销）。「低占用」卖点的观测
-    /// 口径之一；GPU 侧顶点 / 索引缓冲与源同尺寸（蒙皮 / 切线缓冲同），
-    /// 故该值亦即 GPU 网格占用的准确上界估算（切线缺席的网格只绑定
-    /// 渲染器常驻的零填充垫缓冲，无逐网格开销）。
+    /// 32B + 切线 × 16B + 光照贴图 UV × 8B）（不含 Vec 分配器开销）。
+    /// 「低占用」卖点的观测口径之一；GPU 侧顶点 / 索引缓冲与源同尺寸
+    /// （蒙皮 / 切线 / UV2 缓冲同），故该值亦即 GPU 网格占用的准确上界
+    /// 估算（切线与 UV2 缺席的网格只绑定渲染器常驻的零填充垫缓冲，
+    /// 无逐网格开销）。
     pub fn memory_bytes(&self) -> u64 {
         self.meshes
             .iter()
@@ -445,14 +471,17 @@ impl MeshStore {
                         s.len() as u64 * std::mem::size_of::<SkinVertex>() as u64
                     })
                     + data.tangents.as_ref().map_or(0, |t| (t.len() * 16) as u64)
+                    + data.uv2.as_ref().map_or(0, |u| (u.len() * 8) as u64)
             })
             .sum()
     }
 }
 
 /// 便捷上传：由渲染器调用，将 `MeshData` 变为 GPU 缓冲。
-/// 蒙皮属性存在时附带第三张顶点缓冲；切线存在时附带切线顶点缓冲
-/// （`None` 由渲染器绑定常驻零垫——着色器据此走屏幕空间 TBN 路径）。
+/// 蒙皮属性存在时附带第三张顶点缓冲；切线存在时附带切线顶点缓冲；
+/// 光照贴图 UV（R52c）存在时附带 UV2 顶点缓冲（`None` 均由渲染器绑定
+/// 常驻零垫——切线零向量 = 「无顶点切线」标记走屏幕空间 TBN 路径，
+/// UV2 零值配合材质 `lightmap_mask = 0` 走原 IBL 路径）。
 pub(crate) fn upload_mesh(
     gpu: &crate::context::Gpu,
     data: &MeshData,
@@ -460,6 +489,7 @@ pub(crate) fn upload_mesh(
     wgpu::Buffer,
     wgpu::Buffer,
     u32,
+    Option<wgpu::Buffer>,
     Option<wgpu::Buffer>,
     Option<wgpu::Buffer>,
 ) {
@@ -475,6 +505,13 @@ pub(crate) fn upload_mesh(
             tangents.len(),
             data.vertices.len(),
             "切线数量必须与顶点数量一致"
+        );
+    }
+    if let Some(uv2) = &data.uv2 {
+        assert_eq!(
+            uv2.len(),
+            data.vertices.len(),
+            "光照贴图 UV 数量必须与顶点数量一致"
         );
     }
     let vertex_buf = gpu
@@ -507,12 +544,21 @@ pub(crate) fn upload_mesh(
                 usage: wgpu::BufferUsages::VERTEX,
             })
     });
+    let uv2_buf = data.uv2.as_ref().map(|uv2| {
+        gpu.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.mesh.uv2_vbo"),
+                contents: bytemuck::cast_slice(uv2),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+    });
     (
         vertex_buf,
         index_buf,
         data.indices.len() as u32,
         skin_buf,
         tangent_buf,
+        uv2_buf,
     )
 }
 
@@ -766,6 +812,7 @@ mod tests {
                 3
             ]),
             tangents: None,
+            uv2: None,
         };
         let _ = upload_mesh(&gpu, &data);
     }
@@ -782,5 +829,48 @@ mod tests {
             (24 * 32 + 36 * 4 + 24 * 16) as u64,
             "切线缓冲 16 B/顶点必须计入"
         );
+    }
+
+    /// 光照贴图 UV 字节计入内存统计（R52c）：8 B/顶点；缺席时零开销。
+    #[test]
+    fn uv2_bytes_count_into_memory() {
+        let mut store = MeshStore::new();
+        let mut data = primitives::cube();
+        assert!(data.uv2.is_none(), "基础图元默认不带光照贴图 UV");
+        store.add(data.clone());
+        assert_eq!(store.memory_bytes(), (24 * 32 + 36 * 4) as u64);
+        data.uv2 = Some(vec![[0.25, 0.75]; 24]);
+        store.add(data);
+        assert_eq!(
+            store.memory_bytes(),
+            2 * (24 * 32 + 36 * 4) as u64 + 24 * 8,
+            "UV2 缓冲 8 B/顶点必须计入"
+        );
+    }
+
+    /// GPU 布局契约（R52c）：UV2 = 8 B/顶点的单属性缓冲，
+    /// shader_location 13（0–2 主顶点 / 3–9 实例 / 10–11 蒙皮 / 12 切线之后）。
+    #[test]
+    fn uv2_layout_matches_gpu_contract() {
+        assert_eq!(UV2_LAYOUT.array_stride, 8);
+        assert_eq!(UV2_LAYOUT.step_mode, wgpu::VertexStepMode::Vertex);
+        let attrs = UV2_LAYOUT.attributes;
+        assert_eq!(attrs.len(), 1);
+        assert_eq!((attrs[0].shader_location, attrs[0].offset), (13, 0));
+        assert_eq!(attrs[0].format, wgpu::VertexFormat::Float32x2);
+        // 与既有槽位不冲突（切线 12 / 蒙皮 10–11）
+        assert_eq!(TANGENT_LAYOUT.attributes[0].shader_location, 12);
+    }
+
+    #[test]
+    #[should_panic(expected = "光照贴图 UV 数量必须与顶点数量一致")]
+    fn upload_mesh_rejects_mismatched_uv2() {
+        let gpu = crate::context::Gpu::offscreen();
+        let Some(gpu) = gpu else {
+            return; // 无 GPU 环境：跳过
+        };
+        let mut data = primitives::cube();
+        data.uv2 = Some(vec![[0.0, 0.0]; 5]);
+        let _ = upload_mesh(&gpu, &data);
     }
 }

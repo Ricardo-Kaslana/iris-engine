@@ -283,6 +283,27 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // 光照贴图图集（R52c）：Rgba16Float 线性 HDR 辐照度，UV2 顶点
+            // 属性直接是图集归一化坐标 ⇒ 着色器零常量变换。无光照贴图的
+            // 材质由渲染器绑常驻 1×1 黑纹理 + `mask = 0`（间接项走
+            // `select` 取原 IBL 分支，逐位不变，见 lightmap.rs 模块文档）。
+            // 绑定组按 (材质, 图集句柄) 缓存 ⇒ 同图集的实体共组。
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     });
 
@@ -335,21 +356,24 @@ pub(crate) fn create_pipeline(
                               depth_write: bool,
                               msaa: u32|
      -> wgpu::RenderPipeline {
-        // 顶点缓冲（R42 起含切线路 3/4）：普通 = [顶点, 实例, 切线]，
-        // 蒙皮 = [顶点, 蒙皮属性, 实例, 切线]（切线 loc12）。切线缓冲
-        // 按网格携带，缺席由渲染器垫零缓冲（TANGENT_LAYOUT 注释）。
+        // 顶点缓冲（R42 起含切线路、R52c 起含光照贴图 UV2 路）：
+        // 普通 = [顶点, 实例, 切线, UV2]，蒙皮 = [顶点, 蒙皮属性, 实例,
+        // 切线, UV2]（切线 loc12 / UV2 loc13）。两路都按网格携带，缺席由
+        // 渲染器垫零缓冲（TANGENT_LAYOUT / UV2_LAYOUT 注释）。
         let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
             &[
                 Some(crate::mesh::Vertex::LAYOUT),
                 Some(crate::mesh::SkinVertex::LAYOUT),
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
+                Some(crate::mesh::UV2_LAYOUT),
             ]
         } else {
             &[
                 Some(crate::mesh::Vertex::LAYOUT),
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
+                Some(crate::mesh::UV2_LAYOUT),
             ]
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

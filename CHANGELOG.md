@@ -5,6 +5,73 @@
 
 ## [Unreleased]
 
+### Added（R52c：烘焙光照 c 阶段——GPU 集成与混合语义）
+
+写实路线「间接光」三阶段收官（第 52 轮迭代 c；语义规范全文 =
+`iris-render::lightmap` 模块文档 + ARCHITECTURE §4.24 c 小节，诚实清单
+§8.31）。把 R52a/b 的 CPU 产物接到渲染器：图集纹理上传 + UV2 顶点属性 +
+shader 间接项替换 + 动态光叠加语义。**硬约束：未挂光照贴图的场景渲染
+逐位不变**（R52b / R41 两条 FNV-1a 全帧基线锁原值通过）。
+
+- **装配入口 `install_lightmap`**：`LightmapStore`（World 资源）收录
+  `BakedLightmap` → `LightmapHandle`；`build_uv2_mesh` 逐实体把图集角点
+  坐标写进 `MeshData::uv2`（新增字段，`UV2_LAYOUT` = loc13 / Float32x2 /
+  stride 8 独立顶点缓冲，缺席绑常驻零垫）；同一顶点被分进不同 chart 或被
+  重叠偏移移到不同位置时**按需拆分顶点**（复制位置/法线/UV/切线/蒙皮后
+  追加、索引改指——拓扑不变、`triangles_drawn` 不变）；UV2 是逐实体数据
+  而网格是共享资源 ⇒ **每实体一份网格副本**（换 `MeshHandle` 组件）+ 挂
+  `LightmapBinding`。局部三角序号 = 全局下标在实体区间内的**秩**（收集
+  逐实体连续 + `build_charts` 不丢三角 ⇒ 秩即序号，断言连续性）。
+- **GPU 上传**：图集 = `Rgba16Float` 单 mip（线性 HDR **间接**辐照度）懒
+  上传 + 句柄缓存（`ensure_lightmap`，照 `ensure_texture` 模式）；
+  `f32_to_f16` = 本模块自带 IEEE 754 binary16 RNE 纯函数（免引 `half`
+  依赖，全值域解析单测）；采样器全图集共用一份（双线性 + ClampToEdge）；
+  未挂图集的材质绑常驻 1×1 黑纹理（创建即零初始化）。
+- **混合语义 = 「静态 GI 补动态直射」**：图集存 `BakeSample::indirect`
+  （天空 AO + 一次反弹色溢，**不含烘焙直射**——与实时方向光/点光双计会
+  过曝）；片元 `间接项 = select(IBL 环境, kd_amb × albedo × E/π, mask)`，
+  直接项（方向光 CSM + 点光）不受光照贴图影响；mask = 材质常量
+  `MaterialParams.surface.w`（随 (材质, 图集) 绑定组缓存：挂绑定 + 网格有
+  UV2 + 句柄在目录内 = 1，否则 0；网格无 UV2 / 句柄悬垂在收集期退回
+  `NO_LIGHTMAP` 并告警）。**`select` 不做算术** ⇒ mask = 0 时返回值与引入
+  前**同一串位**（逐位不变硬约束的实现根据；写成 `ibl×(1−m) + lm×m` 会把
+  约束交给浮点恒等式）。口径对齐 IBL（其 `irradiance_map` 存 E/π）；光照
+  贴图项不再乘 orm AO（遮蔽已烘进天空项，再乘是双重 AO）。
+- **分批**：材质绑定组缓存键 = `(材质 << 32) | 图集槽位`（同图集共组）；
+  绘制段按 (键, 图集) 切（`run_length`）；**排序键不含图集** ⇒ 无光照贴图
+  场景的排序与批划分与 R52b 逐位一致。主 / 蒙皮 / 透明 / RTT 四条几何
+  通路全部接 UV2 槽位（透明**普通**路径不采样光照贴图，v1 限制）。
+- **dilation 填充**：chart 角点 UV 恰落在 texel 边界 ⇒ 双线性对边界两侧
+  各取一半、外侧是 pad/间隙黑值 ⇒ 不处理则每条 chart 边一道半 texel 暗线
+  （R52b 留给本轮目检的决定）。`dilate_atlas` = 未覆盖 texel 按 4 邻域均值
+  迭代扩散（双缓冲、至多 8 轮、只写未覆盖、已覆盖逐位不变）；覆盖判据用
+  新增的 `BakedLightmap::covered` 位图而**不是** `!= ZERO`（封闭暗角的真黑
+  值必须保留，按零判会漏光）。验收图目检无黑线。
+- **验收**：`examples/bake_lightmap_snapshot.rs`（室内盒同场景同相机，
+  左原状 / 右挂载横拼）→ `docs/bake_lightmap.png`：受影响像素 99.3%、
+  暗部四分位亮度 179.5 → 145.9（**81%**，墙角 AO + 半球遮蔽）、亮部四分位
+  226.7 → 215.5（**95%**，直射保持）；目检墙角 / 柱根接触暗化连续无条带、
+  柱旁地板带暖红色溢、无 chart 边缘黑线、无闪烁伪影。
+- **实测（release，i7-13620H）**：验收场景烘焙 213 ms + 装配 1.3 ms
+  （4 实体、11890 覆盖 texel、8 texel/m、256² 图集 = 512 KiB 显存）。
+- **测试**：lightmap.rs 新增 9 项（f16 全值域解析 + 可表示值往返、
+  dilation 四组解析 + 确定性、UV2 注入逐角点逐位 + 冲突拆分 + 拓扑不变 +
+  数量不符 panic、端到端装配、UV2 ↔ 图集坐标逐位 + dilation 前后逐位 +
+  墙角 AO 对照、悬垂句柄 panic）；mesh.rs 新增 3 项（UV2 字节计入内存、
+  GPU 布局契约、数量不符 panic）；tests/lightmap_render.rs 新增 3 项 GPU
+  集成测试（R52b 全帧 FNV 基线锁 `0x3fe5_f3ff_00e0_f329`、烘焙生效四分位
+  对照 + 懒上传观测 + 两次渲染逐位、绑定但无 UV2 逐位退回 IBL）。
+  计数：debug 881 → **896**、release 879 → **894**（iris-render lib
+  debug 270 → 282 / release 266 → 278，新增 15 项）。
+- **偏离与说明**：①规范「shader 用 UV2 直接采样 + AO 强度常量入材质」
+  落实为 **mask 入材质 uniform（`surface.w`）+ 绑定组按 (材质, 图集) 缓存**
+  ——UV2 已是图集坐标 ⇒ 采样零常量，per-instance 常量不需要；②规范未提
+  dilation，本轮目检确认 chart 边缘黑线必须处理，故新增（R52b 文档预留的
+  决定）；③透明普通路径不采样光照贴图（与视深排序分批冲突），透明蒙皮
+  沿用蒙皮解析结果——规范只要求「蒙皮通路同样传 UV2」；④`BakedLightmap`
+  增 `indirect` / `covered` 两个字段（上传口径与 dilation 判据的真值来源，
+  用 `total()` 或 `!= ZERO` 推断都会错）。
+
 ### Added（R52b：烘焙光照 b 阶段——UV2 参数化与图集布局）
 
 写实路线「间接光」三阶段（a 跟踪器/积分器 → b UV2 图集 → c 渲染集成）

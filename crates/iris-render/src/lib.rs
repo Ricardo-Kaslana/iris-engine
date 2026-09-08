@@ -31,6 +31,13 @@
 //!   （面积降序全序、利用率口径 = 已用高度）→ texel 世界位回溯（含边界 +
 //!   先者得）→ `bake_lightmap` 全链组装（逐 texel 辐照，行主序）→ ACES +
 //!   sRGB 编码的 PPM 预览导出（渲染集成留 c 阶段）；
+//! - 烘焙光照 c 阶段（R52c，`lightmap` 模块）：GPU 集成与混合语义——
+//!   `MeshData` UV2 顶点属性（逐实体注入 + 跨 chart 顶点拆分）→ 图集
+//!   Rgba16Float 懒上传（自带 IEEE 754 half 转换 + dilation 填充 chart
+//!   边缘）→ 材质绑定组按 (材质, 图集) 缓存、绘制按图集切段 → shader
+//!   间接项 `select(IBL 环境, 光照贴图辐照, mask)`（直接光不受影响 =
+//!   「静态 GI 补动态直射」）；未挂光照贴图的场景**逐位不变**（FNV-1a
+//!   全帧基线锁，见 `tests/lightmap_render.rs`）；
 //! - 纹理 BC1 GPU 压缩（确定性编码器 + 特性/对齐/不透明决策树，无特性
 //!   或 web 自动回退 RGBA8）与 CPU / GPU 内存占用统计；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
@@ -48,6 +55,7 @@ pub mod frustum;
 pub mod hand_ik;
 pub mod instance;
 pub mod light;
+pub mod lightmap;
 pub mod material;
 pub mod mesh;
 pub mod offscreen;
@@ -100,9 +108,13 @@ pub mod prelude {
         DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_FACES, PointLight, cascade_fit,
         cascade_splits, snap_aabb_to_texels,
     };
+    pub use crate::lightmap::{
+        LIGHTMAP_DILATE_ITERATIONS, LightmapBinding, LightmapHandle, LightmapInstall, LightmapItem,
+        LightmapStore, NO_LIGHTMAP, build_uv2_mesh, dilate_atlas, f32_to_f16, install_lightmap,
+    };
     pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{
-        LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, Vertex, primitives,
+        LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex, primitives,
     };
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::particles::{

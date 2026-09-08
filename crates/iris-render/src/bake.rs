@@ -1,12 +1,12 @@
 //! 烘焙光照（R52a：三阶段之一）——CPU 光线跟踪核心 + 辐照度烘焙器。
 //!
-//! # 三阶段规划（a / b 已落地，c 未做）
+//! # 三阶段规划（a / b / c 已全部落地）
 //!
 //! | 阶段 | 内容 | 状态 |
 //! |---|---|---|
 //! | **a** | 跟踪器（BVH + 三角求交）、无 RNG 低差异采样、辐照度积分器；输出接口 = **世界空间采样点列表**（[`bake_points`]） | 本文件（R52a） |
 //! | **b** | UV2 参数化（主轴投影 chart + shelf 图集）+ 采样点 ↔ texel 布局（把「采样点列表」换成「texel 网格」）+ 全链组装 [`bake_lightmap`] 与 PPM 预览导出 | [`bake_uv`](crate::bake_uv)（R52b） |
-//! | c | 烘焙结果上传纹理 + 着色器消费（间接光接管 ambient 项）、`MeshData` UV2 顶点属性 | 未做 |
+//! | c | 烘焙结果上传纹理（Rgba16Float）+ 着色器消费（间接项 `select` 替换 IBL 环境项）+ `MeshData` UV2 顶点属性与逐实体注入 | [`lightmap`](crate::lightmap)（R52c） |
 //!
 //! a 阶段刻意不做 texel 网格化：正确性（解析对照）、性能（是否必须并行）、
 //! 确定性（逐位复现）三个风险全部集中在跟踪器与积分器上，而这两块与 GPU /
@@ -685,6 +685,16 @@ impl BakeSample {
     pub fn total(&self) -> Vec3 {
         self.direct + self.sky + self.bounce
     }
+
+    /// **间接**辐照度 = 天空（含 AO 遮蔽）+ 一次反弹（含色溢）。
+    ///
+    /// c 阶段（R52c）上传到光照贴图的是这一份，不是 [`Self::total`]：
+    /// 直接光由运行时的动态方向光 / 点光提供（混合语义 = 「静态 GI 补
+    /// 动态直射」，见 `lightmap.rs` 模块文档），把烘焙的直接光一起上传
+    /// 会与实时直射**双计**（受光面过曝、且烘焙阴影与 CSM 阴影叠成两层）。
+    pub fn indirect(&self) -> Vec3 {
+        self.sky + self.bounce
+    }
 }
 
 /// 单点烘焙：直接光 + 天空/AO + 可选一次反弹（数学口径见模块文档）。
@@ -895,16 +905,29 @@ pub fn collect_bake_triangles(world: &World) -> Vec<BakeTriangle> {
 
 /// 烘焙产物：图集布局 + 逐 texel 辐照度（R52b）。
 ///
-/// `radiance` 为**行主序**、与 `atlas.size²` 对齐（`index = y × size + x`，
-/// 行 0 = v 0）；未覆盖 texel（chart 间隙 / 内边距）恒 `Vec3::ZERO`。
-/// 辐照度是线性 HDR（口径 = [`BakeSample::total`]），预览 / c 阶段上传前
-/// 各自做色调映射。
+/// 两份辐照数组同为**行主序**、与 `atlas.size²` 对齐（`index = y × size + x`，
+/// 行 0 = v 0）；未覆盖 texel（chart 间隙 / 内边距）恒 `Vec3::ZERO`：
+///
+/// - [`Self::radiance`] = [`BakeSample::total`]（直接 + 天空 + 反弹）——
+///   预览 / 调试口径（影带在这一份里才看得见）；
+/// - [`Self::indirect`] = [`BakeSample::indirect`]（天空 + 反弹）——
+///   **c 阶段上传口径**：直接光由运行时动态光提供，双计论证见该方法文档。
+///
+/// 辐照度是线性 HDR，预览 / 上传前各自做色调映射或半精度转换。
 #[derive(Clone, Debug)]
 pub struct BakedLightmap {
     /// 图集布局（chart / 三角形矩形表——c 阶段 UV2 写回与纹理上传的索引）。
     pub atlas: crate::bake_uv::LightmapAtlas,
-    /// 逐 texel 辐照度（行主序，`atlas.size²` 个）。
+    /// 逐 texel 总辐照度（行主序，`atlas.size²` 个）。
     pub radiance: Vec<Vec3>,
+    /// 逐 texel **间接**辐照度（行主序，同上；光照贴图纹理的数据源）。
+    pub indirect: Vec<Vec3>,
+    /// 逐 texel 覆盖位图（行主序，同上）：`true` = 该 texel 被
+    /// [`bake_texels`](crate::bake_uv::bake_texels) 回溯命中（= 辐照数组里
+    /// 的值是真烘焙结果，不是零填充）。c 阶段的 dilation 填充据此区分
+    /// 「真黑（封闭暗角）」与「没烘到（chart 内边距 / 间隙）」——按
+    /// `!= Vec3::ZERO` 判会把前者误当后者填掉。
+    pub covered: Vec<bool>,
 }
 
 /// 全链烘焙（R52b 组装入口）：世界 → 静态三角收集 → BVH → chart 参数化
@@ -937,10 +960,19 @@ pub fn bake_lightmap(
     let samples = bake_points(&bvh, &points, params);
     let size = uv.atlas_size as usize;
     let mut radiance = vec![Vec3::ZERO; size * size];
+    let mut indirect = vec![Vec3::ZERO; size * size];
+    let mut covered = vec![false; size * size];
     for (source, sample) in sources.iter().zip(&samples) {
         radiance[source.index] = sample.total();
+        indirect[source.index] = sample.indirect();
+        covered[source.index] = true;
     }
-    BakedLightmap { atlas, radiance }
+    BakedLightmap {
+        atlas,
+        radiance,
+        indirect,
+        covered,
+    }
 }
 
 #[cfg(test)]
@@ -1899,6 +1931,7 @@ mod tests {
             indices: vec![0, 1, 2],
             skin: None,
             tangents: None,
+            uv2: None,
         };
         let handle = world.resource_mut::<MeshStore>().add(mesh);
         let scaled = world.spawn((

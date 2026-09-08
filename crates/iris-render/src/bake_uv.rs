@@ -93,14 +93,18 @@
 //! - texel 法线 = 面法线（无顶点法线插值，光滑曲面上 AO 有 faceting）；
 //! - `texels_per_meter` 全图集单一值（无按实体 / 按重要度分配分辨率）；
 //! - 内边距 [`CHART_PAD_TEXELS`] = 1 texel：c 阶段双线性采样的 bleed 防护
-//!   靠 pad + 未覆盖 texel 黑值，无 dilate/pushpull 填充（黑 pad 在双线性
-//!   下仍会轻微拉暗 chart 边缘——c 阶段视目检决定是否加 dilation）；
+//!   靠 pad + **dilation 填充**（R52c 已由
+//!   [`dilate_atlas`](crate::lightmap::dilate_atlas) 闭合：未覆盖 texel 按
+//!   4 邻域均值扩散填充，黑 pad 不再被双线性拉进 chart 边缘）；
 //! - 只认 [`MeshHandle`](crate::mesh::MeshHandle) 静态几何（R52a 收集
 //!   口径原样复用：蒙皮 / 隐藏 / LOD 句柄几何不参与）。
 //!
-//! **c 阶段清单（本轮不做）**：GPU 纹理上传（Rgba16Float 或 BC 压缩）、
-//! `MeshData` UV2 顶点属性与管线布局、shader 采样（间接光接管 ambient 项）、
-//! 动态光叠加、dilation 填充、按实体分辨率分配。
+//! **c 阶段（R52c，已落地，[`lightmap`](crate::lightmap) 模块）**：GPU 纹理
+//! 上传（Rgba16Float 单 mip + 自带 IEEE 754 half 转换）、`MeshData` UV2
+//! 顶点属性（loc13 独立缓冲）与逐实体注入（跨 chart 冲突按需拆分顶点）、
+//! shader 采样（间接项 `select` 替换 IBL 环境项 = 「静态 GI 补动态直射」）、
+//! dilation 填充。**仍未做**：BC 压缩上传、按实体 / 重要度分配分辨率、
+//! mipmap 链（清单见 `lightmap.rs` 模块文档与 ARCHITECTURE §8.31）。
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
@@ -1132,6 +1136,9 @@ mod tests {
                 entries: Vec::new(),
             },
             radiance: vec![Vec3::ZERO, Vec3::splat(100.0), Vec3::ONE, Vec3::splat(0.5)],
+            // 预览只消费 radiance；indirect / covered 填自洽值
+            indirect: vec![Vec3::ZERO, Vec3::splat(100.0), Vec3::ONE, Vec3::splat(0.5)],
+            covered: vec![false, true, true, true],
         };
         let path = Path::new("iris_bake_uv_ppm_test.ppm");
         write_lightmap_preview(&lightmap, path).expect("写临时 PPM");

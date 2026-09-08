@@ -908,6 +908,7 @@ mod tests {
             indices: vec![0, 1, 2],
             skin: None,
             tangents: None,
+            uv2: None,
         }
     }
 
