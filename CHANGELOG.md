@@ -5,6 +5,83 @@
 
 ## [Unreleased]
 
+### Added（R52b：烘焙光照 b 阶段——UV2 参数化与图集布局）
+
+写实路线「间接光」三阶段（a 跟踪器/积分器 → b UV2 图集 → c 渲染集成）
+的第二阶段（第 52 轮迭代 b；语义规范全文 = `iris-render::bake_uv` 模块
+文档 + ARCHITECTURE §4.24 b 小节，诚实清单 §8.30）。纯 CPU、零渲染集成、
+确定性；本阶段把 a 阶段的「世界空间采样点列表」接口接到**光照贴图
+texel** 上，产出 CPU 侧完整烘焙管线：世界几何 → chart 参数化 → 图集
+装箱 → texel 世界位回溯 → 逐 texel 辐照（复用 R52a 积分器）→ 图集预览。
+
+- **chart 参数化（主轴投影）**：`classify_axis` **完备分类**——
+  `|n.y| > 0.7`（`FLOOR_NORMAL_THRESHOLD`）→ 水平面投影 XZ；否则
+  `|n.x| ≥ |n.z|` → `WallX` 投影 ZY（并列取低轴号，45° 墙角归 X）否则
+  `WallZ` 投影 XY；墙面类被丢弃轴分量 ≥ sqrt((1−0.49)/2) ≈ 0.505 ⇒
+  **投影面积 ≥ 0.5 × 世界面积**（回溯 2D 重心分母有下界）。chart 粒度 =
+  **(实体, 主轴)**（规范草稿「每 (实体, mesh 句柄)」的细分：本引擎每实体
+  恰一个 `MeshHandle`，但同实体不同朝向三角形投影平面不同）。chart 内
+  UV = 投影坐标 × `texels_per_meter` 的**纯线性**映射（缩放 + 平移）。
+- **投影重叠（串光）防护**：同 chart 内两三角投影**正面积重叠**判定
+  （顶点严格内点 + 边对严格穿越，边界相触 / 共边判否——quad 两半恒共
+  斜边，按 bbox 相交会把每个 quad 撕成两块）+ 按输入序**贪心 +x 偏移**
+  到空位（跳到冲突者右缘 + `OVERLAP_GAP_TEXELS` = 2；每轮越过至少一个
+  已放置三角形 ⇒ 至多 n 轮终止）；chart 矩形取偏移后 bbox（「放不下」
+  不存在）。共边相邻的 texel 归属由「先者得」解决，不是串光。
+- **shelf 图集装箱（`pack_atlas`）**：全序 = `(面积降序 u64 精确整数,
+  实体位升序, 轴序号升序, 原 chart 序)`；层内左到右、放不下开新层、层高
+  = 该层最高 chart；chart 超图集或 shelf 高度耗尽 ⇒ panic（**尺寸不足
+  报错语义**）。输出 `LightmapAtlas { size, used_height, entries }`：
+  `AtlasEntry`（实体 / mesh 句柄 / 轴 / chart uv_rect / texel 原点与尺寸）
+  + **每三角形** `AtlasTriangle`（自身图集 uv_rect + chart 局部三顶点
+  ——回溯直接查表）。利用率口径 `utilization()` = Σ chart 面积 ÷
+  (图集宽 × **已用高度**)：规则网格（16 个 18×18 chart / 图集 128）解析
+  值 **0.75**（单测精确钉住），验收场景 50.4%。
+- **texel 世界位回溯（`bake_texels`）**：逐 entry 逐三角光栅化其图集
+  bbox，texel 中心 → chart 局部 → 2D 重心（投影仿射 ⇒ 即 3D 重心）→
+  世界位；法线 = **三角面法线**（v1 不做顶点法线插值，与分类口径自洽）。
+  归属 = 三边函数同号且 ≥ −1e-4（**含边界**）+ **先者得**（entry 序 =
+  装箱序、三角序 = 输入序）⇒ 8×8 格点斜边 texel 恒归三角 0（解析计数
+  n(n+1)/2 = 36 / n(n−1)/2 = 28 单测钉住）。未覆盖 texel 辐照恒零；
+  输出按 **texel 行主序**升序（行 0 = v 0）= R52a 预留的确定性并行切分点。
+- **全链组装（`bake::bake_lightmap` → `BakedLightmap { atlas, radiance }`）**：
+  收集 → BVH → chart → 装箱 → `AtlasEntry::mesh` 补齐（纯装箱不查世界
+  ⇒ None，组装时填）→ 回溯 → 逐 texel `bake_points` → 行主序回填；空
+  世界合法（空图集 + 全零辐照）。
+- **图集预览导出（`write_lightmap_preview`）**：辐照 → `aces_tonemap`
+  （Narkowicz 系数 2.51/0.03/2.43/0.59/0.14，与 `shaders/blit.wgsl`
+  **同款公式**）→ sRGB 编码（blit 的 sRGB 编码由硬件目标格式完成，CPU
+  预览显式同款）→ **PPM P6**；验收 `examples/bake_preview.rs`（室内盒：
+  10×10 地板 + 两墙 + 0.6×2×0.6 遮挡柱 + 侧照光，8 texel/m、图集 256²）
+  → `docs/bake_preview.png`：headless 断言柱影带 texel = 开阔地板的
+  **23%**（< 70% 界）、墙根 AO texel = 地板中心的 **21%**；目检 = 影带
+  清晰 + 贴墙根渐暗 + 两墙一亮一暗 + 柱成对 chart 并排偏移 + 间隙恒黑。
+- **性能实测（release，i7-13620H，2026-09-08）**：验收场景 11890 覆盖
+  texel × 64 半球样本 + 1 反弹 + 0.08 软影全链 **212 ms** ⇒ 仍单线程
+  （切分点不变：`bake_points` 的 `points` 分段）。
+- **测试**（bake_uv.rs 10 项 + bake.rs 1 项，全解析对照 / 逐位）：分类
+  六轴向 + 45° + 阈值两侧 + 256 哈希方向被丢弃轴下界扫描；UV 线性解析值
+  （Floor / WallZ 两轴）；双层重叠偏移解析位移（+3 texel）+ 共边 quad
+  不偏移 + 偏移后两两无正面积重叠；装箱不相交 + 等面积实体位升序 + shelf
+  结构（7/7/2 层）+ 利用率 0.75 精确 + mesh 恒 None；尺寸不足两 panic 支
+  （chart 超图集 / shelf 耗尽）；回溯 8×8 格点世界位 / pad 与角落不覆盖 /
+  斜边 36/28 计数 / 重心自洽复原；共享边 texel 先者得四格钉死；ACES
+  f(0) = 0 / f(1) = 2.54/3.16 / f(100) clamp 1 / 逐通道 / 单调；PPM P6
+  头 + 黑 / 白 / 232 / 206 字节；全链两次烘焙逐位（atlas 全字段 +
+  radiance `to_bits`）+ mesh 补齐 + 覆盖/零值并存 + 阴影对比。测试总数
+  debug 870 → **881**、release 868 → **879**（iris-render lib 259 → 270 /
+  255 → 266）。
+
+**与规范的偏离**：①chart 粒度 = (实体, 主轴)（规范草稿「每 (实体, mesh
+句柄) 一个 chart」——同实体不同主轴三角形投影平面不同，必须拆）；
+②重叠判定 = **正面积相交**而非规范字面「投影矩形重叠」（bbox 判定会把
+每个 quad 撕成两块、面积翻倍；共边相邻的归属由先者得解决）；③利用率
+口径 = Σ chart ÷ (图集宽 × 已用高度)（规范只说「> 50%」未定分母；末层
+以下空白是调用方 `atlas_size` 的选择而非装箱浪费）；④预览在 ACES 之后
+加 sRGB 编码（blit 输出线性色、sRGB 由硬件目标格式完成，CPU 预览不做则
+图偏暗、目检失真）；⑤`BakeUvParams` 默认 `texels_per_meter = 4.0`（规范
+只给 `atlas_size` 默认 512）。
+
 ### Added（R52a：烘焙光照 a 阶段——CPU 光线跟踪核心 + 辐照度烘焙器）
 
 写实路线「间接光」三阶段（a 跟踪器/积分器 → b UV2 参数化与图集 →

@@ -1,12 +1,12 @@
 //! 烘焙光照（R52a：三阶段之一）——CPU 光线跟踪核心 + 辐照度烘焙器。
 //!
-//! # 三阶段规划（本轮只落 a）
+//! # 三阶段规划（a / b 已落地，c 未做）
 //!
 //! | 阶段 | 内容 | 状态 |
 //! |---|---|---|
-//! | **a（本轮）** | 跟踪器（BVH + 三角求交）、无 RNG 低差异采样、辐照度积分器；输出接口 = **世界空间采样点列表**（[`bake_points`]） | 本文件 |
-//! | b | UV2 参数化（atlas 展开）+ 采样点 ↔ texel 布局（把「采样点列表」换成「texel 网格」） | 未做 |
-//! | c | 烘焙结果上传纹理 + 着色器消费（间接光接管 ambient 项） | 未做 |
+//! | **a** | 跟踪器（BVH + 三角求交）、无 RNG 低差异采样、辐照度积分器；输出接口 = **世界空间采样点列表**（[`bake_points`]） | 本文件（R52a） |
+//! | **b** | UV2 参数化（主轴投影 chart + shelf 图集）+ 采样点 ↔ texel 布局（把「采样点列表」换成「texel 网格」）+ 全链组装 [`bake_lightmap`] 与 PPM 预览导出 | [`bake_uv`](crate::bake_uv)（R52b） |
+//! | c | 烘焙结果上传纹理 + 着色器消费（间接光接管 ambient 项）、`MeshData` UV2 顶点属性 | 未做 |
 //!
 //! a 阶段刻意不做 texel 网格化：正确性（解析对照）、性能（是否必须并行）、
 //! 确定性（逐位复现）三个风险全部集中在跟踪器与积分器上，而这两块与 GPU /
@@ -73,7 +73,8 @@
 //! - 蒙皮实体整体排除（姿态每帧由 [`Skin`] 驱动，绑定姿态烘焙没有意义）；
 //!   只认 [`MeshHandle`] ⇒ 挂 [`LodMesh`](crate::mesh::LodMesh) /
 //!   [`LodMesh3`](crate::terrain::LodMesh3) 的几何（R51 地形 chunk）
-//!   **暂不参与烘焙**，b 阶段按「取最高细节级」接入；
+//!   **暂不参与烘焙**，「取最高细节级」接入推迟（b 阶段规范未含，见
+//!   ARCHITECTURE §4.24）；
 //! - 单线程。实测（release，i7-13620H）：1000 三角的 BVH 构建 217 µs、
 //!   1000 采样点 × 64 sky 样本 + 1 反弹的积分 34.3 ms
 //!   （`benches/render_cpu.rs` 的 `bake_bvh_build_1k_tris` /
@@ -890,6 +891,56 @@ pub fn collect_bake_triangles(world: &World) -> Vec<BakeTriangle> {
         }
     }
     out
+}
+
+/// 烘焙产物：图集布局 + 逐 texel 辐照度（R52b）。
+///
+/// `radiance` 为**行主序**、与 `atlas.size²` 对齐（`index = y × size + x`，
+/// 行 0 = v 0）；未覆盖 texel（chart 间隙 / 内边距）恒 `Vec3::ZERO`。
+/// 辐照度是线性 HDR（口径 = [`BakeSample::total`]），预览 / c 阶段上传前
+/// 各自做色调映射。
+#[derive(Clone, Debug)]
+pub struct BakedLightmap {
+    /// 图集布局（chart / 三角形矩形表——c 阶段 UV2 写回与纹理上传的索引）。
+    pub atlas: crate::bake_uv::LightmapAtlas,
+    /// 逐 texel 辐照度（行主序，`atlas.size²` 个）。
+    pub radiance: Vec<Vec3>,
+}
+
+/// 全链烘焙（R52b 组装入口）：世界 → 静态三角收集 → BVH → chart 参数化
+/// → shelf 装箱 → texel 世界位回溯 → 逐 texel [`bake_sample`] → 图集。
+///
+/// 各环节语义与确定性论证见 [`bake_uv`](crate::bake_uv) 模块文档；texel
+/// 序列按行主序升序喂 [`bake_points`]——这就是 R52a 预留的确定性切分点
+/// （分段并行按 `TexelSource::index` 切、按序拼接即可）。`AtlasEntry::mesh`
+/// 在本函数内补齐（纯函数 [`pack_atlas`](crate::bake_uv::pack_atlas) 不查
+/// 世界）。空世界合法：空图集 + 全零辐照。
+pub fn bake_lightmap(
+    world: &World,
+    params: &BakeParams,
+    uv: &crate::bake_uv::BakeUvParams,
+) -> BakedLightmap {
+    use crate::bake_uv::{bake_texels, build_charts, pack_atlas};
+
+    let triangles = collect_bake_triangles(world);
+    let bvh = build_bvh(triangles.clone());
+    let charts = build_charts(&triangles, uv);
+    let mut atlas = pack_atlas(charts, uv.atlas_size);
+    for entry in &mut atlas.entries {
+        entry.mesh = world.get::<MeshHandle>(entry.entity).map(|handle| *handle);
+    }
+    let sources = bake_texels(&atlas, &triangles);
+    let points: Vec<(Vec3, Vec3)> = sources
+        .iter()
+        .map(|source| (source.position, source.normal))
+        .collect();
+    let samples = bake_points(&bvh, &points, params);
+    let size = uv.atlas_size as usize;
+    let mut radiance = vec![Vec3::ZERO; size * size];
+    for (source, sample) in sources.iter().zip(&samples) {
+        radiance[source.index] = sample.total();
+    }
+    BakedLightmap { atlas, radiance }
 }
 
 #[cfg(test)]
@@ -1946,5 +1997,121 @@ mod tests {
             material,
         ));
         assert!(collect_bake_triangles(&bare).is_empty());
+    }
+
+    // ───────────────────────────── 全链组装（R52b） ─────────────────────────────
+
+    /// 全链两次烘焙逐位一致（收集 → BVH → chart 参数化 → 装箱 → texel
+    /// 回溯 → 积分器 → 行主序回填）：房间场景 = 地板 + 侧墙 + 遮挡柱。
+    /// 顺带钉住：`AtlasEntry::mesh` 由 `bake_lightmap` 补齐（纯装箱为
+    /// None）、覆盖与未覆盖 texel 并存、柱影 / AO 产生辐照对比。
+    #[test]
+    fn bake_lightmap_is_bitwise_deterministic_across_runs() {
+        use crate::bake_uv::BakeUvParams;
+
+        let mut world = bake_world();
+        let floor_mesh = world.resource_mut::<MeshStore>().add(MeshData::plane(6.0));
+        let wall_mesh = world.resource_mut::<MeshStore>().add(MeshData::plane(6.0));
+        let column_mesh = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let material = world
+            .resource_mut::<MaterialStore>()
+            .add(MaterialDef::solid(0.7, 0.7, 0.72, 1.0));
+        let floor = world.spawn((
+            GlobalTransform::from_matrix(Mat4::IDENTITY),
+            floor_mesh,
+            material,
+        ));
+        // 侧墙：plane 绕 X 转 90°（法线 +Y → +Z）、局部 z 缩放 0.5 ⇒ 高 3 m
+        let wall = world.spawn((
+            GlobalTransform::from_transform(Transform {
+                position: Vec3::new(0.0, 1.5, -3.0),
+                rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                scale: Vec3::new(1.0, 1.0, 0.5),
+            }),
+            wall_mesh,
+            material,
+        ));
+        let column = world.spawn((
+            GlobalTransform::from_transform(Transform {
+                position: Vec3::new(1.2, 1.0, 0.8),
+                scale: Vec3::new(0.6, 2.0, 0.6),
+                ..Default::default()
+            }),
+            column_mesh,
+            material,
+        ));
+        let params = BakeParams {
+            light_dir: Vec3::new(-0.6, -1.0, 0.25),
+            light_color: Vec3::new(2.0, 1.8, 1.5),
+            sky_color: Vec3::new(0.25, 0.3, 0.45),
+            shadow_softness: 0.2,
+            sky_samples: 16,
+            bounces: 1,
+        };
+        let uv = BakeUvParams {
+            texels_per_meter: 4.0,
+            atlas_size: 64,
+        };
+        let first = bake_lightmap(&world, &params, &uv);
+        let second = bake_lightmap(&world, &params, &uv);
+        assert_eq!(first.radiance.len(), 64 * 64, "行主序、与 size² 对齐");
+        assert_eq!(first.atlas.size, 64);
+        assert_eq!(first.atlas.entries.len(), second.atlas.entries.len());
+        assert_eq!(first.atlas.used_height, second.atlas.used_height);
+        for (a, b) in first.atlas.entries.iter().zip(&second.atlas.entries) {
+            assert_eq!(a.entity, b.entity);
+            assert_eq!(a.mesh, b.mesh);
+            assert_eq!(a.axis, b.axis);
+            assert_eq!(a.origin, b.origin);
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.uv_rect, b.uv_rect);
+            assert_eq!(a.triangles.len(), b.triangles.len());
+            for (ta, tb) in a.triangles.iter().zip(&b.triangles) {
+                assert_eq!(ta.triangle, tb.triangle);
+                assert_eq!(ta.uv_rect, tb.uv_rect);
+                assert_eq!(ta.local, tb.local);
+            }
+        }
+        for (a, b) in first.radiance.iter().zip(&second.radiance) {
+            assert_eq!(
+                a.to_array().map(f32::to_bits),
+                b.to_array().map(f32::to_bits),
+                "两次烘焙的逐 texel 辐照必须逐位一致"
+            );
+        }
+        // sanity：三实体全部入册、mesh 句柄补齐
+        let entities: Vec<Entity> = first.atlas.entries.iter().map(|e| e.entity).collect();
+        for expected in [floor, wall, column] {
+            assert!(entities.contains(&expected), "实体 {expected:?} 应入册");
+        }
+        assert!(
+            first.atlas.entries.iter().all(|e| e.mesh.is_some()),
+            "bake_lightmap 须补齐 mesh 句柄"
+        );
+        // sanity：覆盖与未覆盖并存、阴影 / AO 产生对比
+        let nonzero: Vec<Vec3> = first
+            .radiance
+            .iter()
+            .copied()
+            .filter(|c| *c != Vec3::ZERO)
+            .collect();
+        assert!(
+            nonzero.len() > 500,
+            "覆盖 texel 应数百（地板 24² + 墙 24×12 + 柱），实际 {}",
+            nonzero.len()
+        );
+        assert!(
+            nonzero.len() < first.radiance.len(),
+            "须存在未覆盖（恒零）texel"
+        );
+        let max = nonzero.iter().map(|c| c.length()).fold(0.0f32, f32::max);
+        let min = nonzero
+            .iter()
+            .map(|c| c.length())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            max > 2.0 * min,
+            "柱影 / AO 应产生 ≥ 2× 辐照对比：max {max}、min {min}"
+        );
     }
 }
