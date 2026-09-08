@@ -22,12 +22,17 @@
 //! - 外部 HDR 环境贴图（Radiance .hdr equirectangular → IBL 与天空盒，generation 失效重烘）；
 //! - 视锥剔除与实体挂载相机；
 //! - 网格距离 LOD（`LodMesh` 组件：近 high / 远 low，收集期按距离选网格）；
+//! - 烘焙光照 a 阶段（R52a，`bake` 模块）：纯 CPU 光线跟踪核心（确定性
+//!   BVH + Möller–Trumbore）+ 无 RNG 低差异采样 + 辐照度积分器（直接光 /
+//!   天空 AO / 一次反弹色溢），输出世界空间采样点列表（UV2 图集与渲染
+//!   集成留 b/c 阶段）；
 //! - 纹理 BC1 GPU 压缩（确定性编码器 + 特性/对齐/不透明决策树，无特性
 //!   或 web 自动回退 RGBA8）与 CPU / GPU 内存占用统计；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
 pub mod animation;
 pub mod asset;
+pub mod bake;
 pub mod camera;
 pub mod context;
 pub mod decal;
@@ -63,6 +68,11 @@ pub mod prelude {
     pub use crate::asset::{
         GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
         spawn_gltf_instance_from_bytes, write_glb,
+    };
+    pub use crate::bake::{
+        BAKE_RAY_MIN_T, BAKE_SHADOW_BIAS, BVH_LEAF_SIZE, BakeParams, BakeSample, BakeTriangle, Bvh,
+        BvhHit, SHADOW_SOFT_SAMPLES, bake_points, bake_sample, build_bvh, collect_bake_triangles,
+        cosine_hemisphere, radical_inverse_2, ray_triangle_intersection, raycast_bvh, uniform_cone,
     };
     pub use crate::camera::{
         ActiveCamera, Camera, screen_ray_from_global, view_from_global, view_proj_from_global,

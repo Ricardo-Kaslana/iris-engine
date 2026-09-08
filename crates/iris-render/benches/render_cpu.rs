@@ -11,6 +11,10 @@
 //! - `collect_instances_5k`：真实 World + MeshStore 下 5k 立方体的
 //!   收集 + 视锥剔除（最接近帧预算的指标——`Renderer::draw` 每帧
 //!   GPU 编码前的全部 CPU 收集工作）。
+//! - `bake_bvh_build_1k_tris`：1000 三角场景的 BVH 构建（R52a 烘焙的
+//!   一次性前置成本）；
+//! - `bake_irradiance_1k_points`：1000 采样点 × 64 sky 样本 + 1 反弹的
+//!   辐照度积分（R52a 烘焙的主成本，决定 b/c 阶段是否必须并行）。
 //!
 //! ```sh
 //! cargo bench -p iris-render
@@ -20,10 +24,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use glam::{Mat4, Vec3};
-use iris_core::prelude::{GlobalTransform, Transform};
+use iris_core::prelude::{Entity, GlobalTransform, Transform};
 use iris_render::prelude::{
-    CpuCollector, Frustum, InstanceRaw, MaterialHandle, MaterialStore, MeshData, MeshHandle,
-    MeshStore, diff_changed_ranges, encode_bc1,
+    BakeParams, BakeTriangle, CpuCollector, Frustum, InstanceRaw, MaterialHandle, MaterialStore,
+    MeshData, MeshHandle, MeshStore, bake_points, build_bvh, diff_changed_ranges, encode_bc1,
 };
 
 /// 确定性 LCG（与既有测试同款，不引依赖）。
@@ -87,6 +91,72 @@ fn collect_world() -> (iris_core::world::World, MeshStore, MaterialStore) {
         ));
     }
     (world, meshes, materials)
+}
+
+/// splitmix64 终结函数（无 RNG 的确定性抖动源，与 `bake.rs` 测试同源）。
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn unit(seed: u64) -> f32 {
+    (mix64(seed) >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// 烘焙基准场景：1000 三角（25 × 20 抖动 quad 场）+ 1000 个采样点
+/// （与 `tests/budgets.rs` 的预算形状同口径）。
+fn bake_scene() -> (Vec<BakeTriangle>, Vec<(Vec3, Vec3)>) {
+    let mut triangles: Vec<BakeTriangle> = Vec::with_capacity(1000);
+    for i in 0..500u64 {
+        let gx = (i % 25) as f32;
+        let gz = (i / 25) as f32;
+        let center = Vec3::new(
+            gx * 2.0 - 25.0 + unit(i * 3 + 1) - 0.5,
+            unit(i * 3 + 2) * 3.0 - 1.5,
+            gz * 2.0 - 20.0 + unit(i * 3 + 3) - 0.5,
+        );
+        let u = Vec3::new(1.0, unit(i * 7 + 1) - 0.5, unit(i * 7 + 2) - 0.5);
+        let v = Vec3::new(unit(i * 11 + 1) - 0.5, 1.0, unit(i * 11 + 2) - 0.5);
+        let corners = [
+            center - u - v,
+            center + u - v,
+            center + u + v,
+            center - u + v,
+        ];
+        let albedo = Vec3::new(unit(i * 13 + 1), unit(i * 13 + 2), unit(i * 13 + 3));
+        for indices in [[0usize, 1, 2], [0, 2, 3]] {
+            triangles.push(BakeTriangle {
+                vertices: [
+                    corners[indices[0]],
+                    corners[indices[1]],
+                    corners[indices[2]],
+                ],
+                normal: u.cross(v),
+                albedo,
+                entity: Entity::from_bits(i + 1),
+            });
+        }
+    }
+    let points: Vec<(Vec3, Vec3)> = (0..1000u64)
+        .map(|i| {
+            (
+                Vec3::new(
+                    unit(i * 5 + 1) * 40.0 - 20.0,
+                    unit(i * 5 + 2) * 4.0 + 0.5,
+                    unit(i * 5 + 3) * 30.0 - 15.0,
+                ),
+                Vec3::new(
+                    unit(i * 17 + 1) - 0.5,
+                    unit(i * 17 + 2),
+                    unit(i * 17 + 3) - 0.5,
+                )
+                .normalize(),
+            )
+        })
+        .collect();
+    (triangles, points)
 }
 
 fn bench_render_cpu(c: &mut Criterion) {
@@ -182,6 +252,29 @@ fn bench_render_cpu(c: &mut Criterion) {
                 black_box(eye),
                 black_box(&frustum),
             )
+        })
+    });
+
+    // ---- 烘焙（R52a）：BVH 构建 + 1000 点辐照度积分 ----
+    let (triangles, points) = bake_scene();
+    assert_eq!(triangles.len(), 1000);
+    c.bench_function("bake_bvh_build_1k_tris", |b| {
+        b.iter(|| black_box(build_bvh(black_box(triangles.clone()))))
+    });
+    let bvh = build_bvh(triangles.clone());
+    let params = BakeParams {
+        sky_samples: 64,
+        bounces: 1,
+        shadow_softness: 0.2,
+        ..Default::default()
+    };
+    c.bench_function("bake_irradiance_1k_points", |b| {
+        b.iter(|| {
+            black_box(bake_points(
+                black_box(&bvh),
+                black_box(&points),
+                black_box(&params),
+            ))
         })
     });
 }
