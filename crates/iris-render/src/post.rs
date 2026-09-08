@@ -11,7 +11,13 @@
 //!   → 泛光（半分辨率：亮度提取 → 3×(水平/垂直) 模糊，ping-pong A/B）
 //!   → 暗角（全分辨率 HDR → HDR，强度 0 时整段跳过）
 //!   → blit（泛光叠加 + 曝光 + ACES 色调映射——链的固定终点）→ sRGB
+//!   → FXAA（可选，R53）：LDR sRGB 域边缘平滑；开启时 blit 改写中间 LDR
+//!     纹理、FXAA 再写最终目标，缺席/关闭时 blit 直写目标、链逐位不变
 //! ```
+//!
+//! **TAA 不做**（未做清单，ARCHITECTURE §8.32）：时域抗锯齿需要历史
+//! 缓冲 + 投影抖动 + 运动向量整合三件套，与本链的单帧架构冲突，列为
+//! 后续候选而非遗漏。
 //!
 //! DOF / MB 排在泛光**之前**：焦外亮源与运动拖影都应在 HDR 线性域参与
 //! 亮度提取（泛光），先在物理域混合、后做镜头合成，与暗角先于曝光同理。
@@ -225,6 +231,39 @@ impl Default for MotionBlurSettings {
             enabled: false,
             strength: 32.0,
             max_samples: 16,
+        }
+    }
+}
+
+/// FXAA（快速近似抗锯齿）设置（R53）。后处理链尾部的 LDR 域边缘平滑：
+/// 色调映射后的画面按亮度梯度识别边缘、沿边缘方向做双点混合（单 pass
+/// 片段着色器，见 `shaders/fxaa.wgsl`）。
+///
+/// **资源缺席或 `enabled = false` 时整段跳过**：blit 直写最终目标，与
+/// 无 FXAA 帧逐位一致（零开销默认路径）；`DefaultPlugins` 不注册本资源。
+/// 开启时 blit 改写一份中间 LDR 纹理（同格式），FXAA 采样后再写最终
+/// 目标——UI 在 FXAA **之后**绘制，HUD 文字不被抹糊（链位理由见
+/// ARCHITECTURE §4.25）。
+///
+/// 阈值工作在显示域（着色器把 sRGB 解码后的线性样本以 `pow(1/2.2)`
+/// 近似回显示值算亮度——FXAA 原文的边缘检测假设即显示空间）：
+/// `edge_threshold` / `edge_threshold_min` 取 FXAA 3.11 的典型常量。
+#[derive(Clone, Copy, Debug, iris_core::Resource)]
+pub struct FxaaSettings {
+    /// 是否启用 FXAA。
+    pub enabled: bool,
+    /// 相对边缘阈值（亮度越大要求越高：暗部小对比度边缘不被抹）。
+    pub edge_threshold: f32,
+    /// 绝对边缘阈值下限（亮部的最小边缘亮度差）。
+    pub edge_threshold_min: f32,
+}
+
+impl Default for FxaaSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            edge_threshold: 0.166,
+            edge_threshold_min: 0.083,
         }
     }
 }

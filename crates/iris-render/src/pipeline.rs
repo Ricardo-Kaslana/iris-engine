@@ -86,6 +86,13 @@ pub(crate) struct PipelineBundle {
     /// （端盖与被贴表面共面，等深必须通过；不污染后续 pass 读取的深度），
     /// 位于蒙皮之后、透明之前（绘制序理由见 decal.rs 模块文档）。
     pub decal_pipeline: wgpu::RenderPipeline,
+    /// FXAA 管线（R53）：全屏三角形 LDR sRGB 域边缘平滑，目标 =
+    /// 最终颜色格式（blit 之后、UI 之前，见 `shaders/fxaa.wgsl`）。
+    pub fxaa_pipeline: wgpu::RenderPipeline,
+    /// 遮挡查询代理管线（R53）：实例世界 AABB 盒、无片段阶段（深度只测
+    /// 不写，查询计数由光栅化 + 深度测试产生），组 0 = 视图投影矩阵
+    /// （`cascade_layout` 同源 64B uniform）。
+    pub occlusion_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
     /// 级联阴影 pass 的每级联精简布局：binding 0 = 64B 级联视图投影矩阵
     /// uniform（顶点算裁剪位置；一缓冲一级联，同 pass 内不读写阴影贴图）。
@@ -1436,6 +1443,97 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
+    // FXAA（R53）：与后处理链共用「参数 uniform + 源纹理 + 采样器」组
+    // 布局（post_layout），唯独目标格式 = 最终颜色格式（LDR sRGB 域
+    // pass，输入是 blit 写出的同格式中间纹理；sRGB 纹理由硬件解码为
+    // 线性样本，着色器内以 pow 近似回显示域，见 fxaa.wgsl 模块头）。
+    let fxaa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.fxaa"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fxaa.wgsl").into()),
+    });
+    let fxaa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.fxaa"),
+        layout: Some(&post_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &fxaa_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &fxaa_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 遮挡查询代理（R53）：世界 AABB 盒 → 裁剪位置（组 0 = 64B 视图投影
+    // 矩阵，`cascade_layout` 与场景深度副本同源复用）。**无片段阶段**
+    // （pass 零颜色附件，计数 = 通过深度测试的样本数）；深度只测不写
+    // （不污染本帧深度——查询 pass 夹在主 pass 与贴花 pass 之间，后者
+    // 仍要 Load 同一附件）；cull None（背面也计数 = 保守方向，见
+    // occlusion.rs）；MSAA 采样数与主 pass 一致（附件就是主深度纹理）。
+    let occlusion_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.occlusion"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/occlusion.wgsl").into()),
+    });
+    let occlusion_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.occlusion.pipeline.layout"),
+            bind_group_layouts: &[Some(&cascade_layout)],
+            immediate_size: 0,
+        });
+    let occlusion_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.occlusion"),
+        layout: Some(&occlusion_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &occlusion_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(crate::occlusion::AABB_CORNER_LAYOUT),
+                Some(crate::occlusion::AabbInstanceRaw::LAYOUT),
+            ],
+        },
+        fragment: None,
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            // LessEqual（贴花 R39 同款教训）：可见实例的 AABB 前面与其
+            // 自身在主 pass 写入的深度共面等深，严格 Less 会「自遮挡」
+            // 误剔自己；等深必须通过。查询计 0 的语义不变——全部采样
+            // **严格更远**于已写入深度 ⇒ 该实例对本帧像素零贡献。
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
     PipelineBundle {
         pipeline,
         skinned_pipeline,
@@ -1463,6 +1561,8 @@ pub(crate) fn create_pipeline(
         particle_additive_pipeline,
         particle_alpha_pipeline,
         decal_pipeline,
+        fxaa_pipeline,
+        occlusion_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,

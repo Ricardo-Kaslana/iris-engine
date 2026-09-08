@@ -102,6 +102,17 @@ impl Gpu {
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
     }
 
+    /// 遮挡查询能力（R53）。wgpu 30 起遮挡查询是**核心能力**：WebGPU
+    /// 规范把它从特性位升格为必选实现，`wgpu::Features` 中已无
+    /// `OCCLUSION_QUERY` 位，各后端（Vulkan / DX12 / Metal / GL / WebGPU）
+    /// 全部实现——因此本方法恒返回 `true`，仅作为能力探测点保留
+    /// （若未来出现不支持的降级后端，改这里即可，调用方语义不变）。
+    /// 真正的「无能力回退 = 全部可见」在渲染器执行路径：查询结果
+    /// 迟到一帧即丢弃、不剔除（见 `occlusion.rs` 模块文档）。
+    pub fn supports_occlusion_query(&self) -> bool {
+        true
+    }
+
     /// 离屏 GPU 上下文（无窗口表面）。
     #[cfg(not(target_arch = "wasm32"))]
     pub fn offscreen() -> Option<Self> {

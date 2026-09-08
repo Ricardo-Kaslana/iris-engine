@@ -38,6 +38,13 @@
 //!   间接项 `select(IBL 环境, 光照贴图辐照, mask)`（直接光不受影响 =
 //!   「静态 GI 补动态直射」）；未挂光照贴图的场景**逐位不变**（FNV-1a
 //!   全帧基线锁，见 `tests/lightmap_render.rs`）；
+//! - 遮挡剔除（R53，`occlusion` 模块）：wgpu 硬件遮挡查询两阶段——
+//!   主 pass 深度上逐实例画世界 AABB 代理领用查询槽，结果异步读回
+//!   延迟一帧裁决（迟到即弃 = 全部可见），只跳过主 pass 绘制、阴影与
+//!   深度副本保守保留；资源缺席关闭，静止场景被剔像素逐位不可见；
+//! - FXAA 抗锯齿（R53，`shaders/fxaa.wgsl`）：后处理链尾 LDR sRGB 域
+//!   单 pass（blit → FXAA → UI，HUD 在其后绘制保持锐利），非边缘像素
+//!   早退逐位透传；资源缺席关闭 = blit 直写目标、链逐位不变；
 //! - 纹理 BC1 GPU 压缩（确定性编码器 + 特性/对齐/不透明决策树，无特性
 //!   或 web 自动回退 RGBA8）与 CPU / GPU 内存占用统计；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
@@ -58,6 +65,7 @@ pub mod light;
 pub mod lightmap;
 pub mod material;
 pub mod mesh;
+pub mod occlusion;
 pub mod offscreen;
 pub mod particles;
 pub mod pipeline;
@@ -116,12 +124,13 @@ pub mod prelude {
     pub use crate::mesh::{
         LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex, primitives,
     };
+    pub use crate::occlusion::OcclusionCulling;
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::particles::{
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };
     pub use crate::post::{
-        BloomSettings, DepthOfFieldSettings, ExposureSettings, MotionBlurSettings,
+        BloomSettings, DepthOfFieldSettings, ExposureSettings, FxaaSettings, MotionBlurSettings,
         VignetteSettings, resolve_focus_distance,
     };
     pub use crate::renderer::{

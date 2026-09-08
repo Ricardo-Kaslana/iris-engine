@@ -30,6 +30,9 @@ use crate::light::{DirectionalLight, MAX_POINT_LIGHTS, PointLight, cascade_fit, 
 use crate::lightmap::{LightmapBinding, LightmapHandle, LightmapStore, NO_LIGHTMAP};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
 use crate::mesh::{LodMesh, MeshHandle, MeshStore, upload_mesh};
+use crate::occlusion::{
+    AABB_CORNERS, AABB_INDEX_COUNT, AABB_INDICES, AabbInstanceRaw, OcclusionCulling, world_aabb,
+};
 use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
 use crate::pipeline::{SHADOW_CASCADES, create_pipeline};
 use crate::rendertarget::{RenderTargetHandle, RenderTargetStore, RendersTo};
@@ -277,6 +280,9 @@ struct DrawItem {
     /// 段划分（`run_length`）与材质绑定键里参与，同批内图集交替时切成
     /// 多段（段数 = draw call 数，v1 取舍见 `lightmap.rs` 诚实清单）。
     lightmap: u32,
+    /// 实体位标识（R53 遮挡查询身份键：查询槽 ↔ 实体映射与「上一帧
+    /// 遮挡」判定按此记账）。**同样不进排序键**，缺席场景逐位不变。
+    entity: u64,
 }
 
 /// 渲染器：可同时服务窗口表面与离屏目标。
@@ -382,6 +388,19 @@ pub struct Renderer {
     scene_depth: Option<SceneDepthTargets>,
     /// 深度副本尺寸（复用判定键）。
     scene_depth_size: (u32, u32),
+    /// 最终颜色目标格式（R53：FXAA 中间 LDR 缓冲与 blit 目标同格式；
+    /// 与 `create_pipeline` 的 color_format 同源）。
+    color_format: wgpu::TextureFormat,
+    /// 遮挡查询常驻 GPU 资源（R53，首次启用时惰性创建；关闭恒 `None`
+    /// ——零开销默认路径的分配侧保证）。
+    occ_gpu: Option<OccGpu>,
+    /// 在途读回（R53，至多一帧；见 [`OccInflight`]）。
+    occ_inflight: Option<OccInflight>,
+    /// 最近一次新鲜读回中「样本数 = 0」的实体 bits（本帧主 pass 剔除
+    /// 依据；无新鲜结果时不使用——全部可见）。
+    occ_hidden: std::collections::HashSet<u64>,
+    /// 帧计数（R53 新鲜度判定与读回双缓冲槽位；每帧 `draw` 开头自增）。
+    occ_frame: u64,
     /// 上一帧主相机视图投影（R43 运动模糊的重投影基准）。`None` = 尚未
     /// 渲染过任何帧（首帧）——MB 用当前帧矩阵补位，速度恒 0、原色透传。
     prev_view_proj: Option<glam::Mat4>,
@@ -447,6 +466,12 @@ pub struct Renderer {
     rt_transparent: Vec<TransparentItem>,
     rt_transparent_skinned: Vec<TransparentSkinnedItem>,
     rt_instance_scratch: Vec<InstanceRaw>,
+    /// 遮挡查询暂存（R53，跨帧复用）：主 pass 绘制判定布尔表、逐实例
+    /// AABB、查询槽 ↔ 实体映射。长度与当帧 items 对齐（bool 表恒覆盖
+    /// 全部不透明实例，`occ_filtered` 标记其是否生效）。
+    occ_drawn_scratch: Vec<bool>,
+    occ_aabb_scratch: Vec<AabbInstanceRaw>,
+    occ_entity_scratch: Vec<u64>,
     /// 粒子收集暂存：additive 段（后接排好序的 alpha 段，一次全量上传）。
     particle_scratch: Vec<ParticleInstance>,
     /// alpha 粒子收集暂存：(视深, 收集序号, 实例)——排序键与数据一体。
@@ -492,6 +517,9 @@ struct HdrTargets {
     /// blit 合成参数（16B，PostParamsRaw：x 泛光强度 / y 曝光 / z 暗角 /
     /// w 保留）。每帧整体覆写。
     post_params: wgpu::Buffer,
+    /// FXAA 中间 LDR 缓冲（R53）：仅 `FxaaSettings` 开启时惰性创建
+    /// （见 `ensure_fxaa_targets`）；关闭恒 `None`、blit 直写最终目标。
+    fxaa: Option<FxaaTargets>,
 }
 
 /// 主相机场景深度副本（R43）：R32Float 单采样纹理（R = 线性视距）+
@@ -508,6 +536,69 @@ struct SceneDepthTargets {
     /// 64B 相机矩阵 uniform（CascadeParams 同布局，cascade_layout 复用）。
     params: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+/// FXAA 中间 LDR 缓冲（R53）：开启时色调映射 blit 改写这里（同格式的
+/// 最终目标），FXAA pass 再采样写最终目标。缺席/关闭时整组资源不存在
+/// （`HdrTargets` 里恒 `None`，blit 直写最终目标——逐位默认路径）。
+/// 随 `HdrTargets` 尺寸重建一并失效重建。
+struct FxaaTargets {
+    /// 纹理本体保活（视图有效性依赖）。
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// 16B 参数（vec4：edge_threshold / edge_threshold_min / 1/w / 1/h）。
+    params: wgpu::Buffer,
+    /// 线性采样器：FXAA 的 A/B 采样点在纹素中心 ±0.5 内偏移，双线性
+    /// 过滤是其定义的一部分（Nearest 会把亚纹素偏移量化回同纹素、
+    /// 整帧无差别透传——实测教训）；中心取样恰在纹素正中，权重
+    /// (1,0,0,0) 精确命中，早退分支的逐位透传性质不受影响。链共享
+    /// `post_sampler` 是 Nearest（泛光模糊靠显式纹素偏移工作），不能复用。
+    /// 字段仅为保活与文档说明（绑定组已引用该采样器）。
+    #[allow(dead_code)]
+    sampler: wgpu::Sampler,
+    /// post_layout 绑定组（参数 + LDR 源视图 + 线性采样器）。
+    bind_group: wgpu::BindGroup,
+}
+
+/// 遮挡查询的常驻 GPU 资源（R53，首次启用时惰性创建，见
+/// `ensure_occ_gpu`）。查询槽上限 = `wgpu::QUERY_SET_MAX_QUERIES`
+/// （4096）：超出部分不查询、恒可见（保守方向，见 occlusion.rs 限制③）。
+struct OccGpu {
+    /// 遮挡查询集（每帧按实例序领用 0..n 槽，容量固定不重建）。
+    query_set: wgpu::QuerySet,
+    /// 单位立方体 8 角点（±0.5，静态）。
+    corner_buf: wgpu::Buffer,
+    /// 立方体 36 索引（u16）。
+    index_buf: wgpu::Buffer,
+    /// 64B 视图投影矩阵（cascade_layout 同源复用）。
+    params_buf: wgpu::Buffer,
+    params_bg: wgpu::BindGroup,
+    /// 双帧读回环：resolve 缓冲（QUERY_RESOLVE | COPY_SRC）与映射读回
+    /// 缓冲（MAP_READ | COPY_DST）成对按帧奇偶交替（读回在途时不覆盖）。
+    resolve_bufs: [wgpu::Buffer; 2],
+    readback_bufs: [wgpu::Buffer; 2],
+    /// 逐实例 AABB 缓冲（容量复用，照实例缓冲模式）。
+    aabb_buf: Option<wgpu::Buffer>,
+    aabb_capacity: usize,
+}
+
+/// 在途的遮挡查询读回（R53）：帧 N 编码期 resolve + copy，本帧提交后
+/// `map_async`；帧 N+1 的 `draw` 开头 `poll(Poll)` + `try_recv` 消费。
+/// 读回缓冲在消费 unmap 前**不可复用**，因此同一时刻至多一条在途
+/// （迟到期间该帧跳过查询与剔除——全部可见，保守方向）。
+struct OccInflight {
+    /// 读回缓冲槽位（`resolve_bufs` / `readback_bufs` 下标）。
+    parity: usize,
+    /// 查询槽 ↔ 实体映射（i = 查询索引，值 = 实体 bits；与帧 N 的
+    /// AABB 实例缓冲同序——排序后 items 前缀，确定性）。
+    entities: Vec<u64>,
+    /// 本批查询数。
+    count: usize,
+    /// 发出帧号（消费时判新鲜：只有上一帧的结果才允许剔除）。
+    frame: u64,
+    /// `map_async` 完成信道（回调送达映射结果）。
+    done: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
 
 impl HdrTargets {
@@ -661,12 +752,18 @@ pub struct FrameStats {
     /// 完全一致、整帧跳过实例上传（静态场景零上传）。粒子与贴花实例走
     /// 独立缓冲、每帧全量上传，**不计入**本字段（见 `particles_drawn`）。
     pub instance_upload_bytes: u64,
-    /// 本帧被视锥剔除的实例数（普通 + 蒙皮 + 透明 + 贴花合计）。
-    /// `Visibility::HIDDEN` 的过滤不算剔除（不进入 `instances` 也不进入本
-    /// 字段）。**粒子不进本口径**：剔除按发射器包围球整批裁决，被剔的
-    /// 发射器既不进 `instances` 也不进本字段（口径为几何实例，避免混淆，
-    /// 见 ARCHITECTURE §4.17）。
+    /// 本帧被视锥剔除的实例数（普通 + 蒙皮 + 透明 + 贴花合计），
+    /// **开启遮挡剔除（R53）时另加本帧被遮挡剔除的实例数**（单列口径见
+    /// [`Self::occlusion_culled`]）。`Visibility::HIDDEN` 的过滤不算剔除
+    /// （不进入 `instances` 也不进入本字段）。**粒子不进本口径**：剔除按
+    /// 发射器包围球整批裁决，被剔的发射器既不进 `instances` 也不进本
+    /// 字段（口径为几何实例，避免混淆，见 ARCHITECTURE §4.17）。
     pub culled_instances: u32,
+    /// 本帧被遮挡剔除的实例数（R53，[`OcclusionCulling`] 开启且有上一帧
+    /// 查询结果时的主 pass 跳过数；同时计入 `culled_instances`，关闭恒
+    /// 0）。被剔实例只是不进入主 pass 绘制——阴影 pass 与场景深度副本
+    /// 照常（保守性论证见 `occlusion.rs` 模块文档）。
+    pub occlusion_culled: u32,
     /// 主几何实际提交的三角形总数：可见项的网格索引数 / 3 累加（普通批
     /// × 批实例数，蒙皮逐项，贴花每实例 4 三角形 = ±Z 两端盖；透明同口径
     /// 计入；粒子每粒 2 三角形）。**主几何口径**——不含 UI pass 与阴影
@@ -1086,6 +1183,7 @@ fn collect_instances(
                 key,
                 instance: InstanceRaw::from_matrix(model),
                 lightmap: resolve_lightmap(e.to_bits(), m),
+                entity: e.to_bits(),
             });
         }
     });
@@ -1809,6 +1907,11 @@ impl Renderer {
             hdr_size: (0, 0),
             scene_depth: None,
             scene_depth_size: (0, 0),
+            color_format,
+            occ_gpu: None,
+            occ_inflight: None,
+            occ_hidden: std::collections::HashSet::new(),
+            occ_frame: 0,
             prev_view_proj: None,
             ui_atlas,
             ui_bind_group,
@@ -1841,6 +1944,9 @@ impl Renderer {
             rt_transparent: Vec::new(),
             rt_transparent_skinned: Vec::new(),
             rt_instance_scratch: Vec::new(),
+            occ_drawn_scratch: Vec::new(),
+            occ_aabb_scratch: Vec::new(),
+            occ_entity_scratch: Vec::new(),
             particle_scratch: Vec::new(),
             particle_alpha_scratch: Vec::new(),
             clear_color: wgpu::Color {
@@ -1991,6 +2097,7 @@ impl Renderer {
             dof_params,
             motion_blur_params,
             post_params,
+            fxaa: None,
         });
     }
 
@@ -2097,6 +2204,228 @@ impl Renderer {
         self.clear_color = color;
     }
 
+    /// FXAA 按需资源（R53）：中间 LDR 纹理（与最终目标同格式，blit 管线
+    /// 原样可写）+ 16B 参数缓冲 + `post_layout` 绑定组。仅
+    /// [`crate::post::FxaaSettings`] 开启时在 `draw` 开头、`hdr` 不可变
+    /// 借用建立之前调用；关闭路径不触本函数（资源恒 `None`）。随
+    /// `HdrTargets` 尺寸重建整体失效、下次开启惰性重建。采样器用专属
+    /// 线性档（字段注释说明为何链共享的 Nearest `post_sampler` 不可用）。
+    fn ensure_fxaa_targets(&mut self, width: u32, height: u32) {
+        let hdr = self
+            .hdr
+            .as_mut()
+            .expect("draw 开头已 ensure_hdr_targets，HDR 中间缓冲必就绪");
+        if hdr.fxaa.is_some() {
+            return;
+        }
+        let device = &self.gpu.device;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.fxaa.ldr"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.fxaa.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.fxaa.params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.fxaa.bg"),
+            layout: &self.bundle.post_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        hdr.fxaa = Some(FxaaTargets {
+            texture,
+            view,
+            params,
+            sampler,
+            bind_group,
+        });
+    }
+
+    /// 遮挡查询常驻资源的首次惰性创建（R53）：4096 槽查询集（核心能力
+    /// 上限，见 `occlusion.rs` 限制③）+ 单位盒代理几何 + 双帧读回环。
+    /// 全部资源与开关同生命周期：功能从未开启过 = 一个字节都不分配。
+    fn ensure_occ_gpu(&mut self) {
+        if self.occ_gpu.is_some() {
+            return;
+        }
+        let device = &self.gpu.device;
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("iris.occlusion.queries"),
+            ty: wgpu::QueryType::Occlusion,
+            count: wgpu::QUERY_SET_MAX_QUERIES,
+        });
+        let corner_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("iris.occlusion.corners"),
+            contents: bytemuck::cast_slice(&AABB_CORNERS),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("iris.occlusion.indices"),
+            contents: bytemuck::cast_slice(&AABB_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.occlusion.params"),
+            size: std::mem::size_of::<CascadeParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.occlusion.params.bg"),
+            layout: &self.bundle.cascade_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buf.as_entire_binding(),
+            }],
+        });
+        let query_bytes = u64::from(wgpu::QUERY_SET_MAX_QUERIES) * u64::from(wgpu::QUERY_SIZE);
+        let resolve_bufs = std::array::from_fn(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.occlusion.resolve"),
+                size: query_bytes,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        });
+        let readback_bufs = std::array::from_fn(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.occlusion.readback"),
+                size: query_bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        self.occ_gpu = Some(OccGpu {
+            query_set,
+            corner_buf,
+            index_buf,
+            params_buf,
+            params_bg,
+            resolve_bufs,
+            readback_bufs,
+            aabb_buf: None,
+            aabb_capacity: 0,
+        });
+        log::debug!(
+            "遮挡查询资源已创建（{} 槽双缓冲）",
+            wgpu::QUERY_SET_MAX_QUERIES
+        );
+    }
+
+    /// 遮挡 AABB 实例缓冲容量复用（与实例缓冲同款：不足时 2 倍扩容整体
+    /// 重建；本缓冲每帧全量上传——实例序随收集变化，增量无意义）。
+    fn ensure_occ_aabb_capacity(&mut self, needed: usize) {
+        let capacity_need = {
+            let occ = self
+                .occ_gpu
+                .as_ref()
+                .expect("ensure_occ_gpu 已在本帧先调用");
+            occ.aabb_capacity < needed
+        };
+        if capacity_need {
+            let capacity = (needed * 2).max(256);
+            let buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.occlusion.aabbs"),
+                size: (capacity * std::mem::size_of::<AabbInstanceRaw>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let occ = self.occ_gpu.as_mut().expect("同上");
+            occ.aabb_buf = Some(buf);
+            occ.aabb_capacity = capacity;
+            log::debug!("遮挡 AABB 缓冲扩容至 {capacity} 实例");
+        }
+    }
+
+    /// 消费上一帧的遮挡查询读回（R53，`draw` 开头帧号自增后调用）。
+    ///
+    /// 非阻塞：`poll(Poll)` 推进一次设备、`try_recv` 取映射回调——
+    /// 到达则重建隐藏表（**只采纳上一帧发出的结果**，迟到丢弃）并
+    /// `unmap` 释放槽位；未到达则保持在途、本帧不剔除（全部可见，
+    /// 保守方向）。返回值 = 本帧可用新鲜剔除裁决。
+    fn consume_occlusion_results(&mut self) -> bool {
+        let Some(inflight) = self.occ_inflight.as_ref() else {
+            return false;
+        };
+        let _ = self.gpu.device.poll(wgpu::PollType::Poll);
+        match inflight.done.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // 映射失败（设备丢失等）：缓冲未被映射，直接废弃在途记录
+                log::warn!("遮挡查询读回映射失败：{e}，本帧不剔除");
+                self.occ_inflight = None;
+                return false;
+            }
+            Err(_) => {
+                // 回调未到（GPU 尚未退休本批提交）：保持在途、稍后再收
+                return false;
+            }
+        }
+        let inflight = self.occ_inflight.take().expect("刚确认回调到达");
+        let fresh = inflight.frame == self.occ_frame - 1;
+        let occ = self.occ_gpu.as_ref().expect("读回缓冲随查询资源同在");
+        {
+            let bytes = occ.readback_bufs[inflight.parity]
+                .get_mapped_range(0..(inflight.count * std::mem::size_of::<u64>()) as u64)
+                .expect("已映射的读回缓冲必须可读");
+            self.occ_hidden.clear();
+            if fresh {
+                for (i, &entity) in inflight.entities.iter().enumerate() {
+                    let slot = i * std::mem::size_of::<u64>();
+                    let samples =
+                        u64::from_le_bytes(bytes[slot..slot + 8].try_into().expect("u64 槽"));
+                    // 0 = 全部深度测试失败 ⇒ 对本帧深度零贡献（保守性论证
+                    // 见 occlusion.rs）；非 0 保守地保留可见
+                    if samples == 0 {
+                        self.occ_hidden.insert(entity);
+                    }
+                }
+            } else {
+                log::debug!(
+                    "遮挡查询结果迟到（帧 {}/{}），本帧跳过剔除",
+                    inflight.frame,
+                    self.occ_frame
+                );
+            }
+        }
+        occ.readback_bufs[inflight.parity].unmap();
+        fresh
+    }
+
     pub fn stats(&self) -> FrameStats {
         self.stats
     }
@@ -2123,6 +2452,10 @@ impl Renderer {
         // 环境源失效检查在最前：重烘焙与绑定组重建必须发生在本帧编码之前
         self.ensure_environment(world);
         self.ensure_hdr_targets(width, height);
+        // 遮挡查询（R53）：帧号自增后先消费上一帧读回（非阻塞 poll +
+        // try_recv，迟到即弃），裁决在本帧收集之后、主 pass 编码之前应用
+        self.occ_frame += 1;
+        let occ_fresh = self.consume_occlusion_results();
         // 暗角 / 景深 / 运动模糊的按需资源（全分辨率中间对 + blit 接入
         // 绑定组 + 主相机深度副本）必须在贯穿全部 pass 的 hdr 不可变借用
         // 建立之前惰性分配（关闭 = 零开销跳过——与可见性、粒子同款
@@ -2148,6 +2481,23 @@ impl Renderer {
         if dof_on || mb_on {
             self.ensure_scene_depth(width, height);
         }
+        // FXAA（R53）：开启 = blit 改写中间 LDR、FXAA pass 再写最终目标；
+        // 缺席/关闭 = blit 直写，命令流与引入本功能前逐位一致。资源分配
+        // 同样必须在 hdr 不可变借用建立之前（随 HdrTargets 尺寸失效）。
+        let fxaa = world
+            .try_resource::<crate::post::FxaaSettings>()
+            .map(|f| *f)
+            .unwrap_or_default();
+        let fxaa_on = fxaa.enabled;
+        if fxaa_on {
+            self.ensure_fxaa_targets(width, height);
+        }
+        // 遮挡剔除（R53）：开启语义、保守性论证与「读回迟到一帧 ⇒ 本帧
+        // 不剔除」的回退见 occlusion.rs 模块文档。
+        let occlusion_on = world
+            .try_resource::<OcclusionCulling>()
+            .is_some_and(|o| o.enabled)
+            && self.gpu.supports_occlusion_query();
         self.stats = FrameStats::default();
         // 相机解析：优先挂载在实体上的 ActiveCamera（跟随层级运动），
         // 其次回退到全局 Camera 资源。`RendersTo`（R40）标记的相机不复用
@@ -2440,6 +2790,58 @@ impl Renderer {
                 counts.culled,
                 counts.visible + counts.culled as usize
             );
+        }
+        // 2e. 遮挡查询（R53）：查询列表 = 排序后全部普通不透明实例的
+        //     世界 AABB（**含已遮挡者**——被剔实体必须持续重查，否则没有
+        //     恢复可见的路径；无 CPU 包围盒的网格不查询、恒可见；超出
+        //     4096 槽上限的尾部不查询、恒可见——都是保守方向）。剔除
+        //     裁决只作用于主 pass 绘制（阴影 / 深度副本保留，保守性论证
+        //     见 occlusion.rs），且仅在上一帧查询的新鲜结果上生效。
+        //     items 序 = 排序后确定序 ⇒ 查询槽 ↔ 实体映射稳定（确定性）。
+        let mut occ_drawn = std::mem::take(&mut self.occ_drawn_scratch);
+        let mut occ_aabbs = std::mem::take(&mut self.occ_aabb_scratch);
+        let mut occ_entities = std::mem::take(&mut self.occ_entity_scratch);
+        occ_drawn.clear();
+        occ_aabbs.clear();
+        occ_entities.clear();
+        let mut occ_filtered = false;
+        if occlusion_on && total > 0 {
+            self.ensure_occ_gpu();
+            for item in items.iter().take(wgpu::QUERY_SET_MAX_QUERIES as usize) {
+                let Some((min, max)) = mesh_store
+                    .get(MeshHandle((item.key >> 32) as u32))
+                    .and_then(|data| data.bounds())
+                else {
+                    continue;
+                };
+                let (lo, hi) = world_aabb(
+                    Vec3::from(min),
+                    Vec3::from(max),
+                    &Mat4::from_cols_array_2d(&item.instance.model),
+                );
+                occ_aabbs.push(AabbInstanceRaw {
+                    min: [lo.x, lo.y, lo.z, 0.0],
+                    max: [hi.x, hi.y, hi.z, 0.0],
+                });
+                occ_entities.push(item.entity);
+            }
+            if occ_fresh && !self.occ_hidden.is_empty() {
+                occ_drawn.resize(items.len(), true);
+                let mut culled_now = 0u32;
+                for (i, item) in items.iter().enumerate() {
+                    if self.occ_hidden.contains(&item.entity) {
+                        occ_drawn[i] = false;
+                        culled_now += 1;
+                    }
+                }
+                self.stats.culled_instances += culled_now;
+                self.stats.occlusion_culled = culled_now;
+                occ_filtered = true;
+            }
+            // 容量复用必须在贯穿后续全部 pass 的 hdr 不可变借用建立之前
+            // （缓冲重建需 &mut self）；空列表 = 零开销 no-op，5a 段据此
+            // 直接取用。
+            self.ensure_occ_aabb_capacity(occ_aabbs.len());
         }
 
         // 2b. 点光阴影 pass 的实例可见性（CPU 粗剔除）：实例包围球到投影灯的
@@ -2944,6 +3346,7 @@ impl Renderer {
                         .slice(..),
                 );
             }
+            let occ_drawn_ref = occ_filtered.then_some(occ_drawn.as_slice());
             index = 0;
             while index < total {
                 let key = items[index].key;
@@ -2959,18 +3362,34 @@ impl Renderer {
                 // 光照贴图 UV2（R52c，槽 3）：缺席网格同样绑零垫
                 pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                let first = index as u32;
-                let last = (index + count) as u32;
-                pass.draw_indexed(0..mesh.num_indices, 0, first..last);
-                draw_calls += 1;
-                instances += count as u32;
-                // 主 pass 三角形统计：网格索引数 / 3 × 批实例数。索引数取
-                // CPU 目录（网格缺席按 0 处理，不 panic——该路径理论上不可达，
+                // 子段遍历（R53）：遮挡关闭 = 恒整段一次 draw，命令流与
+                // 引入前逐位一致；开启 = 只提交「未被遮挡」的连续子段
+                // （实例区间天然全局连续，子段直接可用）。主 pass 三角形
+                // 统计：网格索引数 / 3 × 子段实例数；索引数取 CPU 目录
+                //（网格缺席按 0 处理，不 panic——该路径理论上不可达，
                 // 缺席网格在懒上传阶段已告警跳过）
-                triangles_drawn += mesh_store
+                let tris_per_instance = mesh_store
                     .get(MeshHandle((key >> 32) as u32))
-                    .map_or(0, |data| data.indices.len() as u32 / 3)
-                    * count as u32;
+                    .map_or(0, |data| data.indices.len() as u32 / 3);
+                let mut sub = 0usize;
+                while sub < count {
+                    if !occ_drawn_ref.is_none_or(|d| d[index + sub]) {
+                        sub += 1;
+                        continue;
+                    }
+                    let mut end = sub + 1;
+                    while end < count && occ_drawn_ref.is_none_or(|d| d[index + end]) {
+                        end += 1;
+                    }
+                    let first = (index + sub) as u32;
+                    let last = (index + end) as u32;
+                    pass.draw_indexed(0..mesh.num_indices, 0, first..last);
+                    draw_calls += 1;
+                    let run = (end - sub) as u32;
+                    instances += run;
+                    triangles_drawn += tris_per_instance * run;
+                    sub = end;
+                }
                 index += count;
             }
             // 蒙皮实体：独立管线（组 2 = 关节矩阵 storage），实例区间紧随普通实例
@@ -3008,6 +3427,70 @@ impl Renderer {
                         .map_or(0, |data| data.indices.len() as u32 / 3);
                 }
             }
+        }
+        // 5a. 遮挡查询 pass（R53，紧随主 pass）：复用本帧不透明深度
+        //（Load 不写、Store 原样——其后的贴花/透明 pass 仍要 Load 同一
+        // 附件），逐实例画世界 AABB 盒领用查询槽（一槽一 draw，限制③）。
+        // 结果 resolve → copy 进双缓冲、本帧提交后 map_async，下一帧
+        // draw 开头消费（延迟一帧）。读回在途时整段跳过（缓冲不可覆写、
+        // 帧无新结果 = 不剔除，全部可见）。
+        let mut occ_issued: Option<(usize, Vec<u64>, usize)> = None;
+        if occlusion_on && !occ_aabbs.is_empty() && self.occ_inflight.is_none() {
+            let n = occ_aabbs.len();
+            let occ = self.occ_gpu.as_ref().expect("查询资源已在收集段创建");
+            self.gpu.queue.write_buffer(
+                &occ.params_buf,
+                0,
+                bytemuck::bytes_of(&CascadeParamsRaw {
+                    view_proj: vp.to_cols_array_2d(),
+                }),
+            );
+            let aabb_buf = occ.aabb_buf.as_ref().expect("AABB 缓冲容量已保证");
+            self.gpu
+                .queue
+                .write_buffer(aabb_buf, 0, bytemuck::cast_slice(&occ_aabbs));
+            {
+                let mut qpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("iris.pass.occlusion"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            // 深度内容未变，Store 是严格定义的零成本透传
+                            //（Discard 会把附件置未定义，毁掉后续透明 pass）
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: Some(&occ.query_set),
+                    multiview_mask: None,
+                });
+                qpass.set_pipeline(&self.bundle.occlusion_pipeline);
+                qpass.set_bind_group(0, &occ.params_bg, &[]);
+                qpass.set_vertex_buffer(0, occ.corner_buf.slice(..));
+                qpass.set_vertex_buffer(
+                    1,
+                    aabb_buf.slice(0..(n * std::mem::size_of::<AabbInstanceRaw>()) as u64),
+                );
+                qpass.set_index_buffer(occ.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                for q in 0..n as u32 {
+                    qpass.begin_occlusion_query(q);
+                    qpass.draw_indexed(0..AABB_INDEX_COUNT, 0, q..q + 1);
+                    qpass.end_occlusion_query();
+                }
+            }
+            let parity = (self.occ_frame % 2) as usize;
+            encoder.resolve_query_set(&occ.query_set, 0..n as u32, &occ.resolve_bufs[parity], 0);
+            encoder.copy_buffer_to_buffer(
+                &occ.resolve_bufs[parity],
+                0,
+                &occ.readback_bufs[parity],
+                0,
+                (n * std::mem::size_of::<u64>()) as u64,
+            );
+            occ_issued = Some((parity, std::mem::take(&mut occ_entities), n));
         }
         // 贴花 pass（R39）：主 pass（天空 + 不透明 + 蒙皮）之后、透明 pass
         // 之前——贴花是**不透明表面的装饰**，属于场景「实体」的一部分；
@@ -3592,10 +4075,18 @@ impl Renderer {
                     .as_ref()
                     .expect("全分辨率 B 槽 blit 接入绑定组应已惰性构建"),
             };
+            // FXAA（R53）开启时 blit 改写中间 LDR 纹理（同格式、同管线、
+            // 同绑定组——输出字节与直写最终目标一致），最终目标由紧随
+            // 其后的 FXAA pass 写入；关闭时直写 color_view，本 pass 与
+            // 引入前逐位一致（兼容硬约束实现点）。
+            let blit_dst = match hdr.fxaa.as_ref() {
+                Some(fx) if fxaa_on => &fx.view,
+                _ => color_view,
+            };
             let mut blit = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
+                    view: blit_dst,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -3611,6 +4102,47 @@ impl Renderer {
             blit.set_pipeline(&self.bundle.blit_pipeline);
             blit.set_bind_group(0, blit_bg, &[]);
             blit.draw(0..3, 0..1);
+        }
+        // FXAA pass（R53）：LDR 域边缘平滑，blit 之后、UI 之前——HUD
+        // 文字画在被平滑的画面之上，自身保持锐利。全屏三角形逐像素
+        // 覆写（清屏值随即被覆盖，与 blit pass 同款清屏以走最稳的
+        // 附件生命周期）；非边缘像素在着色器内早退透传中心采样，
+        // 画面与不开 FXAA 的差异只可能出现在边缘带上（开启即视觉
+        // 变化是功能本意，关闭路径不经过本 pass）。
+        if fxaa_on {
+            let fx = hdr
+                .fxaa
+                .as_ref()
+                .expect("FXAA 开启时 ensure_fxaa_targets 已建立中间缓冲");
+            self.gpu.queue.write_buffer(
+                &fx.params,
+                0,
+                bytemuck::bytes_of(&[
+                    fxaa.edge_threshold.max(0.0),
+                    fxaa.edge_threshold_min.max(0.0),
+                    1.0 / width.max(1) as f32,
+                    1.0 / height.max(1) as f32,
+                ]),
+            );
+            let mut fxaa_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.fxaa"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            fxaa_pass.set_pipeline(&self.bundle.fxaa_pipeline);
+            fxaa_pass.set_bind_group(0, &fx.bind_group, &[]);
+            fxaa_pass.draw(0..3, 0..1);
         }
         // UI 叠加层：blit 之后的最后一个 pass。同一 color_view、LoadOp::Load
         // （不清屏，直接叠加在色调映射结果上）、无深度附件。顶点非空才开
@@ -3745,6 +4277,28 @@ impl Renderer {
         self.ui_scratch = ui_vertices;
         self.ui_image_scratch = ui_images;
         self.gpu.queue.submit([encoder.finish()]);
+        // 遮挡查询读回（R53）：提交后对映射区发起 map_async，回调经
+        // 下一帧 draw 开头的 poll + try_recv 消费（缓冲在消费 unmap 前
+        // 不可复用——在途期间该帧跳过查询与剔除）。
+        if let Some((parity, entities, count)) = occ_issued {
+            let occ = self
+                .occ_gpu
+                .as_ref()
+                .expect("发出帧必有查询资源（本帧刚使用）");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            occ.readback_bufs[parity]
+                .slice(0..(count * std::mem::size_of::<u64>()) as u64)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            self.occ_inflight = Some(OccInflight {
+                parity,
+                entities,
+                count,
+                frame: self.occ_frame,
+                done: receiver,
+            });
+        }
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
         self.stats.triangles_drawn = triangles_drawn;
@@ -3753,6 +4307,9 @@ impl Renderer {
         self.skinned_scratch = skinned;
         self.transparent_scratch = transparent;
         self.transparent_skinned_scratch = transparent_skinned;
+        self.occ_drawn_scratch = occ_drawn;
+        self.occ_aabb_scratch = occ_aabbs;
+        self.occ_entity_scratch = occ_entities;
         self.decal_scratch = decal_items;
         self.particle_scratch = particle_instances;
         self.particle_alpha_scratch = particle_alpha;
