@@ -27,6 +27,7 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
           └── iris-bastion（下游示范游戏 III）── iris-ascent（下游示范游戏 IV）
                               └── iris-infiltration（下游示范游戏 V）
                                   └── iris-assault（下游示范游戏 VI）
+                                      └── iris-editor（关卡摆放编辑器，R58a 工具 crate）
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -140,6 +141,23 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   DOF 动态对焦无辅助 / 骨架下标契约全手工 / example 跨 crate 同名
   冲突）见 §8.26——**七条已在「打磨 VI」全部闭合**（①②③⑤⑥ 引擎修复
   + 游戏侧删绕行，④⑦ 文档 / 约定闭合）。
+- **iris-editor**：**关卡摆放编辑器**（R58a 最小 MVP，W5 内容产能工具的
+  第一块）——与六个示范游戏同层的**工具** crate（bin，原生为主；依赖
+  纪律同款：iris-engine 门面 + iris-core 纯函数 + glam，零新增第三方
+  crate）。**架构硬要求 = 命令层与交互壳分离**：`edit.rs` 命令层（编辑
+  器状态 `EditorState` + 摆放 / 拾取 / 拖拽 / 删除 / 复制 / 微移 / 缩放
+  全是 `World + EditorState + 事件参数 → 确定性结果` 的自由函数，
+  headless 可单测）与 `shell.rs` 交互壳（winit 窗口 + 飞行相机 + 输入
+  翻译，刻意薄；`EditorPlugin::build_schedule` 暴露编排供 headless /
+  离屏复用，六个游戏同款范式）。数据层 = R57 关卡档 v2（不发明新格式）：
+  `open_level` / `save_level` 走 `load_scene` / `save_scene`，`level` 段
+  经 `LevelRegistry` 快照语义只读保留。两条机制不变量（§4.27）：编辑器
+  spawn 的网格 / 材质**同步登记进 `SceneAssetRegistry`**（否则 save 还原
+  不出 mesh 段）；**句柄编号对齐**（同源去重 + 瞬态视觉资产先建 ⇒ 保存
+  与重载两侧 `MeshHandle` / `MaterialHandle` 逐位相同）。验收：headless
+  19 项（9 实体往返逐位 + assault 庭院档经编辑器往返）+ 离屏验收图
+  `docs/editor_mvp.png` / `docs/editor_viewport.png`；诚实清单 §8.34 与
+  edit.rs 模块文档。
 
 ## 3. ECS 设计（iris-core）
 
@@ -2652,6 +2670,102 @@ scene.rs 新增 2 项（粒子段往返、同源去重）共 28 项 + assault
 `level_roundtrip.rs` 3 项（档往返逐位 / 档与 logic 常量双源守护 /
 材质三槽接线）。诚实清单见 §8.33 与 level.rs 模块文档。
 
+### 4.27 关卡摆放编辑器（iris-editor，R58a）
+
+**定位**：W5 内容产能工具的第一块——一个**能用的**关卡摆放编辑器
+（a 阶段 MVP）。它不发明数据格式：读写的全是 §4.26 的关卡档 v2，
+「编辑器 = 那份格式的一个写者」。范围边界即验收标准，拒绝清单（多选 /
+undo / 光源参数面板 / 烘焙入口 / GLB 摆放 / 地形雕刻 / 材质编辑器 /
+文本输入框 / 快捷键自定义 / 主题）一条未越。
+
+**分层（架构硬要求）**：
+
+- `edit.rs` **命令层**：`EditorState`（World 资源：选择集 / 摆放类型 /
+  材质预设 / 碰撞体开关 / 吸附开关 / 拖拽平面与偏移 / 状态行 + 私有句柄
+  缓存与瞬态实体清单）+ 全部编辑操作为自由函数——`open_level` /
+  `save_level` / `place_at` / `place_light_at` / `place_from_ray` /
+  `pick` / `pick_with_hit` / `placement_point` / `select` / `begin_drag` /
+  `drag_to` / `end_drag` / `delete_selected` / `duplicate_selected` /
+  `nudge_selected` / `scale_selected` / `cycle_kind` / `cycle_preset` /
+  `toggle_collider` / `toggle_snap` + 只读查询 `editable_entities` /
+  `describe` / `panel_text` / `world_aabb_of` / `screen_ray_at`。签名一律
+  `World(+ 事件参数) → 确定性结果`，**不含窗口 / 输入 / 渲染代码**，
+  headless 直接单测（验收①的载体 `tests/edit_headless.rs` 19 项全走
+  这一层）。
+- `shell.rs` **交互壳**：`EditorPlugin`（Startup 开关卡 + Update 三系统：
+  飞行相机 → 输入翻译 → Esc 退出）。输入翻译先把一帧设备状态读成
+  `FrameInput` 只读快照再调命令层（避免 `Input` 守卫与 `&mut World`
+  借用打架）。键位表在模块文档与运行期面板；`Ctrl` 按住时相机不移动
+  （`Ctrl+S` / `Ctrl+D` 期间镜头不漂）。`build_schedule` 暴露编排，
+  headless 测试与离屏快照不建窗口复用同一条推进路径（六游戏同款范式）。
+
+**机制不变量①：登记表同步登记**。`MeshStore` / `MaterialStore` 只存顶点
+与数值，`save_scene` 靠 `SceneAssetRegistry` 还原 mesh / material 段
+（§4.15）。因此编辑器每创建一个**关卡内容**网格就登记
+`MeshRef::Primitive(段)`（段 = 摆放参数，与存档写出的 mesh 段同源）、每
+创建一个内容材质就登记 `MaterialRef::default()`（= 无外部纹理来源；预设
+恒无纹理，与加载侧对无纹理材质段的登记逐字段相同）。不登记 ⇒ save 认不
+出来源 ⇒ mesh 段整段省略 + 告警（重载后实体没有网格）——这是「编辑器
+产物能被存档完整还原」的机制前提。
+
+**机制不变量②：句柄编号对齐**。往返对照测试要能直接比较
+`MeshHandle` / `MaterialHandle` **数值**（而不只比内容），需要保存侧与
+重载侧的句柄分配序一致。两条手段：(a) 编辑器侧**同源去重**（同
+`PrimitiveSection` 只入 `MeshStore` 一次、同预设只入 `MaterialStore`
+一次——缓存用 `Vec` 线性扫描：键含 `f32` 不可 `Hash`，且插入序即句柄
+序），与 `load_scene` 的 `LoadCache` 去重语义对齐；(b) `open_level` 把
+**瞬态视觉资产**（网格线立方体 + 4 个材质）创建在关卡内容**之前**，两侧
+都如此。于是「摆放 → 保存」与「重载」两侧句柄逐位相同（测试 dump 里
+`mesh 1..5` / `material 5..10` 两侧全等）。注意**实体编号不在此保证内**：
+编辑侧的选中框（12 条边）与关卡内容交错 spawn（摆放后自动选中），原始
+`Entity` 编号必然与重载侧不同——而关卡档里根本没有实体 id，往返可对照
+的是「顺序 + 内容」，故 dump 用清单序号（`slot`）而非实体 bits。
+
+**瞬态视觉不入档**：地面参考网格（±12 m、1 m 间距、50 条线，X / Z 轴
+红 / 蓝）与选中框（世界 AABB 的 12 条边，`gizmo_edge_transforms` 纯函数）
+挂 `EditorTransient` 标记；`save_level` 在调 `save_scene` **之前全部
+despawn、之后按缓存句柄重建**（重建不新占编号）。选 despawn 而非引擎侧
+过滤标记的理由：`save_scene` 的跳过名单是 `GltfMounted` /
+`LevelGenerated`，两者语义都是「该实体由档内某段整体重建」，编辑器视觉
+不属于任何档内段；为它加第三个引擎级标记要改引擎存档过滤规则（a 阶段
+不必）。属性面板 HUD 实体无 `Transform`，`save_scene` 的查询天然不含它。
+拖拽期选中框走 `update_gizmo` **原位更新**（不 despawn 重建，实体编号
+稳定、每帧调用无 churn）。
+
+**拾取选型**：刻意**不复用** `iris_core::physics::raycast`——它只查
+`(Transform, Collider)`，而编辑器摆放的实体可以没有碰撞体（可选挂载），
+会拾取不到自己刚摆的东西。改用「网格实际包围盒」路线：`MeshData::bounds()`
+局部 AABB 经实体模型矩阵变换成世界 AABB（`local_aabb_to_world`，
+iris-render 的 `occlusion::world_aabb` 同语义但 `pub(crate)`，此处按同
+算法重写）再交引擎纯函数 `ray_box`（slab 法，与物理同一份求交实现——
+dogfooding）。命中裁决：`t` 最小者胜，`t` 位相等取**存储序在前**者
+（遍历用严格小于比较即天然满足，无排序、无 HashMap）。摆放落点 =
+实体表面与 y = 0 数学地面的**最近**交点，实体沿 +Y 抬升「网格局部包围盒
+底面到枢轴的距离」⇒ 底面贴合命中面（叠放自然成立）。代价：旋转按轴对齐
+语义放大包围盒（与引擎 `ColliderShape::Box` 忽略旋转的既有简化一致）。
+
+**确定性选型**：句柄缓存 `Vec` 线性扫描（插入序确定）；实体遍历一律
+`world.query`（组件存储序 = spawn 序）；命名计数 `next_name` 扫描世界取
+「同前缀最大下标 + 1」（不维护跨调用计数器 ⇒ 加载既有档后接着摆放不撞
+名）；吸附 `snap_value` 只用除法 / `round` / 乘法（IEEE 确定运算）；面板
+文本非 ASCII 折 `?`（8×8 位图字体只有 ASCII 字形，不伪装能显示中文）。
+
+**验收**：`tests/edit_headless.rs` 19 项——9 实体（四图元 + 五预设中的
+五种 + 静态碰撞体 + 点光 + 复制体）摆放 → `save_level` → 新世界
+`open_level` → 世界 dump（实体数 / 清单序 / 逐实体 Transform 位模式 /
+句柄 / 组件位 / 登记表 BTree 序 / 两 Store 逐句柄 FNV 与位模式 / 方向光
+位模式 / level 段快照）**逐字符相等**；同档二次保存逐字节相同；拾取
+最近 / 同距存储序 / 瞬态不可拾取；拖拽吸附与高度保持；删除级联 / 复制
+后缀；屏幕像素 → 射线 → 拾取闭环；面板只读纯 ASCII；`level` 段快照
+原样保留；**assault 庭院档（R57 产物）经编辑器开 → 编辑 → 存 → 重载
+往返一致**（编辑器不改坏既有档）。离屏验收 `examples/editor_snapshot.rs`
+→ `docs/editor_mvp.png`（整体：24 实体测试关卡 + 网格 + 选中框 + 面板）
+与 `docs/editor_viewport.png`（编辑态近景：换视角换选中）。窗口交互
+`cargo run -p iris-editor --release`（CLI 第一参数 = 关卡档路径，缺省
+`assets/editor_mvp.level.json`；档存在但解析失败 **panic** 而非降级为空
+世界——避免随后一次保存覆盖原档）。诚实清单 §8.34 与 edit.rs 模块文档
+（9 条）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -3514,6 +3628,25 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     UI 不入档**（渲染调节旋钮与游戏表现留代码侧，v1 场景语义原样）；
     ⑦**粒子段只写配置**（运行期状态不入档）；⑧**无编辑器 GUI /
     无 schema 文件**（格式权威 = Rust 类型 + 模块文档，R58 补）。
+
+34. **关卡摆放编辑器 a 阶段的诚实限制（R58a）**——完整清单在 edit.rs
+    模块文档（9 条）与 §4.27，此处索引：①**单选**（一次一个选中实体；
+    多选 / 框选 b 阶段）；②**无 undo / redo**（b 阶段——删除不可逆）；
+    ③**拾取与选中框基于世界 AABB**（旋转后的实体包围盒被放大，拾取判定
+    比可见网格宽松；逐三角形精确拾取的引擎原语 `ray_triangle_intersection`
+    / `raycast_bvh` 在位，留待需要时接）；④**无网格的实体拾取不到**
+    （纯逻辑 / 手写纯灯光段；编辑器自己摆的点光带灯泡网格故可拾取）；
+    ⑤**`level` 段只读**（terrain / nav / bake 经 `LevelRegistry` 快照
+    原样保留，编辑入口 b 阶段；`LevelGenerated` 派生实体不可拾取 / 不可
+    删——改了也会被下次加载覆盖）；⑥**glTF 挂载根不可复制**（子树重挂载
+    需重解析文件，a 阶段只做扁平组件复制；可拾取 / 拖拽 / 级联删除）；
+    ⑦**属性面板只读**（8×8 ASCII 位图字体无 IME，数值修改走热键：方向键
+    微移 0.1 / Alt = Y / Shift 十倍、PgUp·PgDn 等比缩放——**非等比缩放
+    无入口**，b 阶段属性编辑）；⑧**相机不入档且无视角旋转**（`Camera`
+    资源恒由编辑器接管、不挂 `ActiveCamera` 实体以免相机进档；a 阶段
+    飞行相机 = 平移 + 变焦，朝向固定为默认斜俯视角，轨道 / 鼠标转向
+    b 阶段）；⑨**摆放面窄**（四图元 + 五种无纹理材质预设 + 一种点光；
+    GLB 摆放 / 资产浏览器 / 材质编辑器 / 地形雕刻在拒绝清单内）。
 
 ## 9. 关键设计取舍记录
 

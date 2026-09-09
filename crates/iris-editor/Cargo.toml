@@ -1,0 +1,21 @@
+[package]
+name = "iris-editor"
+description = "Iris 关卡摆放编辑器（R58a 最小编辑器 MVP）：飞行视口 + 图元/点光摆放 + 射线拾取 + 地面拖拽吸附 + 删除复制 + 只读属性面板 + 关卡档 v2 存取；编辑命令层（edit.rs）与交互壳（shell.rs）分离，命令层可脱离窗口 headless 单测"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# 依赖方向：iris-editor 是引擎门面 iris-engine 的下游**工具**消费者
+# （与六个 dogfooding 游戏同级、同一依赖纪律）。命令层只用到
+# iris-core 的纯函数射线查询（`physics::ray_box`——刻意 dogfooding：
+# 拾取就是引擎的射线-AABB 求交）与 iris-engine 的关卡档 v2 读写
+# （`scene::load_scene` / `save_scene` / `SceneAssetRegistry`），
+# 不新增任何第三方 crate（Cargo.lock 零新版本号）。
+[dependencies]
+iris-core = { workspace = true }
+iris-engine = { workspace = true }
+glam = { workspace = true }
+# 存档降级告警（save_scene 的 log::warn 同源）
+log = { workspace = true }

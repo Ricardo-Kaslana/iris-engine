@@ -56,8 +56,8 @@ pub mod prelude {
     // 关卡档 v2（version + level 段、材质三纹理槽、粒子段）
     pub use crate::scene::{
         GltfMounted, MaterialRef, MaterialSection, MeshRef, ParticleBlendSection, ParticleSection,
-        ProceduralTextureSection, SCENE_FORMAT_VERSION, SceneAssetRegistry, SceneError,
-        TextureSourceSection, load_scene, load_scene_from, save_scene,
+        PrimitiveSection, ProceduralTextureSection, SCENE_FORMAT_VERSION, SceneAssetRegistry,
+        SceneError, TextureSourceSection, load_scene, load_scene_from, save_scene,
     };
     // 关卡格式（R57）：level 段（terrain / nav / bake）、加载登记与派生
     // 实体标记、光照贴图烘焙产物的外置文件读写（IRISLMAP）

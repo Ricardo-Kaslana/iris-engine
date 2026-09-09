@@ -13,6 +13,7 @@ members = [
     "crates/iris-ascent",
     "crates/iris-infiltration",
     "crates/iris-assault",
+    "crates/iris-editor",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ iris-bastion = { path = "crates/iris-bastion", version = "0.1.0" }
 iris-ascent = { path = "crates/iris-ascent", version = "0.1.0" }
 iris-infiltration = { path = "crates/iris-infiltration", version = "0.1.0" }
 iris-assault = { path = "crates/iris-assault", version = "0.1.0" }
+iris-editor = { path = "crates/iris-editor", version = "0.1.0" }
 
 # 数学：SIMD 优化的线性代数库
 glam = "0.33"

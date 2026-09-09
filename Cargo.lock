@@ -1073,6 +1073,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-editor"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
+ "log",
+]
+
+[[package]]
 name = "iris-engine"
 version = "0.1.0"
 dependencies = [

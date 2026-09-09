@@ -5,6 +5,57 @@
 
 ## [Unreleased]
 
+### Added（R58a：最小编辑器 MVP——视口 / 摆放 / 拖拽 / 存取，路线图 v4 · W5）
+
+新 crate `iris-editor`（bin，原生为主）：**能用的关卡摆放编辑器** a 阶段。
+数据层 = R57 关卡档 v2（不发明新格式）；语义规范全文 = edit.rs / shell.rs
+模块文档 + ARCHITECTURE §4.27，诚实清单 §8.34（9 条）。
+
+- **架构硬要求兑现：命令层与交互壳分离**。`edit.rs` 命令层：`EditorState`
+  资源 + 全部编辑操作为自由函数（`open_level` / `save_level` / `place_at` /
+  `place_light_at` / `pick` / `placement_point` / `select` / `begin_drag` /
+  `drag_to` / `delete_selected` / `duplicate_selected` / `nudge_selected` /
+  `scale_selected` / 参数切换 + 只读查询 `editable_entities` / `describe` /
+  `panel_text` / `screen_ray_at`），签名一律 `World(+ 事件参数) → 确定性
+  结果`，不含窗口 / 输入 / 渲染代码；`shell.rs` 交互壳刻意薄（飞行相机
+  WASD/QE/滚轮 + 输入快照翻译 + Esc，键位表在模块文档与运行期面板）。
+- **a 阶段功能**：地面参考网格（±12 m、纯视觉**不入档**）；图元四态
+  （cube/plane/sphere/cylinder 循环）+ 五种无纹理材质预设 + 可选静态
+  碰撞体 + 点光（灯泡网格）摆放，落点 = 鼠标射线与实体 AABB / y=0 地面
+  的最近交点、底面贴合 + 0.5 m 吸附；射线拾取（`MeshData::bounds` 世界
+  AABB + 引擎 `ray_box`，最近命中、同距取存储序在前）+ 12 边选中框；
+  左键拖拽（射线 ∩ 命中点高度平面、抓取偏移不跳）；Del 删除（级联子树）/
+  Ctrl+D 复制（`_copy{n}` 后缀）；只读属性面板（8×8 ASCII 位图字体，数值
+  修改走热键：方向键微移 0.1 / Alt = Y / Shift 十倍、PgUp·PgDn 等比缩放）；
+  CLI 第一参数 = 关卡档路径（缺省 `assets/editor_mvp.level.json`），存在
+  则 v2 直读（`level` 段经 `LevelRegistry` 快照原样保留）、Ctrl+S 保存；
+  档存在但解析失败 **panic** 而非降级空世界（避免随后一次保存覆盖原档）。
+- **存档往返的两条机制不变量**：① 编辑器 spawn 的网格 / 材质**同步登记
+  进 `SceneAssetRegistry`**（`MeshRef::Primitive(段)` / `MaterialRef::
+  default()`）——不登记则 `save_scene` 还原不出 mesh 段；② **句柄编号
+  对齐**：编辑器侧同源去重（同图元段 / 同预设只入 Store 一次，`Vec` 线性
+  扫描缓存——键含 f32 不可 Hash 且插入序即句柄序）+ 瞬态视觉资产先建 ⇒
+  保存与重载两侧 `MeshHandle` / `MaterialHandle` 逐位相同（往返对照测试
+  直接比句柄数值）。瞬态视觉（网格线 / 选中框）挂 `EditorTransient`，
+  `save_level` 存前 despawn、存后按缓存句柄重建（不新占编号）；HUD 实体
+  无 `Transform` 天然不入档。
+- **引擎侧两处小改动**：`PrimitiveSection::to_mesh_data` 提升为 pub
+  （编辑器复用同一份「段 → 网格」映射，避免两处生成参数漂移）；prelude
+  补导出 `PrimitiveSection`。
+- **验收**：① headless `tests/edit_headless.rs` **19 项**——9 实体（四
+  图元 + 五预设 + 静态碰撞体 + 点光 + 复制体）摆放 → save → load → 世界
+  dump（实体数 / 清单序 / 逐实体 Transform 位模式 / 句柄 / 组件位 / 登记
+  表 BTree 序 / 两 Store 逐句柄 FNV 与位模式 / 方向光位模式 / level 段
+  快照）**逐字符相等**；同档二次保存逐字节相同；assault 庭院档（R57
+  产物）经编辑器开 → 编辑 → 存 → 重载往返一致；既有 924 / 922 测试
+  **零改动全过**（基线 debug 924 → **957** / release 922 → **955**，新增
+  33 = 命令层 14 + headless 19）；② 离屏验收图 `docs/editor_mvp.png`
+  （整体：命令层摆出 24 实体测试关卡 + 网格 + 选中框 + 面板）与
+  `docs/editor_viewport.png`（编辑态近景：换视角换选中），
+  `examples/editor_snapshot.rs` 产出（保存 + 重载对账同一条代码路径）；
+  ③ 六项门禁全绿（wasm32 clippy 含新 crate 照绿——crate 内无原生专属
+  API）。
+
 ### Added（R57：关卡格式与编辑数据模型——路线图 v4 · W5 首轮）
 
 关卡档 v2（`iris-engine::level` + `scene` 格式升级）：让箱庭关卡的

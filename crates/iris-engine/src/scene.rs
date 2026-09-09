@@ -584,7 +584,10 @@ fn default_rings() -> u32 {
 impl PrimitiveSection {
     /// 生成图元网格。分段数低于图元生成器断言下限时提前报
     /// [`SceneError::OutOfRange`]（而非让引擎 panic）。
-    fn to_mesh_data(&self) -> Result<MeshData, SceneError> {
+    ///
+    /// 公开（R58a）：编辑器摆放图元时走同一份「段 → 网格」映射——
+    /// 摆放产物与存档段一一对应，避免两处生成参数漂移。
+    pub fn to_mesh_data(&self) -> Result<MeshData, SceneError> {
         match self {
             Self::Cube => Ok(MeshData::cube()),
             Self::Plane { size } => Ok(MeshData::plane(*size)),
