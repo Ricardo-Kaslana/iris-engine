@@ -20,6 +20,7 @@ pub mod async_loading;
 pub mod audio;
 pub mod camera_rig;
 pub mod gltf_builder;
+pub mod level;
 pub mod pack;
 pub mod plugin;
 pub mod scene;
@@ -51,10 +52,20 @@ pub mod prelude {
     };
     pub use crate::vfs::{AssetError, AssetMount, AssetSource};
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记；
-    // R45 追加挂载变体 load_scene_from（pack / 嵌入来源）
+    // R45 追加挂载变体 load_scene_from（pack / 嵌入来源）；R57 升格为
+    // 关卡档 v2（version + level 段、材质三纹理槽、粒子段）
     pub use crate::scene::{
-        GltfMounted, MaterialRef, MeshRef, SceneAssetRegistry, SceneError, load_scene,
-        load_scene_from, save_scene,
+        GltfMounted, MaterialRef, MaterialSection, MeshRef, ParticleBlendSection, ParticleSection,
+        ProceduralTextureSection, SCENE_FORMAT_VERSION, SceneAssetRegistry, SceneError,
+        TextureSourceSection, load_scene, load_scene_from, save_scene,
+    };
+    // 关卡格式（R57）：level 段（terrain / nav / bake）、加载登记与派生
+    // 实体标记、光照贴图烘焙产物的外置文件读写（IRISLMAP）
+    pub use crate::level::{
+        BakeSection, HeightmapSection, LIGHTMAP_ARTIFACT_MAGIC, LIGHTMAP_ARTIFACT_VERSION,
+        LevelGenerated, LevelRegistry, LevelSection, NavSection, TerrainOptionsSection,
+        TerrainSection, encode_lightmap_artifact, load_lightmap_artifact, parse_lightmap_artifact,
+        save_lightmap_artifact,
     };
     // 编程式 glTF / GLB 构造器（打磨 IV）：记账归 builder，人只声明
     // 几何 / 层级 / 关键帧；打磨 VI 追加纹理通道声明（material_textured）

@@ -1,19 +1,29 @@
 //! 场景序列化：JSON 场景描述文件 ↔ 世界实体（关卡数据与游戏代码分离）。
 //!
+//! **格式 v2（R57）= 关卡档**：v1 纯场景档的超集——顶层 `version` 字段 +
+//! `level` 段（地形 / 导航构建参数 / 光照贴图烘焙参数，类型与语义全文见
+//! [`crate::level`]）。`version` 缺席 = v1 档无损直读（迁移钩子加默认空
+//! `level` 段），save 恒写当前版本。本模块是加载 / 保存的**单通路**：
+//! 两代格式共用同一 IO 与实体段逻辑。
+//!
 //! 场景文件描述两类内容：**环境段**（场景级资源形态：方向光 + 天空源）与
 //! **实体段**（逐实体挂载内置组件集）。缺省值全部与引擎默认一致——
 //! `Transform` 恒等、材质取 [`MaterialDef::default`]、点光字段照
-//! [`PointLight::default`]，手写关卡文件时只需写与默认不同的字段。
+//! [`PointLight::default`]、粒子字段照 `ParticleEmitter::new(Alpha)`，
+//! 手写关卡文件时只需写与默认不同的字段。
 //!
 //! ```jsonc
 //! {
+//!   "version": 2,                                   // 可选；缺席 = v1
 //!   "environment": {                              // 可选；缺席不改既有资源
 //!     "directional_light": {                      // 各字段可选，缺省 = 引擎默认
 //!       "direction": [-0.5, -1.0, -0.4], "color": [1.0, 0.98, 0.92],
-//!       "intensity": 1.0, "ambient": [0.14, 0.14, 0.14], "shadows": true
+//!       "intensity": 1.0, "ambient": [0.14, 0.14, 0.14], "shadows": true,
+//!       "shadow_range": 24.0                      // 可选；缺省省略（v2 补齐）
 //!     },
 //!     "sky_source": "assets/sunset.hdr"           // 可选；缺席 = 程序化天空
 //!   },
+//!   "level": { /* 地形 / nav / bake，见 crate::level */ },
 //!   "entities": [                                 // 必需
 //!     {
 //!       "name": "wall-north",                     // 可选 → Name 组件
@@ -22,10 +32,15 @@
 //!       "mesh":    { "primitive": { "kind": "cube" } },   // 三态之一（见下）
 //!       "material": { "color": [0.8,0.2,0.1,1], "metallic": 0.0,
 //!                     "roughness": 0.5, "emissive": [0,0,0],
-//!                     "texture": "assets/tex.png",
+//!                     "texture": "assets/tex.png",        // 或程序化源（见下）
+//!                     "normal_texture": { "file": "assets/n.png" },
+//!                     "orm_texture": { "brick_normal_orm": { "rows": 8,
+//!                                        "cols": 5, "size": 256,
+//!                                        "seam": 0.05, "bump": 2.4 } },
 //!                     "alpha_mode": "Blend" },       // 全可选；缺省 Opaque
 //!       "point_light": { "color": [1,1,1], "intensity": 20, "range": 30,
 //!                        "shadows": false },
+//!       "particles": { "blend": "alpha", "spawn_rate": 90.0, /* 全可选 */ },
 //!       "collider":  { "shape": { "sphere": { "radius": 0.5 } },
 //!                      "static": true, "restitution": 0.2 },
 //!       "rigidbody": { "gravity_scale": 1.0, "friction": 0.3,
@@ -42,34 +57,63 @@
 //!   顶层实体作为该实体的**子实体**（本实体 `transform` 作用于整棵子树）；
 //! - 缺席。
 //!
+//! **纹理源两态**（材质段的 `texture` / `normal_texture` / `orm_texture`，
+//! v2 新增后两槽）：字符串 = 文件路径（PNG / JPEG，v1 语义原样）；对象 =
+//! 程序化源（`{"grass": {size}}` 三件套 / `{"brick_normal_orm": {rows, cols,
+//! size, seam, bump}}` 法线 + ORM 对——引擎侧确定性生成器全参数，同参逐位
+//! 一致）。sRGB 语义按槽位：基色 = sRGB，法线 / ORM = 线性数据。程序化源
+//! 让写实材质**零二进制资产**入档（关卡文件保持纯文本自包含）。
+//!
+//! **particles 段**（v2 新增）：[`ParticleEmitter`] 的全部配置字段
+//! （blend / spawn_rate / burst_count / emitter_lifetime / particle_lifetime /
+//! initial_speed / velocity_jitter / gravity_scale / size_start / size_end /
+//! color_start / color_end / max_particles），缺省 = `new(Alpha)`。运行期
+//! 状态（粒子池 / 计数器）不入档——重载后发射器从新鲜状态开始。
+//!
 //! # 往返（save ↔ load）
 //!
 //! [`save_scene`] 查询内置组件集（Transform + 可选 Name / Visibility /
-//! MeshHandle / MaterialHandle / PointLight / Collider / RigidBody）全量写出，
-//! [`load_scene`] 逐实体还原，构成不变量 `load(save(load(f)))` 与 `load(f)`
-//! 实体组件语义等价（实体顺序 = spawn 顺序，稳定）。mesh / material /
-//! 天空源的**来源**（图元参数、glTF 文件路径、贴图路径）由 [`SceneAssetRegistry`]
+//! MeshHandle / MaterialHandle / PointLight / ParticleEmitter / Collider /
+//! RigidBody）全量写出，[`load_scene`] 逐实体还原，构成不变量
+//! `load(save(load(f)))` 与 `load(f)` 实体组件语义等价（实体顺序 =
+//! spawn 顺序，稳定）。mesh / material / 天空源的**来源**（图元参数、
+//! glTF 文件路径、贴图路径 / 程序化参数）由 [`SceneAssetRegistry`]
 //! 资源在 load 时登记、save 时还原——`MeshStore` / `TextureStore` 本身没有
 //! 「文件路径」概念，登记表是数值句柄与场景文件之间的桥：
 //!
 //! - mesh 句柄在登记表 → 还原图元段 / glTF 段；不在（用户代码 `MeshStore::add`）
 //!   → mesh 段省略 + `log::warn`（数量统计，重新加载后该实体没有网格）；
-//! - material 句柄在登记表 → 数值字段照 [`MaterialDef`] 写出 + 登记的贴图路径；
-//!   不在 → 只写数值字段 + 贴图路径丢失警告（纯数值材质无损）；
+//! - material 句柄在登记表 → 数值字段照 [`MaterialDef`] 现读 + 登记的
+//!   纹理来源（基色 / 法线 / ORM 三槽，文件路径或程序化参数）；不在 →
+//!   只写数值字段 + 纹理来源丢失警告（纯数值材质无损）；
 //!   句柄 0（默认材质，隐式）→ 整段省略；
 //! - 天空源为 `EquirectHdr` 且登记了路径 → 写 `sky_source`；无登记（用户手工
 //!   挂入）→ 省略 + 警告（v1 简化：HDR 图像内容不回写文件）。
 //!
-//! glTF 实例生成的内部实体（根 + 后代）带 [`GltfMounted`] 标记，save 时跳过
-//! ——它们由 glTF 段在下次加载时整体重建，不属于场景文件本身。
+//! **同源去重（v2）**：一次加载内，参数相同的图元 mesh、同路径 / 同参数
+//! 的纹理、解析结果相同的材质**共享同一句柄**（首见注册、后见复用）——
+//! 「文件内同源 ⇒ 世界内同句柄」让手写关卡（九面墙同引用一个 cube）与
+//! 代码侧共享网格的布局一致，批处理 / 内存与逐位复现都以此为前提。
+//! glTF 例外：整实例挂载每次引用独立解析（v1 语义原样，见 §4.15）。
 //!
-//! # v1 不含（诚实清单）
+//! glTF 实例生成的内部实体（根 + 后代）带 [`GltfMounted`] 标记、
+//! `level.terrain` 段派生的实体（根 / chunk / 碰撞拼块）带
+//! [`LevelGenerated`](crate::level::LevelGenerated) 标记，save 时跳过
+//! ——它们由对应段在下次加载时整体重建，不属于实体段本身。`level` 段
+//! 与 `version` 的回写由 [`LevelRegistry`](crate::level::LevelRegistry)
+//! 登记驱动（加载时快照，语义见 [`crate::level`] 模块文档）。
+//!
+//! # 诚实清单（格式限制）
 //!
 //! - UI 组件（HUD 属游戏逻辑，`UiRect` / `UiText` 实体不参与往返）与相机
 //!   （资源级，由代码或平台层配置）；
 //! - 克隆 / 预设 / 组件插件扩展点（自定义组件不经序列化）；
-//! - `RigidBody.velocity` 与 `DirectionalLight.shadow_range` 不写入文件
-//!   （物体从静止开始、阴影覆盖半径取默认）；
+//! - `RigidBody.velocity` 不写入文件（物体从静止开始——把模拟中途的速度
+//!   冻结进关卡文件不是想要的行为）；`DirectionalLight.shadow_range`
+//!   v2 起可选序列化（等于引擎默认时省略，v1 文件重存字节级不变）；
+//! - 粒子段只写配置字段，运行期状态（粒子池 / 计数器）不入档；
+//! - `level` 段的格式侧限制（双源常量 / 登记快照语义 / 外置高度场缺席）
+//!   见 [`crate::level`] 模块文档诚实清单；
 //! - 热重载：场景文件为手工编写，加载后与文件的关联即断开；
 //! - wasm32 注意：`load_scene` 的场景 / glTF / HDR / 贴图读取走
 //!   `std::fs`——native 可用，**web 上不可用**；web 场景用 [`load_scene_from`]
@@ -90,6 +134,7 @@
 //! let count = save_scene(&mut world, "assets/arena_out.json")?;
 //! ```
 
+use crate::level::{LevelRegistry, LevelSection, apply_bake, apply_nav, apply_terrain};
 use crate::vfs::AssetMount;
 use iris_core::name::Name;
 use iris_core::physics::{BodyType, Collider, ColliderShape, RigidBody};
@@ -100,9 +145,9 @@ use iris_render::asset::{
     spawn_gltf_instance_from_bytes,
 };
 use iris_render::prelude::{
-    AlphaMode, CpuTexture, DirectionalLight, MaterialDef, MaterialHandle, MaterialStore, MeshData,
-    MeshHandle, MeshStore, PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore,
-    Visibility,
+    AlphaMode, CpuTexture, DirectionalLight, GrassTextures, MaterialDef, MaterialHandle,
+    MaterialStore, MeshData, MeshHandle, MeshStore, ParticleBlend, ParticleEmitter, PointLight,
+    SkySource, SkySourceKind, TextureHandle, TextureStore, Visibility, grass_textures,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -195,12 +240,70 @@ pub enum MeshRef {
     Gltf(String),
 }
 
-/// 场景 material 段的来源：`TextureStore` 没有路径概念，load 时把贴图路径
-/// 登记在此，save 时据此还原 `texture` 字段（数值字段照 `MaterialDef` 现读）。
+/// 场景 material 段的来源：`TextureStore` 没有路径 / 生成参数概念，load
+/// 时把三个纹理槽（基色 / 法线 / ORM）的来源登记在此，save 时据此还原
+/// 对应字段（数值字段照 [`MaterialDef`] 现读）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MaterialRef {
-    /// 基础色贴图的场景内相对路径；无贴图（白色兜底句柄 0）为 `None`。
+    /// 基础色贴图的场景内相对路径（**仅文件来源**登记于此，v1 字段语义
+    /// 原样）；程序化基色源登记在 [`Self::base_source`]，两者互斥。
     pub texture: Option<String>,
+    /// 基础色的程序化来源（与 [`Self::texture`] 互斥；均为 `None` =
+    /// 无基色贴图，白色兜底句柄 0）。
+    pub base_source: Option<ProceduralTextureSection>,
+    /// 法线贴图来源（文件路径或程序化参数；`None` = 无该槽）。
+    pub normal_source: Option<TextureSourceSection>,
+    /// ORM 贴图来源（同上）。
+    pub orm_source: Option<TextureSourceSection>,
+}
+
+/// 纹理源两态（材质段三槽共用）：字符串 = 文件路径（PNG / JPEG，v1
+/// `texture` 字段语义原样）；对象 = 程序化源。serde `untagged`——旧档的
+/// `"texture": "x.png"` 字符串形式直读为 [`Self::File`]（向后兼容），
+/// 序列化同样还原为裸字符串（旧档重存字节级稳定）。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum TextureSourceSection {
+    /// 场景文件内相对路径（PNG / JPEG）。
+    File(String),
+    /// 程序化生成器参数（引擎侧纯函数，同参逐位一致）。
+    Procedural(ProceduralTextureSection),
+}
+
+/// 程序化纹理源（外部标签，键名即生成器名）：参数与引擎生成器一一对应，
+/// **不复制粘贴字段语义**——`grass` = [`grass_textures`]（三件套：基色
+/// sRGB + 法线 / ORM 线性），`brick_normal_orm` =
+/// [`CpuTexture::brick_normal_orm`]（法线 + ORM 对，无基色产物——用于
+/// 基色槽报 [`SceneError::Unsupported`]）。
+///
+/// 同参数在一次加载内只生成一次（[`LoadCache`]），逐槽按需登记进
+/// `TextureStore`——槽位语义决定 sRGB 标志（基色 sRGB / 法线 ORM 线性）。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProceduralTextureSection {
+    /// [`grass_textures`]：`size` ≥ 8（生成器断言前置校验为
+    /// [`SceneError::OutOfRange`]）。
+    Grass { size: u32 },
+    /// [`CpuTexture::brick_normal_orm`]：`rows` / `cols` ≥ 1、`size` ≥ 4
+    /// （同上）；`seam` 越出 [0.01, 0.45] 时生成器钳位（引擎语义原样）。
+    BrickNormalOrm {
+        rows: u32,
+        cols: u32,
+        size: u32,
+        seam: f32,
+        bump: f32,
+    },
+}
+
+/// 纹理槽位（sRGB 语义与程序化产物选择的判据）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextureSlot {
+    /// 基色（sRGB 编码）。
+    Base,
+    /// 法线（线性数据）。
+    Normal,
+    /// ORM 打包（线性数据）。
+    Orm,
 }
 
 /// 场景资产登记表（World 资源）：记录「场景创建的句柄 ↔ 场景文件内的来源」。
@@ -234,13 +337,54 @@ pub struct GltfMounted;
 // JSON 格式定义（serde；全蛇形命名，与模块文档的格式样例一致）
 // ---------------------------------------------------------------------------
 
-/// 场景文档根：环境段（可选）+ 实体段（必需）。
+/// 当前场景 / 关卡格式版本（R57 = v2：`level` 段与 `version` 字段）。
+pub const SCENE_FORMAT_VERSION: u32 = 2;
+
+/// 场景文档根：版本（可选，缺席 = v1）+ 环境段（可选）+ level 段
+/// （可选，v2）+ 实体段（必需）。字段声明序 = JSON 键序（save 输出
+/// 规范化：固定顺序）。
 #[derive(Serialize, Deserialize, Debug)]
 struct SceneDoc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     environment: Option<EnvironmentSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    level: Option<LevelSection>,
     /// save 恒为 `Some`；load 缺席 → [`SceneError::Missing`]。
     entities: Option<Vec<EntitySection>>,
+}
+
+/// 版本迁移钩子：把 `version = 下标 + 1` 的文档就地升到下一版。
+/// 表长恒 = [`SCENE_FORMAT_VERSION`] − 1（每版一步，顺序施加）。
+type Migration = fn(&mut SceneDoc) -> Result<(), SceneError>;
+
+/// 迁移钩子函数表（索引 = 源版本 − 1）。
+const MIGRATIONS: &[Migration] = &[migrate_v1_to_v2];
+
+/// v1 → v2：加默认（空）`level` 段——v1 纯场景档无损直读，这就是第一条
+/// 迁移路径（空段在 save 时省略，v1 内容重存只多 `version` 字段）。
+fn migrate_v1_to_v2(doc: &mut SceneDoc) -> Result<(), SceneError> {
+    if doc.level.is_none() {
+        doc.level = Some(LevelSection::default());
+    }
+    Ok(())
+}
+
+/// 版本校验 + 顺序迁移：返回迁移后的文档（`version` 归一为当前版）。
+fn migrate_doc(doc: &mut SceneDoc) -> Result<(), SceneError> {
+    let version = doc.version.unwrap_or(1);
+    if version == 0 || version > SCENE_FORMAT_VERSION {
+        return Err(SceneError::Unsupported(format!(
+            "场景文件版本 = {version}，本引擎支持 1..={SCENE_FORMAT_VERSION}\
+             （高于当前版本的档请升级引擎——拒读而非误读）"
+        )));
+    }
+    for migration in &MIGRATIONS[(version - 1) as usize..] {
+        migration(doc)?;
+    }
+    doc.version = Some(SCENE_FORMAT_VERSION);
+    Ok(())
 }
 
 /// 环境段：场景级资源形态（非实体）。
@@ -253,7 +397,8 @@ struct EnvironmentSection {
 }
 
 /// 方向光段：各字段缺省 = [`DirectionalLight::default`]。
-/// `shadow_range` v1 不序列化（取默认 24.0，见模块文档 v1 清单）。
+/// `shadow_range` v2 起可选序列化（等于引擎默认时省略——v1 文件重存
+/// 字节级不变；该字段自 R29 起不参与生产渲染路径，序列化是为档面完整）。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 struct DirectionalLightSection {
@@ -262,6 +407,14 @@ struct DirectionalLightSection {
     intensity: f32,
     ambient: [f32; 3],
     shadows: bool,
+    #[serde(skip_serializing_if = "shadow_range_is_default")]
+    shadow_range: f32,
+}
+
+/// `shadow_range` 序列化省略条件：等于引擎默认（旧档重存字节级稳定，
+/// 与 `alpha_mode` 的省略策略同款）。
+fn shadow_range_is_default(value: &f32) -> bool {
+    *value == DirectionalLight::default().shadow_range
 }
 
 impl Default for DirectionalLightSection {
@@ -273,6 +426,7 @@ impl Default for DirectionalLightSection {
             intensity: light.intensity,
             ambient: light.ambient.to_array(),
             shadows: light.shadows,
+            shadow_range: light.shadow_range,
         }
     }
 }
@@ -285,8 +439,7 @@ impl DirectionalLightSection {
             intensity: self.intensity,
             ambient: self.ambient.into(),
             shadows: self.shadows,
-            // shadow_range v1 不序列化：取引擎默认（模块文档 v1 清单）
-            ..DirectionalLight::default()
+            shadow_range: self.shadow_range,
         }
     }
 
@@ -297,6 +450,7 @@ impl DirectionalLightSection {
             intensity: light.intensity,
             ambient: light.ambient.to_array(),
             shadows: light.shadows,
+            shadow_range: light.shadow_range,
         }
     }
 }
@@ -318,6 +472,8 @@ struct EntitySection {
     material: Option<MaterialSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     point_light: Option<PointLightSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    particles: Option<ParticleSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collider: Option<ColliderSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -461,20 +617,29 @@ impl PrimitiveSection {
 }
 
 /// 材质段：全缺省 = [`MaterialDef::default`]。`emissive` 为 RGB 三元组
-/// （引擎侧 alpha 恒为 1.0）；`texture` 为场景文件内的相对路径（PNG / JPEG）；
+/// （引擎侧 alpha 恒为 1.0）；三个纹理槽（`texture` 基色 /
+/// `normal_texture` 法线 / `orm_texture` ORM 打包）各为纹理源两态
+/// （[`TextureSourceSection`]：文件路径字符串或程序化生成器参数）；
 /// `alpha_mode` 缺省 = `Opaque`（R23 之前的旧场景文件没有该字段，
 /// 反序列化回退不透明——向后兼容）；`Blend` 走透明 pass（R23）。
+///
+/// 法线 / ORM 槽是 v2 新增（v1 只写基色路径，两槽恒 `None` = 中性纹理
+/// 路径）——旧档直读零变化，旧档重存字节级不变（两槽 `None` 时省略）。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
-struct MaterialSection {
-    color: [f32; 4],
-    metallic: f32,
-    roughness: f32,
-    emissive: [f32; 3],
-    texture: Option<String>,
+pub struct MaterialSection {
+    pub color: [f32; 4],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emissive: [f32; 3],
+    pub texture: Option<TextureSourceSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal_texture: Option<TextureSourceSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orm_texture: Option<TextureSourceSection>,
     /// 序列化省略不透明（旧场景文件往返字节级不变，见下方断言函数）。
     #[serde(skip_serializing_if = "alpha_mode_is_opaque")]
-    alpha_mode: AlphaMode,
+    pub alpha_mode: AlphaMode,
 }
 
 impl Default for MaterialSection {
@@ -485,6 +650,8 @@ impl Default for MaterialSection {
             roughness: 0.5,
             emissive: [0.0; 3],
             texture: None,
+            normal_texture: None,
+            orm_texture: None,
             alpha_mode: AlphaMode::Opaque,
         }
     }
@@ -497,28 +664,54 @@ fn alpha_mode_is_opaque(mode: &AlphaMode) -> bool {
 }
 
 impl MaterialSection {
-    fn to_def(&self, texture: TextureHandle) -> MaterialDef {
+    /// 转引擎材质定义：三个纹理槽传**已解析**的句柄（解析与去重在
+    /// [`resolve_material`]，本函数是纯组装）。
+    fn to_def(
+        &self,
+        texture: TextureHandle,
+        normal_texture: Option<TextureHandle>,
+        orm_texture: Option<TextureHandle>,
+    ) -> MaterialDef {
         MaterialDef {
             base_color: self.color,
             emissive: [self.emissive[0], self.emissive[1], self.emissive[2], 1.0],
             metallic: self.metallic,
             roughness: self.roughness,
             texture,
-            // 场景序列化 v1 不含法线 / ORM 贴图槽位（缺省 None =
-            // 中性纹理路径，渲染与既有场景逐位一致）
-            normal_texture: None,
-            orm_texture: None,
+            normal_texture,
+            orm_texture,
             alpha_mode: self.alpha_mode,
         }
     }
 
-    fn from_def(def: &MaterialDef, texture: Option<String>) -> Self {
+    /// 从引擎材质 + 登记表还原材质段：数值字段照 `def` 现读，纹理来源照
+    /// 登记表 `refs` 还原。**只在 `def` 实际持有该槽时写出来源**——代码侧
+    /// 摘掉的槽不因登记残留而复现（登记表是来源记录，不是槽位真值）。
+    fn from_def(def: &MaterialDef, refs: Option<&MaterialRef>) -> Self {
+        let base = match refs {
+            Some(r) if def.texture.0 != 0 => match (&r.texture, &r.base_source) {
+                (Some(path), _) => Some(TextureSourceSection::File(path.clone())),
+                (None, Some(procedural)) => Some(TextureSourceSection::Procedural(*procedural)),
+                (None, None) => None,
+            },
+            _ => None,
+        };
+        let normal_texture = match refs {
+            Some(r) if def.normal_texture.is_some() => r.normal_source.clone(),
+            _ => None,
+        };
+        let orm_texture = match refs {
+            Some(r) if def.orm_texture.is_some() => r.orm_source.clone(),
+            _ => None,
+        };
         Self {
             color: def.base_color,
             metallic: def.metallic,
             roughness: def.roughness,
             emissive: [def.emissive[0], def.emissive[1], def.emissive[2]],
-            texture,
+            texture: base,
+            normal_texture,
+            orm_texture,
             alpha_mode: def.alpha_mode,
         }
     }
@@ -542,6 +735,98 @@ impl Default for PointLightSection {
             intensity: light.intensity,
             range: light.range,
             shadows: light.shadows,
+        }
+    }
+}
+
+/// 粒子段（v2 新增）：[`ParticleEmitter`] 的**全部配置字段**，各字段
+/// 缺省 = `ParticleEmitter::new(Alpha)`（60 粒/秒、1 秒寿命、竖直上抛
+/// 无抖动、标准重力）。运行期状态（粒子池 / 累计余量 / 计数器）是私有
+/// 字段也不入档——重载后发射器从新鲜状态开始（与 `RigidBody.velocity`
+/// 不序列化同一哲学：关卡文件不冻结模拟中途状态）。
+///
+/// `max_particles` 以 u64 承载（wasm32 的 `usize` 是 32 位——超界报
+/// [`SceneError::OutOfRange`] 而非静默截断）。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+pub struct ParticleSection {
+    pub blend: ParticleBlendSection,
+    pub spawn_rate: f32,
+    pub burst_count: u32,
+    pub emitter_lifetime: f32,
+    pub particle_lifetime: f32,
+    pub initial_speed: f32,
+    pub velocity_jitter: f32,
+    pub gravity_scale: f32,
+    pub size_start: f32,
+    pub size_end: f32,
+    pub color_start: [f32; 4],
+    pub color_end: [f32; 4],
+    pub max_particles: u64,
+}
+
+/// 混合模式段（[`ParticleBlend`] 无 serde derive——渲染层组件不带格式
+/// 依赖，映射在本层；蛇形命名 `alpha` / `additive`）。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticleBlendSection {
+    #[default]
+    Alpha,
+    Additive,
+}
+
+impl Default for ParticleSection {
+    fn default() -> Self {
+        Self::from_emitter(&ParticleEmitter::new(ParticleBlend::Alpha))
+    }
+}
+
+impl ParticleSection {
+    fn to_emitter(self) -> Result<ParticleEmitter, SceneError> {
+        let blend = match self.blend {
+            ParticleBlendSection::Alpha => ParticleBlend::Alpha,
+            ParticleBlendSection::Additive => ParticleBlend::Additive,
+        };
+        let max_particles = usize::try_from(self.max_particles).map_err(|_| {
+            SceneError::OutOfRange(format!(
+                "particles.max_particles = {} 超出本平台 usize 值域",
+                self.max_particles
+            ))
+        })?;
+        let mut emitter = ParticleEmitter::new(blend);
+        emitter.spawn_rate = self.spawn_rate;
+        emitter.burst_count = self.burst_count;
+        emitter.emitter_lifetime = self.emitter_lifetime;
+        emitter.particle_lifetime = self.particle_lifetime;
+        emitter.initial_speed = self.initial_speed;
+        emitter.velocity_jitter = self.velocity_jitter;
+        emitter.gravity_scale = self.gravity_scale;
+        emitter.size_start = self.size_start;
+        emitter.size_end = self.size_end;
+        emitter.color_start = self.color_start;
+        emitter.color_end = self.color_end;
+        emitter.max_particles = max_particles;
+        Ok(emitter)
+    }
+
+    fn from_emitter(emitter: &ParticleEmitter) -> Self {
+        Self {
+            blend: match emitter.blend {
+                ParticleBlend::Alpha => ParticleBlendSection::Alpha,
+                ParticleBlend::Additive => ParticleBlendSection::Additive,
+            },
+            spawn_rate: emitter.spawn_rate,
+            burst_count: emitter.burst_count,
+            emitter_lifetime: emitter.emitter_lifetime,
+            particle_lifetime: emitter.particle_lifetime,
+            initial_speed: emitter.initial_speed,
+            velocity_jitter: emitter.velocity_jitter,
+            gravity_scale: emitter.gravity_scale,
+            size_start: emitter.size_start,
+            size_end: emitter.size_end,
+            color_start: emitter.color_start,
+            color_end: emitter.color_end,
+            max_particles: emitter.max_particles as u64,
         }
     }
 }
@@ -632,17 +917,18 @@ impl Default for RigidBodySection {
 // load
 // ---------------------------------------------------------------------------
 
-/// 子资产解析策略（内部）：场景 JSON 本体之外的引用（glTF / 贴图 /
-/// HDR 天空）都经它解析。`Fs` = [`load_scene`] 的既有 base_dir 文件
-/// 系统语义；`Mount` = [`load_scene_from`] 的挂载顺序查找。
-enum SubAssets<'a> {
+/// 子资产解析策略（内部，`crate::level` 共用）：场景 JSON 本体之外的
+/// 引用（glTF / 贴图 / HDR 天空 / 光照贴图产物）都经它解析。`Fs` =
+/// [`load_scene`] 的既有 base_dir 文件系统语义；`Mount` =
+/// [`load_scene_from`] 的挂载顺序查找。
+pub(crate) enum SubAssets<'a> {
     Fs(PathBuf),
     Mount(&'a AssetMount),
 }
 
-impl SubAssets<'_> {
+impl<'a> SubAssets<'a> {
     /// 读子资产字节。
-    fn read(&self, rel: &str) -> Result<Vec<u8>, SceneError> {
+    pub(crate) fn read(&self, rel: &str) -> Result<Vec<u8>, SceneError> {
         match self {
             Self::Fs(dir) => std::fs::read(dir.join(rel)).map_err(SceneError::Io),
             Self::Mount(mount) => mount
@@ -674,6 +960,262 @@ impl SubAssets<'_> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 同源去重（一次加载内）
+// ---------------------------------------------------------------------------
+
+/// 一次加载内的同源去重缓存（语义与动机见模块文档「同源去重（v2）」）。
+///
+/// 选型：**Vec 线性扫描而非 HashMap**——去重键含 f32（图元参数 / 材质
+/// 数值，无 `Hash` 且 `Eq` 不成立），位模式元组比较是确定性文化的对照
+/// 口径；规模 = 单文件内的来源数（手写关卡数十量级），线性扫描足够且
+/// 首见序天然确定（BTree 类容器在此无额外收益，选型理由照
+/// `broadphase.rs` 的规约写明：需要迭代序确定性时用有序结构，这里
+/// 迭代序不参与语义、仅查找）。
+#[derive(Default)]
+pub(crate) struct LoadCache {
+    /// 图元参数 → 网格句柄（glTF 不去重：整实例每次独立解析，v1 语义）。
+    meshes: Vec<(PrimitiveSection, MeshHandle)>,
+    /// 解析后的材质位模式 → 材质句柄。
+    materials: Vec<(MaterialKey, MaterialHandle)>,
+    /// (文件路径, srgb) → 纹理句柄（同一文件用于基色与法线槽 = 两个
+    /// 条目——sRGB 语义按槽位，数据虽同、上传解释不同）。
+    file_textures: Vec<(String, bool, TextureHandle)>,
+    /// 程序化源 → 生成产物 + 逐槽已登记句柄（同参数只生成一次）。
+    procedural: Vec<(ProceduralTextureSection, ProcCache)>,
+}
+
+/// 程序化源的生成产物与逐槽登记状态（槽位按需登记，未引用的槽不进
+/// `TextureStore`——句柄布局紧凑且由文件序唯一决定）。
+struct ProcCache {
+    grass: Option<GrassTextures>,
+    brick: Option<(CpuTexture, CpuTexture)>,
+    base: Option<TextureHandle>,
+    normal: Option<TextureHandle>,
+    orm: Option<TextureHandle>,
+}
+
+/// 材质去重键：解析后 [`MaterialDef`] 的位模式（f32 逐位、句柄与
+/// `AlphaMode` 本身 `Eq`）。
+type MaterialKey = (
+    [u32; 4],
+    [u32; 4],
+    u32,
+    u32,
+    TextureHandle,
+    Option<TextureHandle>,
+    Option<TextureHandle>,
+    AlphaMode,
+);
+
+fn material_key(def: &MaterialDef) -> MaterialKey {
+    (
+        def.base_color.map(f32::to_bits),
+        def.emissive.map(f32::to_bits),
+        def.metallic.to_bits(),
+        def.roughness.to_bits(),
+        def.texture,
+        def.normal_texture,
+        def.orm_texture,
+        def.alpha_mode,
+    )
+}
+
+impl LoadCache {
+    /// 图元网格（去重）：首见生成 + 登记来源，后见复用同句柄。
+    fn primitive_mesh(
+        &mut self,
+        world: &mut World,
+        primitive: &PrimitiveSection,
+    ) -> Result<MeshHandle, SceneError> {
+        if let Some((_, handle)) = self.meshes.iter().find(|(section, _)| section == primitive) {
+            return Ok(*handle);
+        }
+        let data = primitive.to_mesh_data()?;
+        let handle = world.resource_mut::<MeshStore>().add(data);
+        world
+            .resource_mut::<SceneAssetRegistry>()
+            .meshes
+            .insert(handle.0, MeshRef::Primitive(primitive.clone()));
+        self.meshes.push((primitive.clone(), handle));
+        Ok(handle)
+    }
+
+    /// 文件纹理（去重，键含槽位 sRGB 语义）。
+    fn file_texture(
+        &mut self,
+        world: &mut World,
+        sub: &SubAssets<'_>,
+        path: &str,
+        slot: TextureSlot,
+    ) -> Result<TextureHandle, SceneError> {
+        let srgb = slot == TextureSlot::Base;
+        if let Some((_, _, handle)) = self
+            .file_textures
+            .iter()
+            .find(|(p, s, _)| p == path && *s == srgb)
+        {
+            return Ok(*handle);
+        }
+        let handle = load_texture(world, sub, path, srgb)?;
+        self.file_textures.push((path.to_string(), srgb, handle));
+        Ok(handle)
+    }
+
+    /// 程序化纹理（同参数只生成一次；逐槽按需登记）。`brick_normal_orm`
+    /// 无基色产物——用于基色槽报 [`SceneError::Unsupported`]。
+    fn procedural_texture(
+        &mut self,
+        world: &mut World,
+        source: &ProceduralTextureSection,
+        slot: TextureSlot,
+    ) -> Result<TextureHandle, SceneError> {
+        // 生成器断言前置校验（加载路径不 panic）
+        match source {
+            ProceduralTextureSection::Grass { size } => {
+                if *size < 8 {
+                    return Err(SceneError::OutOfRange(format!(
+                        "grass.size 至少 8 像素（草地纹理生成器下限），实际 {size}"
+                    )));
+                }
+            }
+            ProceduralTextureSection::BrickNormalOrm {
+                rows, cols, size, ..
+            } => {
+                if *rows < 1 || *cols < 1 {
+                    return Err(SceneError::OutOfRange(format!(
+                        "brick_normal_orm 行列数至少 1，实际 {rows}×{cols}"
+                    )));
+                }
+                if *size < 4 {
+                    return Err(SceneError::OutOfRange(format!(
+                        "brick_normal_orm.size 至少 4 像素（砖墙纹理生成器下限），实际 {size}"
+                    )));
+                }
+            }
+        }
+        if !self.procedural.iter().any(|(s, _)| s == source) {
+            let cache = match *source {
+                ProceduralTextureSection::Grass { size } => ProcCache {
+                    grass: Some(grass_textures(size)),
+                    brick: None,
+                    base: None,
+                    normal: None,
+                    orm: None,
+                },
+                ProceduralTextureSection::BrickNormalOrm {
+                    rows,
+                    cols,
+                    size,
+                    seam,
+                    bump,
+                } => ProcCache {
+                    grass: None,
+                    brick: Some(CpuTexture::brick_normal_orm(rows, cols, size, seam, bump)),
+                    base: None,
+                    normal: None,
+                    orm: None,
+                },
+            };
+            self.procedural.push((*source, cache));
+        }
+        let (_, cache) = self
+            .procedural
+            .iter_mut()
+            .find(|(s, _)| s == source)
+            .expect("上方刚插入");
+        let slot_handle = match slot {
+            TextureSlot::Base => &mut cache.base,
+            TextureSlot::Normal => &mut cache.normal,
+            TextureSlot::Orm => &mut cache.orm,
+        };
+        if let Some(handle) = *slot_handle {
+            return Ok(handle);
+        }
+        let texture = match (slot, &cache.grass, &cache.brick) {
+            (TextureSlot::Base, Some(grass), _) => grass.albedo.clone(),
+            (TextureSlot::Normal, Some(grass), _) => grass.normal.clone(),
+            (TextureSlot::Orm, Some(grass), _) => grass.orm.clone(),
+            (TextureSlot::Normal, _, Some(brick)) => brick.0.clone(),
+            (TextureSlot::Orm, _, Some(brick)) => brick.1.clone(),
+            (TextureSlot::Base, None, Some(_)) => {
+                return Err(SceneError::Unsupported(
+                    "brick_normal_orm 程序化源产出法线 + ORM 两张纹理，不能用于基色槽\
+                     （基色用 grass 源或文件路径）"
+                        .into(),
+                ));
+            }
+            // 生成产物与源一一对应（上方构造保证），此支不可达
+            (_, None, None) => unreachable!("程序化缓存必持有其源的生成产物"),
+        };
+        let handle = world.resource_mut::<TextureStore>().add(texture);
+        *slot_handle = Some(handle);
+        Ok(handle)
+    }
+}
+
+/// 单槽纹理来源解析（文件 / 程序化 / 缺席三态）。
+fn resolve_texture_source(
+    world: &mut World,
+    sub: &SubAssets<'_>,
+    cache: &mut LoadCache,
+    source: &Option<TextureSourceSection>,
+    slot: TextureSlot,
+) -> Result<Option<TextureHandle>, SceneError> {
+    match source {
+        Some(TextureSourceSection::File(path)) => {
+            Ok(Some(cache.file_texture(world, sub, path, slot)?))
+        }
+        Some(TextureSourceSection::Procedural(procedural)) => {
+            Ok(Some(cache.procedural_texture(world, procedural, slot)?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// 解析材质段（实体段与 `level.terrain` 共用）：三槽纹理逐一解析（去重）
+/// → 组装 [`MaterialDef`] → 材质级去重 → 首见入 `MaterialStore` 并登记
+/// 来源（[`MaterialRef`]），后见复用同句柄。
+pub(crate) fn resolve_material(
+    world: &mut World,
+    sub: &SubAssets<'_>,
+    section: &MaterialSection,
+    cache: &mut LoadCache,
+) -> Result<MaterialHandle, SceneError> {
+    let base = resolve_texture_source(world, sub, cache, &section.texture, TextureSlot::Base)?;
+    let normal = resolve_texture_source(
+        world,
+        sub,
+        cache,
+        &section.normal_texture,
+        TextureSlot::Normal,
+    )?;
+    let orm = resolve_texture_source(world, sub, cache, &section.orm_texture, TextureSlot::Orm)?;
+    let def = section.to_def(base.unwrap_or(TextureHandle(0)), normal, orm);
+    let key = material_key(&def);
+    if let Some((_, handle)) = cache.materials.iter().find(|(k, _)| *k == key) {
+        return Ok(*handle);
+    }
+    let handle = world.resource_mut::<MaterialStore>().add(def);
+    world.resource_mut::<SceneAssetRegistry>().materials.insert(
+        handle.0,
+        MaterialRef {
+            texture: match &section.texture {
+                Some(TextureSourceSection::File(path)) => Some(path.clone()),
+                _ => None,
+            },
+            base_source: match &section.texture {
+                Some(TextureSourceSection::Procedural(procedural)) => Some(*procedural),
+                _ => None,
+            },
+            normal_source: section.normal_texture.clone(),
+            orm_source: section.orm_texture.clone(),
+        },
+    );
+    cache.materials.push((key, handle));
+    Ok(handle)
 }
 
 /// 从 JSON 场景文件加载实体：插入缺失的资源兜底（`MeshStore` /
@@ -721,13 +1263,21 @@ pub fn load_scene_from(
     load_scene_bytes(world, &bytes, SubAssets::Mount(mount))
 }
 
-/// 两入口共用的加载主体：解析 JSON → 兜底资源 → 环境 → 逐实体 spawn。
+/// 两入口共用的加载主体：解析 JSON → 版本迁移 → 兜底资源 → 环境 →
+/// `level.terrain` → 逐实体 spawn → `level.nav` → `level.bake` →
+/// [`LevelRegistry`] 登记。
+///
+/// 应用顺序的设计依据：terrain 先于实体段（「地基先于摆设」——地形
+/// 派生实体占据实体序低段，编辑器心智模型）；nav / bake 后于实体段
+/// （两者消费世界内静态碰撞体 / 几何的**全集**，实体段与 terrain 都
+/// 就位后才有完整输入）。
 fn load_scene_bytes(
     world: &mut World,
     bytes: &[u8],
     sub: SubAssets<'_>,
 ) -> Result<Vec<Entity>, SceneError> {
-    let doc: SceneDoc = serde_json::from_slice(bytes)?;
+    let mut doc: SceneDoc = serde_json::from_slice(bytes)?;
+    migrate_doc(&mut doc)?;
     let defs = doc
         .entities
         .ok_or_else(|| SceneError::Missing("entities".into()))?;
@@ -737,10 +1287,26 @@ fn load_scene_bytes(
         apply_environment(world, &sub, environment)?;
     }
 
+    let level = doc.level.unwrap_or_default();
+    let mut cache = LoadCache::default();
+    if let Some(terrain) = &level.terrain {
+        apply_terrain(world, &sub, terrain, &mut cache)?;
+    }
+
     let mut spawned = Vec::with_capacity(defs.len());
     for section in defs {
-        spawned.push(spawn_section(world, &sub, section)?);
+        spawned.push(spawn_section(world, &sub, section, &mut cache)?);
     }
+
+    if let Some(nav) = &level.nav {
+        apply_nav(world, nav)?;
+    }
+    if let Some(bake) = &level.bake {
+        apply_bake(world, &sub, bake)?;
+    }
+    // 登记加载时快照：save 回写 version / level 段的依据（语义见
+    // crate::level 模块文档「诚实清单」）
+    world.insert_resource(LevelRegistry { section: level });
     Ok(spawned)
 }
 
@@ -783,6 +1349,7 @@ fn spawn_section(
     world: &mut World,
     sub: &SubAssets<'_>,
     section: EntitySection,
+    cache: &mut LoadCache,
 ) -> Result<Entity, SceneError> {
     let transform = section
         .transform
@@ -801,12 +1368,7 @@ fn spawn_section(
     if let Some(mesh) = &section.mesh {
         match mesh {
             MeshSection::Primitive(primitive) => {
-                let data = primitive.to_mesh_data()?;
-                let handle = world.resource_mut::<MeshStore>().add(data);
-                world
-                    .resource_mut::<SceneAssetRegistry>()
-                    .meshes
-                    .insert(handle.0, MeshRef::Primitive(primitive.clone()));
+                let handle = cache.primitive_mesh(world, primitive)?;
                 world.insert(entity, handle);
                 // 渲染器收集查询要求 (MeshHandle, MaterialHandle) 成对：
                 // 无材质段时挂默认材质（0 号槽位 = 纯白，引擎既有兜底），
@@ -832,19 +1394,7 @@ fn spawn_section(
     }
 
     if let Some(material) = &section.material {
-        let texture = match &material.texture {
-            Some(rel) => Some(load_texture(world, sub, rel)?),
-            None => None,
-        };
-        let handle = world
-            .resource_mut::<MaterialStore>()
-            .add(material.to_def(texture.unwrap_or(TextureHandle(0))));
-        world.resource_mut::<SceneAssetRegistry>().materials.insert(
-            handle.0,
-            MaterialRef {
-                texture: material.texture.clone(),
-            },
-        );
+        let handle = resolve_material(world, sub, material, cache)?;
         world.insert(entity, handle);
     }
 
@@ -858,6 +1408,10 @@ fn spawn_section(
                 shadows: light.shadows,
             },
         );
+    }
+
+    if let Some(particles) = &section.particles {
+        world.insert(entity, particles.to_emitter()?);
     }
 
     if let Some(collider) = section.collider {
@@ -902,10 +1456,13 @@ fn mark_gltf_tree(world: &mut World, entity: Entity) {
 }
 
 /// 读取并解码贴图文件（PNG / JPEG，复用依赖树内的 image crate）。
+/// `srgb` 按材质槽位：基色 = 颜色数据（sRGB 上传），法线 / ORM =
+/// 线性数据（原样上传）——数据字节相同、GPU 采样解释不同。
 fn load_texture(
     world: &mut World,
     sub: &SubAssets<'_>,
     rel: &str,
+    srgb: bool,
 ) -> Result<TextureHandle, SceneError> {
     let bytes = sub.read(rel)?;
     let decoded = image::load_from_memory(&bytes)
@@ -916,8 +1473,7 @@ fn load_texture(
         width,
         height,
         rgba: rgba.into_raw(),
-        // 场景贴图是颜色数据（baseColor 语义），按 sRGB 上传
-        srgb: true,
+        srgb,
     }))
 }
 
@@ -925,15 +1481,23 @@ fn load_texture(
 // save
 // ---------------------------------------------------------------------------
 
-/// 把世界的内置组件集保存为 JSON 场景文件，返回写出的实体数。
+/// 把世界的内置组件集保存为 JSON 场景 / 关卡文件（格式 v2），返回写出的
+/// 实体数。
 ///
 /// - 查询 `(Transform + 可选 Name / Visibility / MeshHandle / MaterialHandle /
-///   PointLight / Collider / RigidBody)` 全量写出；带 [`GltfMounted`] 标记的
-///   glTF 内部实体跳过；无 `Transform` 的实体（如 UI）不参与往返；
+///   PointLight / ParticleEmitter / Collider / RigidBody)` 全量写出；带
+///   [`GltfMounted`] 标记的 glTF 内部实体与带
+///   [`LevelGenerated`](crate::level::LevelGenerated) 标记的 terrain 派生
+///   实体跳过；无 `Transform` 的实体（如 UI）不参与往返；
 /// - mesh / material / 天空源的来源按 [`SceneAssetRegistry`] 登记还原；
 ///   非场景来源的句柄按模块文档的降级规则省略并 `log::warn`；
+/// - `version` 恒写当前版本（[`SCENE_FORMAT_VERSION`]）；`level` 段按
+///   [`LevelRegistry`] 的加载时快照原样回写（空段省略——v1 档重存只多
+///   `version` 字段）；
 /// - 实体顺序 = 组件存储序（= spawn 顺序），稳定；`save(load(f))` 再
-///   `save` 一次产出逐字节相同的文件（同输入确定性输出）。
+///   `save` 一次产出逐字节相同的文件（同输入确定性输出——字段序 =
+///   结构体声明序，浮点 = serde_json 最短往返表示，位保真由
+///   `serde_json_f32_roundtrip_is_bitwise_exact` 测试钉住）。
 ///
 /// # 平台注意
 /// 文件写入走 `std::fs`：native 可用，web（wasm32）上不可用。
@@ -950,6 +1514,10 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     world.query::<(Entity, &Transform)>(|(entity, transform)| {
         // glTF 内部实体由 mesh 段整体重建，不属于场景文件
         if world.get::<GltfMounted>(entity).is_some() {
+            return;
+        }
+        // terrain 派生实体由 level.terrain 段整体重建，同理跳过
+        if world.get::<crate::level::LevelGenerated>(entity).is_some() {
             return;
         }
         sections.push(build_entity_section(
@@ -970,8 +1538,9 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     }
     if lost_textures > 0 {
         log::warn!(
-            "save_scene：{lost_textures} 个材质的贴图无来源路径登记 \
-             （TextureStore 无路径概念，非场景加载的贴图无法回写），texture 字段已省略"
+            "save_scene：{lost_textures} 个材质的纹理（基色 / 法线 / ORM）无来源登记 \
+             （TextureStore 无路径 / 生成参数概念，非场景加载的纹理无法回写），\
+             对应字段已省略"
         );
     }
 
@@ -994,9 +1563,17 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     let has_environment =
         environment.directional_light.is_some() || environment.sky_source.is_some();
 
+    // level 段：加载时快照原样回写（空段省略）
+    let level = world
+        .try_resource::<LevelRegistry>()
+        .map(|registry| registry.section.clone())
+        .filter(|section| !section.is_empty());
+
     let count = sections.len();
     let doc = SceneDoc {
+        version: Some(SCENE_FORMAT_VERSION),
         environment: has_environment.then_some(environment),
+        level,
         entities: Some(sections),
     };
     let json = serde_json::to_string_pretty(&doc)?;
@@ -1040,19 +1617,22 @@ fn build_entity_section(
         }
     }
 
-    // material：句柄 0 = 默认材质（隐式，整段省略）；登记表还原贴图路径，
-    // 数值字段照 MaterialDef 现读（保存「当前值」而非「加载时的值」）
+    // material：句柄 0 = 默认材质（隐式，整段省略）；登记表还原三槽纹理
+    // 来源，数值字段照 MaterialDef 现读（保存「当前值」而非「加载时的值」）
     if let Some(handle) = world.get::<MaterialHandle>(entity) {
         if handle.0 != 0 {
             if let Some(def) = materials.and_then(|m| m.get(*handle)) {
-                let texture = registry
-                    .materials
-                    .get(&handle.0)
-                    .and_then(|m| m.texture.clone());
-                if def.texture.0 != 0 && texture.is_none() {
+                let refs = registry.materials.get(&handle.0);
+                let base_lost = def.texture.0 != 0
+                    && refs.is_none_or(|r| r.texture.is_none() && r.base_source.is_none());
+                let normal_lost =
+                    def.normal_texture.is_some() && refs.is_none_or(|r| r.normal_source.is_none());
+                let orm_lost =
+                    def.orm_texture.is_some() && refs.is_none_or(|r| r.orm_source.is_none());
+                if base_lost || normal_lost || orm_lost {
                     *lost_textures += 1;
                 }
-                section.material = Some(MaterialSection::from_def(def, texture));
+                section.material = Some(MaterialSection::from_def(def, refs));
             }
         }
     }
@@ -1064,6 +1644,12 @@ fn build_entity_section(
             range: light.range,
             shadows: light.shadows,
         });
+    }
+
+    // particles：只写配置字段（运行期状态是私有字段也不入档——重载后
+    // 发射器从新鲜状态开始，模块文档「诚实清单」）
+    if let Some(emitter) = world.get::<ParticleEmitter>(entity) {
+        section.particles = Some(ParticleSection::from_emitter(&emitter));
     }
 
     if let Some(collider) = world.get::<Collider>(entity) {
@@ -2314,5 +2900,120 @@ mod tests {
             "未命中应报 Asset：{err}"
         );
         std::fs::remove_file(&pack_path).ok();
+    }
+
+    // ---- v2（R57）：粒子段与同源去重 ----
+
+    /// particles 段：配置字段进组件（缺省 = `ParticleEmitter::new(Alpha)`），
+    /// save ↔ load 往返逐字段位级一致；运行期状态不入档（重载后新鲜）。
+    #[test]
+    fn particles_section_loads_and_roundtrips() {
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "particles.scene.json",
+            r#"{
+                "entities": [
+                    { "name": "jet", "transform": { "position": [0.0, 0.72, 0.0] },
+                      "particles": { "blend": "alpha", "spawn_rate": 90.0,
+                                     "particle_lifetime": 1.6, "initial_speed": 6.0,
+                                     "velocity_jitter": 0.35, "size_start": 0.22,
+                                     "size_end": 0.05,
+                                     "color_start": [0.6, 0.8, 1.0, 0.85],
+                                     "color_end": [0.15, 0.3, 0.8, 0.0],
+                                     "max_particles": 1024 } },
+                    { "name": "boom", "particles": { "blend": "additive", "burst_count": 32 } }
+                ]
+            }"#,
+        );
+        let jet = world
+            .get::<ParticleEmitter>(entities[0])
+            .expect("粒子段应进组件");
+        assert_eq!(jet.blend, ParticleBlend::Alpha);
+        assert_eq!(jet.spawn_rate.to_bits(), 90.0f32.to_bits());
+        assert_eq!(jet.particle_lifetime.to_bits(), 1.6f32.to_bits());
+        assert_eq!(jet.initial_speed.to_bits(), 6.0f32.to_bits());
+        assert_eq!(jet.velocity_jitter.to_bits(), 0.35f32.to_bits());
+        assert_eq!(jet.size_start.to_bits(), 0.22f32.to_bits());
+        assert_eq!(jet.size_end.to_bits(), 0.05f32.to_bits());
+        assert_eq!(
+            jet.color_start.map(f32::to_bits),
+            [0.6f32, 0.8, 1.0, 0.85].map(f32::to_bits)
+        );
+        assert_eq!(
+            jet.color_end.map(f32::to_bits),
+            [0.15f32, 0.3, 0.8, 0.0].map(f32::to_bits)
+        );
+        assert_eq!(jet.max_particles, 1024);
+        assert_eq!(jet.live_count(), 0, "加载即新鲜状态（无运行期残留）");
+
+        // 缺省字段 = new(Alpha)：burst 段只写两个字段，其余照默认
+        let boom = world.get::<ParticleEmitter>(entities[1]).unwrap();
+        assert_eq!(boom.blend, ParticleBlend::Additive);
+        assert_eq!(boom.burst_count, 32);
+        assert_eq!(boom.spawn_rate.to_bits(), 60.0f32.to_bits(), "缺省发射率");
+        assert_eq!(boom.max_particles, 1024, "缺省池上限");
+        // 组件守卫析构会延长 &world 借用——save 前显式释放
+        drop(jet);
+        drop(boom);
+
+        // save → load：配置逐字段位级一致
+        let out = test_dir().join("particles_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains(r#""particles""#), "particles 段应写出");
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out).expect("重载");
+        for (&a, &b) in entities.iter().zip(&entities_b) {
+            let ea = world.get::<ParticleEmitter>(a).unwrap();
+            let eb = world_b.get::<ParticleEmitter>(b).unwrap();
+            assert_eq!(
+                ParticleSection::from_emitter(&ea),
+                ParticleSection::from_emitter(&eb),
+                "配置字段应往返一致"
+            );
+        }
+    }
+
+    /// 同源去重（v2）：同图元参数 / 同材质段 / 同贴图文件在一次加载内
+    /// 共享句柄（首见注册、后见复用）；异源不共享。这是「文件内同源 ⇒
+    /// 世界内同句柄」的规范化保证（模块文档「同源去重」）。
+    #[test]
+    fn identical_sources_share_handles_within_one_load() {
+        let dir = test_dir();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]))
+            .save(dir.join("dedup_tex.png"))
+            .expect("写测试 PNG");
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "dedup.scene.json",
+            r#"{
+                "entities": [
+                    { "name": "a", "mesh": { "primitive": { "kind": "cube" } },
+                      "material": { "color": [0.8, 0.2, 0.1, 1.0], "texture": "dedup_tex.png" } },
+                    { "name": "b", "mesh": { "primitive": { "kind": "cube" } },
+                      "material": { "color": [0.8, 0.2, 0.1, 1.0], "texture": "dedup_tex.png" } },
+                    { "name": "c", "mesh": { "primitive": { "kind": "cube" } },
+                      "material": { "color": [0.1, 0.2, 0.8, 1.0] } },
+                    { "name": "d", "mesh": { "primitive": { "kind": "sphere", "segments": 8, "rings": 4 } } }
+                ]
+            }"#,
+        );
+        let mesh_of = |e: Entity| *world.get::<MeshHandle>(e).unwrap();
+        let mat_of = |e: Entity| *world.get::<MaterialHandle>(e).unwrap();
+        assert_eq!(mesh_of(entities[0]), mesh_of(entities[1]), "同图元共享");
+        assert_eq!(mesh_of(entities[0]), mesh_of(entities[2]), "同图元共享");
+        assert_ne!(mesh_of(entities[0]), mesh_of(entities[3]), "异图元不共享");
+        assert_eq!(mat_of(entities[0]), mat_of(entities[1]), "同材质共享");
+        assert_ne!(mat_of(entities[0]), mat_of(entities[2]), "异材质不共享");
+
+        // Store 布局：mesh 2 条（cube + sphere）、材质 2 条、纹理 2 条
+        // （0 号白兜底 + 同一 PNG 只解码登记一次）
+        assert_eq!(world.resource::<MeshStore>().len(), 2);
+        assert_eq!(world.resource::<TextureStore>().len(), 2);
+        let registry = world.resource::<SceneAssetRegistry>();
+        assert_eq!(registry.meshes.len(), 2, "登记表按句柄一条");
+        assert_eq!(registry.materials.len(), 2);
     }
 }

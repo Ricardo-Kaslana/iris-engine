@@ -529,6 +529,12 @@ impl NavGrid {
         }
     }
 
+    /// 构建参数（只读出口，R57）：关卡格式的 `level.nav` 段往返对照与
+    /// 重建核对用。参数按值返回（`NavGridParams` 是 `Copy`）。
+    pub fn params(&self) -> NavGridParams {
+        self.params
+    }
+
     /// X 方向 cell 数。
     pub fn cols(&self) -> usize {
         self.cols

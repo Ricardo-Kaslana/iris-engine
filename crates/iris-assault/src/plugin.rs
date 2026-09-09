@@ -5,7 +5,7 @@
 //! 职责划分（iris-infiltration 同款分层）：
 //! - **Startup**：`setup_resources`（引擎资源兜底 + **R45** pack 挂载 +
 //!   **R44** 流式氛围音乐 + 程序化音效 + **R43** DOF / MB 设置）→
-//!   `build_scene`（庭院几何 / **R42** 写实材质 / 三层角色结构 /
+//!   `build_scene`（**R57** 庭院关卡档加载 / 三层角色结构 /
 //!   **R46** 双播放器上下身动画 + 足部 / 手部 IK / HUD / 粒子 FX 池）→
 //!   **R47** 开场演出；
 //! - **Update**：`run_assault`（输入翻译 → **R47** 时间线事件消费 →
@@ -503,177 +503,30 @@ fn build_scene(world: &mut World) {
     });
 }
 
-/// 庭院几何：地面 / 围墙 / 石柱 / 喷泉（视觉网格与逻辑静态体同源，
-/// 插件层按 `half × 2` 缩放立方体）+ **R42** 写实材质 + 灯光。
+/// 庭院关卡档条目（仓库资产，经 [`asset_path`] 解析；测试同款引用）。
+pub const LEVEL_ENTRY: &str = "assets/assault_courtyard.level.json";
+
+/// 庭院（**R57：静态世界迁入关卡档**）：地面 / 围墙 / 石柱 / 喷泉 /
+/// 水柱粒子 / 黄昏方向光 / 火盆点光全部由 `assets/assault_courtyard.level.json`
+/// （关卡格式 v2）描述，经 [`load_scene`] 一次载入——石板 / 砖墙的
+/// **R42** 写实材质以程序化纹理源（`brick_normal_orm` 全参数）入档，
+/// 零二进制资产。插件层不再 spawn 任何静态几何（本函数即「加载关卡档」，
+/// 动态实体——角色 / 相机 / FX 池 / HUD——仍在 `build_scene` 代码侧）。
+///
+/// 一致性契约：实体 spawn 序 / 句柄布局 / 组件位模式与代码生成时代
+/// **逐位一致**（迁移验收：同帧离屏渲染 FNV 相等 + parity dump 对照）；
+/// 墙 / 柱 / 喷泉的**逻辑**碰撞数据权威仍在 `crate::logic` 常量
+/// （`WALLS` / `PILLARS` / `FOUNTAIN_COLLIDER`，纯逻辑核心不读档）——
+/// 关卡档是表现 + 物理层的镜像，双源一致性由 `tests/level_roundtrip.rs`
+/// 钉住（漂移守护；单一事实来源见 ARCHITECTURE §8 编辑器轮计划）。
+///
+/// 档缺失 = 部署损坏：显式 panic（中文消息含路径），不做代码侧兜底
+/// ——兜底会让「档与代码漂移」退化为静默双实现。
 fn build_courtyard(world: &mut World) {
-    // ---- R42：程序化写实材质。地面石板 / 砖墙用引擎 R42 验收生成器
-    // brick_normal_orm（解析式高度场 + splitmix64，确定性有引擎侧单测）；
-    // 刀身划痕 / 布料褶皱在角色装配时生成（见 assemble_animated_character）。
-    let (paving_normal, paving_orm) = {
-        let mut store = world.resource_mut::<TextureStore>();
-        let (normal, orm) = CpuTexture::brick_normal_orm(5, 7, 256, 0.05, 1.2);
-        (store.add(normal), store.add(orm))
-    };
-    let (brick_normal, brick_orm) = {
-        let mut store = world.resource_mut::<TextureStore>();
-        let (normal, orm) = CpuTexture::brick_normal_orm(8, 5, 256, 0.05, 2.4);
-        (store.add(normal), store.add(orm))
-    };
-
-    let paving_mat = {
-        let mut materials = world.resource_mut::<MaterialStore>();
-        materials.add(
-            MaterialDef {
-                base_color: [0.42, 0.40, 0.365, 1.0],
-                metallic: 0.0,
-                roughness: 0.9,
-                ..MaterialDef::default()
-            }
-            .with_normal(paving_normal)
-            .with_orm(paving_orm),
-        )
-    };
-    let brick_mat = {
-        let mut materials = world.resource_mut::<MaterialStore>();
-        materials.add(
-            MaterialDef {
-                base_color: [0.46, 0.33, 0.27, 1.0],
-                metallic: 0.0,
-                roughness: 0.85,
-                ..MaterialDef::default()
-            }
-            .with_normal(brick_normal)
-            .with_orm(brick_orm),
-        )
-    };
-    // 石柱不用砖法线：高细柱的立方体 UV 是 0..1 整面铺贴，砖纹会拉伸成
-    // 碟叠（快照目检实录）——纯色石面 + 高粗糙即可
-    let pillar_mat = {
-        let mut materials = world.resource_mut::<MaterialStore>();
-        materials.add(MaterialDef {
-            base_color: [0.38, 0.385, 0.40, 1.0],
-            metallic: 0.0,
-            roughness: 0.75,
-            ..MaterialDef::default()
-        })
-    };
-    let basin_mat = {
-        let mut materials = world.resource_mut::<MaterialStore>();
-        materials.add(MaterialDef {
-            base_color: [0.36, 0.37, 0.39, 1.0],
-            metallic: 0.1,
-            roughness: 0.7,
-            ..MaterialDef::default()
-        })
-    };
-    let water_mat = {
-        let mut materials = world.resource_mut::<MaterialStore>();
-        materials.add(MaterialDef {
-            base_color: [0.15, 0.35, 0.45, 1.0],
-            emissive: [0.08, 0.22, 0.30, 1.0],
-            metallic: 0.0,
-            roughness: 0.15,
-            ..MaterialDef::default()
-        })
-    };
-
-    let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
-    let basin = world
-        .resource_mut::<MeshStore>()
-        .add(MeshData::cylinder(1.7, 0.7, 24));
-    let water = world
-        .resource_mut::<MeshStore>()
-        .add(MeshData::cylinder(1.5, 0.06, 24));
-    let spout = world
-        .resource_mut::<MeshStore>()
-        .add(MeshData::cylinder(0.22, 1.1, 12));
-
-    // 地板：视觉 + 静态碰撞体（IK 落地 / ragdoll 承托）
-    world.spawn((
-        Name("assault/ground".into()),
-        Transform {
-            position: Vec3::new(0.0, -0.25, 0.0),
-            scale: Vec3::new(20.8, 0.5, 14.8),
-            ..Transform::IDENTITY
-        },
-        cube,
-        paving_mat,
-        Collider::static_box(Vec3::new(10.4, 0.25, 7.4)),
-    ));
-    // 围墙 + 石柱（视觉与逻辑静态体同源）
-    for (index, block) in logic::WALLS.iter().enumerate() {
-        world.spawn((
-            Name(format!("assault/wall/{index}")),
-            Transform {
-                position: block.center,
-                scale: block.half * 2.0,
-                ..Transform::IDENTITY
-            },
-            cube,
-            brick_mat,
-            Collider::static_box(block.half),
-        ));
-    }
-    for (index, block) in logic::PILLARS.iter().enumerate() {
-        world.spawn((
-            Name(format!("assault/pillar/{index}")),
-            Transform {
-                position: block.center,
-                scale: block.half * 2.0,
-                ..Transform::IDENTITY
-            },
-            cube,
-            pillar_mat,
-            Collider::static_box(block.half),
-        ));
-    }
-    // 喷泉：盆（物理球体碰撞元略大于盆沿，防 ragdoll 陷盆）+ 水面 +
-    // 中柱 + 水花粒子（R24 粒子的庭院化复用）
-    world.spawn((
-        Name("assault/fountain".into()),
-        Transform::from_xyz(0.0, 0.35, 0.0),
-        basin,
-        basin_mat,
-        Collider::static_sphere(1.75),
-    ));
-    world.spawn((
-        Name("assault/fountain/water".into()),
-        Transform::from_xyz(0.0, 0.62, 0.0),
-        water,
-        water_mat,
-    ));
-    world.spawn((
-        Name("assault/fountain/spout".into()),
-        Transform::from_xyz(0.0, 1.25, 0.0),
-        spout,
-        basin_mat,
-    ));
-    world.spawn((
-        Name("assault/fountain/jet".into()),
-        Transform::from_xyz(0.0, 0.72, 0.0),
-        ParticleEmitter::fountain(),
-    ));
-
-    // ---- 灯光：黄昏斜阳（方向光带阴影）+ 两盏暖色火盆点光 ----
-    if let Some(mut light) = world.try_resource_mut::<DirectionalLight>() {
-        light.direction = Vec3::new(-0.35, -0.8, -0.45).normalize_or_zero();
-        light.color = Vec3::new(1.0, 0.88, 0.74);
-        light.intensity = 1.3;
-        light.ambient = Vec3::new(0.22, 0.21, 0.21);
-        light.shadows = true;
-    }
-    for (index, (x, z)) in [(7.4, 5.8), (-7.4, -5.8)].iter().enumerate() {
-        world.spawn((
-            Name(format!("assault/torch/{index}")),
-            Transform::from_xyz(*x, 2.6, *z),
-            PointLight {
-                color: Vec3::new(1.0, 0.62, 0.3),
-                intensity: 7.0,
-                range: 13.0,
-                shadows: false,
-            },
-        ));
-    }
+    let path = asset_path(LEVEL_ENTRY);
+    load_scene(world, &path).unwrap_or_else(|err| {
+        panic!("庭院关卡档 {} 加载失败：{err}", path.display());
+    });
 }
 
 /// 组装一名角色（玩家或敌人共用）：根（逻辑位置）→ 模型（GLB 经 pack

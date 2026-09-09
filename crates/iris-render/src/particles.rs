@@ -32,8 +32,10 @@
 //! burst 重新上膛（运行期即时触发亦可用
 //! [`ParticleEmitter::trigger_burst`]），无需销毁重建组件。
 //!
-//! v1 限制：不写场景序列化（JSON 场景无粒子段）；渲染实例缓冲每帧全量
-//! 上传（粒子逐帧全变，增量比对无价值）；无碰撞与光照交互。
+//! v1 限制：渲染实例缓冲每帧全量上传（粒子逐帧全变，增量比对无价值）；
+//! 无碰撞与光照交互。场景序列化（R57 起）只写**配置字段**——粒子池 /
+//! 计数器 / 累计余量等模拟状态不入档，重载后发射器从新鲜状态开始
+//! （见 `iris_engine::scene` 的 `ParticleSection`）。
 
 use glam::Vec3;
 use iris_core::prelude::{Entity, GlobalTransform, Time};

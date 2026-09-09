@@ -40,7 +40,8 @@ iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
   cpal 设备层为 native 专属依赖，wasm32 下优雅降级为纯混音器。
 - **iris-engine**：App 框架、插件、winit `ApplicationHandler` 主循环，把三者粘合；
   另承载**场景序列化**（§4.15——场景横跨 mesh / material / 灯光 / 物理，
-  属门面层的编排职责）。
+  属门面层的编排职责）与其 v2 超集**关卡格式**（§4.26，`level` 模块——
+  地形 / 导航 / 烘焙参数段与光照贴图产物文件，编辑器轮的数据地基）。
 - **iris-game**：引擎的最下游消费者（示范游戏 Iris Collect，第三人称限时收集）——
   只依赖 iris-engine 门面（+ glam），是「只用公开 API 能否拼出完整游戏」的
   dogfooding 验证（§8.12 起的引擎缺口清单即来自这次实践）。纯逻辑状态机
@@ -1717,13 +1718,17 @@ DOF / MB 排在泛光**之前**：焦外亮源与运动拖影应参与后续亮�
 **关卡数据与游戏代码分离**：JSON 场景描述文件 ↔ 世界实体（`load_scene` /
 `save_scene`，iris-engine 门面层——场景横跨 mesh / material / 灯光 / 物理，
 正好是门面的职责）。serde derive（零新依赖：serde / serde_json / image 均在
-iris-render 的 glTF 管线依赖树内，Cargo.lock 无新版本号）。
+iris-render 的 glTF 管线依赖树内，Cargo.lock 无新版本号）。**R57 起本格式
+升为 v2 = 关卡档**（顶层 `version` + `level` 段，v1 档无损直读）——v2 新增
+面（关卡段 / 材质三纹理槽 / 粒子段 / 同源去重 / 版本迁移）全文见 §4.26，
+本节保留 v1 基底语义的权威描述。
 
 **格式设计（全蛇形命名）**：两类内容——
 
 - **环境段**（场景级资源形态，非实体）：`directional_light`（方向 / 颜色 /
   强度 / 环境光 / 阴影开关，各字段可选、缺省 = 引擎默认；`shadow_range` v1
-  不序列化）与 `sky_source`（Radiance `.hdr` 相对路径 → `SkySource::equirect_hdr`，
+  不序列化，v2 补齐为缺省省略的可选字段——§4.26）与 `sky_source`（Radiance
+  `.hdr` 相对路径 → `SkySource::equirect_hdr`，
   缺席 = 程序化天空）。缺席的环境段**不改动**既有资源（方向光常由代码按关卡
   氛围覆盖）。
 - **实体段**（必需，逐实体可选字段，缺省值全部与引擎默认一致——`Transform`
@@ -1768,8 +1773,9 @@ glTF 段在下次加载时整体重建，不属于场景文件本身。错误收
 glTF / HDR 错误经 `From` 映射保上下文）。
 
 **v1 不含（诚实清单）**：UI 组件（HUD 属游戏逻辑）与相机（资源级）不进
-场景文件；克隆 / 预设 / 组件插件扩展点；`RigidBody.velocity` 与
-`DirectionalLight.shadow_range` 不序列化（物体从静止开始）；同一 glTF 文件
+场景文件；克隆 / 预设 / 组件插件扩展点；`RigidBody.velocity` 不序列化
+（物体从静止开始）；`DirectionalLight.shadow_range` v1 不序列化（v2 补齐，
+§4.26）；同一 glTF 文件
 被多次引用时每引用重新解析（各得独立实体树与网格句柄——句柄级去重需跨实例
 复制异构组件树或共享实体，后者会被 `add_child` 重挂载破坏，v1 不做）；
 无热重载（§8.4）；文件读写走 `std::fs`（wasm32 编译可用、web 运行时不可用，
@@ -2540,6 +2546,111 @@ bake_lightmap(world)                       ← R52b 全链组装
   不透明 HUD 色块逐位不变 + 开启态逐位确定。**指标学**：总变差（TV）
   对单调重映射不变，判别不了平滑——首版用 TV 假失败，改最大跳变 +
   过渡带计数（实测教训）。
+
+### 4.26 关卡格式 v2（iris-engine/level + scene，R57）
+
+**定位**：给「关卡」一份持久化格式，让箱庭关卡的**静态世界**完全脱离
+游戏代码存在——后续编辑器（R58）的数据地基，本轮只做格式与数据模型
+（**无编辑器 GUI**）。边界：**关卡档管静态世界**（地形、静态碰撞体、
+装饰网格含 glTF 实例、光照、天空源、NavGrid 构建参数、烘焙参数、命名
+锚点）；**游戏代码管动态实体**（玩家 / 敌人 / HUD / 粒子池仍由 plugin
+spawn）。命名锚点 = 实体段的 `name` + `transform`——格式**游戏语义中立**
+（无 "player_spawn" 类专用字段，锚点含义由游戏侧约定）。
+
+**关卡档 = 场景档（§4.15）的超集**：顶层 `version`（缺席 = v1 无损直读）
++ `level` 段。单通路——`load_scene` / `save_scene` 同时服务两代格式，
+无第二套 IO。版本迁移 = 钩子函数表（`MIGRATIONS`，索引 = 源版本 − 1，
+顺序施加）：v1 → v2 = 加默认空 `level` 段；高于当前版本 → `Unsupported`
+拒读（与 pack「版本号 +1 旧 reader 拒读而非误读」同一策略）；save 恒写
+当前版本，空 `level` 段省略 ⇒ v1 档重存只多 `version` 字段（无损迁移）。
+
+**`level` 段三子段**（全可选；应用顺序 terrain → 实体段 → nav → bake——
+地基先于摆设、nav / bake 消费静态几何全集）：
+
+- **terrain**：heightmap 两态——`hills`（`generate_hills` 生成器全参数，
+  无 RNG 同 seed 逐位一致）或 `inline`（行主序高度数组）。取舍：**不引用
+  外置高度场文件**——v1 引擎没有高度场装载器，生成器参数与内联数组是与
+  现状最贴合的表达；大地形内联 JSON 体积大（129² ≈ 16k 浮点），外置
+  二进制高度场留待编辑器轮。材质段可选（缺席 = 句柄 0 白兜底），建造
+  参数缺省 = `TerrainOptions::default`。`build_terrain` 派生实体（根 /
+  chunk / 碰撞拼块）打 `LevelGenerated` 标记，save 跳过（terrain 段下次
+  加载整体重建——`GltfMounted` 同款模式）。`Heightmap::new` /
+  `build_terrain` 的全部断言前提在加载路径前置校验为 `OutOfRange`；
+- **nav**：**只存 `NavGridParams` 全字段，不存烘焙格子**——加载后由
+  世界静态碰撞体（无 `RigidBody` 或 `is_static`，排除传感器；收集序 =
+  组件存储序）经 `NavGrid::build` 重建入 World 资源。位图是静态几何的
+  纯函数（§3.9「便宜重建」），存格子 = 存冗余 + 「格子与几何失配」整类
+  陈旧态。已知边界：被静态盒**全覆盖**的域无顶面雕刻种子（§3.9 实测
+  教训）——整块地面盒的关卡应以 terrain 或隐式地面表达地面（assault
+  关卡档因此不带 nav 段，其导航权威在 `logic.rs`，见 §8.33①）；
+- **bake**：烘焙**参数**（`BakeParams` + `BakeUvParams` 全字段，对齐
+  `bake_lightmap` 实际入参）+ 记录性 `dilate_iterations`（dilation 轮数
+  是引擎常量 `LIGHTMAP_DILATE_ITERATIONS`，非运行期入参——不符告警）+
+  **产物文件名引用**。产物存独立外置文件（IRISLMAP 二进制，见下）；
+  加载时**存在则挂、缺失则诚实降级为无光照贴图并告警**（参数仍可驱动
+  重烘）；**损坏 / 与关卡几何失配 = 报错**（静默挂错位阴影比不挂更糟）。
+
+**光照贴图产物文件（IRISLMAP v1，全小端）**：魔数 + 版本 + 图集布局表
+（chart 表项按 `Entity::to_bits` / `MeshHandle` 引用 + 逐三角图集矩形与
+局部坐标）+ radiance / indirect 双辐照数组（f32 原样字节）+ covered
+位图——`BakedLightmap` 全字段无损（radiance 保住 preview 工具通路）。
+选型：自定义二进制而非 JSON（512² 图集 ≈ 6 MB 二进制 vs 13 MB 文本，
+位保真免十进制往返论证）；编码是纯函数（同输入逐位同输出，测试锁定），
+风格照 pack.rs 格式文档规约。**一致性校验**：产物必须产自「同一关卡档
+加载出的世界」（确定性加载 ⇒ 实体位模式与句柄可复现）；挂载前逐项
+校验（实体在世 / `MeshHandle` 相符 / 三角数相符 / 全局下标逐实体连续），
+穷尽 `install_lightmap` 的 panic 前提后才安装；安装后把 UV2 副本句柄的
+来源**回补进登记表**（照抄原句柄的图元 / glTF 来源）⇒ save 的 mesh 段
+仍还原为原始来源，重载后产物重挂——往返闭环（测试钉住副本句柄可复现）。
+
+**实体段扩展（v2）**：①材质段升为**三纹理槽**（`texture` 基色 /
+`normal_texture` / `orm_texture`），每槽**纹理源两态**——字符串 = 文件
+路径（v1 语义原样，serde untagged 直读）或对象 = **程序化源**
+（`grass` = `grass_textures` 三件套 / `brick_normal_orm` = 法线 + ORM
+对，引擎确定性生成器全参数）。sRGB 按槽位（基色 sRGB / 法线 ORM 线性）；
+brick 源无基色产物，用于基色槽报 `Unsupported`。程序化源让写实材质
+**零二进制资产**入档（关卡档保持纯文本自包含——assault 石板 / 砖墙即
+此路径）；②`particles` 段 = `ParticleEmitter` 全部 13 个配置字段（缺省
+= `new(Alpha)`；运行期状态不入档，重载新鲜）——水柱 / 装饰粒子自此可
+入档（particles.rs 的「不写场景序列化」v1 限制作废）；③方向光段补齐
+`shadow_range`（等于引擎默认时省略——v1 档重存字节级不变）。**点光
+核实结论**：v1 实体段 `point_light` 已全覆盖 `PointLight` 四字段
+（color / intensity / range / shadows），无缺口；方向光走 `environment`
+资源段先例（`DirectionalLight` 不是实体）。
+
+**同源去重（v2 加载语义）**：一次加载内，参数相同的图元 mesh、同
+(路径, srgb) 的文件纹理、同参数的程序化纹理、解析结果位级相同的材质
+**共享同一句柄**（首见注册、后见复用；`LoadCache` Vec 线性扫描——键含
+f32 无 Hash，位模式元组对照，首见序确定）。「文件内同源 ⇒ 世界内同
+句柄」是 assault 迁移逐位复现代码侧共享布局（一个 cube 九处引用、
+盆材质双引用）的机制前提，也是编辑器（R58）的资产心智。glTF 例外
+（整实例每次独立解析，v1 语义原样）。
+
+**往返与规范化**：save 输出字段序 = 结构体声明序、`version` 恒写、
+`level` 段按 `LevelRegistry`（加载时快照）原样回写。**浮点往返实测
+结论**：serde_json 的 f32 序列化走 ryu 最短往返表示、反序列化正确舍入，
+**逐位保真**（4112 个确定性伪随机位模式 + 边界值全集 `to_bits` 对照
+测试钉住；NaN / Inf 是 JSON 非法值、被加载校验排除）——无需自定义
+浮点输出策略，「经 f64 中转 1 ULP 漂移」的担忧实测不成立（最短表示
+的十进制恰为 f32 值的精确 double，回转 cast 无损）。
+
+**assault 庭院迁移实证（验收口径）**：`build_courtyard` 的约 170 行
+代码生成（程序化纹理 / 五材质 / 四网格 / 15 实体 / 灯光）整体替换为
+`load_scene(assets/assault_courtyard.level.json)`。迁移前后：同帧离屏
+渲染两帧 **FNV-1a 逐位相等**（帧 A 0x1070dd6e79e0523c / 帧 B
+0x31ca9c4842076a08，改码前捕获基线法）；FrameStats 全等（72/230/19/3150
+与 83/275/19/2500，定格帧号 473 同）；headless parity dump（288 实体 +
+三大 Store 内容 FNV + 登记表 + 资源位模式）**逐行一致**；既有 29 项
+单测 + 8 项 headless 零改动全过。粒子 RNG 以 `Entity::to_bits` 为种子
+⇒ 水柱实体 id 必须原位复现——档内实体序 = 原 spawn 序是硬约束
+（`level_roundtrip.rs` 的实体位模式断言钉住）。
+
+**测试**：level.rs 14 项（terrain hills / inline / 校验 / 草地三源、
+nav 重建 / 校验、bake 产物闭环 / 缺失降级 / 陈旧报错 / 损坏报错 /
+参数校验 / preview 通路、版本迁移、f32 位保真、端到端浮点往返）+
+scene.rs 新增 2 项（粒子段往返、同源去重）共 28 项 + assault
+`level_roundtrip.rs` 3 项（档往返逐位 / 档与 logic 常量双源守护 /
+材质三槽接线）。诚实清单见 §8.33 与 level.rs 模块文档。
 
 ## 5. 内存安全策略总表
 
@@ -3385,6 +3496,24 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     走样 / 轻微软化；⑨**FXAA 工作在色调映射后的 LDR 域**：HDR 域
     抗锯齿（或 SMAA / TAA）在路线图；⑩**TAA 未做**：历史缓冲 +
     投影抖动 + 运动向量整合三件套与单帧链架构冲突，列为后续候选。
+
+33. **关卡格式 v2 的诚实限制（R57）**——完整清单在 level.rs / scene.rs
+    模块文档与 §4.26，此处索引：①**关卡档与游戏侧常量可能双源**
+    （assault 的墙 / 柱同时存在于关卡档与 `logic.rs` 常量——纯逻辑核心
+    不读档是分层纪律；`tests/level_roundtrip.rs` 位级对照钉住一致性，
+    单一事实来源留待编辑器轮 R58）；②**`LevelRegistry` 是加载时快照**
+    （代码侧改 `Terrain` / `NavGrid` / 烘焙参数不回写——与材质「现读
+    数值」语义不同，level 段的来源数据没有可现读的世界侧完整形态）；
+    ③**无外置高度场文件**（.r16 / PNG 高度图无装载器，`inline` 数组
+    大地形体积大；烘焙产物的 pack 打包工具链未接，产物经 `AssetMount`
+    可读）；④**产物实体引用对加载序敏感**（IRISLMAP 按 `Entity::to_bits`
+    引用——档面实体序变化即失配报错，重烘是唯一出路；这是「陈旧产物
+    是错误不是降级」的自觉代价）；⑤**assault 关卡档不带 nav 段**
+    （整块地面盒全覆盖导航域 ⇒ 顶面雕刻无种子整图不可走，§3.9 实测
+    教训；其导航权威在 `logic.rs`）；⑥**EnvironmentSettings / 相机 /
+    UI 不入档**（渲染调节旋钮与游戏表现留代码侧，v1 场景语义原样）；
+    ⑦**粒子段只写配置**（运行期状态不入档）；⑧**无编辑器 GUI /
+    无 schema 文件**（格式权威 = Rust 类型 + 模块文档，R58 补）。
 
 ## 9. 关键设计取舍记录
 
