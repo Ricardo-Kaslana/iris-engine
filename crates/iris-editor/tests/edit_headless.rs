@@ -26,11 +26,15 @@ use std::path::PathBuf;
 use glam::Vec3;
 use iris_editor::edit::{
     self, DEFAULT_SNAP, EditorState, EditorTransient, GIZMO_EDGE_COUNT, GRID_EXTENT, GRID_STEP,
-    HUD_NAME, MATERIAL_PRESETS, PlaceKind, ascii_only, begin_drag, clear_transient, cycle_kind,
-    cycle_preset, delete_selected, describe, drag_to, duplicate_selected, editable_entities,
-    end_drag, nudge_selected, open_level, panel_text, pick, place_at, place_from_ray,
-    placement_point, rebuild_grid, save_level, scale_selected, screen_ray_at, select, snap_value,
-    toggle_collider, toggle_snap, update_gizmo, world_aabb_of,
+    HUD_NAME, LIGHT_INTENSITY_STEP, LIGHT_RANGE_STEP, MATERIAL_PRESETS, PlaceKind, ascii_only,
+    bake_and_install, begin_drag, clear_transient, cycle_kind, cycle_preset, delete_selected,
+    describe, drag_to, duplicate_selected, editable_entities, end_drag, focus_selected,
+    light_edit_mode, light_hue_step, light_intensity_step, light_range_step, light_shadow_toggle,
+    nav_blocked_count, nav_bounds_from_statics, nudge_selected, open_level, orbit_camera,
+    panel_text, pick, place_at, place_from_ray, placement_point, rebuild_grid, rebuild_nav, redo,
+    redo_depth, save_level, scale_selected, screen_ray_at, select, snap_value, sun_ambient_step,
+    sun_direction_step, toggle_collider, toggle_nav_viz, toggle_snap, undo, undo_depth,
+    update_gizmo, world_aabb_of,
 };
 use iris_engine::prelude::*;
 
@@ -121,15 +125,34 @@ fn feed_u32(hash: &mut u64, value: u32) {
 /// 枚举标签与整数字段（f32 的 `Debug` 是最短往返表示，本身单射，但位模式
 /// 断言更直白）。
 fn dump_world(world: &World) -> String {
+    dump_world_with(world, &editable_entities(world))
+}
+
+/// 名字序版世界转储（R58b undo 测试用）：undo 恢复是「全删全建」，实体
+/// 槽位号经分配器空闲列表（LIFO 复用）后不可复现——槽位本就是分配器
+/// 副产物（[`dump_world`] 注释同款立场）。undo 的正确性性质 =「同实体
+/// 集 + 同组件内容」，名字唯一（`next_name` / `_copy{n}` 保证），按名字
+/// 序转储即与槽位无关。
+fn dump_world_sorted(world: &World) -> String {
+    let mut entities = editable_entities(world);
+    entities.sort_by_key(|entity| {
+        world
+            .get::<Name>(*entity)
+            .map(|name| name.0.clone())
+            .unwrap_or_default()
+    });
+    dump_world_with(world, &entities)
+}
+
+fn dump_world_with(world: &World, entities: &[Entity]) -> String {
     let mut out = String::new();
 
-    out.push_str(&format!("editable {}\n", editable_entities(world).len()));
+    out.push_str(&format!("editable {}\n", entities.len()));
     // 转储**清单序号**而非 `Entity` 原始编号：编辑侧的瞬态视觉（选中框
     // 12 条边、网格线）与关卡内容是交错 spawn 的（摆放后自动选中 ⇒ 立刻
     // 生成选中框），原始编号必然与重载侧不同；而关卡档里没有实体 id 这个
     // 东西——往返可对照的是「顺序 + 内容」，编号只是分配器副产物。
-    for (slot, entity) in editable_entities(world).iter().enumerate() {
-        let entity = *entity;
+    for (slot, &entity) in entities.iter().enumerate() {
         let transform = *world.get::<Transform>(entity).expect("查询已确认");
         out.push_str(&format!("entity slot={slot}\n"));
         out.push_str(&format!(
@@ -479,12 +502,16 @@ fn placed_level_roundtrips_bitwise() {
         before,
         "往返一致：实体数 / 编号 / Transform 位模式 / 句柄 / 组件位 / 登记表 / Store 内容全等"
     );
+    // R58b：重载侧走「内容实体先行」的规范位布局（内容实体 0 号槽起步，
+    // 与 `load_scene` 一致——烘焙产物按实体位引用的前提）；创建会话的
+    // 内容实体在家具（50 网格线 + HUD）之后，两侧编号本就不同构
+    // （dump 用清单序号对照，见模块文档「句柄编号对齐」）。
     assert_eq!(
-        editable_entities(&reloaded)[0],
-        a,
-        "首个内容实体的编号两侧相同：内容之前两侧都恰好建了 50 条网格线 + 1 个 HUD\
-         （后续实体的编号会因编辑侧选中框交错 spawn 而不同，故 dump 用清单序号）"
+        editable_entities(&reloaded)[0].index(),
+        0,
+        "重载侧首个内容实体 = 0 号槽（规范位布局）"
     );
+    assert!(a.index() > 50, "创建会话的内容实体在家具之后");
 }
 
 /// 存档字节稳定：同一档二次保存逐字节相同（`save_scene` 的规范化输出 +
@@ -1283,4 +1310,768 @@ fn open_report_and_path_are_faithful() {
     assert!(!path.exists(), "新建路径此时还没落盘");
     save_level(&mut world).expect("保存后落盘");
     assert!(path.exists());
+}
+
+// ---------------------------------------------------------------------------
+// R58b：undo / redo（快照栈）
+// ---------------------------------------------------------------------------
+
+/// undo / redo 多步序列：逐步 dump 对照 + 「undo 到头再 redo 到尾」全恢复。
+/// 覆盖的写操作：摆放 ×2、复制、微移、缩放、删除。快照字段集 = dump
+/// 字段集 ⇒ 每步 undo 后的 dump 与该操作执行前逐字符一致。
+#[test]
+fn undo_redo_multi_step_sequence_with_full_recovery() {
+    let dir = temp_dir("undo");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("undo.level.json")).expect("新建");
+
+    let d0 = dump_world_sorted(&world); // 空世界
+    let a = place_with(&mut world, PlaceKind::Cube, 0, true, Vec3::ZERO);
+    let d1 = dump_world_sorted(&world);
+    place_with(
+        &mut world,
+        PlaceKind::Sphere,
+        2,
+        false,
+        Vec3::new(3.0, 0.0, 0.0),
+    );
+    let d2 = dump_world_sorted(&world);
+    select(&mut world, Some(a));
+    let _copy = duplicate_selected(&mut world).expect("复制");
+    let d3 = dump_world_sorted(&world);
+    nudge_selected(&mut world, Vec3::X, 0.3).expect("微移");
+    let d4 = dump_world_sorted(&world);
+    scale_selected(&mut world, 1.5).expect("缩放");
+    let d5 = dump_world_sorted(&world);
+    // 删除球
+    let sphere = world.entity_named("sphere/1").expect("球在位");
+    select(&mut world, Some(sphere));
+    delete_selected(&mut world);
+    let d6 = dump_world_sorted(&world);
+    assert_eq!(undo_depth(&world), 6, "六步写操作 = 六个快照");
+    assert_eq!(redo_depth(&world), 0);
+
+    // undo：每步都精确回到该步执行前的 dump
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d5, "undo 删除");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d4, "undo 缩放");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d3, "undo 微移");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d2, "undo 复制");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d1, "undo 第二次摆放");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d0, "undo 第一次摆放：世界回到空");
+    assert!(!undo(&mut world), "undo 到头再按 = no-op");
+    assert_eq!(dump_world_sorted(&world), d0);
+    assert_eq!(undo_depth(&world), 0);
+    assert_eq!(redo_depth(&world), 6);
+
+    // redo 到尾：全恢复
+    for expected in [
+        d1.as_str(),
+        d2.as_str(),
+        d3.as_str(),
+        d4.as_str(),
+        d5.as_str(),
+        d6.as_str(),
+    ] {
+        assert!(redo(&mut world));
+        assert_eq!(dump_world_sorted(&world), expected, "redo 逐步恢复");
+    }
+    assert!(!redo(&mut world), "redo 到尾再按 = no-op");
+    assert_eq!(undo_depth(&world), 6);
+    // undo 后新写操作清空 redo 栈
+    assert!(undo(&mut world));
+    assert_eq!(redo_depth(&world), 1);
+    place_with(
+        &mut world,
+        PlaceKind::Cube,
+        1,
+        false,
+        Vec3::new(-5.0, 0.0, 0.0),
+    );
+    assert_eq!(redo_depth(&world), 0, "新写操作清空 redo 栈");
+    assert!(!redo(&mut world));
+    // 撤销后的世界照常保存、重载：内容逐实体一致（按名对照 Transform
+    // 位模式）。注意不比整份 dump——undo 的全删全建让槽位序（= 存档实体
+    // 序）偏离编辑器首触序，重载侧按文件序给句柄编号，两侧句柄号本就
+    // 允许不同（编号是分配器 / 加载序副产物，R58a dump 注释同款立场）。
+    save_level(&mut world).expect("undo 后保存");
+    let mut reloaded = World::new();
+    open_level(&mut reloaded, &dir.join("undo.level.json")).expect("重载");
+    let world_names = editable_entities(&world).len();
+    assert_eq!(editable_entities(&reloaded).len(), world_names);
+    for entity in editable_entities(&world) {
+        let name = world
+            .get::<Name>(entity)
+            .map(|n| n.0.clone())
+            .expect("可编辑实体都有名");
+        let reloaded_entity = reloaded
+            .entity_named(&name)
+            .unwrap_or_else(|| panic!("重载侧缺实体 {name}"));
+        let a = *world.get::<Transform>(entity).expect("在位");
+        let b = *reloaded
+            .get::<Transform>(reloaded_entity)
+            .unwrap_or_else(|| panic!("重载侧 {name} 缺 Transform"));
+        let t_bits = |t: &Transform| {
+            (
+                t.position.to_array().map(|v| v.to_bits()),
+                t.rotation.to_array().map(|v| v.to_bits()),
+                t.scale.to_array().map(|v| v.to_bits()),
+            )
+        };
+        assert_eq!(t_bits(&a), t_bits(&b), "{name} 的 Transform 逐位一致");
+    }
+}
+
+/// undo 深度 32 环形丢弃（最旧覆盖）：33 次摆放后栈里只剩 32 份快照，
+/// undo 32 次回到「第 1 次摆放后」而非空世界（最早的快照已被丢弃）。
+#[test]
+fn undo_depth_ring_discards_oldest() {
+    let dir = temp_dir("undoring");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("ring.level.json")).expect("新建");
+    for i in 0..33 {
+        place_with(
+            &mut world,
+            PlaceKind::Cube,
+            0,
+            false,
+            Vec3::new(i as f32 * 2.0, 0.0, 0.0),
+        );
+    }
+    assert_eq!(editable_entities(&world).len(), 33);
+    assert_eq!(undo_depth(&world), 32, "环形丢弃最旧（33 入 32 出）");
+    for remaining in (1..=32).rev() {
+        assert!(undo(&mut world));
+        assert_eq!(
+            editable_entities(&world).len(),
+            remaining,
+            "undo 后实体数 = 快照时点"
+        );
+    }
+    assert!(!undo(&mut world), "栈已空");
+    assert_eq!(
+        editable_entities(&world).len(),
+        1,
+        "最早的快照（空世界）已被环形丢弃——只能回到第 1 次摆放后"
+    );
+}
+
+/// 拖拽的快照语义：按下时拍一次（拖动中途不拍），undo 一步回到按下前。
+#[test]
+fn drag_is_one_undo_step_taken_at_press() {
+    let dir = temp_dir("undodrag");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("undodrag.level.json")).expect("新建");
+    place_with(&mut world, PlaceKind::Cube, 0, true, Vec3::ZERO);
+    let d_after_place = dump_world_sorted(&world);
+
+    begin_drag(
+        &mut world,
+        Vec3::new(0.0, 5.0, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+    )
+    .expect("拾取并进入拖拽");
+    assert_eq!(undo_depth(&world), 2, "按下即拍（摆放 + 拖拽按下）");
+    drag_to(
+        &mut world,
+        Vec3::new(2.3, 5.0, -1.7),
+        Vec3::new(0.0, -1.0, 0.0),
+    )
+    .expect("拖动");
+    drag_to(
+        &mut world,
+        Vec3::new(5.0, 5.0, 5.0),
+        Vec3::new(0.0, -1.0, 0.0),
+    )
+    .expect("再拖");
+    assert_eq!(undo_depth(&world), 2, "拖动中途不拍");
+    end_drag(&mut world);
+    assert_ne!(
+        dump_world_sorted(&world),
+        d_after_place,
+        "拖拽确实移动了实体"
+    );
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_after_place,
+        "一步 undo 回到按下前（实体回原位，编号已换）"
+    );
+}
+
+/// 无编辑器状态时新命令照常 inert（不 panic、不产生实体）。
+#[test]
+fn b_stage_commands_are_inert_without_editor_state() {
+    let mut world = World::new();
+    assert!(!undo(&mut world));
+    assert!(!redo(&mut world));
+    assert_eq!(undo_depth(&world), 0);
+    assert_eq!(redo_depth(&world), 0);
+    assert_eq!(
+        bake_and_install(&mut world),
+        None,
+        "无状态 = 无档路径，不烘焙"
+    );
+    assert_eq!(toggle_nav_viz(&mut world), None);
+    assert_eq!(rebuild_nav(&mut world), None);
+    assert_eq!(focus_selected(&mut world), None);
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::Inert);
+    assert_eq!(light_intensity_step(&mut world, 1.0), None);
+    assert_eq!(light_range_step(&mut world, -1.0), None);
+    assert_eq!(light_hue_step(&mut world), None);
+    assert_eq!(light_shadow_toggle(&mut world), None);
+    assert_eq!(sun_ambient_step(&mut world, 1.0), None);
+    assert_eq!(sun_direction_step(&mut world, 0.1, 0.1), None);
+    orbit_camera(&mut world, (30.0, 30.0));
+    assert_eq!(world.entity_count(), 0, "新命令在无状态世界不产生任何实体");
+}
+
+// ---------------------------------------------------------------------------
+// R58b：光源参数编辑（位模式精确）
+// ---------------------------------------------------------------------------
+
+/// 点光四键：强度 / 范围 / 色相 / 阴影全部入 undo 栈；逐步 undo 的每一步
+/// dump 与该步编辑前逐字符一致，全部 undo 后点光参数逐位复原。
+#[test]
+fn point_light_edits_undo_bit_exact() {
+    let dir = temp_dir("lightedit");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("light.level.json")).expect("新建");
+    let light = edit::place_light_at(&mut world, Vec3::new(1.0, 0.0, 1.0)).expect("点光");
+    assert_eq!(
+        world.resource::<EditorState>().selected,
+        Some(light),
+        "摆放后自动选中 ⇒ 点光模式"
+    );
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::PointLight);
+    let d_before = dump_world_sorted(&world);
+
+    // `]`：强度 ×1.25（6.0 × 1.25 = 7.5 精确）
+    let intensity = light_intensity_step(&mut world, 1.0).expect("点光模式");
+    assert_eq!(
+        intensity.to_bits(),
+        (6.0f32 * LIGHT_INTENSITY_STEP).to_bits()
+    );
+    let d_intensity = dump_world_sorted(&world);
+    // `-`：范围 −0.5（10 − 0.5 = 9.5 精确）
+    let range = light_range_step(&mut world, -1.0).expect("点光模式");
+    assert_eq!(range.to_bits(), (10.0f32 - LIGHT_RANGE_STEP).to_bits());
+    let d_range = dump_world_sorted(&world);
+    // `H`：色相 +30°（饱和度 / 明度保持）
+    let color = light_hue_step(&mut world).expect("点光模式");
+    let (_, s_rot, v_rot) = edit::rgb_to_hsv(color);
+    let (_, s0, v0) = edit::rgb_to_hsv(Vec3::from(edit::LIGHT_COLOR));
+    assert!((s_rot - s0).abs() < 1e-5, "饱和度保持");
+    assert!((v_rot - v0).abs() < 1e-6, "明度保持");
+    let d_hue = dump_world_sorted(&world);
+    // `K`：阴影开
+    assert_eq!(light_shadow_toggle(&mut world), Some(true));
+    let d_shadow = dump_world_sorted(&world);
+    assert_eq!(undo_depth(&world), 5, "摆放 + 四步编辑 = 五个快照");
+
+    // 逐步 undo：每步回到该步编辑前
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d_hue, "undo 阴影");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d_range, "undo 色相");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d_intensity, "undo 范围");
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_before,
+        "undo 强度：回到摆放时点"
+    );
+    let light_restored = world.entity_named("light/1").expect("undo 后按名找点光");
+    let restored = *world.get::<PointLight>(light_restored).expect("在位");
+    assert_eq!(
+        restored.intensity.to_bits(),
+        6.0f32.to_bits(),
+        "强度逐位复原"
+    );
+    assert_eq!(
+        restored.color.to_array().map(|v| v.to_bits()),
+        Vec3::from(edit::LIGHT_COLOR)
+            .to_array()
+            .map(|v| v.to_bits()),
+        "颜色逐位复原"
+    );
+    assert!(!restored.shadows, "阴影复原");
+    let _ = d_shadow;
+}
+
+/// 方向光五键：强度 / 环境光 / 偏航俯仰全部入 undo 栈，undo 后资源位模式
+/// 逐位复原（to_bits 对照）。
+#[test]
+fn directional_light_edits_undo_bit_exact() {
+    let dir = temp_dir("sunedit");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("sun.level.json")).expect("新建");
+    select(&mut world, None);
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::Directional);
+    let before = world.resource::<DirectionalLight>().clone();
+
+    let intensity = light_intensity_step(&mut world, 1.0).expect("方向光模式");
+    assert!(intensity > before.intensity);
+    let ambient = sun_ambient_step(&mut world, 1.0).expect("方向光模式");
+    assert!(ambient.x > before.ambient.x);
+    let yaw = sun_direction_step(&mut world, edit::SUN_DIR_STEP, 0.0).expect("方向光模式");
+    let pitch = sun_direction_step(&mut world, 0.0, -edit::SUN_DIR_STEP).expect("方向光模式");
+    assert!(yaw.x.is_finite() && pitch.is_finite());
+    assert_eq!(undo_depth(&world), 4, "四步编辑 = 四个快照");
+
+    let after = world.resource::<DirectionalLight>().clone();
+    assert_ne!(
+        after.intensity.to_bits(),
+        before.intensity.to_bits(),
+        "强度位模式已变"
+    );
+    assert_ne!(
+        after.ambient.to_array().map(|v| v.to_bits()),
+        before.ambient.to_array().map(|v| v.to_bits())
+    );
+    assert_ne!(
+        after.direction.to_array().map(|v| v.to_bits()),
+        before.direction.to_array().map(|v| v.to_bits())
+    );
+
+    // 逐位复原
+    assert!(undo(&mut world));
+    assert!(undo(&mut world));
+    assert!(undo(&mut world));
+    assert!(undo(&mut world));
+    let restored = world.resource::<DirectionalLight>().clone();
+    assert_eq!(
+        restored.intensity.to_bits(),
+        before.intensity.to_bits(),
+        "强度逐位"
+    );
+    assert_eq!(
+        restored.ambient.to_array().map(|v| v.to_bits()),
+        before.ambient.to_array().map(|v| v.to_bits()),
+        "环境光逐位"
+    );
+    assert_eq!(
+        restored.direction.to_array().map(|v| v.to_bits()),
+        before.direction.to_array().map(|v| v.to_bits()),
+        "方向逐位"
+    );
+    assert_eq!(restored.color, before.color, "未编辑字段不受影响");
+}
+
+/// 模式裁决与 Inert：非灯光实体选中时光源键 no-op（方向光不被触碰）。
+#[test]
+fn light_edit_mode_dispatch() {
+    let dir = temp_dir("lightmode");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("mode.level.json")).expect("新建");
+    // 未选中 = 方向光
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::Directional);
+    let sun_before = world.resource::<DirectionalLight>().clone();
+    // 选中立方体 = Inert：光源键全部 no-op 且方向光不动
+    let cube = place_with(&mut world, PlaceKind::Cube, 0, false, Vec3::ZERO);
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::Inert);
+    assert_eq!(light_intensity_step(&mut world, 1.0), None);
+    assert_eq!(light_range_step(&mut world, 1.0), None);
+    assert_eq!(light_hue_step(&mut world), None);
+    assert_eq!(light_shadow_toggle(&mut world), None);
+    assert_eq!(sun_ambient_step(&mut world, 1.0), None);
+    assert_eq!(sun_direction_step(&mut world, 0.1, 0.1), None);
+    assert_eq!(
+        world.resource::<DirectionalLight>().intensity.to_bits(),
+        sun_before.intensity.to_bits(),
+        "Inert 模式方向光不被触碰"
+    );
+    // 选回点光 = PointLight
+    let light = edit::place_light_at(&mut world, Vec3::new(2.0, 0.0, 0.0)).expect("点光");
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::PointLight);
+    select(&mut world, Some(cube));
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::Inert);
+    select(&mut world, Some(light));
+    assert_eq!(light_edit_mode(&world), edit::LightEditMode::PointLight);
+}
+
+// ---------------------------------------------------------------------------
+// R58b：烘焙入口
+// ---------------------------------------------------------------------------
+
+/// 烘焙闭环（复用 R57 闭环测试技术）：带 `level.bake` 段的档 → 烘焙 →
+/// 产物落盘 → 挂载（UV2 副本 + LightmapBinding）→ undo 栈被清空 →
+/// 烘焙后摆放的同图元实体无图集绑定 → save 写原始 mesh 段 + artifact
+/// 引用 → 新世界重载重挂（句柄可复现、世界 dump 逐字符一致）。
+#[test]
+fn bake_closed_loop_roundtrip() {
+    let dir = temp_dir("bake");
+    let path = dir.join("bake.level.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "version": 2,
+  "level": { "bake": { "sky_samples": 4, "bounces": 0, "texels_per_meter": 4.0,
+                        "atlas_size": 32, "artifact": "baked.ilmap" } },
+  "entities": []
+}"#,
+    )
+    .expect("写测试档");
+
+    let mut world = World::new();
+    open_level(&mut world, &path).expect("新建（档存在）");
+    place_with(&mut world, PlaceKind::Cube, 0, true, Vec3::ZERO);
+    assert_eq!(undo_depth(&world), 1, "摆放已入 undo 栈");
+
+    let report = bake_and_install(&mut world).expect("烘焙成功");
+    assert_eq!(report.entities, 1, "一个烘焙实体");
+    assert!(report.texels > 0, "立方体表面应产出覆盖 texel");
+    assert!(report.from_level_section, "参数来自档内 bake 段");
+    assert_eq!(
+        report.artifact,
+        dir.join("baked.ilmap"),
+        "产物按档内引用名落在档目录"
+    );
+    assert!(report.artifact.exists(), "产物已落盘");
+    assert_eq!(
+        undo_depth(&world),
+        0,
+        "烘焙清空 undo 栈（跨烘焙 undo 会截掉在用 UV2 句柄）"
+    );
+
+    let baked_entity = editable_entities(&world)[0];
+    assert!(
+        world.get::<LightmapBinding>(baked_entity).is_some(),
+        "烘焙实体应挂 LightmapBinding"
+    );
+    let uv2_handle = *world.get::<MeshHandle>(baked_entity).expect("在位");
+    let has_uv2 = world
+        .resource::<MeshStore>()
+        .get(uv2_handle)
+        .map(|mesh| mesh.uv2.is_some())
+        .unwrap_or(false);
+    assert!(has_uv2, "网格应已换 UV2 副本");
+    assert!(
+        matches!(
+            world
+                .resource::<SceneAssetRegistry>()
+                .meshes
+                .get(&uv2_handle.0),
+            Some(MeshRef::Primitive(_))
+        ),
+        "登记表回补：UV2 副本句柄继承图元来源"
+    );
+    // 烘焙后继续摆放（同图元段 ⇒ 句柄缓存命中，不新增 Store 条目——
+    // 重载侧 Store 序才可复现）：新实体无图集绑定（引擎既有混合语义：
+    // 无 UV2 的实体走 IBL）
+    place_with(
+        &mut world,
+        PlaceKind::Cube,
+        0,
+        true,
+        Vec3::new(4.0, 0.0, 0.0),
+    );
+    let later = editable_entities(&world)[1];
+    assert!(
+        world.get::<LightmapBinding>(later).is_none(),
+        "烘焙后摆放的实体不入图集"
+    );
+    assert_eq!(undo_depth(&world), 1, "烘焙后的摆放重新入栈");
+    let d_after_bake = dump_world(&world);
+
+    // save：mesh 段仍还原为原始图元（登记表回补生效）+ artifact 引用回写
+    save_level(&mut world).expect("烘焙后保存");
+    let json = std::fs::read_to_string(&path).expect("档已写出");
+    assert_eq!(
+        json.matches("\"primitive\"").count(),
+        2,
+        "两个实体的 mesh 段都是图元来源"
+    );
+    assert!(json.contains("baked.ilmap"), "artifact 引用原样回写");
+
+    // 新世界重载：产物重挂、UV2 副本句柄可复现、后摆实体无绑定、
+    // 世界 dump 与烘焙保存时的世界逐字符一致
+    let mut reloaded = World::new();
+    open_level(&mut reloaded, &path).expect("重载");
+    assert_eq!(editable_entities(&reloaded).len(), 2);
+    let first = editable_entities(&reloaded)[0];
+    let second = editable_entities(&reloaded)[1];
+    assert!(
+        reloaded.get::<LightmapBinding>(first).is_some(),
+        "产物重挂到烘焙实体"
+    );
+    assert!(reloaded.get::<LightmapBinding>(second).is_none());
+    let handle_b = *reloaded.get::<MeshHandle>(first).unwrap();
+    assert_eq!(handle_b, uv2_handle, "UV2 副本句柄可复现（同序加载）");
+    assert_eq!(
+        dump_world(&reloaded),
+        d_after_bake,
+        "烘焙保存的世界与重载世界逐字符一致"
+    );
+}
+
+/// 无 bake 段的档：默认参数 + 档同目录 `*.ilm` 默认名，状态行提示；
+/// `level` 段保持只读语义不被写入（诚实限制：重载不自动挂载）。
+#[test]
+fn bake_without_section_uses_default_artifact_name() {
+    let dir = temp_dir("bakedefault");
+    let path = dir.join("no_bake_section.level.json");
+
+    let mut world = World::new();
+    open_level(&mut world, &path).expect("新建（无 level 段）");
+    place_with(&mut world, PlaceKind::Cube, 0, true, Vec3::ZERO);
+
+    let report = bake_and_install(&mut world).expect("默认参数烘焙");
+    assert!(!report.from_level_section, "参数 = 引擎默认");
+    let expected = dir.join("no_bake_section.level.ilm");
+    assert_eq!(report.artifact, expected, "默认名 = 档同目录 *.ilm");
+    assert!(expected.exists());
+    assert!(
+        world.resource::<EditorState>().status.contains("ilm"),
+        "状态行提示产物名：{}",
+        world.resource::<EditorState>().status
+    );
+    assert_eq!(undo_depth(&world), 0, "烘焙清栈");
+
+    save_level(&mut world).expect("保存");
+    let json = std::fs::read_to_string(&path).expect("档已写出");
+    assert!(
+        !json.contains("\"bake\""),
+        "level 段只读语义：无 bake 段则保存仍无 bake 段（参数编辑在拒绝清单内）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R58b：NavGrid 重建与可视化
+// ---------------------------------------------------------------------------
+
+/// 导航重建 + 可视化：自动 bounds 推导（与纯函数同源对照）、blocked 统计
+/// 与 `is_blocked` 逐格一致、可视化实体挂 EditorTransient（不入档、不可
+/// 拾取）、开关语义（每次开都重建；关只撤可视化、NavGrid 资源保留）。
+#[test]
+fn nav_rebuild_and_viz_end_to_end() {
+    let dir = temp_dir("nav");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("nav.level.json")).expect("新建");
+    // 两个静态盒：自动 bounds = AABB 并集
+    place_with(&mut world, PlaceKind::Cube, 0, true, Vec3::ZERO);
+    place_with(
+        &mut world,
+        PlaceKind::Cube,
+        0,
+        true,
+        Vec3::new(4.0, 0.0, 0.0),
+    );
+    // 清空选择：摆放自动选中会挂 12 条选中框边（瞬态），下面按
+    // grid_line_count() 基线数红片，先归零
+    select(&mut world, None);
+    assert_eq!(
+        transient_count(&world),
+        grid_line_count(),
+        "基线 = 仅网格线"
+    );
+
+    // 期望 bounds：与纯函数同一输入（两盒的 (position, shape)）
+    let expected = nav_bounds_from_statics(&[
+        (
+            Vec3::new(0.0, 0.5, 0.0),
+            ColliderShape::Box {
+                half_extents: Vec3::splat(0.5),
+            },
+        ),
+        (
+            Vec3::new(4.0, 0.5, 0.0),
+            ColliderShape::Box {
+                half_extents: Vec3::splat(0.5),
+            },
+        ),
+    ])
+    .expect("有静态体");
+
+    let report = toggle_nav_viz(&mut world).expect("开 = 重建成功");
+    assert!(!report.from_level_section, "无 nav 段 = 自动推导");
+    // 只读阶段：全部 NavGrid 查询收在一个块里（资源借用不与后续写操作重叠）
+    let blocked_center = {
+        let grid = world.resource::<NavGrid>();
+        assert_eq!(grid.params().bounds_min, expected.0, "自动 bounds min 同源");
+        assert_eq!(grid.params().bounds_max, expected.1, "自动 bounds max 同源");
+        assert_eq!(grid.cols(), 10, "X 跨 5 m / cell 0.5 = 10 列");
+        assert_eq!(grid.rows(), 2, "Z 跨 1 m / cell 0.5 = 2 行");
+        assert_eq!(report.cells, grid.cols() * grid.rows());
+        assert_eq!(
+            report.blocked,
+            nav_blocked_count(&grid),
+            "报告与 is_blocked 逐格统计一致"
+        );
+        assert!(report.blocked > 0, "两个实体盒应阻塞若干格");
+        assert_eq!(
+            report.size,
+            [
+                grid.cols() as f32 * grid.params().cell_size,
+                grid.rows() as f32 * grid.params().cell_size
+            ]
+        );
+        let mut center = None;
+        for row in 0..grid.rows() {
+            for col in 0..grid.cols() {
+                if grid.is_blocked(col, row) {
+                    center = Some(grid.cell_center(col, row));
+                }
+            }
+        }
+        center.expect("有 blocked 格")
+    };
+
+    // 可视化实体：blocked 红片 + 4 条边框，全部挂 EditorTransient
+    let viz_count = transient_count(&world) - grid_line_count();
+    assert_eq!(
+        viz_count,
+        report.blocked + 4,
+        "红片数 = blocked 数，另有 4 条边框"
+    );
+    let mut viz_names = 0usize;
+    world.query::<(Entity, &Name)>(|(_, name)| {
+        if name.0.starts_with("navviz/") {
+            viz_names += 1;
+        }
+    });
+    assert_eq!(viz_names, viz_count, "可视化实体都以 navviz/ 命名");
+    // blocked 格中心上方拾取：命中（若有）只能是可编辑实体——navviz
+    // 红片挂 EditorTransient，从不参与拾取（editable_entities 排除）
+    if let Some(hit) = pick(
+        &world,
+        blocked_center + Vec3::new(0.0, 5.0, 0.0),
+        Vec3::NEG_Y,
+    ) {
+        let hit_name = world
+            .get::<Name>(hit)
+            .map(|n| n.0.clone())
+            .unwrap_or_default();
+        assert!(
+            !hit_name.starts_with("navviz/"),
+            "瞬态红片不可被拾取，实际命中 {hit_name}"
+        );
+    }
+    // 直接命中红片位置的射线若穿过它之前先命中可编辑体，也证明同一点；
+    // 再补一条必然不穿任何可编辑体的射线：纯红片区域 = None
+    assert_eq!(
+        pick(
+            &world,
+            Vec3::new(9.75, edit::NAV_BORDER_Y + 5.0, 0.25),
+            Vec3::NEG_Y
+        ),
+        None,
+        "红片本身（若在射线域内）不产生命中——此处无可编辑实体"
+    );
+
+    // 存档：可视化不入档；保存后可视化照旧在位
+    save_level(&mut world).expect("保存");
+    let json = std::fs::read_to_string(dir.join("nav.level.json")).expect("档已写出");
+    assert!(!json.contains("navviz/"), "导航可视化不入档");
+    assert_eq!(
+        transient_count(&world) - grid_line_count(),
+        viz_count,
+        "保存后可视化重建"
+    );
+
+    // 关：撤可视化但 NavGrid 资源保留
+    assert_eq!(toggle_nav_viz(&mut world), None, "关返回 None");
+    assert_eq!(transient_count(&world), grid_line_count(), "可视化撤掉");
+    assert!(
+        world.try_resource::<NavGrid>().is_some(),
+        "NavGrid 资源保留"
+    );
+
+    // 再开 = 重建（确定性 ⇒ 报告与第一次相同）
+    let again = toggle_nav_viz(&mut world).expect("重开");
+    assert_eq!(again, report, "同世界重建结果确定");
+}
+
+/// 档内 `level.nav` 段优先：参数取段值而非自动推导。
+#[test]
+fn nav_section_params_take_priority() {
+    let dir = temp_dir("navsection");
+    let path = dir.join("nav_section.level.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "version": 2,
+  "level": { "nav": { "bounds_min": [-2, 0, -2], "bounds_max": [2, 0, 2],
+                       "cell_size": 1.0 } },
+  "entities": []
+}"#,
+    )
+    .expect("写测试档");
+    let mut world = World::new();
+    open_level(&mut world, &path).expect("直读");
+    let report = toggle_nav_viz(&mut world).expect("段参数合法");
+    assert!(report.from_level_section, "参数来自档内 nav 段");
+    let grid = world.resource::<NavGrid>();
+    assert_eq!(grid.params().cell_size, 1.0);
+    assert_eq!(grid.params().bounds_min.x, -2.0);
+    assert_eq!(grid.params().bounds_max.x, 2.0);
+    assert_eq!(grid.cols(), 4, "ceil(4 / 1.0) = 4 列");
+    assert_eq!(grid.rows(), 4);
+    assert_eq!(report.cells, 16);
+}
+
+// ---------------------------------------------------------------------------
+// R58b：相机轨道与聚焦
+// ---------------------------------------------------------------------------
+
+/// 中键轨道：eye 绕 target 旋转、target 不动、半径保持；`F` 聚焦 =
+/// target 直设选中实体世界 AABB 中心（eye 不动）。
+#[test]
+fn orbit_camera_and_focus_selected() {
+    let dir = temp_dir("orbit");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("orbit.level.json")).expect("新建");
+    let (eye0, target0) = {
+        let camera = world.resource::<Camera>();
+        (camera.eye, camera.target)
+    };
+
+    orbit_camera(&mut world, (90.0, 0.0)); // 拖右 90 px = 偏航 +0.45 rad
+    {
+        let camera = world.resource::<Camera>();
+        assert_eq!(camera.target, target0, "target 不动");
+        assert_ne!(camera.eye, eye0, "eye 已绕转");
+        let radius = (camera.eye - camera.target).length();
+        let radius0 = (eye0 - target0).length();
+        assert!(
+            (radius - radius0).abs() < 1e-4 * radius0,
+            "半径保持：{radius} vs {radius0}"
+        );
+    }
+    // 垂直拖拽：屏幕 y 向下 ⇒ 拖上（dy < 0）= 俯仰 +；大幅拖拽被钳制
+    orbit_camera(&mut world, (0.0, -100000.0));
+    {
+        let camera = world.resource::<Camera>();
+        let offset = camera.eye - camera.target;
+        let pitch = (offset.y / offset.length()).asin();
+        assert!(
+            (pitch - edit::ORBIT_PITCH_LIMIT).abs() < 1e-5,
+            "俯仰钳制 +89°：{}",
+            pitch.to_degrees()
+        );
+    }
+
+    // F 聚焦：target = 选中实体世界 AABB 中心，eye 不动
+    let placed = place_with(
+        &mut world,
+        PlaceKind::Cube,
+        0,
+        true,
+        Vec3::new(2.0, 0.0, 0.0),
+    );
+    let eye_before = world.resource::<Camera>().eye;
+    let (min, max) = world_aabb_of(&world, placed).expect("立方体有网格");
+    let center = focus_selected(&mut world).expect("有选中");
+    assert_eq!(center, (min + max) * 0.5);
+    assert_eq!(center, Vec3::new(2.0, 0.5, 0.0));
+    assert_eq!(world.resource::<Camera>().target, center, "target 直设中心");
+    assert_eq!(world.resource::<Camera>().eye, eye_before, "eye 不动");
+    select(&mut world, None);
+    assert_eq!(focus_selected(&mut world), None, "无选中 = no-op");
 }

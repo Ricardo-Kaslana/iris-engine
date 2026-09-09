@@ -17,8 +17,9 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Transform, World};
 use iris_render::prelude::*;
 
-/// 高模 uv_sphere(1.0, 32, 24) 三角形数：32 × 24 × 6 索引 / 3。
-const HIGH_TRIANGLES: u32 = 32 * 24 * 2;
+/// 高模 uv_sphere(1.0, 32, 24) 三角形数：中间带 (24−2) × 32 × 2
+/// + 上下极点扇 2 × 32（R58b：极点带改三角扇，消除零面积退化三角）。
+const HIGH_TRIANGLES: u32 = (24 - 2) * 32 * 2 + 2 * 32;
 /// 低模 cube 三角形数。
 const LOW_TRIANGLES: u32 = 12;
 

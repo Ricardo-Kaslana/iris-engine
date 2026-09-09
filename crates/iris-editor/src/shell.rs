@@ -1,15 +1,19 @@
-//! 交互壳（R58a）：窗口 / 输入 / 相机 → 编辑命令层。刻意做**薄**——本模块
-//! 不含任何编辑语义，只把设备事件换算成 [`crate::edit`] 的参数。
+//! 交互壳（R58a a 阶段 → R58b b 阶段）：窗口 / 输入 / 相机 → 编辑命令层。
+//! 刻意做**薄**——本模块不含任何编辑语义，只把设备事件换算成
+//! [`crate::edit`] 的参数（光源键的「点光 / 方向光」模式裁决也只经
+//! [`crate::edit::light_edit_mode`] 只读查询，语义在命令层）。
 //!
-//! # 键位表（a 阶段固定，无自定义——自定义在拒绝清单内）
+//! # 键位表（固定，无自定义——自定义在拒绝清单内）
 //!
 //! | 输入 | 命令 |
 //! |---|---|
 //! | 鼠标左键单击 | 拾取并选中（未命中 = 清空选择） |
-//! | 鼠标左键按住拖动 | 拖拽选中实体（射线 ∩ 命中点高度平面，x / z 吸附） |
+//! | 鼠标左键按住拖动 | 拖拽选中实体（射线 ∩ 命中点高度平面，x / z 吸附；undo 步 = 按下时拍一次） |
+//! | 鼠标中键拖动 | 绕 target 轨道旋转视角（俯仰钳 ±89°） |
 //! | 鼠标右键单击 | 在命中点摆放当前图元 |
 //! | `P` | 同右键（键盘等价，光标位置照样生效） |
-//! | `L` | 在命中点摆放点光 |
+//! | `L` | 有选中实体：在命中点摆放点光（R58a 语义）；**未选中实体：方向光偏航 +**（双语义裁决见 [`crate::edit`] 模块文档） |
+//! | `F` | 聚焦选中实体（target = 世界 AABB 中心） |
 //! | `Tab` | 循环切换图元（cube → plane → sphere → cylinder） |
 //! | `R` | 循环切换材质预设 |
 //! | `C` | 开关「摆放时挂静态碰撞体」 |
@@ -17,6 +21,16 @@
 //! | `Delete` | 删除选中（级联子树） |
 //! | `Ctrl+D` | 复制选中（原地，名字加 `_copy{n}` 后缀） |
 //! | `Ctrl+S` | 保存关卡档 |
+//! | `Ctrl+Z` | undo（快照栈，深度 32） |
+//! | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
+//! | `B` | 烘焙当前静态世界并挂载（产物 IRISLMAP 落盘） |
+//! | `N` | NavGrid 可视化开关（每次开都重建） |
+//! | `[` / `]` | 光强 − / +（选中点光：点光强度；未选中：方向光强度，×/÷） |
+//! | `-` / `=` | 点光范围 −0.5 / +0.5 m（选中点光时） |
+//! | `H` | 点光色相 +30°（HSV，饱和度 / 明度保持） |
+//! | `K` | 选中点光：阴影开关；未选中：方向光俯仰 − |
+//! | `I` / `J` | 方向光俯仰 + / 偏航 −（未选中实体时） |
+//! | `;` / `'` | 方向光环境光 ÷ / ×（未选中实体时） |
 //! | 方向键 | 微移选中 0.1 m（左/右 = ∓X，上/下 = ∓Z）；`Alt`+上/下 = ±Y；`Shift` = 十倍 |
 //! | `PgUp` / `PgDn` | 缩放选中 ×1.1 / ÷1.1 |
 //! | `W` `A` `S` `D` | 飞行相机水平移动（相机偏航系） |
@@ -25,15 +39,16 @@
 //! | 滚轮 | 变焦（视场角） |
 //! | `Esc` | 退出 |
 //!
-//! `Ctrl` 按住时相机不移动（避免 `Ctrl+S` / `Ctrl+D` 期间镜头漂移）。
+//! `Ctrl` 按住时相机不平移（避免 `Ctrl+S` / `Ctrl+Z` 期间镜头漂移）；
+//! 中键轨道不受 Ctrl 影响（轨道本身就是有意的视角操作）。
 //!
 //! # 相机
 //!
 //! 用 [`Camera`] **资源**（不挂 `ActiveCamera` 实体——那会把相机变成有
 //! `Transform` 的实体、进而被 `save_scene` 写进档里，见 [`crate::edit`]
-//! 模块文档诚实清单第 8 条）。渲染器在无 `ActiveCamera` 实体时回退
-//! `Camera` 资源。a 阶段**无视角旋转**（规格给的飞行相机 = 平移 + 变焦，
-//! 朝向固定为 [`crate::edit::open_level`] 写入的默认斜俯视角）。
+//! 模块文档诚实清单第 10 条）。渲染器在无 `ActiveCamera` 实体时回退
+//! `Camera` 资源。b 阶段起有视角旋转：中键轨道（[`crate::edit::
+//! orbit_camera`]）+ `F` 聚焦；WASD 平移与滚轮变焦语义不变。
 //!
 //! # 平台
 //!
@@ -207,6 +222,33 @@ struct FrameInput {
     nudge: Option<(Vec3, f32)>,
     /// 缩放倍率（PgUp / PgDn）。
     scale: Option<f32>,
+    // ---- b 阶段 ----
+    /// 中键按住（按住期间按像素增量轨道旋转）。
+    middle_held: bool,
+    /// 本帧鼠标位移（像素）。
+    mouse_delta: (f64, f64),
+    undo: bool,
+    redo: bool,
+    bake: bool,
+    toggle_nav: bool,
+    focus: bool,
+    /// `]` / `[`：光强 + / −。
+    intensity_up: bool,
+    intensity_down: bool,
+    /// `=` / `-`：点光范围 + / −。
+    range_up: bool,
+    range_down: bool,
+    /// `H`：点光色相 +30°。
+    hue: bool,
+    /// `K`：双语义键（点光阴影 / 方向光俯仰 −，按模式路由）。
+    key_k: bool,
+    /// `'` / `;`：方向光环境光 × / ÷。
+    ambient_up: bool,
+    ambient_down: bool,
+    /// `J` / `L` / `I`：方向光偏航 − / 偏航 + / 俯仰 +（按模式路由）。
+    key_j: bool,
+    key_l: bool,
+    key_i: bool,
 }
 
 /// Update 2：输入翻译 → 命令层。编辑器状态缺席（Startup 未跑）则 no-op。
@@ -272,15 +314,41 @@ fn read_input(world: &World) -> FrameInput {
         place_light: input.key_pressed(KeyCode::KeyL),
         nudge,
         scale,
+        middle_held: input.mouse_button(MouseButton::Middle),
+        mouse_delta: input.mouse_delta(),
+        undo: ctrl && !shift && input.key_pressed(KeyCode::KeyZ),
+        redo: (ctrl && input.key_pressed(KeyCode::KeyY))
+            || (ctrl && shift && input.key_pressed(KeyCode::KeyZ)),
+        bake: input.key_pressed(KeyCode::KeyB),
+        toggle_nav: input.key_pressed(KeyCode::KeyN),
+        focus: input.key_pressed(KeyCode::KeyF),
+        intensity_up: input.key_pressed(KeyCode::BracketRight),
+        intensity_down: input.key_pressed(KeyCode::BracketLeft),
+        range_up: input.key_pressed(KeyCode::Equal),
+        range_down: input.key_pressed(KeyCode::Minus),
+        hue: input.key_pressed(KeyCode::KeyH),
+        key_k: input.key_pressed(KeyCode::KeyK),
+        ambient_up: input.key_pressed(KeyCode::Quote),
+        ambient_down: input.key_pressed(KeyCode::Semicolon),
+        key_j: input.key_pressed(KeyCode::KeyJ),
+        key_l: input.key_pressed(KeyCode::KeyL),
+        key_i: input.key_pressed(KeyCode::KeyI),
     }
 }
 
-/// 把一帧的输入事实翻译成命令层调用（顺序即优先级：存取 → 删除 / 复制 →
-/// 摆放 → 拾取 / 拖拽 → 数值微调 → 参数切换）。
+/// 把一帧的输入事实翻译成命令层调用（顺序即优先级：存取 → undo / redo →
+/// 删除 / 复制 → 光源热键 → 摆放 → 拾取 / 拖拽 → 数值微调 → 参数切换 →
+/// 烘焙 / 导航 / 聚焦 → 轨道旋转）。
 fn apply_input(world: &mut World, frame: &FrameInput) {
     if frame.save {
         // 错误已由命令层双通道报告（log::error + 面板状态行），壳不重复处理
         let _ = edit::save_level(world);
+    }
+    if frame.undo {
+        edit::undo(world);
+    }
+    if frame.redo {
+        edit::redo(world);
     }
     if frame.duplicate {
         edit::duplicate_selected(world);
@@ -288,13 +356,61 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
     if frame.delete {
         edit::delete_selected(world);
     }
-    // 摆放与拾取都需要光标射线；无光标位置（无窗口 / 未进视口）则跳过
+    // 光源热键：模式裁决在命令层（[ ] 两模式共用；K / L 双语义键按模式
+    // 路由——语义见 edit 模块文档「光源参数编辑」）
+    let light_mode = edit::light_edit_mode(world);
+    if frame.intensity_up {
+        edit::light_intensity_step(world, 1.0);
+    }
+    if frame.intensity_down {
+        edit::light_intensity_step(world, -1.0);
+    }
+    if frame.range_up {
+        edit::light_range_step(world, 1.0);
+    }
+    if frame.range_down {
+        edit::light_range_step(world, -1.0);
+    }
+    if frame.hue {
+        edit::light_hue_step(world);
+    }
+    match light_mode {
+        edit::LightEditMode::PointLight => {
+            if frame.key_k {
+                edit::light_shadow_toggle(world);
+            }
+        }
+        edit::LightEditMode::Directional => {
+            if frame.key_k {
+                edit::sun_direction_step(world, 0.0, -edit::SUN_DIR_STEP);
+            }
+            if frame.key_i {
+                edit::sun_direction_step(world, 0.0, edit::SUN_DIR_STEP);
+            }
+            if frame.key_j {
+                edit::sun_direction_step(world, -edit::SUN_DIR_STEP, 0.0);
+            }
+            if frame.key_l {
+                edit::sun_direction_step(world, edit::SUN_DIR_STEP, 0.0);
+            }
+            if frame.ambient_up {
+                edit::sun_ambient_step(world, 1.0);
+            }
+            if frame.ambient_down {
+                edit::sun_ambient_step(world, -1.0);
+            }
+        }
+        edit::LightEditMode::Inert => {}
+    }
+    // 摆放与拾取都需要光标射线；无光标位置（无窗口 / 未进视口）则跳过。
+    // L 双语义：方向光模式（未选中实体）下 L = 偏航 +（上方已消费），
+    // 其余模式回落为摆放点光（R58a 语义）
     if let Some((px, py)) = frame.cursor {
         if let Some((origin, dir)) = edit::screen_ray_at(world, px, py) {
             if frame.right_pressed || frame.place {
                 edit::place_from_ray(world, origin, dir);
             }
-            if frame.place_light {
+            if frame.place_light && light_mode != edit::LightEditMode::Directional {
                 edit::place_light_from_ray(world, origin, dir);
             }
             if frame.left_pressed && edit::begin_drag(world, origin, dir).is_none() {
@@ -326,6 +442,19 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
     }
     if frame.toggle_snap {
         edit::toggle_snap(world);
+    }
+    if frame.bake {
+        // 烘焙失败已由命令层双通道报告，壳不重复处理
+        let _ = edit::bake_and_install(world);
+    }
+    if frame.toggle_nav {
+        edit::toggle_nav_viz(world);
+    }
+    if frame.focus {
+        edit::focus_selected(world);
+    }
+    if frame.middle_held {
+        edit::orbit_camera(world, frame.mouse_delta);
     }
 }
 

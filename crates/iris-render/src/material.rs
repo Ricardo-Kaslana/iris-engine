@@ -169,6 +169,29 @@ impl MaterialStore {
     pub fn get(&self, handle: MaterialHandle) -> Option<&MaterialDef> {
         self.materials.get(handle.0 as usize)
     }
+
+    /// 已注册材质数（含 0 号默认材质）。
+    pub fn len(&self) -> usize {
+        self.materials.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.materials.is_empty()
+    }
+
+    /// 目录内容只读视图（下标 = 句柄号）。
+    pub fn contents(&self) -> &[MaterialDef] {
+        &self.materials
+    }
+
+    /// 整体替换目录内容（下标 = 句柄号重新按序分配）。
+    ///
+    /// **安全前提在调用方**：替换后，旧内容中未保留的句柄不得再被任何
+    /// 实体引用（当前唯一消费者是 iris-editor 的 undo 快照恢复，见
+    /// `MeshStore::set_contents` 同款论证）。
+    pub fn set_contents(&mut self, materials: Vec<MaterialDef>) {
+        self.materials = materials;
+    }
 }
 
 #[cfg(test)]

@@ -342,7 +342,20 @@ pub mod primitives {
                 // 球内，因此索引须按 [a,d,c / a,b,d] 反向——此前为 [a,c,d / a,d,b]，
                 // 正面被剔除后渲染的是内壁（法线背向相机，直接光照全为 0，
                 // 实测症状：球体在强光下仍是纯黑剪影）。
-                data.indices.extend_from_slice(&[a, d, c, a, b, d]);
+                //
+                // 极点带（ring 0 / rings−1）只发**一个**三角：极点环的所有
+                // 顶点位置重合（φ = 0 / π），quad 剖分的另一半（a,b,d /
+                // a,d,c）是零面积退化三角——渲染上无贡献（零面积永不
+                // 光栅化），但烘焙 BVH 的「退化 = 上游数据 bug」断言会拒绝
+                // 整个场景（R58b 编辑器烘焙入口实测踩坑）。三角扇 = 极点
+                // 带的正确拓扑。
+                if ring == 0 {
+                    data.indices.extend_from_slice(&[a, d, c]);
+                } else if ring == rings - 1 {
+                    data.indices.extend_from_slice(&[a, b, d]);
+                } else {
+                    data.indices.extend_from_slice(&[a, d, c, a, b, d]);
+                }
             }
         }
         data
@@ -453,6 +466,21 @@ impl MeshStore {
 
     pub fn is_empty(&self) -> bool {
         self.meshes.is_empty()
+    }
+
+    /// 目录内容只读视图（下标 = 句柄号）。
+    pub fn contents(&self) -> &[MeshData] {
+        &self.meshes
+    }
+
+    /// 整体替换目录内容（下标 = 句柄号重新按序分配）。
+    ///
+    /// **安全前提在调用方**：替换后，旧内容中未保留的句柄不得再被任何
+    /// 实体引用（当前唯一消费者是 iris-editor 的 undo 快照恢复——快照存
+    /// 整库克隆、恢复先换库再重建实体，前提天然成立；对比截断式恢复的
+    /// 论证：整库克隆同时是 redo 可逆的前提——截断丢数据无法 redo）。
+    pub fn set_contents(&mut self, meshes: Vec<MeshData>) {
+        self.meshes = meshes;
     }
 
     /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 ×
@@ -675,7 +703,13 @@ mod tests {
     fn sphere_topology() {
         let sphere = primitives::uv_sphere(1.0, 16, 12);
         assert_eq!(sphere.vertices.len(), (16 + 1) * (12 + 1) as usize);
-        assert_eq!(sphere.indices.len(), 16 * 12 * 6);
+        // R58b：极点带改三角扇（消除极点零面积退化三角）——
+        // 索引数 = 中间带 (rings−2) × segments × 6 + 上下极点扇 2 × segments × 3
+        let (segments, rings) = (16u32, 12u32);
+        assert_eq!(
+            sphere.indices.len() as u32,
+            (rings - 2) * segments * 6 + 2 * segments * 3
+        );
         for v in &sphere.vertices {
             let len = (v.position[0] * v.position[0]
                 + v.position[1] * v.position[1]
