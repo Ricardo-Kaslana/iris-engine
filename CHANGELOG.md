@@ -5,6 +5,58 @@
 
 ## [Unreleased]
 
+### Added（R59：资产管线强化——动画注册表 / BC3 压缩通路 / manifest + 优先级加载，路线图 v4 · W5）
+
+三块独立能力服务同一目标：外部资产「从导入到运行」一条龙。设计记录
+ARCHITECTURE §4.28（新增）与 §7.3 R59 增量，诚实清单 §8.35（新增）、
+§8.24 修订。
+
+- **GLB 动画注册表**（`iris_render::asset::registry`）：`AnimationRegistry`
+  （World 资源，`BTreeMap` 路径字典序）——`import` headless 批量导入
+  （不 spawn 也能解析剪辑元数据：名字 / 时长 / 轨道数 / 事件数 + 骨架
+  节点名表）；`spawn_instance` 命中即复用（未命中自动导入）；按名查
+  剪辑（重名取先）。**多实例共享**：`AnimationPlayer::clips` /
+  `GltfInstance::clips` 升级 `Arc<Vec<AnimationClip>>`——注册表命中
+  spawn 的 N 实例共享同一份关键帧数据（引用计数，取舍见 §4.28），
+  `GltfInstance` 新增 `textures: Vec<TextureHandle>`（本次 spawn 落库
+  句柄，BC3 声明的桥梁）；写时复制口 `AnimationPlayer::clips_mut()`
+  （`Arc::make_mut`，事件轨道注入用；iris-ascent 同步迁移）。常规
+  spawn 行为不变（独占份，读路径 Deref 全兼容）。
+- **BC3 编码器 + 压缩通路**（`texture_bcn` / `texture` / 渲染器）：
+  `encode_bc3`（BC4 alpha 块 + BC1 色块复用 = 1 B/px）与
+  `bc3_eligible`（分层规则：全不透明归 BC1、带 alpha 走 BC3，两判定
+  恒互斥）；确定性全整数编码（纯色 alpha 块索引全 0 恒等还原——绕开
+  端点相等的硬件穿透调色板）；**默认路径逐位不变**：BC3 只对
+  `TextureStore::declare_bc3` / `add_bc3_declared` 声明过的纹理生效，
+  渲染器决策树未声明分支与 R59 之前逐位一致（既有 GPU 基线零变化；
+  `texture_is_bc3` 观测口、`gpu_bytes_estimate` 计 BC3 口径 1 B/px）；
+  误差断言诚实口径：alpha 单像素上界 255/14 ≈ 18.2（端点即块内极值
+  像素），GPU 等价渲染块内纯色棋盘格全帧平均误差 < 2/255。
+- **资产 manifest + 优先级加载**（`iris_engine::manifest` +
+  `async_loading`）：JSON 清单（路径 / kind / 优先级整数（越小越先）/
+  bc3 标志，serde 零新依赖，中文校验报错，未知字段前向兼容）；
+  `AssetLoader::request_with_priority`——出队键 =（优先级，请求序）升序
+  （请求序在调用线程分配，与到达线程的先后无关），加载线程排空通道再
+  弹最小键，在途作业不抢占；inline 后端共用同一队列（**契约修订**：
+  读取耗时计入 poll 而非 request——同 API 同语义；同优先级仍请求序
+  FIFO，既有调用方无感）；**中断 / 续载语义**：loader 无记忆，丢弃即
+  在途请求作废，续载 = 消费方持已得结果重发未完成请求（幂等重读），
+  两后端全流程测试钉住（线程后端确定性出队由测试闸门定序）。
+- **生成工具 + 全流程验收**：`gen_r59_assets`（含内嵌 alpha 贴图 +
+  法线 + idle/swing/hit 三命名动画的 GLB 与 manifest）→ `r59_snapshot`
+  （manifest → 优先级异步分帧加载 → 注册表导入 → 双实例 spawn → 按名
+  切动画 → `docs/asset_pipeline.png` 六面板：三姿势帧 / BC3 vs RGBA8
+  对照 / 加载时序 + 显存数字（292 B → 100 B）；快照跨运行逐字节一致）。
+  headless 端到端 `iris-engine/tests/asset_pipeline.rs`。
+- **验收**：① headless 端到端 2 项 + 单测 registry 5 / async_loading +5 /
+  manifest 5 / BC3（texture_bcn 7 + texture 1 + bc3_render GPU 2），基线
+  debug 976 → **1003** / release 974 → **1001**（既有测试零改动全过——
+  默认路径逐位不变的最终证据；唯 iris-ascent 事件注入一处走新的
+  `clips_mut` 写时复制口）；② 离屏验收图 `docs/asset_pipeline.png`
+  （`examples/r59_snapshot.rs` 产出，MD5 跨运行逐字节一致）；③ 六项
+  门禁全绿（wasm32 clippy 含新代码照绿）。
+
+
 ### Added（R58b：编辑器 b 阶段——undo / 光源编辑 / 烘焙入口 / 导航可视化 / 视角旋转，路线图 v4 · W5）
 
 `iris-editor` b 阶段五件事全部落在命令层（交互壳只加键位与面板行），

@@ -8,6 +8,15 @@
 //! `srgb = true`——与 R42 之前所有纹理一律按 sRGB 上传的既有行为
 //! 逐位一致；程序化砖墙法线 / ORM 对（[`CpuTexture::brick_normal_orm`]）
 //! 是数据贴图，恒 `srgb = false`。
+//!
+//! **BC3 声明（R59）**：[`TextureStore`] 维护一张「经理入期 manifest
+//! 声明走 BC3 压缩」的句柄侧表（[`TextureStore::declare_bc3`] /
+//! [`TextureStore::is_bc3_declared`]）——**声明的准入闸门**，渲染器
+//! 只对声明过的纹理启用 BC3 上传路径（[`crate::texture_bcn::bc3_eligible`]），
+//! 未声明纹理维持既有 RGBA8 / BC1 决策树逐位不变。声明表用
+//! `BTreeSet`（确定性文化：迭代序 = 句柄序，与 broadphase 同规约）。
+
+use std::collections::BTreeSet;
 
 use iris_core::Resource;
 
@@ -180,12 +189,16 @@ impl CpuTexture {
 #[derive(Resource)]
 pub struct TextureStore {
     textures: Vec<CpuTexture>,
+    /// 经 manifest 声明走 BC3 上传的句柄表（R59，见模块文档）。
+    /// 缺席 = 既有 RGBA8 / BC1 决策树逐位不变——默认路径零改动。
+    bc3_declared: BTreeSet<u32>,
 }
 
 impl Default for TextureStore {
     fn default() -> Self {
         Self {
             textures: vec![CpuTexture::solid([255, 255, 255, 255])],
+            bc3_declared: BTreeSet::new(),
         }
     }
 }
@@ -198,6 +211,28 @@ impl TextureStore {
     pub fn add(&mut self, texture: CpuTexture) -> TextureHandle {
         self.textures.push(texture);
         TextureHandle(self.textures.len() as u32 - 1)
+    }
+
+    /// 登记纹理并**同时声明 BC3 压缩**（R59）：等价 `add` + `declare_bc3`，
+    /// 一步完成「导入期 manifest 标志 → 入库声明」。典型消费方是清单
+    /// 驱动的 GLB 导入路径。
+    pub fn add_bc3_declared(&mut self, texture: CpuTexture) -> TextureHandle {
+        let handle = self.add(texture);
+        self.bc3_declared.insert(handle.0);
+        handle
+    }
+
+    /// 为已存在的句柄补 BC3 声明（R59）：GLB / 场景先经常规入口 spawn
+    /// （纹理已入目录），消费方再按 manifest 标志逐句柄补声明——声明
+    /// 只需发生在**首次 GPU 上传前**（渲染器懒上传，首帧 draw 才编码）。
+    /// 返回是否新插入（重复声明幂等，返回 false）。
+    pub fn declare_bc3(&mut self, handle: TextureHandle) -> bool {
+        self.bc3_declared.insert(handle.0)
+    }
+
+    /// 该句柄是否声明了 BC3 压缩（渲染器决策树与显存估算共用的查询口）。
+    pub fn is_bc3_declared(&self, handle: TextureHandle) -> bool {
+        self.bc3_declared.contains(&handle.0)
     }
 
     pub fn get(&self, handle: TextureHandle) -> Option<&CpuTexture> {
@@ -222,18 +257,30 @@ impl TextureStore {
     }
 
     /// GPU 侧显存占位**估算**（非精确值：驱动可能对齐 / 复制分配，
-    /// 采样器等附属对象不计）。按渲染器上传决策树逐纹理计算（R30）：
-    /// - BC1 路径（`feature_bc` 为真且尺寸 4 对齐且全不透明，决策见
-    ///   [`crate::texture_bcn::bc1_eligible`]）：4×4 块 8 字节 = 0.5 B/px；
-    /// - 其余（含 web / 无特性 / 非对齐 / 半透明回退）：RGBA8 4 B/px。
+    /// 采样器等附属对象不计）。按渲染器上传决策树逐纹理计算（R30 / R59）：
+    /// - BC3 路径（声明过且 `feature_bc` 为真、尺寸 4 对齐、带 alpha，
+    ///   决策见 [`crate::texture_bcn::bc3_eligible`]）：4×4 块 16 字节
+    ///   = 1 B/px；
+    /// - BC1 路径（`feature_bc` 为真且尺寸 4 对齐且全不透明）：4×4 块
+    ///   8 字节 = 0.5 B/px；
+    /// - 其余（含 web / 无特性 / 非对齐 / 未声明的半透明回退）：RGBA8
+    ///   4 B/px。
     ///
     /// mipmap v1 无（单 mip 计）；同一 `feature_bc` 取值下与渲染器实际上传
     /// 格式一致（决策函数共用），`false` / `true` 两次调用的差即压缩节省。
+    /// 分层互斥（全不透明即使声明 BC3 也归 BC1，0.5 B/px 优于 1 B/px）。
     pub fn gpu_bytes_estimate(&self, feature_bc: bool) -> u64 {
         self.textures
             .iter()
-            .map(|t| {
-                if crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc) {
+            .enumerate()
+            .map(|(index, t)| {
+                let handle = TextureHandle(index as u32);
+                if feature_bc
+                    && self.bc3_declared.contains(&handle.0)
+                    && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)
+                {
+                    (t.width as u64 / 4) * (t.height as u64 / 4) * 16
+                } else if crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc) {
                     (t.width as u64 / 4) * (t.height as u64 / 4) * 8
                 } else {
                     t.width as u64 * t.height as u64 * 4
@@ -290,6 +337,47 @@ mod tests {
         assert_eq!(store.gpu_bytes_estimate(true), 4 + 32);
         // 同一 store 关闭特性：全 RGBA
         assert_eq!(store.gpu_bytes_estimate(false), 4 + 8 * 8 * 4);
+    }
+
+    /// BC3 声明（R59）：声明过的句柄在显存估算中按 1 B/px 计（4 对齐 +
+    /// 带 alpha），未声明纹理的估算与既有口径逐字节一致（默认路径零
+    /// 改动）；全不透明纹理即使声明 BC3 也归 BC1 口径（分层互斥）；
+    /// 重复声明幂等。
+    #[test]
+    fn bc3_declaration_gates_gpu_estimate() {
+        let mut store = TextureStore::new();
+        // 64×64 半透明棋盘：未声明 → RGBA8 4 B/px = 16 384
+        let mut translucent = CpuTexture::checkerboard(8, 8, [0, 0, 0, 40], [255, 255, 255, 255]);
+        for px in translucent.rgba.chunks_exact_mut(4).step_by(2) {
+            px[3] = 40;
+        }
+        let handle = store.add(translucent.clone());
+        assert!(!store.is_bc3_declared(handle), "新登记纹理无声明");
+        assert_eq!(
+            store.gpu_bytes_estimate(true),
+            4 + 64 * 64 * 4,
+            "未声明半透明纹理恒走 RGBA8 口径"
+        );
+        // 补声明 → BC3 口径：64×64 = 16×16 = 256 块 × 16 B = 4 096（1 B/px，
+        // 源 RGBA8 16 384 B 的 1/4）
+        assert!(store.declare_bc3(handle), "首次声明应报告新插入");
+        assert!(!store.declare_bc3(handle), "重复声明幂等");
+        assert_eq!(store.gpu_bytes_estimate(true), 4 + 256 * 16);
+        // 无 BC 特性：声明无效，回 RGBA8
+        assert_eq!(store.gpu_bytes_estimate(false), 4 + 64 * 64 * 4);
+        // 一步登记 + 声明
+        let h2 = store.add_bc3_declared(translucent);
+        assert!(store.is_bc3_declared(h2));
+        // 全不透明声明 BC3：分层规则归 BC1 口径（256 块 × 8 B）而非 BC3
+        let opaque = CpuTexture::checkerboard(8, 8, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let h3 = store.add_bc3_declared(opaque);
+        assert_eq!(
+            store.gpu_bytes_estimate(true) - 4 - 2 * 256 * 16,
+            256 * 8,
+            "全不透明已声明纹理应按 BC1 口径计"
+        );
+        assert!(store.is_bc3_declared(h3));
+        let _ = h2;
     }
 
     /// 色彩空间标注（R42）：程序化颜色纹理恒 sRGB（与 R42 前一律按

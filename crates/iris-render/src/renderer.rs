@@ -221,6 +221,18 @@ struct GpuTexture {
     /// 上传时是否走了 BC1 压缩（R30：`texture_is_bc1` 的观测口径，
     /// 供测试断言与内存对账）。
     bc1: bool,
+    /// 上传时是否走了 BC3 压缩（R59：`texture_is_bc3` 的观测口径，
+    /// 与 `bc1` 恒互斥——分层决策树一次只走一条压缩路径）。
+    bc3: bool,
+}
+
+/// 单次纹理上传走的路径（`ensure_texture` 决策树的内部分类，标签与
+/// 观测口径共用一个来源）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompressedPath {
+    Bc3,
+    Bc1,
+    Rgba8,
 }
 
 struct GpuMaterial {
@@ -1636,6 +1648,7 @@ impl Renderer {
                 .create_sampler(&wgpu::SamplerDescriptor::default()),
             // 1×1 兜底纹理非 4 对齐，恒走 RGBA 路径（决策树与其一致）
             bc1: false,
+            bc3: false,
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
@@ -4966,14 +4979,43 @@ impl Renderer {
         // 无 cfg 分支）。mipmap v1 无——单 mip 上传，`mip_level_count` 恒 1。
         // R42 色彩空间：`srgb == false`（法线 / ORM 数据贴图）上传为线性
         // 格式（采样即原值）；`true`（颜色数据）维持既有 sRGB 格式。
-        let use_bc1 =
-            crate::texture_bcn::bc1_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
+        //
+        // R59 BC3 分层：**只对经理入期 manifest 声明的纹理**启用
+        // （`TextureStore` 声明表是准入闸门——未声明纹理的决策树与
+        // R59 之前逐位一致，全部既有 GPU 基线零变化）；声明过的带
+        // alpha 纹理走 BC3（1 B/px），全不透明仍归 BC1（分层互斥，
+        // 见 `bc3_eligible` / `bc1_eligible` 文档）。
+        let declared_bc3 = store.is_some_and(|s| s.is_bc3_declared(handle));
+        let use_bc3 = declared_bc3
+            && crate::texture_bcn::bc3_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
+        if use_bc3 {
+            log::info!("纹理 {handle:?}（{width}×{height}）经声明走 BC3 压缩上传（显存 1/4）");
+        }
+        let use_bc1 = !use_bc3
+            && crate::texture_bcn::bc1_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
         if use_bc1 {
             log::info!("纹理 {handle:?}（{width}×{height}）走 BC1 压缩上传（显存 1/8）");
         }
-        // 压缩路径：数据为 4×4 块流，bytes_per_row 按块计（宽/4 块 × 8B）；
-        // 回退路径：RGBA8 逐字节（Cow 借用源数据，零拷贝）。
-        let (format, data, bytes_per_row, bc1) = if use_bc1 {
+        // 压缩路径：数据为 4×4 块流，bytes_per_row 按块计（BC3 宽/4 块
+        // × 16B、BC1 × 8B）；回退路径：RGBA8 逐字节（Cow 借用源数据，
+        // 零拷贝）。
+        let (format, data, bytes_per_row, path) = if use_bc3 {
+            let blocks = crate::texture_bcn::encode_bc3(&cpu.rgba, width, height);
+            debug_assert_eq!(
+                blocks.len() as u64,
+                crate::texture_bcn::encoded_len_bc3(width, height)
+            );
+            (
+                if cpu.srgb {
+                    wgpu::TextureFormat::Bc3RgbaUnormSrgb
+                } else {
+                    wgpu::TextureFormat::Bc3RgbaUnorm
+                },
+                std::borrow::Cow::Owned(blocks),
+                (width / 4) * 16,
+                CompressedPath::Bc3,
+            )
+        } else if use_bc1 {
             let blocks = crate::texture_bcn::encode_bc1(&cpu.rgba, width, height);
             debug_assert_eq!(
                 blocks.len() as u64,
@@ -4987,7 +5029,7 @@ impl Renderer {
                 },
                 std::borrow::Cow::Owned(blocks),
                 (width / 4) * 8,
-                true,
+                CompressedPath::Bc1,
             )
         } else {
             (
@@ -4998,14 +5040,14 @@ impl Renderer {
                 },
                 std::borrow::Cow::Borrowed(&cpu.rgba[..]),
                 width * 4,
-                false,
+                CompressedPath::Rgba8,
             )
         };
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: if bc1 {
-                Some("iris.texture.bc1")
-            } else {
-                Some("iris.texture")
+            label: match path {
+                CompressedPath::Bc3 => Some("iris.texture.bc3"),
+                CompressedPath::Bc1 => Some("iris.texture.bc1"),
+                CompressedPath::Rgba8 => Some("iris.texture"),
             },
             size: wgpu::Extent3d {
                 width,
@@ -5048,14 +5090,29 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        self.texture_gpu
-            .insert(handle.0, GpuTexture { view, sampler, bc1 });
+        self.texture_gpu.insert(
+            handle.0,
+            GpuTexture {
+                view,
+                sampler,
+                bc1: path == CompressedPath::Bc1,
+                bc3: path == CompressedPath::Bc3,
+            },
+        );
     }
 
     /// 该纹理句柄的 GPU 上传是否走了 BC1 压缩（R30）。未上传（懒上传未
     /// 触发）/ 不存在 / 回退 RGBA8 均返回 `false`。测试与内存对账用。
     pub fn texture_is_bc1(&self, handle: TextureHandle) -> bool {
         self.texture_gpu.get(&handle.0).is_some_and(|t| t.bc1)
+    }
+
+    /// 该纹理句柄的 GPU 上传是否走了 BC3 压缩（R59）：只对经理入期
+    /// manifest 声明且带 alpha 的纹理成立。未上传 / 不存在 / 回退 / 走
+    /// BC1 均返回 `false`（与 [`Self::texture_is_bc1`] 恒互斥）。测试与
+    /// 内存对账用。
+    pub fn texture_is_bc3(&self, handle: TextureHandle) -> bool {
+        self.texture_gpu.get(&handle.0).is_some_and(|t| t.bc3)
     }
 
     /// 光照贴图图集的懒上传（R52c）：`Rgba16Float` 线性 HDR 纹理，数据源

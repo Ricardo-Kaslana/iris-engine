@@ -441,9 +441,17 @@ pub struct AnimationMask {
 
 /// 动画播放器组件：挂在任意实体上（通常是 glTF 根实体），
 /// 持有剪辑与「节点索引 → 实体」映射，由 [`update_animations`] 每帧推进。
+///
+/// `clips` 为 `Arc<Vec<AnimationClip>>`（R59）：同一 GLB 的多实例经
+/// 动画注册表（`crate::asset::AnimationRegistry`）spawn 时共享同一份
+/// 剪辑数据（引用计数 +1，零拷贝）——「每实例深拷贝一份关键帧」的
+/// 内存重复归零。生命周期 = Arc 语义：注册表与全部播放器都丢弃后数据
+/// 才释放，无悬垂风险；克隆播放器（`Clone`）同样只复制引用。直接构造
+/// （不经注册表）的播放器持有独占的 `Arc`（强计数 1），对外行为与
+/// 过去的按值 `Vec` 语义等价（读路径全部经 Deref 透传）。
 #[derive(Clone, Debug, iris_core::Component)]
 pub struct AnimationPlayer {
-    pub clips: Vec<AnimationClip>,
+    pub clips: std::sync::Arc<Vec<AnimationClip>>,
     /// 节点索引 → 目标实体；未在 active scene 中的节点为 None。
     pub node_entities: Vec<Option<Entity>>,
     /// 节点索引 → glTF 节点名（与 [`Self::node_entities`] **同下标对齐**，
@@ -530,7 +538,7 @@ impl Default for AnimationPlayer {
     /// 行为与 v1 一致）。
     fn default() -> Self {
         Self {
-            clips: Vec::new(),
+            clips: std::sync::Arc::new(Vec::new()),
             node_entities: Vec::new(),
             node_names: Vec::new(),
             active: 0,
@@ -558,12 +566,33 @@ impl Default for AnimationPlayer {
 
 impl AnimationPlayer {
     /// 默认播放器：循环播放第一个剪辑，原速，自动开始。
+    ///
+    /// `clips` 经 `Arc` 包装持有（R59 共享语义，见结构体文档）；
+    /// 已持有 `Arc` 的调用方（注册表 / 共享 spawn 路径）请用
+    /// [`Self::new_shared`] 避免二次包装。
     pub fn new(clips: Vec<AnimationClip>, node_entities: Vec<Option<Entity>>) -> Self {
+        Self::new_shared(std::sync::Arc::new(clips), node_entities)
+    }
+
+    /// 同 [`Self::new`]，但直接接管剪辑数据的 `Arc`（共享构造口）：
+    /// 注册表命中路径用它在多实例间共享同一份剪辑数据。
+    pub fn new_shared(
+        clips: std::sync::Arc<Vec<AnimationClip>>,
+        node_entities: Vec<Option<Entity>>,
+    ) -> Self {
         Self {
             clips,
             node_entities,
             ..Default::default()
         }
+    }
+
+    /// 剪辑数据的可写访问（R59，写时复制语义）：独占持有者就地修改
+    /// 零开销；共享自注册表的播放器首次调用会经 `Arc::make_mut` 克隆
+    /// 出**本实例私有副本**，修改不影响注册表与其他实例。GLB 解析不产
+    /// 事件轨道，注入 `clip.events`（脚步声等 API 侧事件）应走此口。
+    pub fn clips_mut(&mut self) -> &mut Vec<AnimationClip> {
+        std::sync::Arc::make_mut(&mut self.clips)
     }
 
     /// 按 glTF **节点名**查映射实体（打磨 VI 摩擦⑥）：骨架装配（IK 链 /

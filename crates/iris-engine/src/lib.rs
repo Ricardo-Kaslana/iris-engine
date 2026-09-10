@@ -21,6 +21,7 @@ pub mod audio;
 pub mod camera_rig;
 pub mod gltf_builder;
 pub mod level;
+pub mod manifest;
 pub mod pack;
 pub mod plugin;
 pub mod scene;
@@ -44,6 +45,7 @@ pub mod prelude {
     // 资产打包与挂载（R45）：PACK1 单文件格式 + 多源顺序查找挂载 +
     // 异步加载骨架（线程 / inline 双后端）
     pub use crate::async_loading::{AssetKind, AssetLoadError, AssetLoader, LoadRequest};
+    pub use crate::manifest::{AssetManifest, ManifestEntry, ManifestError};
     pub use crate::pack::{PackError, PackReader, PackWriter};
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, CommandsPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin,

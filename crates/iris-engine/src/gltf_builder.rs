@@ -177,6 +177,11 @@ struct MaterialDef {
     normal_texture: Option<usize>,
     /// ORM 打包图（同时充当 `occlusionTexture`，见 [`GltfMaterialTextures`]）。
     orm_texture: Option<usize>,
+    /// glTF `alphaMode`（R59）：`None` = 不写（规范默认 OPAQUE）；
+    /// `Some("BLEND")` = alpha 混合（玻璃 / 镂空类）。加载器读取后映射
+    /// 为 [`iris_render::material::AlphaMode`]（MASK v1 按 OPAQUE 处理，
+    /// 故 builder 只开放 BLEND）。
+    alpha_mode: Option<&'static str>,
 }
 
 struct MeshDef {
@@ -461,8 +466,18 @@ impl GltfBuilder {
             base_color_texture,
             normal_texture,
             orm_texture,
+            alpha_mode: None,
         });
         self.materials.len() - 1
+    }
+
+    /// 声明材质为 alpha 混合（glTF `alphaMode: "BLEND"`，R59）：玻璃 /
+    /// 镂空类材质，加载器读取后映射为透明 pass（`AlphaMode::Blend`）。
+    /// 与 `material_textured` 搭配使用：带 alpha 通道的 baseColor 贴图
+    /// 只有在 BLEND 材质上才真正进入画面（不透明材质不消费纹理 alpha）。
+    pub fn set_alpha_blend(&mut self, material: usize) -> &mut Self {
+        self.materials[material].alpha_mode = Some("BLEND");
+        self
     }
 
     /// 登记一张内嵌图（尺寸与像素缓冲校验 + **内容去重**：同一张图被多
@@ -747,6 +762,9 @@ impl GltfBuilder {
                     value["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
                         json!({ "index": texture });
                     value["occlusionTexture"] = json!({ "index": texture });
+                }
+                if let Some(mode) = material.alpha_mode {
+                    value["alphaMode"] = json!(mode);
                 }
                 value
             })

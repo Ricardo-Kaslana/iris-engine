@@ -602,7 +602,9 @@ fn build_player(world: &mut World, model_path: &Path) -> (Entity, Entity, Entity
             let mut player = instance.player();
             configure_state_machine(&mut player);
             // 事件轨道：GLB 解析不产事件，由 API 侧注入 walk 的脚步标记
-            if let Some(walk) = player.clips.get_mut(1) {
+            // （R59 起剪辑数据为 Arc 共享形态——clips_mut 写时复制出本
+            // 实例私有副本，注入不影响注册表 / 其他实例）
+            if let Some(walk) = player.clips_mut().get_mut(1) {
                 walk.events = vec![
                     AnimationEvent {
                         time: 0.15,

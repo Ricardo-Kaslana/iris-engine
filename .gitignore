@@ -7,3 +7,8 @@ iris_offscreen.bmp
 # Web 冒烟构建产物（wasm-bindgen 输出，可按 README「Web 构建」重新生成）
 /web-demo/
 infiltration_settings.json
+# R59 补遗：外部模型导入实战的本地资产（32MB 版权模型，不入库——
+# 引擎仓库面向开源发布，示例资产纪律为 KB 量级程序化生成）
+assets/JingLiu_*.glb
+/jingliu_preview.png
+/crates/iris-engine/examples/jingliu_preview.rs

@@ -88,8 +88,9 @@ pub mod prelude {
         collect_events, root_motion_delta, update_animations,
     };
     pub use crate::asset::{
-        GltfError, GltfInstance, HdrError, HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance,
-        spawn_gltf_instance_from_bytes, write_glb,
+        AnimationRegistry, ClipMeta, GltfAnimationLibrary, GltfError, GltfInstance, HdrError,
+        HdrImage, load_hdr, spawn_gltf, spawn_gltf_instance, spawn_gltf_instance_from_bytes,
+        write_glb,
     };
     pub use crate::bake::{
         BAKE_RAY_MIN_T, BAKE_SHADOW_BIAS, BVH_LEAF_SIZE, BakeParams, BakeSample, BakeTriangle,
@@ -148,7 +149,8 @@ pub mod prelude {
     };
     pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
     pub use crate::texture_bcn::{
-        BC1_BLOCK_BYTES, bc1_eligible, encode_bc1, encoded_len, padded_extent,
+        BC1_BLOCK_BYTES, BC3_BLOCK_BYTES, bc1_eligible, bc3_eligible, encode_bc1, encode_bc3,
+        encoded_len, encoded_len_bc3, padded_extent,
     };
     pub use crate::ui::{
         Focusable, UiAnchor, UiAnchorPoint, UiButton, UiClickEvent, UiColor, UiFocus, UiImage,

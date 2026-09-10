@@ -7,7 +7,9 @@
 //!   TEXCOORD_0 缺失时填充 (0, 0)；
 //! - 索引 u16 / u32，顶点分量 FLOAT；
 //! - 材质：`baseColorFactor`、`emissiveFactor`；`roughness` 映射为高光锐度；
-//!   `baseColorTexture` 支持外部图片文件或 data URI（PNG / JPEG）；
+//!   `baseColorTexture` 支持外部图片文件、data URI 或 GLB 内嵌
+//!   bufferView（PNG / JPEG——bufferView 为规范推荐形态，主流导出器
+//!   默认输出）；
 //! - 节点 TRS 与 children 层级 → Iris 实体树（父节点实体 + 每 primitive 一个子实体）；
 //!   蒙皮实例自动收编兄弟顶层关节树（移动实例根即移动整只蒙皮角色）；
 //! - 动画剪辑（translation / rotation / scale 通道，LINEAR / STEP 插值）
@@ -232,6 +234,13 @@ struct GltfTexture {
 struct GltfImage {
     #[serde(default)]
     uri: Option<String>,
+    /// GLB 内嵌图片（规范推荐形态）：BIN chunk 里的 bufferView 引用 +
+    /// mimeType 标注。Blender / gltf-pipeline 等主流导出器的 GLB 全用
+    /// 此形态（R59 后补支持——外部下载模型的一条龙通路）。
+    #[serde(default)]
+    buffer_view: Option<usize>,
+    #[serde(default)]
+    mime_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -306,7 +315,7 @@ struct GltfAnimationSampler {
     interpolation: Option<String>,
 }
 
-const COMPONENT_UNSIGNED_BYTE: u32 = 5120;
+const COMPONENT_UNSIGNED_BYTE: u32 = 5121;
 const COMPONENT_FLOAT: u32 = 5126;
 const COMPONENT_UNSIGNED_SHORT: u32 = 5123;
 const COMPONENT_UNSIGNED_INT: u32 = 5125;
@@ -408,6 +417,10 @@ struct GltfLoader {
     /// 同时被 baseColor（sRGB）与 normal / ORM（线性）引用，两种语义
     /// 需要两份不同上传格式的 CpuTexture，故色彩空间并入缓存键（R42）。
     texture_handles: RefCell<HashMap<(usize, bool), TextureHandle>>,
+    /// 本次 spawn 落入 TextureStore 的全部句柄（R59，按登记序，含 ORM
+    /// 合成路径产出的条目）——`GltfInstance::textures` 的数据源，注册表
+    /// / 清单消费方据此补 BC3 声明。
+    registered_textures: RefCell<Vec<TextureHandle>>,
     /// 节点索引 → 已生成实体（动画目标解析用）。
     node_entities: RefCell<Vec<Option<iris_core::prelude::Entity>>>,
     /// 节点索引 → 其网格 primitive 子实体（蒙皮组件挂载用）。
@@ -760,11 +773,6 @@ impl GltfLoader {
             .get(image_index)
             .ok_or_else(|| GltfError::OutOfRange(format!("image #{image_index}")))?;
         let bytes = match &image.uri {
-            None => {
-                return Err(GltfError::Unsupported(format!(
-                    "image #{image_index}：bufferView 引用图片暂不支持，请使用 uri"
-                )));
-            }
             Some(uri) if uri.starts_with("data:") => {
                 let payload = uri
                     .split_once("base64,")
@@ -781,6 +789,34 @@ impl GltfLoader {
                     ))
                 })?;
                 std::fs::read(dir.join(uri))?
+            }
+            // GLB 内嵌（规范推荐形态）：BIN chunk 的 bufferView 字节按
+            // mimeType 解码。范围校验对齐 buffer 读取的越界口径。
+            None => {
+                match image.mime_type.as_deref() {
+                    Some("image/png") | Some("image/jpeg") | None => {}
+                    Some(other) => {
+                        return Err(GltfError::Unsupported(format!(
+                            "image #{image_index} 的 mimeType {other} 不支持                             （支持 image/png / image/jpeg，解码按字节嗅探）"
+                        )));
+                    }
+                }
+                let view_index = image.buffer_view.ok_or_else(|| {
+                    GltfError::Missing(format!("image #{image_index} 缺 uri 与 bufferView"))
+                })?;
+                let view =
+                    self.doc.buffer_views.get(view_index).ok_or_else(|| {
+                        GltfError::OutOfRange(format!("bufferView #{view_index}"))
+                    })?;
+                let bin = self.buffer(0)?;
+                let start = view.byte_offset;
+                let end = start + view.byte_length;
+                if end > bin.len() {
+                    return Err(GltfError::OutOfRange(format!(
+                        "image #{image_index} 的 bufferView #{view_index} 越界"
+                    )));
+                }
+                bin[start..end].to_vec()
             }
         };
         let decoded = image::load_from_memory(&bytes)?;
@@ -819,6 +855,7 @@ impl GltfLoader {
         let mut cpu = self.load_image(source)?;
         cpu.srgb = srgb;
         let handle = world.resource_mut::<TextureStore>().add(cpu);
+        self.registered_textures.borrow_mut().push(handle);
         self.texture_handles
             .borrow_mut()
             .insert((index, srgb), handle);
@@ -873,12 +910,14 @@ impl GltfLoader {
                         mr_cpu.height
                     );
                     let handle = world.resource_mut::<TextureStore>().add(mr_cpu);
+                    self.registered_textures.borrow_mut().push(handle);
                     return Ok(Some(handle));
                 }
                 for (i, occ_px) in occ_cpu.rgba.chunks_exact(4).enumerate() {
                     mr_cpu.rgba[i * 4] = occ_px[0]; // R ← AO
                 }
                 let handle = world.resource_mut::<TextureStore>().add(mr_cpu);
+                self.registered_textures.borrow_mut().push(handle);
                 return Ok(Some(handle));
             }
             (None, Some(occ_index)) => {
@@ -890,6 +929,7 @@ impl GltfLoader {
                     px[2] = 255;
                 }
                 let handle = world.resource_mut::<TextureStore>().add(occ_cpu);
+                self.registered_textures.borrow_mut().push(handle);
                 return Ok(Some(handle));
             }
         };
@@ -1195,17 +1235,33 @@ pub struct GltfInstance {
     /// （[`AnimationPlayer::node_entity_by_name`]），不再需要外部维护
     /// 裸下标表。
     pub node_names: Vec<Option<String>>,
-    /// 文件内的全部动画剪辑。
-    pub clips: Vec<AnimationClip>,
+    /// 文件内的全部动画剪辑（R59 起为 `Arc` 共享形态）：注册表命中
+    /// spawn 的实例共享注册表里的同一份（引用计数 +1，零拷贝）；常规
+    /// spawn 的实例持有独占份（强计数 1，语义与过去的按值 Vec 等价）。
+    /// 读路径经 Deref 透传，`len` / 索引 / 迭代用法不变。
+    pub clips: std::sync::Arc<Vec<AnimationClip>>,
+    /// 本次 spawn 经 [`TextureStore::add`] 登记的全部纹理句柄（R59，
+    /// 按登记序；同一下标多色彩空间引用会产生多个句柄）。注册表 /
+    /// 清单消费方据此把「经理入期声明」的 BC3 标志补登记到具体句柄
+    /// （`TextureStore::declare_bc3`）——GLB 内嵌纹理走 BC3 压缩通路
+    /// 的桥梁。不含未落目录的中间产物（如 `load_cpu` 的临时合成源，
+    /// 合成后落目录的已含）。
+    pub textures: Vec<TextureHandle>,
 }
 
 impl GltfInstance {
     /// 构造默认播放器：循环播放第一个剪辑，原速，自动开始。
     /// 用 `world.insert(root, instance.player())` 挂到根实体上。
+    ///
+    /// 剪辑数据以 `Arc` 克隆共享（R59）：注册表命中实例的播放器与
+    /// 注册表、彼此实例之间共享同一份关键帧数据，零拷贝。
     pub fn player(&self) -> crate::animation::AnimationPlayer {
         crate::animation::AnimationPlayer {
             node_names: self.node_names.clone(),
-            ..crate::animation::AnimationPlayer::new(self.clips.clone(), self.node_entities.clone())
+            ..crate::animation::AnimationPlayer::new_shared(
+                std::sync::Arc::clone(&self.clips),
+                self.node_entities.clone(),
+            )
         }
     }
 }
@@ -1246,6 +1302,7 @@ pub fn spawn_gltf_instance(
         world,
         doc,
         Some(path.parent().unwrap_or(Path::new(".")).to_path_buf()),
+        None,
     )
 }
 
@@ -1261,15 +1318,68 @@ pub fn spawn_gltf_instance_from_bytes(
     bytes: Vec<u8>,
 ) -> Result<GltfInstance, GltfError> {
     let doc = parse_document(bytes)?;
-    spawn_from_document(world, doc, None)
+    spawn_from_document(world, doc, None, None)
+}
+
+/// 从内存字节生成实例树，但**动画剪辑不重新解析**，直接共享调用方
+/// 传入的 `Arc`（R59）：动画注册表命中路径的 spawn 入口——同一 GLB
+/// 多实例的剪辑关键帧数据只解析一次、处处共享（生命周期与取舍见
+/// `AnimationPlayer::clips` 与注册表模块文档）。其余工作（实体树 /
+/// 网格 / 材质 / 蒙皮）与 [`spawn_gltf_instance_from_bytes`] 完全一致。
+pub(crate) fn spawn_gltf_instance_from_bytes_shared(
+    world: &mut World,
+    bytes: Vec<u8>,
+    clips: std::sync::Arc<Vec<AnimationClip>>,
+) -> Result<GltfInstance, GltfError> {
+    let doc = parse_document(bytes)?;
+    spawn_from_document(world, doc, None, Some(clips))
+}
+
+/// headless 解析产物（R59）：共享剪辑数据 + 骨架节点名表
+/// （[`parse_library`] 的返回形态，注册表入库的原料）。
+pub(crate) type ParsedLibrary = (std::sync::Arc<Vec<AnimationClip>>, Vec<Option<String>>);
+
+/// 从 glTF / GLB 文件解析剪辑库与节点名表（R59）：**不生成任何实体**
+/// 的 headless 解析口——动画注册表批量导入用（先看有什么动画再决定
+/// 是否 spawn）。剪辑解析与 spawn 路径共用 [`GltfLoader::build_clip`]
+/// 同一实现（不支持的插值等错误在导入期即报，不产生半解析的库）。
+pub(crate) fn parse_library(bytes: Vec<u8>) -> Result<ParsedLibrary, GltfError> {
+    let doc = parse_document(bytes)?;
+    let loader = GltfLoader {
+        node_entities: RefCell::new(Vec::new()),
+        node_parts: RefCell::new(Vec::new()),
+        doc: doc.json,
+        bin: doc.bin,
+        base_dir: None,
+        buffers: RefCell::new(HashMap::new()),
+        mesh_handles: RefCell::new(HashMap::new()),
+        material_handles: RefCell::new(HashMap::new()),
+        texture_handles: RefCell::new(HashMap::new()),
+        registered_textures: RefCell::new(Vec::new()),
+    };
+    let mut clips = Vec::with_capacity(loader.doc.animations.len());
+    for i in 0..loader.doc.animations.len() {
+        clips.push(loader.build_clip(i)?);
+    }
+    // 节点名表：下标 = glTF 节点声明序，与 spawn 路径的
+    // `GltfInstance::node_names` 同一来源同一顺序
+    let names: Vec<Option<String>> = loader
+        .doc
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect();
+    Ok((std::sync::Arc::new(clips), names))
 }
 
 /// 文档 → 实体树的公共主体（路径 / 内存两入口汇合处）。
-/// `base_dir = None` 即内存语义（外部 uri 显式报错，见 loader 字段）。
+/// `base_dir = None` 即内存语义（外部 uri 显式报错，见 loader 字段）；
+/// `shared_clips = Some` 时动画不重复解析（注册表共享路径，R59）。
 fn spawn_from_document(
     world: &mut World,
     doc: GltfDocument,
     base_dir: Option<PathBuf>,
+    shared_clips: Option<std::sync::Arc<Vec<AnimationClip>>>,
 ) -> Result<GltfInstance, GltfError> {
     let json = doc.json;
     if !json.scenes.is_empty() && json.scene >= json.scenes.len() {
@@ -1289,6 +1399,7 @@ fn spawn_from_document(
         mesh_handles: RefCell::new(HashMap::new()),
         material_handles: RefCell::new(HashMap::new()),
         texture_handles: RefCell::new(HashMap::new()),
+        registered_textures: RefCell::new(Vec::new()),
     };
 
     // 顶层节点：优先使用 active scene；无 scenes 时以全部无父节点为顶层
@@ -1306,11 +1417,19 @@ fn spawn_from_document(
         loader.doc.scenes[loader.doc.scene].nodes.clone()
     };
 
-    // 动画在生成实体前解析：不支持的特性直接报错，不产生半加载场景
-    let mut clips = Vec::with_capacity(loader.doc.animations.len());
-    for i in 0..loader.doc.animations.len() {
-        clips.push(loader.build_clip(i)?);
-    }
+    // 动画在生成实体前解析：不支持的特性直接报错，不产生半加载场景。
+    // 注册表共享路径（shared_clips 为 Some）跳过解析——错误已在导入期
+    // 报过，此处直接复用同一份剪辑数据
+    let clips = match shared_clips {
+        Some(clips) => clips,
+        None => {
+            let mut clips = Vec::with_capacity(loader.doc.animations.len());
+            for i in 0..loader.doc.animations.len() {
+                clips.push(loader.build_clip(i)?);
+            }
+            std::sync::Arc::new(clips)
+        }
+    };
 
     let mut roots = Vec::new();
     for node_index in top_level {
@@ -1424,6 +1543,7 @@ fn spawn_from_document(
         node_entities: loader.node_entities.into_inner(),
         node_names: names,
         clips,
+        textures: loader.registered_textures.into_inner(),
     })
 }
 
@@ -1490,6 +1610,74 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("内存 PNG 编码不应失败");
         format!("data:image/png;base64,{}", base64::encode(&png))
+    }
+
+    /// 4×4 单色 PNG 字节（测试内编码）。
+    fn solid_png_bytes(rgba: [u8; 4]) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba(rgba))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("内存 PNG 编码不应失败");
+        png
+    }
+
+    /// 回归（外部资产触发）：GLB 内嵌图片的 **bufferView 形态**（规范
+    /// 推荐写法，Blender / gltf-pipeline 等主流导出器的默认输出）必须
+    /// 能加载——曾显式报「bufferView 引用图片暂不支持」。
+    #[test]
+    fn loads_glb_image_from_buffer_view() -> Result<(), GltfError> {
+        // bin 布局：三角形顶点 0..36 | 索引 36..42 | pad→44 | PNG 44..end
+        let mut bin: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            bin.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        bin.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let png_at = bin.len() as u32;
+        let png = solid_png_bytes([30, 90, 200, 255]);
+        let png_len = png.len() as u32;
+        bin.extend_from_slice(&png);
+
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "byteLength": {} }}],
+                "bufferViews": [
+                    {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }},
+                    {{ "buffer": 0, "byteOffset": 36, "byteLength": 6 }},
+                    {{ "buffer": 0, "byteOffset": {}, "byteLength": {} }}
+                ],
+                "accessors": [
+                    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+                    {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+                ],
+                "images": [{{ "bufferView": 2, "mimeType": "image/png" }}],
+                "textures": [{{ "source": 0 }}],
+                "materials": [{{ "name": "tinted", "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0 }} }} }}],
+                "meshes": [{{ "primitives": [{{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 0 }}] }}],
+                "nodes": [{{ "mesh": 0 }}],
+                "scenes": [{{ "nodes": [0] }}],
+                "scene": 0
+            }}"#,
+            bin.len(),
+            png_at,
+            png_len
+        );
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance_from_bytes(&mut world, write_glb(&json, &bin))?;
+        assert_eq!(instance.textures.len(), 1, "bufferView 图片应登记进目录");
+        let store = world.resource::<TextureStore>();
+        let tex = store.get(instance.textures[0]).unwrap();
+        assert_eq!(tex.width, 4);
+        assert_eq!(tex.height, 4);
+        assert_eq!(
+            &tex.rgba[0..4],
+            &[30, 90, 200, 255],
+            "像素应与源 PNG 逐位一致"
+        );
+        Ok(())
     }
 
     /// TANGENT 属性 + 法线 / ORM 纹理引用解析（R42）：
@@ -2001,6 +2189,56 @@ mod tests {
             None,
             "文件里没有的节点名应为 None"
         );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// 回归（外部资产触发）：JOINTS_0 为 UNSIGNED_BYTE（componentType
+    /// 5121）的蒙皮网格必须加载——曾因常量误写 5120（glTF 规范里是
+    /// 有符号 BYTE）导致 u8 关节索引的标准资产被拒（骨数 < 256 的转换
+    /// 资产普遍用 u8 关节，真实 MMD 转换模型踩中）。
+    #[test]
+    fn loads_skinned_glb_with_unsigned_byte_joints() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join(format!("iris-gltf-u8joints-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, mut bin) = skinned_triangle_parts();
+        // JOINTS_0 区域（bufferView 2 = 44..68）改写为 u8 VEC4 ×3
+        //（12 字节有效 + 12 字节补零——view 偏长合法，accessor 按计数读）
+        let mut patch = 44usize;
+        for j in [[0u8, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]] {
+            bin[patch..patch + 4].copy_from_slice(&j);
+            patch += 4;
+        }
+        for b in &mut bin[56..68] {
+            *b = 0;
+        }
+        let json = json.replace(
+            "\"bufferView\": 2, \"componentType\": 5123, \"count\": 3, \"type\": \"VEC4\"",
+            "\"bufferView\": 2, \"componentType\": 5121, \"count\": 3, \"type\": \"VEC4\"",
+        );
+        assert!(
+            json.contains("\"componentType\": 5121"),
+            "fixture 必须真的把 JOINTS accessor 改为 UNSIGNED_BYTE"
+        );
+        let path = dir.join("u8_joints.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        let instance = spawn_gltf_instance(&mut world, &path)?;
+        let hip = instance.node_entities[1].expect("hip 应已生成");
+        let elbow = instance.node_entities[2].expect("elbow 应已生成");
+        let mesh_root = instance.roots[0];
+        let parts = world.children(mesh_root);
+        let skin = world
+            .get::<Skin>(
+                *parts
+                    .iter()
+                    .find(|&&child| world.get::<Skin>(child).is_some())
+                    .expect("应有挂 Skin 的 primitive 子实体"),
+            )
+            .expect("u8 关节索引的蒙皮网格应有 Skin 组件")
+            .clone();
+        assert_eq!(skin.joints, vec![hip, elbow], "u8 关节索引应与 u16 同语义");
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }

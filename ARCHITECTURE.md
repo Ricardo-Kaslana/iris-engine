@@ -891,8 +891,8 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   **打磨 VI 摩擦③ 追加 `material_textured`**：`GltfMaterialTextures`
   三通道（baseColor / 法线 / ORM）收 CPU 端 `CpuTexture` 像素，登记时
   校验尺寸与非零缓冲，build 时 PNG → base64 写成 `data:` URI 内嵌
-  （**不用 bufferView 引用图片**——加载器对该形态仍显式报 Unsupported，
-  见上「v1 不支持」；data URI 也保证 GLB 自包含、内存加载路径可用）；
+  （data URI 保证 GLB 自包含、内存加载路径可用；bufferView 引用图片
+  形态亦受支持——补全于 R59 后的**外部模型导入支线**，见 §8.24 修订）；
   ORM 图同下标写进 `metallicRoughnessTexture` 与 `occlusionTexture`
   两通道，走加载器「同下标免重打包」快路（§4.6 ORM 合并策略）。
   无纹理声明时 `images` / `textures` 两键不写 ⇒ 既有资产产物逐字不变。
@@ -903,7 +903,10 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   Missing / OutOfRange），越界引用不 panic；NORMAL 缺失时按三角形自动生成
   平面法线；TEXCOORD 缺失填充 (0,0)。
 - **v1 不支持**（显式报错而非静默出错）：骨架 / 蒙皮 / 形变目标、
-  CUBICSPLAT 插值、非三角形拓扑、非 FLOAT 顶点分量、bufferView 引用图片。
+  CUBICSPLAT 插值、非三角形拓扑、非 FLOAT 顶点分量、bufferView 引用
+  图片。——其中前三条与「非 FLOAT 顶点分量」在后续演进中已部分放开
+  （蒙皮 R38 起、u8 关节索引与 bufferView 图片补全于 R59 后外部模型
+  导入支线，见 §8.24 修订与 REPORT 补遗）。
 - base64 解码为手写实现（RFC 4648 严格校验：长度 4 对齐、padding 后禁止数据、
   残位必须为零），避免为此引入依赖。
 
@@ -2852,6 +2855,87 @@ UNDO/BAKED/NAV 行，`examples/editor_b_snapshot.rs` 产出，两帧跨运行逐
 世界——避免随后一次保存覆盖原档）。诚实清单 §8.34 与 edit.rs 模块文档
 （9 条）。
 
+### 4.28 资产管线 v2：动画注册表 / BC3 压缩通路 / manifest + 优先级（R59）
+
+外部资产「从导入到运行」一条龙的三块独立能力（管线骨架层的优先级 /
+续载语义修订见 §7.3 R59 增量）。
+
+**GLB 动画注册表**（`iris_render::asset::registry`）：`AnimationRegistry`
+（World 资源）维护 资产路径 → `GltfAnimationLibrary`（`BTreeMap`，迭代
+恒路径字典序——与 broadphase / pack 条目表同一确定性选型）。库 = 共享
+剪辑数据 `Arc<Vec<AnimationClip>>` + 骨架节点名表（glTF 节点声明序）+
+逐剪辑元数据 `ClipMeta`（名字 / 时长 / 轨道数 / 事件数）。三个动作：
+`import`（headless 批量导入——不 spawn 实例也能解析元数据，先看有什么
+动画再决定加载；解析与 spawn 路径共用 `build_clip` 同一实现，错误在
+导入期即报）；`spawn_instance`（命中则共享剪辑数据不重新解析、未命中
+自动导入；实体树 / 网格 / 材质 / 纹理工作与常规 spawn 完全一致）；
+`clip_index_by_name`（按名取用，重名**取先**——与骨架名表同一约定）。
+
+**共享生命周期取舍**：`AnimationPlayer::clips` 与 `GltfInstance::clips`
+升级为 `Arc<Vec<AnimationClip>>`——注册表命中 spawn 的 N 个实例 + 注册
+表共享**同一份**关键帧数据（引用计数），「每 spawn 深拷贝一份」的内存
+重复归零。选**引用计数而非克隆**：克隆语义只省解析 CPU、内存重复原样
+保留，与本轮动机相悖；Arc 生命周期 = 最后一个持有者（注册表或任一播放
+器），无悬垂风险。读路径经 Deref 透传全兼容；**写时复制口**
+`AnimationPlayer::clips_mut()`（`Arc::make_mut`）给「注入事件轨道」这类
+私有修改——共享播放器首次调用克隆出本实例私有副本，不影响注册表与
+其他实例（iris-ascent 脚步事件注入即此用法）。诚实边界：`Arc` 强计数
+> 1 时直接 `get_mut` 返回 None（共享数据不可变借用规则）——修改剪辑
+应走 `clips_mut` 或独占构造。常规（非注册表）spawn 行为不变：每实例
+独占一份（强计数 1，语义与按值 Vec 等价）。
+
+**BC3 压缩通路**（`texture_bcn.rs` + `texture.rs` + 渲染器决策树）：
+`encode_bc3` = BC4 alpha 块（8 B：a0/a1 端点 + 16 像素 × 3-bit 索引，
+LSB 优先）+ BC1 色块（8 B，**复用 `encode_bc1` 输出**）= 16 B/块 =
+1 B/px（RGBA8 的 1/4）。**分层规则**（`bc1_eligible` / `bc3_eligible`
+判定口径，两决策对同一输入恒互斥）：全不透明走 BC1（0.5 B/px，无 alpha
+语义可丢且压缩率翻倍）；带 alpha 走 BC3（BC1 的 1-bit punch-through
+表达不了连续半透明）。**兼容硬约束的兑现方式**：BC3 只对「经理入期
+manifest 声明」的纹理生效——`TextureStore` 维护声明侧表
+（`declare_bc3` / `add_bc3_declared` / `is_bc3_declared`，BTreeSet），
+渲染器 `ensure_texture` 决策树只对声明过的纹理启用 BC3 分支，未声明
+纹理的决策路径与 R59 之前**逐位一致**（全部既有 GPU FNV 基线零变化，
+`bc1_render` / `post_render` 等兼容锁原值看门）。**入库形态选「加载期
+编码」**（渲染器懒上传时编码，与 BC1 同模式）：上传决策保持单一事实
+来源（避免「盘上格式 × 运行时格式」两套真相）；GLB 内嵌纹理是 PNG
+data URI，盘上预编码需发明新容器（拒绝清单禁 KTX2/DDS）；CpuTexture
+保持 RGBA8 使默认路径不变最易论证。代价是上传时一次 CPU 编码（与既有
+BC1 路径同量级）。**误差断言口径（诚实）**：BC3 有损——alpha 端点取
+块内极值像素（8-bit 原值零量化），8 值调色板等分端点区间，单像素误差
+上界 = (a0−a1)/14 ≤ 255/14 ≈ 18.2；纯色 alpha 块索引全 0 恒等还原
+（8 值模式端点相等时硬件解为含 0/255 穿透值的退化调色板，索引全 0
+绕开）。GPU 侧等价渲染测试（`bc3_render.rs`）：块内纯色棋盘格 alpha
+与 RGB 解码精确，BC3 路径与 RGBA8 回退全帧平均误差 < 2/255；无 BC
+特性环境两侧同走 RGBA（无分支回退，与 BC1 同款）。
+
+**资产 manifest**（`iris_engine::manifest`）：JSON 清单（路径 / kind
+`"scene"|"raw"` / 优先级整数 / `bc3` 标志），serde derive 零新依赖；
+校验中文报错（空路径 / 重复路径 / 未知 kind / 结构损坏，定位到条目）；
+未知字段按 serde 默认忽略（前向兼容，与场景 JSON 同约定）。条目表
+`BTreeMap` 按路径字典序——`request_all` 按该序逐条以自身优先级入队，
+**请求序与清单内容一一对应** ⇒ 加载线程出队序列完全由清单内容决定
+（分帧 poll 的完成序 = 出队序，串行加载线程）。`bc3: true` 条目的
+消费通路：异步加载拿到 GLB 字节 → 注册表 spawn → `GltfInstance::textures`
+（R59 新字段：本次 spawn 落入 `TextureStore` 的全部句柄，含 ORM 合成
+路径）→ 按 manifest 标志逐句柄 `declare_bc3`（只需发生在首次 GPU 上传
+前——懒上传）。
+
+**全流程验收**：`gen_r59_assets`（程序化生成含内嵌 alpha 贴图 + 法线
+贴图 + idle/swing/hit 三命名动画的 GLB 与 manifest）→ `r59_snapshot`
+（manifest → 优先级异步分帧加载 → 注册表导入 → 双实例 spawn（共享
+`ptr_eq` 断言）→ 按名切动画 → 离屏渲染 `docs/asset_pipeline.png` 六
+面板：三动画姿势帧 / BC3 vs RGBA8 对照 / 加载时序与显存数字
+（RGBA8+BC1 292 B → BC3+BC1 100 B）；快照跨运行逐字节一致）。
+headless 端到端测试 `iris-engine/tests/asset_pipeline.rs`（清单 → 异步
+优先级出队 → 注册表元数据 → 双实例共享 → bc3 声明落表显存口径 → 按名
+播放姿势精确断言 + 管线级中断续载）。
+
+**v1 不含（诚实清单 → §8.35）**：网格 / 材质 / 纹理的跨实例去重（注册
+表只共享动画数据，spawn 仍逐实例解析实体树）；纹理 GPU 上传异步化；
+BC3 盘上预编码容器；剪辑数据惰性解析（导入即全量读关键帧浮点）；清单
+无目录递归 / 通配符；同一 GLB 多实例的纹理重复登记（每次 spawn 独立
+注册句柄——`GltfInstance::textures` 按次返回，去重是独立工程）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -3034,8 +3118,33 @@ proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
 轮询是既定用法。与音频流「后台错误不可回传」相反，这里错误**保真回传**
 （加载无实时回调约束）；`AssetKind::Scene` 在加载线程上做 JSON 结构校验
 （坏文件在后台报错，主线程拿到的字节保证可解析）。wasm 无线程 →
-`spawn` 自动退化为 `inline` 同步后端（同 API 同语义，唯一契约差异是
-读取耗时计入 request 调用）。
+`spawn` 自动退化为 `inline` 同步后端（同 API 同语义；R59 起两后端共用
+同一优先级队列，唯一契约差异是读取发生在出队 `poll` 调用——耗时计入
+poll 而非 request，见下方 R59 增量）。
+
+**R59 增量：manifest + 优先级出队 + 续载语义**（§4.28 是本轮资产管线的
+完整设计记录，此处补管线骨架层的语义修订）：
+
+- **优先级出队**：`request_with_priority(path, kind, priority)`，
+  `priority: i32` **越小越先加载**（缺省 0 = `request` 的既有行为）；
+  出队键 = `(priority, seq)` 升序，`seq` 是入队调用序的单调计数
+  （**在调用线程分配**——排序键在入队时即确定，与到达加载线程的先后
+  无关，`AssetLoader::next_seq` 原子计数）。加载线程主循环 =
+  **排空命令通道 → 弹最小键作业执行**：尽最大可能把「已入队」请求收进
+  同一批排序；串行执行 ⇒ **在途作业不抢占**（后到的高优先级请求等当前
+  作业完成）。`inline` 后端 `request` 入队、`poll` 出队并即时执行——
+  与线程后端共用同一 [`PendingQueue`]（`BTreeMap<(i32, u64), _>`，
+  键即出队序，与 broadphase 同一确定性选型）；**契约修订**：R45 的
+  「inline 耗时计入 request」改为「耗时计入 poll」（同 API 同语义的
+  代价；同优先级下结果仍按请求序 FIFO，既有调用方无感）。线程后端的
+  确定性出队序测试靠**测试闸门**（加载线程每次出队前等待，生产恒
+  `None`）把「请求全部入队」与「线程开始消费」定序。
+- **中断 / 续载**：loader **无记忆**（无缓存 / 无去重 / 无完成登记）。
+  丢弃 loader（native 通道关闭线程自然退出；inline 未出队请求随结构体
+  丢弃）即在途请求作废——v1 无 join 语义不变。**续载 = 消费方持已得
+  结果、对未完成路径重新 request**：同路径重请求即幂等重读（字节一致），
+  已取回结果归消费方、不重复投递。两后端各有「部分完成 → 中断 → 重建
+  → 补齐」全流程测试钉住。
 
 **实测数字**（Windows 11 笔记本 i7-13620H，release，2026-09-06，
 `cargo run -p iris-engine --release --example pack_demo`；量级参考）：
@@ -3490,7 +3599,9 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     但缺粒位置提示的码流可能保留约 2 k 采样头尾冗余）；**wasm32 无线程**
     ⇒ 退化为混音调用内同步解码（该平台上解码耗时计入当次混音，因其本无
     cpal 实时回调）。
-24. **资产打包 / 挂载 / 异步加载为 v1**（§7.3，R45）：**PACK1 无压缩、
+24. **资产打包 / 挂载 / 异步加载为 v1**（§7.3，R45；**R59 修订**——优先
+    级与中断续载语义已闭合（§4.28 / §7.3 R59 增量），取消仍未做）：
+    **PACK1 无压缩、
     无去重、无加密**（CRC-32 防损坏不防篡改；同内容两份存两份，压缩率
     收益留给版本号演进）；**大资产整条读回**——`PackReader::read` 返回
     完整 `Vec<u8>`，条目内部分段流式读（边读边解码）未做；**挂载无
@@ -3499,10 +3610,16 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     （GLB 容器或 data URI——内存来源没有 base_dir，外部 uri 引用显式
     报错，见 `spawn_gltf_instance_from_bytes`）；**异步骨架只覆盖字节
     读取**——`AssetKind` 仅 Scene（后台 JSON 校验）与 RawBytes 两类，
-    渲染纹理 / 网格的 GPU 上传异步化、进度回调、优先级与取消均未做；
+    渲染纹理 / 网格的 GPU 上传异步化、进度回调与取消均未做（优先级出队
+    已于 R59 闭合，§7.3）；
     **结果无完成顺序保证**（native 并行乱序到达），且丢弃 `AssetLoader`
     不等待在途请求（无 join 语义）；**glTF 加载器只有内存入口不支持
-    外部 uri**，路径入口行为不变。
+    外部 uri**，路径入口行为不变。**R59 后外部模型导入支线的加载器
+    补全**（REPORT 补遗）：u8 关节索引（UNSIGNED_BYTE，常量笔误
+    5120 → 规范值 5121）与 GLB 内嵌图片的 bufferView 形态（规范推荐
+    形态，主流导出器默认输出；mimeType 前置校验 + 越界校验）均已支持，
+    各配回归测试；诚实限制仍在：外部 uri、CUBICSPLAT、形变目标、
+    稀疏 accessor。
 25. **演出时间线为 Sequencer-lite**（§4.22，R47）：**单播放器**
     （`TimelinePlayer` = Resource，并发多条时间线不支持）；相机轨道
     **段内均匀参数化**（不按弦长 / 向心重参数化——非均匀关键帧间距的
@@ -3745,6 +3862,32 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     编辑使产物陈旧 = 重载报错（R57「陈旧是错误不是降级」语义），重烘是
     唯一出路）；⑫◆**Nav 可视化是重建时点的快照**（后续编辑不自动刷新；
     自动 bounds 按轴对齐语义忽略旋转）。
+
+35. **资产管线 v2 的诚实限制（R59）**——完整清单在 registry.rs /
+    manifest.rs / async_loading.rs 模块文档与 §4.28，此处索引：
+    ①**注册表只共享动画数据**（网格 / 材质 / 纹理仍逐 spawn 重新解析
+    与登记——同一 GLB 多实例的纹理在 `TextureStore` 中是独立句柄重复
+    像素，`GltfInstance::textures` 按次返回本轮新增的句柄列表；跨实例
+    网格 / 纹理去重需共享句柄的实体树语义，独立工程）；②**共享剪辑
+    不可就地改**（`Arc` 强计数 > 1 时 `get_mut` 为 None——修改剪辑走
+    `clips_mut` 写时复制或 `AnimationPlayer::new` 独占构造；注册表本身
+    的库内容只读）；③**BC3 只对声明纹理生效且加载期编码**（盘上无
+    压缩容器——GLB 内嵌图是 PNG data URI，预编码需发明新容器，拒绝
+    清单禁 KTX2/DDS；上传时一次 CPU 编码，与 BC1 路径同量级）；全不
+    透明纹理即使声明 BC3 也归 BC1（分层互斥）；非 4 对齐 / 无 BC 特性
+    自动回退 RGBA8（无分支回退）；④**BC3 是有损压缩**（alpha 单像素
+    误差上界 255/14 ≈ 18.2，端点即块内极值像素的 8 值调色板口径；纯色
+    alpha 块恒等还原；像素断言写上界不写「完全相等」）；⑤**优先级出
+    队的并发边界**（在途作业不抢占——串行加载线程，后到高优先级请求
+    等当前作业完成；「已入队请求按（优先级，请求序）确定性出队」由
+    测试闸门定序钉住）；inline 后端读取耗时在 poll 而非 request
+    （R45 契约修订，同 API 同语义的代价）；⑥**续载 = 消费方重发**
+    （loader 无记忆：中断即在途请求作废，无 join / 无进度回调 / 无
+    取消；同路径重请求幂等重读）；⑦**清单无递归 / 通配 / 依赖图**
+    （平铺条目表，`"scene"|"raw"` 两类 kind；加载顺序由优先级整数表达，
+    无显式依赖拓扑）；⑧**剪辑导入即全量解析**（无「只读名字」的惰性
+    形态；GLB 动画数据量级下一次解析成本可接受）；⑨**GLB 重定向 /
+    热重载 / 网络加载不在本轮**（拒绝清单）。
 
 ## 9. 关键设计取舍记录
 

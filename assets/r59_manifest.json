@@ -1,0 +1,6 @@
+{
+    "assets": [
+        { "path": "r59_support.bin", "kind": "raw", "priority": 0 },
+        { "path": "r59_actor.glb", "kind": "raw", "priority": 5, "bc3": true }
+    ]
+}

@@ -31,9 +31,33 @@
 //! **mipmap v1 不做**：引擎暂无 mipmap 机制（`mip_level_count` 恒 1），
 //! BC1 压缩不含 mip 链生成；引入 mipmap 时本模块补 `encode_bc1_mips`
 //! （逐级对半 + 递归编码，接口另议）。
+//!
+//! # BC3（DXT5，R59）
+//!
+//! [`encode_bc3`] 在 BC1 色块（8 B）前拼一个 **BC4 alpha 块**（8 B：
+//! a0/a1 两端点 + 16 像素 × 3-bit 调色板索引），合计 16 B/块 =
+//! 1 B/px（RGBA8 的 1/4）。色彩部分与 BC1 逐位相同（复用同一编码器），
+//! alpha 部分是单通道 8-bit 的同一套「端点 + 插值调色板 + 最近邻索引」
+//! 数学。**分层规则**（[`bc1_eligible`] / [`bc3_eligible`] 的判定口径，
+//! 两决策对同一输入恒互斥）：
+//!
+//! - **全不透明** → BC1（0.5 B/px）：BC1 没有 alpha 通道，全不透明时
+//!   不丢任何语义，压缩率是 BC3 的两倍；
+//! - **带 alpha（任一像素 < 255）** → BC3（1 B/px，且**须经理入期
+//!   manifest 声明**——渲染器决策树只对声明过的纹理启用 BC3 路径，
+//!   未声明纹理维持既有 RGBA8 / BC1 行为，默认路径逐位不变）：BC1 的
+//!   1-bit punch-through 表达不了连续半透明，BC4 的 8-bit 调色板可以。
+//!
+//! BC3 的 alpha 端点即块内极值像素（8-bit 原值，端点零量化误差），
+//! 8 项调色板等分端点区间，最近邻匹配的单像素误差上界 =
+//! (a0 − a1) / 14 ≤ 255/14 ≈ 18.2（端点级差最坏满量程）——像素断言
+//! 口径据此给出（见测试，**有损压缩不写「完全相等」式假断言**）。
 
 /// BC1 单块字节数（color0 2B + color1 2B + 索引 4B）。
 pub const BC1_BLOCK_BYTES: usize = 8;
+
+/// BC3 单块字节数（alpha 块 8 B + BC1 色块 8 B）。
+pub const BC3_BLOCK_BYTES: usize = 16;
 
 /// 压缩后尺寸：向上取整到 4 的倍数（wgpu 压缩纹理的块对齐要求）。
 pub fn padded_extent(width: u32, height: u32) -> (u32, u32) {
@@ -52,6 +76,122 @@ pub fn is_fully_opaque(rgba: &[u8]) -> bool {
     rgba.chunks_exact(4).all(|px| px[3] == 255)
 }
 
+/// BC3 压缩编码后的总字节数：块数 × 16（alpha 块 8 B + 色块 8 B，
+/// 1 B/px）。BC1 口径的同名函数 [`encoded_len`] 恒为块数 × 8——两者
+/// 是不同格式的不同承诺，不共用一个函数避免口径漂移。
+pub fn encoded_len_bc3(width: u32, height: u32) -> u64 {
+    let (pw, ph) = padded_extent(width, height);
+    (pw as u64 / 4) * (ph as u64 / 4) * BC3_BLOCK_BYTES as u64
+}
+
+/// BC3 编码：RGBA8 源 → 4×4 块流（每块 16 字节 = alpha 块 8 B 在前 +
+/// BC1 色块 8 B 在后，块内行主序；布局见模块文档 BC3 节）。
+///
+/// pad 语义与 [`encode_bc1`] 一致（非 4 倍数尺寸内部 pad 边缘复制）；
+/// 色彩块与 `encode_bc1` 的输出**逐位相同**（复用同一编码器——BC3 的
+/// RGB 载体就是 BC1），alpha 块按 BC4 语义编码（[`encode_alpha_block`]）。
+pub fn encode_bc3(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    assert!(width >= 1 && height >= 1, "纹理尺寸必须为正");
+    assert_eq!(
+        rgba.len(),
+        width as usize * height as usize * 4,
+        "RGBA 数据长度与纹理尺寸不一致"
+    );
+    let colors = encode_bc1(rgba, width, height);
+    let (pw, ph) = padded_extent(width, height);
+    let blocks_x = (pw / 4) as usize;
+    let blocks_y = (ph / 4) as usize;
+    let mut out = Vec::with_capacity(blocks_x * blocks_y * BC3_BLOCK_BYTES);
+    let mut alphas = [0u8; 16];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let (x0, y0) = (bx as u32 * 4, by as u32 * 4);
+            for (k, a) in alphas.iter_mut().enumerate() {
+                *a = pixel_alpha(
+                    rgba,
+                    width,
+                    height,
+                    x0 + (k % 4) as u32,
+                    y0 + (k / 4) as u32,
+                );
+            }
+            out.extend_from_slice(&encode_alpha_block(&alphas));
+            let c = (by * blocks_x + bx) * BC1_BLOCK_BYTES;
+            out.extend_from_slice(&colors[c..c + BC1_BLOCK_BYTES]);
+        }
+    }
+    out
+}
+
+/// 取像素 alpha，越界时复制边缘（pad 语义，与 [`pixel_rgb`] 同规则）。
+fn pixel_alpha(rgba: &[u8], width: u32, height: u32, x: u32, y: u32) -> u8 {
+    let x = x.min(width - 1);
+    let y = y.min(height - 1);
+    let i = ((y * width + x) * 4) as usize;
+    rgba[i + 3]
+}
+
+/// 编码单个 4×4 alpha 块（BC4 语义）：byte0 = 端点 a0（块内最大 alpha），
+/// byte1 = 端点 a1（最小），随后 16 像素 × 3-bit 调色板索引（LSB 优先，
+/// 像素 0 占最低 3 位，行主序）。
+///
+/// 调色板（a0 > a1 的 8 值模式）：索引 0/1 即两端点，索引 2..=7 为
+/// `((8−i)·a0 + (i−1)·a1) / 7`（+3 后整除 = 四舍五入）；端点取块内
+/// 极值像素（8-bit 原值零量化），最近邻匹配的单像素误差上界
+/// ≤ (a0 − a1) / 14 ≈ 18.2（见模块文档）。**端点相等的纯色块**（如
+/// alpha 恒 255）索引全部取 0——8 值模式下 a0 == a1 会被硬件解为
+/// 「4 插值 + 0/255 穿透」退化调色板（含 0 与 255 两外谬值），索引
+/// 全 0 保证解码恒等回 a0（与 BC1 纯色块同款并列取先处理）。
+///
+/// **确定性**：全整数运算；最大/最小值扫描取严格 `>` / `<`（并列保留
+/// 首个像素）；索引匹配严格 `<`（并列取最低调色板下标）——同输入两次
+/// 编码逐位一致。
+fn encode_alpha_block(alphas: &[u8; 16]) -> [u8; 8] {
+    // 端点 = 块内极值（并列保留首个：严格比较）
+    let mut a0 = alphas[0];
+    let mut a1 = alphas[0];
+    for &a in &alphas[1..] {
+        if a > a0 {
+            a0 = a;
+        }
+        if a < a1 {
+            a1 = a;
+        }
+    }
+    let mut out = [0u8; 8];
+    out[0] = a0;
+    out[1] = a1;
+    if a0 == a1 {
+        // 纯色块：索引全 0（out 已零初始化），解码恒等回 a0
+        return out;
+    }
+    // 8 值调色板：p[0] = a0、p[1] = a1，p[i] = ((8−i)·a0 + (i−1)·a1) / 7
+    let mut palette = [0u8; 8];
+    palette[0] = a0;
+    palette[1] = a1;
+    for (i, slot) in palette.iter_mut().enumerate().skip(2) {
+        let v = ((8 - i) as u32 * a0 as u32 + (i as u32 - 1) * a1 as u32 + 3) / 7;
+        *slot = v.clamp(0, 255) as u8;
+    }
+    // 最近邻索引（并列取最低下标）；48 bit LSB 优先打包，像素 k 占
+    // 第 3k 位起的 3 bit——16 像素恰好 48 bit = 6 字节
+    let mut bits: u64 = 0;
+    for (k, &a) in alphas.iter().enumerate() {
+        let mut nearest = 0u32;
+        let mut nearest_d = u32::MAX;
+        for (pi, &p) in palette.iter().enumerate() {
+            let d = (a as i32 - p as i32).unsigned_abs();
+            if d < nearest_d {
+                nearest_d = d;
+                nearest = pi as u32;
+            }
+        }
+        bits |= (nearest as u64) << (3 * k);
+    }
+    out[2..8].copy_from_slice(&bits.to_le_bytes()[..6]);
+    out
+}
+
 /// BC1 上传决策（渲染器 `ensure_texture` 与 `TextureStore::gpu_bytes_estimate`
 /// 共用，单一事实来源避免两处漂移）。全部满足才走 BC1：
 /// 1. 设备启用 `wgpu::Features::TEXTURE_COMPRESSION_BC`（wasm 的 WebGPU
@@ -68,6 +208,24 @@ pub fn bc1_eligible(width: u32, height: u32, rgba: &[u8], feature_bc: bool) -> b
         && height % 4 == 0
         && rgba.len() == width as usize * height as usize * 4
         && is_fully_opaque(rgba)
+}
+
+/// BC3 上传决策（R59）：与 [`bc1_eligible`] 的**分层规则**——
+/// 「全不透明走 BC1、带 alpha 走 BC3」。条件与 BC1 相同（特性 + 4 对齐 +
+/// 长度一致），唯 alpha 条件取反：`!is_fully_opaque`（存在任一 < 255 的
+/// alpha 像素）。两个决策函数对同一输入**恒互斥**（alpha 条件互补）——
+/// 全不透明纹理即使被声明走 BC3，也由渲染器决策树落回 BC1（0.5 B/px
+/// 优于 1 B/px，且语义无损）。注意本函数不含「manifest 声明」条件：
+/// 声明是渲染器 / 存储层的准入闸门（BC3 只对经理入期声明的纹理生效，
+/// 默认路径逐位不变），本函数只回答「这份数据适合 BC3 吗」。
+pub fn bc3_eligible(width: u32, height: u32, rgba: &[u8], feature_bc: bool) -> bool {
+    feature_bc
+        && width > 0
+        && height > 0
+        && width % 4 == 0
+        && height % 4 == 0
+        && rgba.len() == width as usize * height as usize * 4
+        && !is_fully_opaque(rgba)
 }
 
 /// BC1 编码：RGBA8 源 → 4×4 块流（每块 8 字节，块内行主序）。
@@ -385,5 +543,211 @@ mod tests {
     #[should_panic(expected = "RGBA 数据长度与纹理尺寸不一致")]
     fn encode_rejects_length_mismatch() {
         let _ = encode_bc1(&[0u8; 10], 2, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // BC3（R59）
+    // -----------------------------------------------------------------
+
+    /// 测试辅助：从 BC3 块流解码 RGBA8（镜像硬件语义：alpha 块按 a0/a1
+    /// 端点 + 8 值调色板展开——a0 == a1 的纯色块除外，此时硬件会走
+    /// 「4 插值 + 穿透」退化模式，但编码器保证纯色块索引全 0，两模式
+    /// 在索引 0/1 上同为端点值，解码一致）。返回 pad 后尺寸的像素。
+    fn decode_bc3(blocks: &[u8], width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+        let (pw, ph) = padded_extent(width, height);
+        let blocks_x = (pw / 4) as usize;
+        let blocks_y = (ph / 4) as usize;
+        let mut out = vec![0u8; (pw * ph * 4) as usize];
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let base = (by * blocks_x + bx) * BC3_BLOCK_BYTES;
+                let a = &blocks[base..base + BC3_BLOCK_BYTES];
+                let (a0, a1) = (a[0], a[1]);
+                let mut palette = [0u8; 8];
+                palette[0] = a0;
+                palette[1] = a1;
+                if a0 > a1 {
+                    for (i, slot) in palette.iter_mut().enumerate().skip(2) {
+                        *slot = (((8 - i) as u32 * a0 as u32 + (i as u32 - 1) * a1 as u32 + 3) / 7)
+                            as u8;
+                    }
+                } else {
+                    // 退化模式（本编码器不产此形态，解码端按规范补全
+                    // 以便对照外部工具）：p2..p3 插值、p4/p5 = 0、p6/p7 = 255
+                    for (i, slot) in palette.iter_mut().enumerate().skip(2).take(2) {
+                        *slot = (((5 - i) as u32 * a0 as u32 + (i as u32 - 1) * a1 as u32 + 2) / 5)
+                            as u8;
+                    }
+                    palette[4] = 0;
+                    palette[5] = 0;
+                    palette[6] = 255;
+                    palette[7] = 255;
+                }
+                let mut bits: u64 = 0;
+                for i in 0..6 {
+                    bits |= (a[2 + i] as u64) << (8 * i);
+                }
+                // 色块 = BC1（复用 BC1 解码）
+                let (_, _, rgba_color) = decode_bc1(&blocks[base + 8..base + 16], 4, 4);
+                for k in 0..16 {
+                    let idx = ((bits >> (3 * k)) & 0b111) as usize;
+                    let i = (((by * 4 + k / 4) * pw as usize) + bx * 4 + k % 4) * 4;
+                    out[i..i + 4].copy_from_slice(&[
+                        rgba_color[k * 4],
+                        rgba_color[k * 4 + 1],
+                        rgba_color[k * 4 + 2],
+                        palette[idx],
+                    ]);
+                }
+            }
+        }
+        (pw, ph, out)
+    }
+
+    /// BC3 位打包布局（手工构造已知块）：alpha 恒 255 + 颜色循环
+    /// 白/黑/170 灰/85 灰。alpha 块 = 端点 255/255 + 索引全 0（纯色块
+    /// 恒等还原）；色块与 BC1 已知块逐位一致（ff ff 00 00 + e4×4）。
+    #[test]
+    fn bc3_bit_packing_layout_matches_manual_construction() {
+        let mut rgba = Vec::with_capacity(4 * 4 * 4);
+        for _ in 0..4 {
+            for v in [255u8, 0, 170, 85] {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let blocks = encode_bc3(&rgba, 4, 4);
+        assert_eq!(blocks.len(), BC3_BLOCK_BYTES);
+        // alpha 块：端点 255/255，48 bit 索引全零
+        assert_eq!(&blocks[..8], &[255, 255, 0, 0, 0, 0, 0, 0], "alpha 纯色块");
+        // 色块 = BC1 已知块
+        assert_eq!(
+            &blocks[8..],
+            &[0xff, 0xff, 0x00, 0x00, 0xe4, 0xe4, 0xe4, 0xe4]
+        );
+        // 解码：alpha 精确还原 255，RGB 走 BC1 调色板
+        let (_, _, decoded) = decode_bc3(&blocks, 4, 4);
+        assert!(decoded.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    /// 全不透明图像走 BC3：alpha 通道必须逐像素零误差（端点 255 = 255、
+    /// 索引全 0 的恒等块），RGB 误差与 BC1 完全一致。
+    #[test]
+    fn bc3_opaque_alpha_round_trips_exactly() {
+        let (w, h) = (16u32, 16u32);
+        let rgba: Vec<u8> = (0..w * h * 4)
+            .map(|i| ((i * 53 + 11) % 251) as u8)
+            .collect();
+        let mut rgba = rgba;
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let blocks = encode_bc3(&rgba, w, h);
+        assert_eq!(blocks.len() as u64, encoded_len_bc3(w, h));
+        let (_, _, decoded) = decode_bc3(&blocks, w, h);
+        for (i, px) in decoded.chunks_exact(4).enumerate() {
+            assert_eq!(px[3], 255, "全不透明 alpha 必须零误差还原（像素 {i}）");
+        }
+    }
+
+    /// 常数半透明 alpha（128）零误差往返：端点 128 = 128、索引全 0 →
+    /// 解码恒等回 128（纯色块不走含 0/255 穿透值的退化调色板）。
+    #[test]
+    fn bc3_constant_alpha_round_trips_exactly() {
+        let rgba = std::iter::repeat_n([200, 100, 50, 128], 16)
+            .flatten()
+            .collect::<Vec<u8>>();
+        let blocks = encode_bc3(&rgba, 4, 4);
+        assert_eq!(blocks[..2], [128, 128], "端点应为 128/128");
+        assert_eq!(&blocks[2..8], &[0; 6], "纯色 alpha 块索引应全 0");
+        let (_, _, decoded) = decode_bc3(&blocks, 4, 4);
+        assert!(decoded.chunks_exact(4).all(|px| px[3] == 128));
+    }
+
+    /// alpha 渐变块的误差上界（诚实口径——BC3 有损，断言上界而非相等）：
+    /// 满量程 0→255 渐变块的端点级差 = 255，8 值调色板等分后最大半步
+    /// ≤ 255/14 ≈ 18.22；像素断言取 19（上界 + 1 容差，容差来源：
+    /// 四舍五入的调色板值与理想等分点至多差 0.5）。全图均方误差按同
+    /// 口径 < 19²，实测满量程渐变约 60–80。
+    #[test]
+    fn bc3_alpha_gradient_error_bounded() {
+        let (w, h) = (64u32, 64u32);
+        let mut rgba: Vec<u8> = (0..w * h * 4).map(|i| ((i * 31 + 7) % 199) as u8).collect();
+        // alpha：满量程对角渐变 0..255（每块内端点级差 ≤ 255/15×√2 < 24，
+        // 但最坏块仍可能接近满量程——断言用理论最坏口径）
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            let (x, y) = ((i % w as usize) as f32, (i / w as usize) as f32);
+            px[3] = ((x + y) / ((w + h - 2) as f32) * 255.0).round() as u8;
+        }
+        let blocks = encode_bc3(&rgba, w, h);
+        let (_, _, decoded) = decode_bc3(&blocks, w, h);
+        let mut max_err = 0u32;
+        let mut sq_total = 0f64;
+        for (src, dst) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+            let err = (src[3] as i32 - dst[3] as i32).unsigned_abs();
+            max_err = max_err.max(err);
+            sq_total += (err as f64) * (err as f64);
+        }
+        let mse = sq_total / (w as f64 * h as f64);
+        assert!(
+            max_err <= 19,
+            "满量程渐变单像素 alpha 误差 {max_err} 应 ≤ 255/14 + 1 ≈ 19"
+        );
+        assert!(
+            mse < 19.0 * 19.0,
+            "全图均方误差 {mse:.1} 应 < 19² = 361（上界口径一致）"
+        );
+    }
+
+    /// BC3 确定性 + 字节数：同输入两次编码逐位一致；64×64 源
+    /// （16 384 B = 4 B/px）编码后 1 024 B = 1 B/px（4 倍节省）。
+    #[test]
+    fn bc3_encoding_is_deterministic_and_quarter_size() {
+        let (w, h) = (64u32, 64u32);
+        let mut rgba: Vec<u8> = (0..w * h * 4)
+            .map(|i| ((i * 89 + 13) % 251) as u8)
+            .collect();
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            px[3] = if i % 3 == 0 { 40 } else { 255 };
+        }
+        let a = encode_bc3(&rgba, w, h);
+        let b = encode_bc3(&rgba, w, h);
+        assert_eq!(a, b, "同输入两次 BC3 编码必须逐位一致");
+        assert_eq!(a.len() as u64, encoded_len_bc3(w, h));
+        assert_eq!(
+            a.len(),
+            (w * h) as usize,
+            "64×64 BC3 应为 1 B/px（RGBA8 的 1/4）"
+        );
+        assert_eq!(encoded_len_bc3(w, h) * 4, (w as u64 * h as u64 * 4));
+    }
+
+    /// 决策分层：bc3_eligible 与 bc1_eligible 对同一输入恒互斥
+    /// （alpha 条件互补）；BC3 要求「带 alpha」+ 特性 + 4 对齐 +
+    /// 长度一致，空数据 / 零尺寸 / 不对齐 / 全不透明一律否决。
+    #[test]
+    fn bc3_eligible_is_disjoint_from_bc1_by_alpha_layering() {
+        let opaque: Vec<u8> = std::iter::repeat_n([200, 100, 50, 255], 8 * 8)
+            .flatten()
+            .collect();
+        let translucent: Vec<u8> = std::iter::repeat_n([200, 100, 50, 128], 8 * 8)
+            .flatten()
+            .collect();
+        // 带 alpha + 特性 + 对齐 → BC3 可用、BC1 不可用
+        assert!(bc3_eligible(8, 8, &translucent, true));
+        assert!(!bc1_eligible(8, 8, &translucent, true));
+        // 全不透明 → BC1 可用、BC3 否决（分层规则：全不透明归 BC1）
+        assert!(!bc3_eligible(8, 8, &opaque, true));
+        assert!(bc1_eligible(8, 8, &opaque, true));
+        // 无 BC 特性 / 非对齐 / 零尺寸 / 长度不符一律否决
+        assert!(!bc3_eligible(8, 8, &translucent, false));
+        assert!(!bc3_eligible(7, 8, &translucent, true));
+        assert!(!bc3_eligible(0, 8, &[], true));
+        assert!(!bc3_eligible(4, 4, &[255; 4 * 4 * 3], true));
+    }
+
+    #[test]
+    #[should_panic(expected = "RGBA 数据长度与纹理尺寸不一致")]
+    fn encode_bc3_rejects_length_mismatch() {
+        let _ = encode_bc3(&[0u8; 10], 2, 2);
     }
 }
