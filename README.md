@@ -296,9 +296,20 @@ buffer + POSITION/NORMAL/TEXCOORD + 45° 旋转节点）加载渲染，材质因
 正交矩阵（XY 纹素对齐消除相机平移闪烁）——近 / 中 / 远三距物体排开俯斜视：
 近处影子锐利（首级联 ~100 texel/m），~104 m 处影子仍在，136 m 处（超出
 120 m 覆盖距离）正确无影，级联过渡带无可见跳变；片元按 view 深度选级联后
-3×3 PCF 软阴影，`DirectionalLight.shadows = false` 可整帧关闭。
+3×3 PCF 软阴影，`DirectionalLight.shadows = false` 可整帧关闭。**R61 起
+偏移为「坡度缩放 bias + 法线偏移」**（逐级联按纹素世界尺寸缩放，常数只作
+下限），掠射角 acne 与接触阴影浮起同时消除——四面板对照见
+`docs/shadow_v2.png`。
 
 ![方向光级联阴影](docs/csm.png)
+
+阴影偏移 v2 验收图（`docs/shadow_v2.png`，R61）：①掠射角平面 旧常数 bias
+（acne 点状伪影 12883 px）| v2（0 px）；②0.07 m 薄板接触阴影 旧常数 bias
+（整条消失、阴影浮起）| v2（完整且贴住根部）；③双点光 关 | 两盏同时投影
+（两条方向不同的阴影带，互不串扰）；④CSM 级联 0/1 接缝 2× 放大（红线 =
+接缝）| 同裁剪的暗化差分 ×6——阴影带跨接缝连续、相邻采样跳变 0.7/255。
+
+![阴影偏移 v2 验收](docs/shadow_v2.png)
 
 小场景单张对照（`docs/shadow_preview.png`）：立方体与球体向地面投射软阴影，
 PCF 边缘自然、无 acne 条纹（v1 单张路径的验收图，CSM 下同场景近景更清晰）。
@@ -308,7 +319,9 @@ PCF 边缘自然、无 acne 条纹（v1 单张路径的验收图，CSM 下同场
 点光 cubemap 阴影实测（`docs/point_shadow_preview.png`）：暗色房间中央点光
 （512² × 6 面 R32Float，存归一化线性距离），环灯方块/球的阴影从根部
 **背离点光方向径向拉伸**——放射状阴影是点光区别于方向光平行阴影的视觉特征；
-`PointLight.shadows = true` 时查询顺序中的第一盏点光投影（v1 限定）。
+**R61 起为预算化多盏**：最多 4 盏 `PointLight.shadows = true` 同时投影
+（cubemap 纹理数组，逐灯开关 + 槽位；超出预算按「相机距离升序, 实体位
+模式升序」的确定性选择键裁掉并 warn）。
 
 ![点光 cubemap 阴影](docs/point_shadow_preview.png)
 
@@ -961,7 +974,7 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] GLB 二进制容器与 glTF 节点动画（AnimationPlayer + crossfade 混合 / 状态机 / 事件轨道）
 - [x] 骨骼蒙皮动画（GPU LBS + 蒙皮阴影）
 - [x] 外部 HDR 资产加载（equirectangular）
-- [x] 点光阴影（cubemap，首灯 6 面归一化距离）
+- [x] 点光阴影（cubemap，预算 4 盏 6 面归一化距离 + 确定性选择键）
 - [x] 2D UI 叠加层（HUD：屏幕空间矩形 + 位图字体文本，单批单 draw）
 - [x] 多线程系统调度（声明式读写集 + 冲突分批并行）
 - [x] wasm32 Web 目标端到端验证（全 workspace 编译 + Instant/线程/异步 GPU 初始化平台封装 + 真实浏览器渲染确认）

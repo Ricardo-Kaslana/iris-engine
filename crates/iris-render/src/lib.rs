@@ -12,8 +12,12 @@
 //! - 粒子系统 v1（Emitter 组件 + CPU 确定性模拟 + billboard 实例化渲染，
 //!   additive / alpha 双混合）；
 //! - 方向光级联阴影 CSM v2（2048² × 3 层 2D 数组深度图 + PFS 分割 +
-//!   纹素对齐拟合 + PCF；覆盖距离 120 m 之外保持受光）与点光 cubemap 阴影
-//!   （首灯 6 面 × 512²，R32Float 存归一化线性距离）；
+//!   纹素对齐拟合 + PCF；覆盖距离 120 m 之外保持受光）与点光 cubemap
+//!   阴影（R61 预算化多盏：最多 4 盏同时投影，cubemap 纹理数组 + 逐灯
+//!   开关 / 槽位 + 确定性选择键，R32Float 存归一化线性距离）；两者的
+//!   偏移自 R61 起为「坡度缩放 bias + 法线偏移」（逐级联 / 逐灯按纹素
+//!   世界尺寸缩放、常数 bias 只作下限——掠射角 acne 与接触阴影浮起同时
+//!   消除，`docs/shadow_v2.png` 四面板对照）；
 //! - HDR 中间缓冲 + ACES 色调映射 + 后处理链（泛光 / 曝光 / 暗角，
 //!   pass 串联框架：描述 → 编码 + ping-pong 中间纹理分配）；
 //! - 2D UI 叠加层（HUD）：屏幕空间彩色矩形 + 内嵌 font8x8 位图字体文本，
@@ -114,8 +118,12 @@ pub mod prelude {
     pub use crate::hand_ik::{HandIk, IkTarget, update_hand_ik};
     pub use crate::instance::InstanceRaw;
     pub use crate::light::{
-        DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_FACES, PointLight, cascade_fit,
-        cascade_splits, snap_aabb_to_texels,
+        CascadeFit, DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY,
+        POINT_SHADOW_BIAS_MIN, POINT_SHADOW_BUDGET, POINT_SHADOW_FACES, PointLight,
+        PointShadowCandidate, SHADOW_BIAS_LEGACY, SHADOW_BIAS_MIN, cascade_fit, cascade_fit_params,
+        cascade_splits, point_shadow_bias_meters, point_shadow_texel_world,
+        select_point_shadow_casters, shadow_bias_ndc, shadow_normal_offset_world, slope_tan,
+        snap_aabb_to_texels,
     };
     pub use crate::lightmap::{
         LIGHTMAP_DILATE_ITERATIONS, LightmapBinding, LightmapHandle, LightmapInstall, LightmapItem,

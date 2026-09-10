@@ -1161,8 +1161,8 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   历史版本曾把 `xy/w` 直接当 uv 用（缺 NDC→UV 变换），弱断言的差分测试
   没有抓住它，视觉放大后才定位到；修复已固化在 shader 注释里。
 - **比较**：遮挡判定 `d >= depth − bias`（清空值 1.0 = 远平面 = 无遮挡）；
-  bias 0.0015（正交投影 + 深度测试下的常数偏移，抑制 acne），
-  阴影暗部保留 45% 光照（`shadow_params.z`）。
+  bias 自 R61 起为**坡度缩放 + 常数下限**（见 §4.7.2「阴影偏移 v2」，
+  R29–R60 为常数 0.0015），阴影暗部保留 45% 光照（`shadow_params.z`）。
 - **覆盖范围（v1 单张）**：以注视点为中心、`shadow_range`（默认 24）为半边长的正交盒；
   光源相机沿光传播方向反向拉远 `2×range`，保证中心两侧 `±range` 的深度都落在 [0,1]。
   R29 起生产路径为级联阴影（CSM，见 §4.7.2），本节所述贴图形态/双附件/
@@ -1177,18 +1177,49 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
 - **透明几何不进阴影 pass**（R23）：收集期按 `alpha_mode` 分区，阴影
   只遍历不透明实例区间——半透明不应投实心阴影（语义与理由见 §4.16）。
 
-### 4.7.1 点光阴影（cubemap）
+### 4.7.1 点光阴影（cubemap 数组，预算化多盏，R61）
 
-- **范围（v1 限定）**：只有查询顺序中的**第一盏** `PointLight.shadows == true`
-  的点光投射阴影（收集后交换到 uniform 槽位 0，着色器只对 `i == 0` 采样）；
-  多盏开启时取首灯并 `log::warn`。cubemap 每灯 6 个 pass，多灯投影在路线图。
+- **范围（R61 起为预算化多盏）**：最多 `POINT_SHADOW_BUDGET = 4` 盏
+  `PointLight.shadows == true` 的点光**同时**投射 cubemap 阴影，各自
+  6 个捕获 pass + 一张 512² 面；超出预算的灯按确定性选择键裁掉并
+  `log::warn`（不是静默丢弃）。R61 之前（v1）只允许查询顺序中的**首盏**
+  生效，其余开启者被 warn 忽略。
+- **选择键（确定性）**：`(相机距离升序, 实体位模式升序)`
+  （`light::select_point_shadow_casters`，纯函数）——距离近的灯其阴影更
+  可能落在画面近处（cubemap 的角度分辨率与距离无关，屏幕空间重要性却
+  随距离迅速下降），并列时以 `Entity::to_bits()` 收尾使比较器成为**全序**：
+  结果只取决于灯集合本身，**与查询 / 插入顺序无关**（乱序插入的两次
+  世界选中同一批灯，单测与 GPU 测试双重守护）。选中者按选择键序占据
+  cubemap 数组槽位 0..n。只有一盏开启时选中结果与 v1 的「查询序首盏」
+  一致（只有一盏，任一确定性键都选中它）。
+- **uniform 布局（R61 调整，渲染内部契约）**：`PointLight` 从 2×vec4
+  扩到 3×vec4（新增 `shadow = (是否投影, cubemap 槽位, −, −)`），
+  `Globals` 512B → 640B，逐灯自带阴影开关与槽位——着色器不再假设
+  「i == 0 才有阴影」，也不再需要收集期把投影灯交换到槽位 0。
+  `point_shadow_params` 语义同步调整为（是否有投影灯, bias 常数下限,
+  坡度系数, 法线偏移系数），range 从「投影灯 range」改为**逐灯**
+  `color.w`（多盏各自的 range 不同）。**并行布局陷阱**：`skybox.wgsl`
+  为了让天空盒只读 `inv_view_proj` 而自持一份 `Globals` 前缀声明，
+  `point_lights` 的长度必须同步（8 × 3 = 24 个 vec4）——R61 实测漏改
+  一次，症状是天空整体错色（读到的 `inv_view_proj` 落在别的字段上），
+  现由 `pipeline.rs::skybox_globals_prefix_matches_standard_layout` 看门。
 - **归一化距离存储**：cubemap 的 `R32Float` 存
   `length(world_frag − light_pos) / range` 而非光空间 `z/w`——
   采样侧因此**无需任何光空间矩阵**：`normalize(world_pos − light_pos)` 直接
-  `textureSampleLevel(shadow_cube, ..., dir, 0.0)` 查 texel，比较
+  `textureSampleLevel(shadow_cube, ..., dir, layer, 0.0)` 查 texel，比较
   `stored >= dist/range − bias/range`（bias 以米存 uniform，比较时归一化）。
   捕获侧由片段着色器从插值世界坐标现算距离（距离函数非线性，顶点插值会在
   大三角形上产生米级误差）；清空值 1.0（= range/range）代表无遮挡。
+- **偏移 v2 的点光适配（R61）**：与方向光同两技术、同口径——
+  `bias_m = clamp(BIAS_MIN + SLOPE · texel_world(d) · tanθ, BIAS_MIN, MAX)`
+  其中 `texel_world(d) = d · 2/512`（90° 面摊在 512 纹素上，`d` = 片元到
+  灯的距离），`tanθ = tan(acos(NdotL))`（clamp 到 64）；采样点另沿**几何
+  法线**推移 `NORMAL · texel_world(d) · (1 − NdotL)`（上限 0.15 m）。
+  常数下限从 v1 的 0.03 m 降到 0.005 m（掠射角由坡度项承担）。点光是
+  **单采样**（无 PCF），纹素跨度内的深度变化上限就是 1 纹素 · tanθ，
+  故坡度系数取 1.0（方向光因 3×3 PCF 取 1.5）。**对照模式**
+  （`Renderer::set_legacy_shadow_bias`）把两个系数置零并写回 0.03 m
+  ⇒ 采样表达式与 v1 逐位等价（实测三个场景哈希相同）。
 - **面矩阵**：每面 `look_at(light_pos, light_pos + dir, up)` × 90° 透视
   （near 0.05、far = range，DirectX 深度 [0,1] 约定）；面序 = wgpu/OpenGL
   立方体层序 `[+X, −X, +Y, −Y, +Z, −Z]`，(dir, up) 取标准正交面集
@@ -1207,20 +1238,33 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   `Depth32Float` 深度附件（Less）并存，颜色附件的 texel 只在深度测试通过时
   更新，保证存最近遮挡物；没有深度测试时重叠表面按绘制顺序互相覆盖，
   背面值污染贴图（§4.7 的实证教训）。
-- **6 个渲染视图与 6 份独立 uniform**：采样视图 dimension Cube 一次创建；
-  渲染视图每面一个（D2 + `base_array_layer = i`）。每面参数（64B 面矩阵 +
-  16B 灯位置/range = 80B）放**独立小 uniform 缓冲**而非一份缓冲的六个插槽——
-  绑定偏移必须满足 min_uniform_buffer_offset_alignment（典型 256），且同一
-  submit 内对同一缓冲的多次 write_buffer 会在执行前全部合并（泛光参数教训，
+- **资源形态（R61）**：颜色与深度纹理都是 `512² × （预算 × 6）` 层的
+  `texture_2d_array`，采样侧用 `CubeArray` 视图（层 = 槽位 × 6 + 面序），
+  渲染侧每（槽位, 面）一个 D2 视图。**显存**：单盏 6 MiB 颜色 +
+  6 MiB 深度 = 12 MiB；预算 4 盏 = 48 MiB（净增 +36 MiB，对照方向光 CSM
+  的 96 MiB 固定开销，点光预算控制在 CSM 的一半）。预算做成**常量而非
+  资源**：纹理数组层数在 `Renderer::new` 固定，运行时调整需重建纹理与
+  24 个面视图 / 绑定组，收益远小于复杂度。
+- **每（槽位, 面）独立 uniform**：每面参数（64B 面矩阵 + 16B 灯位置/range
+  = 80B）放**独立小 uniform 缓冲**而非一份缓冲的多个插槽——绑定偏移必须
+  满足 min_uniform_buffer_offset_alignment（典型 256），且同一 submit 内
+  对同一缓冲的多次 write_buffer 会在执行前全部合并（泛光参数教训，
   §4.11）。全部 write_buffer 后随本帧统一 submit。
 - **uniform 控制流掩码**：采样在 `dist < range` 受光分支之外无条件执行
-  （`i == 0` 由均匀的 point_count 派生，分支均匀；`textureSampleLevel` 带
+  （逐灯开关与槽位都由 uniform 派生，分支均匀；`textureSampleLevel` 带
   显式 mip 不依赖导数），最后把阴影系数乘进该灯的 radiance——与
   `shadow_factor` 同款模式；超出 range 的片段不进受光分支，掩码自然为受光。
 - **捕获时的粗剔除**：实例包围球到灯的距离减去半径仍超出 range 的，六个
-  90° 面的并集（以灯为中心的完整球域）必不覆盖它，六面全部跳过；剔除只
-  影响阴影 pass 的绘制区间（可见性变化处拆分 run），不影响主 pass 合批。
-- 阴影只调制首盏点光的辐射度，不影响环境光 / 方向光 / 其余点光 / 自发光。
+  90° 面的并集（以灯为中心的完整球域）必不覆盖它，六面全部跳过；R61 起
+  **逐槽位**各自计算（各灯的 range / 位置不同），布局 = 槽位主序的一维
+  bool 表。剔除只影响阴影 pass 的绘制区间（可见性变化处拆分 run），
+  不影响主 pass 合批。
+- 每盏投影灯只调制**自己**的辐射度；不影响环境光 / 方向光 / 其余点光 /
+  自发光。无阴影点光走与 v1 完全相同的路径（逐位一致，见
+  `tests/shadow_v2_render.rs` 的「无阴影点光零变化」对照组）。
+- **v1 不做（→ §8.6）**：点光阴影仍为单采样硬边（无 PCF / PCSS）；灯数量
+  上限仍是 8（`MAX_POINT_LIGHTS`），预算选择只在进入 uniform 的前 8 盏内
+  进行；逐灯阴影图集化 / 软阴影在路线图。
 
 ### 4.7.2 方向光级联阴影（CSM v2，R29）
 
@@ -1252,13 +1296,43 @@ v1 的单张阴影贴图以注视点为中心、`shadow_range`（24 m）为半�
   采样相位只会整纹素跳变，视觉稳定。**Z（深度）不对齐**：深度只影响
   比较精度，无可见相位漂移。深度窗口向光/背光各外扩一个 AABB 包围球
   半径，保证切片外的遮挡物（高塔向切片投影）与足印内的地面都落在
-  窗口内；SHADOW_BIAS（NDC 常数 0.0015）对应的世界偏移 = 0.0015 ×
-  窗口宽，随级联变大（远级联接触阴影略有 peter-panning，v1 接受）。
-- **级联参数独立缓冲**：主 pass 片元需要 3 × 矩阵 + 相机前向 + 分割点
-  （224B `CsmParams`，globals 组 binding 8——排在现有最大 binding 7 之后，
-  **不扩 Globals**，Globals 反而因单一 `light_view_proj` 移除而从 576B
-  缩到 512B）；阴影 pass 每级联只读一个 64B 矩阵（一级联一缓冲，规避
-  同 submit 多次 write_buffer 合并问题，同 §4.7.1 面参数教训）。
+  窗口内；偏移口径见下「阴影偏移 v2」。
+- **阴影偏移 v2（坡度缩放 bias + 法线偏移，R61；闭合 §8.8）**：
+  常数 bias（v1 = 0.0015 NDC）必须按最坏情况（掠射角）取值，于是平地上
+  也吃下同样大的世界偏移——peter-panning 与「接触阴影浮起」的根源，且
+  掠射角仍会漏 acne（实测：无遮挡物的掠射角平面在 0.0015 下 12883 个
+  acne 像素）。v2 把偏移拆成两项，**逐级联按世界尺度缩放**：
+  ```text
+  texel_world   = max(对齐后 AABB 的 XY 跨度) / 2048      （米/纹素）
+  depth_window  = far − near                              （米）
+  k             = texel_world / depth_window              （每单位 tanθ 的 NDC 深度误差）
+  bias          = clamp(BIAS_MIN + SLOPE_SCALE · k · tanθ, BIAS_MIN, BIAS_MAX)
+  法线偏移       = min(NORMAL_SCALE · texel_world · (1 − NdotL), NORMAL_MAX)
+  采样点         = world_pos + 几何法线 · 法线偏移
+  ```
+  **推导**：接收面相对光源平面倾斜 θ 时，一个阴影图纹素跨度内的深度变化
+  = `texel_world · tanθ`（`tanθ = tan(acos(NdotL))`，clamp 到 64 防发散）；
+  最近邻比较下片段与该纹素的深度差就是这个量，3×3 PCF 的对角样本再乘
+  √2 ⇒ 系数取下界 √2 与实测值之间的 `SLOPE_SCALE = 1.5`。`BIAS_MIN`
+  保留常数项（**完全去掉常数会复发平地 acne**）但降到 0.0004（v1 的
+  1/3.75）；`BIAS_MAX = 0.02` 限制掠射极端退化为无影。
+  **法线偏移用几何法线**（不用法线贴图扰动后的着色法线：深度误差由光栅化
+  几何决定，高频抖动的法线只会给偏移量注入噪声、在凹凸面漏光）。
+  **逐级联缩放**：`texel_world` 与 `depth_window` 随级联增大（近 ≈ 16 mm /
+  101 m，远级联更大），CPU 由 `cascade_fit_params` 逐级联算出并放进
+  `CsmParams.cascade_texel / cascade_slope_k`（256B，+32B），着色器按片元
+  选中的级联动态索引。
+  **效果（同场景对照，逐位可复现）**：掠射角平面 acne 12883 px → **0**；
+  0.07 m 薄板的接触阴影在常数 bias 下**整条消失**（开/关阴影两帧逐位
+  相同），v2 保留 2591 px 且根部亮带 0 px（不浮起）。
+  **对照模式**：`Renderer::set_legacy_shadow_bias(true)` 把两个系数置零、
+  写回 v1 常数——采样路径与 R60 **逐位等价**（三个场景哈希实测相同），
+  供验收图左右面板与归因测试同一二进制内对照。
+- **级联参数独立缓冲**：主 pass 片元需要 3 × 矩阵 + 相机前向 + 分割点 +
+  逐级联的两个世界尺度（256B `CsmParams`，globals 组 binding 8——排在
+  现有最大 binding 7 之后，**不扩 Globals**）；阴影 pass 每级联只读一个
+  64B 矩阵（一级联一缓冲，规避同 submit 多次 write_buffer 合并问题，
+  同 §4.7.1 面参数教训）。
 - **片元级联选择**：`view_z = dot(world_pos − eye, cam_forward)`（**view
   深度**而非欧氏距离——欧氏距离在视锥边缘把近处片元误分到远级联；也
   不用 clip z——透视非线性，分割点得先换算）。`view_z < splits[i]` 即第
@@ -1267,12 +1341,16 @@ v1 的单张阴影贴图以注视点为中心、`shadow_range`（24 m）为半�
   事后混向「受光」（§4.7 的 uniform 控制流模式不变）。
 - **实例区间沿用主 pass**：三个级联 pass 复用主 pass 视锥剔除后的不透明
   实例区间全部重画（透明项与粒子不投影，语义不变）——保守不漏影；
-  按级联视锥再剔除是后续优化点。`FrameStats` 口径不变（阴影 pass 不计）。
+  按级联视锥再剔除是后续优化点。`FrameStats` 口径不变（阴影 pass 不计，
+  投影灯数单列在 `point_shadow_casters`）。
 - **测试**：`cascade_splits` 单调性/钳制/λ 混合生效、`snap_aabb_to_texels`
   对齐后跨度为 texel 整数倍/只扩不缩/幂等、`cascade_fit` 含住 8 角点/
-  光空间深度单调/亚纹素平移 UV 漂移 ≤ 2 texel（相位稳定性的数学形态）；
-  GPU 侧 `csm_render.rs` 大场景（~80 m）断言近/远级联物体脚下都有阴影、
-  级联边界两侧阴影带连续（无接缝）。
+  光空间深度单调/亚纹素平移 UV 漂移 ≤ 2 texel（相位稳定性的数学形态）、
+  `cascade_fit_params` 与 `cascade_fit` 矩阵逐位相同 + 逐级联世界尺度
+  单调（R61）；GPU 侧 `csm_render.rs` 大场景（~80 m）断言近/远级联物体
+  脚下都有阴影、级联边界两侧阴影带连续（无接缝），
+  `shadow_v2_snapshot` 另以「跨接缝剖线最小暗化 > 5/255、相邻采样跳变
+  < 1/255」量化验收图 ④。
 
 ### 4.8 MSAA 与深度
 
@@ -3283,18 +3361,27 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
    （点光场景 + HUD，`docs/web_preview.png`）。WebGL2 回退未启用
    （需非默认 `webgl` feature）；离屏渲染器在 web 不可用（恒 `None`）；
    `env_logger` 无输出。
-6. **点光阴影为 v1 限定**：只有查询顺序中的首盏 `shadows` 点光投影
-   （cubemap 每灯 6 个 pass，多灯投影在路线图）；单采样无 PCF，阴影边缘
-   为硬边；面矩阵约定（OpenGL 层序 + NDC y 翻转）依赖 GPU Cube 采样的
-   方向语义——更换图形栈或 wgpu 大版本时需重新验证
-   （集成测试 `face_orientation_matches_cube_sampling` 守护）。
+6. **点光阴影为 v2 预算化多盏**（R61 起）：最多 `POINT_SHADOW_BUDGET = 4`
+   盏 `shadows` 点光同时投影，超出预算按（相机距离升序, 实体位模式升序）
+   确定性裁掉并 warn；预算选择只在进入 uniform 的前
+   `MAX_POINT_LIGHTS = 8` 盏内进行。仍为**单采样无 PCF**（阴影边缘硬边，
+   无 PCSS / 接触硬化）；投影灯与普通灯共享同一 8 盏上限；面矩阵约定
+   （OpenGL 层序 + NDC y 翻转）依赖 GPU Cube 采样的方向语义——更换图形栈
+   或 wgpu 大版本时需重新验证（集成测试
+   `face_orientation_matches_cube_sampling` 守护）。逐灯阴影图集化、
+   软阴影、按级联视锥二次剔除均在路线图。
 7. **外部 HDR 环境源仅覆盖 Radiance .hdr 的 `-Y +X` equirectangular 形式**：
    其他分辨率朝向（±X ±Z 组合、垂直镜像）解析为 Unsupported；不读 `.exr` /
    `.ktx` 等其他 HDR 容器；超大图受设备纹理尺寸上限约束（Rgba16Float 中间
    纹理按原图尺寸上传）。程序化天空仍是缺席 `SkySource` 时的默认（零资产
    依赖）；烘焙在主线程同步执行，换入大贴图的当帧有一次性停顿。
-8. **阴影偏移为常数 bias**：无坡度缩放 / 法线偏移（normal offset），大入射角
-   掠射表面可能有轻微 acne；PCF 9 采样在实际场景中已足够干净。
+8. **阴影偏移 v2 的残留限制**（R61 闭合了「常数 bias」条目本身，留下
+   的是新口径的边界）：偏移量仍是**逐片元启发式**而非解析精确的
+   depth-range 重建——`BIAS_MAX = 0.02` / 法线偏移上限 0.15 m 在极端
+   掠射（NdotL < 0.05）与极远级联下会退化为「阴影变浅」而非「无影」，
+   属保守方向；点光阴影仍是单采样（无 PCF），其 bias 口径与方向光同构
+   但只有 1 纹素的容差余量。两者都不做 PCSS / 接触硬化软阴影、不做
+   阴影去噪、不做逐灯图集化（拒绝清单）。
 9. **动画**：骨骼蒙皮已覆盖刚性关节 LBS（GPU 蒙皮 + 蒙皮阴影）；形变目标、
    CUBICSPLAT 插值与关节非均匀缩放的精确法线变换在路线图中。
 10. **2D UI 为 v1**：无层级、无锚点、无剪裁（元素完全靠屏幕像素坐标手工

@@ -293,7 +293,12 @@ fn vignette_zero_and_absent_equal_nopass_bitwise() {
 /// 场景：地面 + 砖色立方体 + 金属圆柱 + 默认 IBL / 阴影 / 侧光，320×180，
 /// 泛光关闭）。DOF / MB 资源缺席或 enabled = false 时本帧哈希必须逐位
 /// 等于该值——两个新 pass「零开销默认路径」的硬约束。
-const R42_BASELINE_HASH: u64 = 0x609b_2457_f4d5_cd82;
+///
+/// **R61 重锁**：0x609b_2457_f4d5_cd82 → 0xe51d_b127_6079_ce39（与
+/// `normal_render.rs` 交叉一致）。归因证据见 `normal_render.rs` 同名常量
+/// 的注释：阴影关闭对照组在 R61 前后逐位一致、对照模式逐位复现 R60，
+/// 本值变化只来自阴影偏移口径（R61 阴影 v2）。
+const R42_BASELINE_HASH: u64 = 0xe51d_b127_6079_ce39;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

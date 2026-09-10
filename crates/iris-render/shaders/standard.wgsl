@@ -1,8 +1,11 @@
 // Iris 标准材质着色器：Cook-Torrance PBR（金属度/粗糙度工作流）。
 // 照明 = 环境光（Lambert 近似）+ 1 个方向光 + 最多 8 个点光（物理平方衰减）。
-// 方向光带级联阴影 CSM v2（R29）：3 层 2D 数组深度贴图（R 通道存光空间
-// 深度），片元按 view 深度选级联后做 3×3 手工比较 PCF；首盏点光带
-// cubemap 阴影贴图（R 通道存归一化线性距离，单采样无 PCF）。
+// 方向光带级联阴影 CSM v2（R29）：3 层 2D 数组深度贴图（R通道存光空间
+// 深度），片元按 view 深度选级联后做 3×3 手工比较 PCF；点光带 cubemap
+// **数组**阴影贴图（R61 预算化多盏：逐灯开关 + 槽位，R 通道存归一化线性
+// 距离，单采样无 PCF）。
+// 两处阴影偏移自 R61 起为「坡度缩放 bias + 法线偏移」（v2，见
+// slope_tan / shadow_factor / 点光循环的注释），常数 bias 只作下限。
 // 渲染在线性 HDR 空间，色调映射由 blit pass 完成。
 // 实例化绘制：每个实例携带模型矩阵（4 个 vec4 列）与法线矩阵（3 个 vec4 列）。
 
@@ -11,6 +14,10 @@ struct PointLight {
     position: vec4<f32>,
     // rgb: 颜色 × 强度, w: 有效半径
     color: vec4<f32>,
+    // x: 是否投射 cubemap 阴影（1/0）, y: cubemap 数组槽位（0..预算-1）,
+    // z/w: 保留。R61 起阴影参数逐灯携带——多盏点光各投各影，v1 的
+    // 「只对 i==0 采样」限制废止。
+    shadow: vec4<f32>,
 };
 
 struct Globals {
@@ -26,18 +33,21 @@ struct Globals {
     // x: 实际点光数量
     point_count: vec4<f32>,
     point_lights: array<PointLight, 8>,
-    // x: 阴影贴图 texel 尺寸(1/2048), y: 深度偏移 bias, z: 阴影强度, w: 是否启用
+    // x: 阴影贴图 texel 尺寸(1/2048), y: bias 常数下限, z: 阴影强度,
+    // w: 是否启用（R61：y 从 v1 的常数 bias 降为下限，坡度项另加）
     shadow_params: vec4<f32>,
     // x: 预滤波环境最大 mip 级, y: IBL 强度
     env_params: vec4<f32>,
     // 天空盒射线重建用（clip -> world）
     inv_view_proj: mat4x4<f32>,
-    // x: 是否启用点光阴影, y: bias（米）, z: 投影灯 range, w: 保留
+    // x: 是否有投影灯（全局掩码；逐灯开关看 point_lights[i].shadow.x）,
+    // y: 点光 bias 常数下限（米）, z: 坡度缩放系数（对照模式为 0）,
+    // w: 法线偏移系数（对照模式为 0）——R61
     point_shadow_params: vec4<f32>,
 };
 
-// 级联阴影参数（224 字节，POD；独立 uniform 缓冲，不占 Globals）。
-// 与 Rust 侧 CsmParamsRaw 逐字段对齐（array<mat4,3> = 192B + 2×vec4）。
+// 级联阴影参数（256 字节，POD；独立 uniform 缓冲，不占 Globals）。
+// 与 Rust 侧 CsmParamsRaw 逐字段对齐（array<mat4,3> = 192B + 4×vec4）。
 struct CsmParams {
     // 每级联的光空间视图投影矩阵（世界 -> 第 i 级光源裁剪空间）
     view_proj: array<mat4x4<f32>, 3>,
@@ -46,6 +56,12 @@ struct CsmParams {
     // x/y/z: 级联分割点（沿相机前向的距离，递增；与 CPU cascade_splits
     // 同源），w: 保留。级联 i 覆盖 [splits[i-1], splits[i]]。
     splits: vec4<f32>,
+    // x/y/z: 每级联一个纹素的世界边长（米；与 CPU CascadeFit::texel_world
+    // 同源），w: 保留。法线偏移量 = 该值 × 系数 × (1 − NdotL)。
+    cascade_texel: vec4<f32>,
+    // x/y/z: 每级联的 texel_world / depth_window（NDC 深度误差随 tanθ 的
+    // 斜率），w: 保留。bias 坡度项 = 该值 × 系数 × tanθ。
+    cascade_slope_k: vec4<f32>,
 };
 
 struct MaterialParams {
@@ -55,6 +71,24 @@ struct MaterialParams {
     // w: 光照贴图掩码（R52c，1 = 间接光取光照贴图、0 = 取 IBL 环境）
     surface: vec4<f32>,
 };
+
+// ---- 阴影偏移 v2 的着色器侧常量（R61，与 light.rs 同名常量一一对应）----
+
+// 坡度缩放 bias 系数（× texel_world / depth_window × tanθ）
+const SHADOW_SLOPE_SCALE: f32 = 1.5;
+// bias 上限（NDC）：tanθ 在掠射极端发散，不封顶会让掠射面退化为无影
+const SHADOW_BIAS_MAX: f32 = 0.02;
+// 法线偏移系数（× texel_world × (1 − NdotL)）与世界上限（米）
+const SHADOW_NORMAL_SCALE: f32 = 1.5;
+const SHADOW_NORMAL_MAX: f32 = 0.15;
+// tan(acos(NdotL)) 的数值上限：clamp 保证「系数 × tan」不产生 Inf/NaN
+// （对照模式下系数为 0，Inf 会给出 NaN 并把整帧判成阴影）
+const SHADOW_TAN_MAX: f32 = 64.0;
+// 点光 bias 的米制上限，与点光法线偏移的世界上限
+const POINT_SHADOW_BIAS_MAX: f32 = 0.5;
+const POINT_SHADOW_NORMAL_MAX: f32 = 0.15;
+// 点光 cubemap 一个纹素在距离 d 处的世界边长：90° 面视锥摊在 512 个纹素上
+const POINT_SHADOW_TEXEL_SCALE: f32 = 2.0 / 512.0;
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 // 级联阴影贴图：R32Float 2D 数组，层序 = 级联序（R 通道存光空间深度，
@@ -67,9 +101,10 @@ struct MaterialParams {
 @group(0) @binding(4) var env_map: texture_cube<f32>;
 @group(0) @binding(5) var brdf_lut: texture_2d<f32>;
 @group(0) @binding(6) var env_sampler: sampler;
-// 点光 cubemap 阴影贴图（R 存归一化线性距离 length(world-light)/range，
-// 清空值 1.0 = 无遮挡）。
-@group(0) @binding(7) var point_shadow_cube: texture_cube<f32>;
+// 点光 cubemap 阴影贴图**数组**（R61）：R 存归一化线性距离
+// length(world-light)/range（清空值 1.0 = 无遮挡），层 = 槽位 × 6 + 面，
+// 逐灯按 point_lights[i].shadow.y 选 cube。
+@group(0) @binding(7) var point_shadow_cube: texture_cube_array<f32>;
 // 级联阴影参数（排在现有最大 binding 7 之后，不扩 Globals）
 @group(0) @binding(8) var<uniform> csm: CsmParams;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
@@ -240,23 +275,44 @@ fn pbr_light(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
     return (kd * albedo / 3.14159265 + specular) * radiance * nol;
 }
 
-/// 级联阴影采样（CSM v2）：按片元的 view 深度选级联，用该级联的光空间
-/// 矩阵投影后做 3×3 PCF 百分比渐近软阴影（R 通道存光源空间深度，清空值
-/// 1.0 代表无遮挡）。返回阴影后保留的光照比例。
+/// `tan(acos(NdotL))` 的保守取值（clamp 到 SHADOW_TAN_MAX）。
+///
+/// 坡度缩放 bias 的核心量：接收面相对光源平面的倾角 θ 使「一个阴影图纹素
+/// 跨度内的深度变化」= texel_world · tanθ，这正是最近邻比较下的自遮挡量
+/// （acne）。NdotL → 0 时 tan 发散，clamp 到 64（≈ NdotL ≥ 0.016）既保
+/// 有界、也避免 `系数 × tan` 在对照模式（系数 = 0）下产生 NaN。
+fn slope_tan(nol: f32) -> f32 {
+    let n = max(nol, 0.0);
+    return min(sqrt(max(1.0 - n * n, 0.0)) / max(n, 1e-4), SHADOW_TAN_MAX);
+}
+
+/// 级联阴影采样（CSM v2 + 阴影偏移 v2）：按片元的 view 深度选级联，
+/// 用该级联的光空间矩阵投影后做 3×3 PCF 百分比渐近软阴影（R 通道存光源
+/// 空间深度，清空值 1.0 代表无遮挡）。返回阴影后保留的光照比例。
 ///
 /// **级联选择用 view 深度**（世界位置到相机的前向投影距离
 /// `dot(world_pos − eye, cam_forward)`），而非欧氏距离——欧氏距离在视锥
 /// 边缘会把本属近级联的片元误分到远级联；也不直接用 clip z（透视下
 /// 非线性，分割点得先在 CPU 做一次非线性换算，view 深度更直白）。
 /// 选择条件与 CPU 分割同源：`view_z < splits[i]` 即落入第 i 级。
+/// 级联选择用**原始**世界位（法线偏移只作用于投影采样点，不改变片元的
+/// 深度归属——否则边界处的片元会随偏移在级联间跳变）。
 ///
 /// **越最远级联（view_z ≥ splits.z，即超过 SHADOW_DISTANCE 覆盖带）的
 /// 片元不投影、保持受光**（lit = 1）——级联只铺到覆盖距离。
 ///
+/// **阴影偏移 v2（R61）**：`bias = clamp(bias_min + SLOPE_SCALE · k · tanθ,
+/// bias_min, BIAS_MAX)`（k = texel_world / depth_window，逐级联取自
+/// `csm.cascade_slope_k`），采样点另沿几何法线推移
+/// `NORMAL_SCALE · texel_world · (1 − NdotL)`（`csm.cascade_texel`）。
+/// 两项都由 CPU 逐级联算好世界尺度后传入——级联越远纹素越大、深度窗口
+/// 越宽，偏移量随之缩放，平地上则退回常数下限（v1 的 0.0015 降到
+/// 0.0004，peter-panning 相应缩小）。
+///
 /// textureSample 要求 uniform 控制流，因此级联越界/阴影关闭都不做提前
 /// 返回：级联序号钳制在 [0, 2] 后照常采样，最后用掩码把结果混向「受光」。
 /// 阴影相机覆盖范围外（NDC/深度越界，含光空间背后）的片段同样混向受光。
-fn shadow_factor(world_pos: vec3<f32>) -> f32 {
+fn shadow_factor(world_pos: vec3<f32>, n_geo: vec3<f32>, l: vec3<f32>) -> f32 {
     let view_z = dot(world_pos - globals.eye_pos.xyz, csm.cam_forward.xyz);
     var cascade = 2u;
     if (view_z < csm.splits.x) {
@@ -265,7 +321,17 @@ fn shadow_factor(world_pos: vec3<f32>) -> f32 {
         cascade = 1u;
     }
     let beyond = view_z >= csm.splits.z || globals.shadow_params.w < 0.5;
-    let sp = csm.view_proj[cascade] * vec4<f32>(world_pos, 1.0);
+    // 偏移 v2：坡度缩放 bias（法线入射角越大偏移越大）+ 法线偏移
+    let nol = max(dot(n_geo, l), 0.0);
+    let texel_w = csm.cascade_texel[cascade];
+    let bias = clamp(
+        globals.shadow_params.y
+            + SHADOW_SLOPE_SCALE * csm.cascade_slope_k[cascade] * slope_tan(nol),
+        globals.shadow_params.y,
+        SHADOW_BIAS_MAX,
+    );
+    let n_off = min(SHADOW_NORMAL_SCALE * texel_w * (1.0 - nol), SHADOW_NORMAL_MAX);
+    let sp = csm.view_proj[cascade] * vec4<f32>(world_pos + n_geo * n_off, 1.0);
     let w = max(sp.w, 1e-6);
     let ndc = sp.xy / w;
     let depth = sp.z / w;
@@ -280,8 +346,8 @@ fn shadow_factor(world_pos: vec3<f32>) -> f32 {
             let d = textureSample(shadow_map, shadow_sampler,
                                   uv + vec2<f32>(f32(dx), f32(dy)) * texel,
                                   i32(cascade)).r;
-            // 遮挡物深度 >= 片段参考深度 -> 未被遮挡
-            lit = lit + select(0.0, 1.0, d >= depth - globals.shadow_params.y);
+            // 遮挡物深度 >= 片段参考深度 - bias -> 未被遮挡
+            lit = lit + select(0.0, 1.0, d >= depth - bias);
         }
     }
     lit = lit / 9.0;
@@ -359,41 +425,60 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // perturbed_normal 的逐位一致说明），归一化只在此处做一次，
     // 与 R41 的 normalize(in.world_normal) 同构。
     let n = normalize(perturbed_normal(in, in.world_normal));
+    // 阴影偏移 v2 用**几何法线**（而非扰动后的着色法线）：深度误差由
+    // 光栅化几何决定，用逐纹素高频抖动的法线贴图法线只会给偏移量注入
+    // 噪声（凹凸面出现漏光条纹）。归一化一次供两处阴影共用。
+    let n_geo = normalize(in.world_normal);
     let v = normalize(globals.eye_pos.xyz - in.world_pos);
 
     // 方向光（受级联阴影遮挡）
     let l = normalize(globals.light_dir.xyz);
-    let sun = shadow_factor(in.world_pos);
+    let sun = shadow_factor(in.world_pos, n_geo, l);
     let radiance = globals.light_color.rgb * sun;
     var color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
 
-    // 点光：物理平方衰减 + range 平滑窗口；首灯（i==0）受 cubemap 阴影调制
+    // 点光：物理平方衰减 + range 平滑窗口；投影灯（预算内多盏）各自受
+    // 自己的 cubemap 阴影调制
     let count = u32(globals.point_count.x);
     for (var i = 0u; i < count; i = i + 1u) {
         let light = globals.point_lights[i];
         let to_light = light.position.xyz - in.world_pos;
         let dist = length(to_light);
+        let lp = to_light / max(dist, 1e-4);
 
-        // 点光阴影系数：只有查询顺序中的第 0 盏点光投射 cubemap 阴影（v1 限定）。
-        // 采样在 `dist < range` 分支之外无条件执行（textureSample 系要求均匀
-        // 控制流的掩码模式，与 shadow_factor 一致）；i==0 与开关掩码都由
-        // uniform 派生，分支本身均匀。textureSampleLevel 带显式 mip 不依赖导数。
-        // 采样方向 = 从灯指向片段的归一化方向——Cube 按此方向查 texel，
-        // 与捕获面矩阵的方向约定（POINT_SHADOW_FACES + NDC y 翻转）配对。
-        // 超出 range 的片段不会进入受光分支（掩码自然混向受光），贴图清空值
-        // 1.0（= range/range）代表无遮挡。
+        // 点光阴影系数（R61 预算化多盏）：逐灯读 light.shadow.x（0/1 开关）
+        // 与 light.shadow.y（cubemap 数组槽位），对对应 cube 单采样（无 PCF）。
+        // 采样在 `dist < range` 分支之外无条件执行（textureSampleLevel 带
+        // 显式 mip 不依赖导数，掩码模式与 shadow_factor 一致）；开关与槽位
+        // 都由 uniform 派生，分支本身均匀。
+        // 偏移 v2：bias = clamp(bias_min + 坡度系数 · texel_world(dist) · tanθ,
+        // bias_min, MAX)，texel_world(dist) = dist · 2/512（90° 面摊在 512
+        // 纹素上）；采样点沿几何法线推移「法线偏移系数 · texel_world ·
+        // (1 − NdotL)」——两项的系数由 uniform 给出（对照模式为 0）。
+        // 比较口径与 v1 一致：bias 以米存、除以 range 后与归一化距离比较。
         var shadow = 1.0;
-        if (i == 0u && globals.point_shadow_params.x > 0.5) {
-            let dir = (in.world_pos - light.position.xyz) / max(dist, 1e-4);
-            let stored = textureSampleLevel(point_shadow_cube, shadow_sampler, dir, 0.0).r;
-            let range = max(globals.point_shadow_params.z, 1e-4);
-            // bias 以米存储，除以 range 归一化到距离值域后再比较
-            let biased = dist / range - globals.point_shadow_params.y / range;
-            shadow = select(0.0, 1.0, stored >= biased);
+        if (light.shadow.x > 0.5) {
+            let nol = max(dot(n_geo, lp), 0.0);
+            let texel_w = dist * POINT_SHADOW_TEXEL_SCALE;
+            let bias_m = clamp(
+                globals.point_shadow_params.y
+                    + globals.point_shadow_params.z * texel_w * slope_tan(nol),
+                globals.point_shadow_params.y,
+                POINT_SHADOW_BIAS_MAX,
+            );
+            let n_off = min(
+                globals.point_shadow_params.w * texel_w * (1.0 - nol),
+                POINT_SHADOW_NORMAL_MAX,
+            );
+            let dir = (in.world_pos + n_geo * n_off - light.position.xyz)
+                / max(dist, 1e-4);
+            let range = max(light.color.w, 1e-4);
+            let stored = textureSampleLevel(point_shadow_cube, shadow_sampler, dir,
+                                            i32(light.shadow.y), 0.0).r;
+            shadow = select(0.0, 1.0, stored >= dist / range - bias_m / range);
         }
 
         if (dist < light.color.w) {
-            let lp = to_light / max(dist, 1e-4);
             let t = dist / light.color.w;
             let window = 1.0 - t * t;
             let atten = (window * window) / max(dist * dist, 0.01);

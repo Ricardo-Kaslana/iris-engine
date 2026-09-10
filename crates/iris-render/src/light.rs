@@ -8,6 +8,200 @@ use crate::pipeline::{SHADOW_CASCADES, SHADOW_DISTANCE, SHADOW_MAP_SIZE};
 /// 单帧允许的最大点光数量（uniform 数组容量，超出部分被忽略并记录日志）。
 pub const MAX_POINT_LIGHTS: usize = 8;
 
+/// 点光阴影**预算**（R61）：允许同时投射 cubemap 阴影的点光盏数上限。
+///
+/// **取 4 的理由**：单盏 cubemap 的分辨率与 v1 完全一致（512² × 6 面，
+/// 逐灯质量零回归），代价只随盏数线性增长——4 盏 = 每帧 24 个阴影 pass
+/// 与 48 MiB 显存（24 MiB `R32Float` 颜色 + 24 MiB `Depth32Float`，
+/// v1 单盏 12 MiB，净增 +36 MiB）；对照方向光 CSM 的固定开销
+/// （2048² × 3 层双附件 = 96 MiB），点光阴影总预算控制在 CSM 的一半，
+/// 「低占用」卖点不失守。预算**常量而非资源**：显存分配发生在
+/// `Renderer::new`（纹理数组层数固定），做成运行时可调需要重建纹理与
+/// 全部 24 个面视图 / 绑定组，收益（多一盏少一盏）远小于复杂度；
+/// 超出预算的灯由 [`select_point_shadow_casters`] 按确定性选择键裁掉并
+/// 记录日志（不是静默丢弃）。
+pub const POINT_SHADOW_BUDGET: usize = 4;
+
+// ═══════════════════════════════════════════════════════════════════════
+// 阴影偏移 v2（R61）：坡度缩放 bias + 法线偏移
+//
+// R60 之前两处阴影都是**常数 bias**（CSM 0.0015 NDC、点光 0.03 m）：
+// 常数必须按最坏情况（掠射角）取值，于是平地上吃下与掠射角同样的偏移
+// ——peter-panning 与「接触阴影浮起」的根源（ARCHITECTURE §8.8 曾列为
+// 已知限制）。v2 把偏移拆成两项：
+//
+//   1. **坡度缩放 bias**：`bias ∝ tan(acos(NdotL))`——
+//      经典推导：接收面相对光源平面的倾角 θ 使「一个阴影图纹素跨度内的
+//      深度变化」= `texel_world · tanθ`；用最近邻采样时片段与纹素中心的
+//      光空间 XY 相差最多半纹素、3×3 PCF 最多 1.5 纹素（对角样本到
+//      1.41 纹素），所以要压住自遮挡，NDC 深度容差须 ≥
+//      `SLOPE_SCALE · (texel_world / depth_window) · tanθ`。
+//      与常数项取 max/相加并 clamp 到 [下限, 上限]：下限 = 常数 bias
+//      （平地与数值噪声的兜底，完全去掉常数会复发平地 acne），上限
+//      限制 tanθ → ∞（掠射极端）时的 peter-panning。
+//   2. **法线偏移（normal offset）**：采样点沿**几何法线**推移
+//      `texel_world · NORMAL_SCALE · (1 − NdotL)`。它同时移动采样点的
+//      光空间 XY 与深度：对掠射面（NdotL → 0）把采样点推离接收面，
+//      等效深度余量随 tanθ 增长，正是坡度项之外的第二道保险；
+//      `(1 − NdotL)` 因子保证垂直入射时偏移归零（不引入接触阴影浮起）。
+//      上限 `SHADOW_NORMAL_MAX_WORLD` 约束远级联（纹素世界尺寸 ~0.09 m）
+//      的偏移量，避免远级联接触阴影被推走。
+//
+// 几何法线（而非法线贴图扰动后的着色法线）参与这两项：深度误差由
+// **光栅化几何**决定，扰动后的法线逐纹素高频抖动只会给偏移量注入噪声
+// （凹凸面上出现漏光条纹）。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 方向光阴影 bias 的常数下限（NDC 深度单位）。
+///
+/// v1 的常数 0.0015 必须按掠射角取值；v2 把它降到 0.0004 —— 掠射角由
+/// 坡度项与法线偏移承担，平地上的固定 peter-panning 随之缩小到约 1/4。
+/// 保留下限而非归零：R32Float 深度虽精确，但「原地平面对自身的最近邻
+/// 比较」仍有浮点与光栅化量化残差（实测归零后平地上出现零星 acne）。
+pub const SHADOW_BIAS_MIN: f32 = 0.0004;
+
+/// v1 的常数 bias（NDC）：R61 起仅由**对照模式**使用
+/// （`Renderer::set_legacy_shadow_bias`，归因测试与验收图左侧面板）。
+pub const SHADOW_BIAS_LEGACY: f32 = 0.0015;
+
+/// 坡度缩放 bias 的系数（无量纲）：乘 `texel_world / depth_window · tanθ`。
+///
+/// 1.5 的来历：3×3 PCF 的对角样本距片段最多 1.41 纹素（`√2`），取 1.5
+/// 留浮点与纹素对齐（`snap_aabb_to_texels` 只扩不缩，实际纹素略大于
+/// 拟合值）的余量；理论下界 `√2` 与实测（掠射角场景 0 像素 acne）
+/// 一致。
+pub const SHADOW_SLOPE_SCALE: f32 = 1.5;
+
+/// 方向光阴影 bias 的上限（NDC 深度单位）。
+///
+/// `tanθ` 在 NdotL → 0 时发散（法线偏移同样发散），不设上界会让掠射面
+/// 的阴影整体退化成「无影」。0.02 ≈ 下限的 50 倍，实测只在大入射角
+/// （NdotL < 0.1）逼近。
+pub const SHADOW_BIAS_MAX: f32 = 0.02;
+
+/// 法线偏移系数（无量纲）：乘 `texel_world · (1 − NdotL)`。
+pub const SHADOW_NORMAL_SCALE: f32 = 1.5;
+
+/// 法线偏移的世界空间上限（米）：约束远级联（纹素 ~0.09 m）的偏移量。
+pub const SHADOW_NORMAL_MAX_WORLD: f32 = 0.15;
+
+/// `tan(acos(NdotL))` 的数值上限（防 0 除与 Inf 传播：NdotL → 0 时
+/// `sqrt(1−x²)/x` 发散，clamp 后保证 bias 有界且 `0 × Inf` 不产生 NaN
+/// ——对照模式下坡度系数为 0，NaN 会让整帧变黑）。
+pub const SHADOW_TAN_MAX: f32 = 64.0;
+
+/// 点光阴影 bias 的常数下限（米）。
+///
+/// v1 的 0.03 m 是为「距离值域大 + 掠射面」一次取足的常数；v2 降到
+/// 0.005 m（归一化值域下 0.005/range），掠射角由坡度项承担。
+pub const POINT_SHADOW_BIAS_MIN: f32 = 0.005;
+
+/// v1 的点光常数 bias（米）：R61 起仅由对照模式使用。
+pub const POINT_SHADOW_BIAS_LEGACY: f32 = 0.03;
+
+/// 点光阴影 bias 的米制上限（防掠射极端退化为无影）。
+pub const POINT_SHADOW_BIAS_MAX: f32 = 0.5;
+
+/// 点光坡度缩放系数（无量纲）：乘 `texel_world(dist) · tanθ`（米）。
+///
+/// 点光阴影是**单采样**（无 PCF），纹素跨度内的深度变化上限就是
+/// 1 纹素 · tanθ，故系数取 1.0（方向光因 3×3 PCF 取 1.5）。
+pub const POINT_SHADOW_SLOPE_SCALE: f32 = 1.0;
+
+/// 点光法线偏移系数（无量纲）：乘 `texel_world(dist) · (1 − NdotL)`。
+pub const POINT_SHADOW_NORMAL_SCALE: f32 = 1.0;
+
+/// 点光法线偏移的世界空间上限（米）。
+pub const POINT_SHADOW_NORMAL_MAX_WORLD: f32 = 0.15;
+
+/// `tan(acos(NdotL))` 的保守取值（clamp 到 [`SHADOW_TAN_MAX`]）。
+///
+/// 与 WGSL 侧 `slope_tan` 同式同序（同样的 `sqrt` + `min/max`），
+/// 单测钉住分段行为（单调、端点、clamp）。
+pub fn slope_tan(nol: f32) -> f32 {
+    let n = nol.max(0.0);
+    ((1.0 - n * n).max(0.0).sqrt() / n.max(1e-4)).min(SHADOW_TAN_MAX)
+}
+
+/// 方向光阴影的 NDC 深度容差（bias）——坡度缩放 + 常数下限 + 上限。
+///
+/// ```text
+/// bias = clamp(BIAS_MIN + SLOPE_SCALE · (texel_world / depth_window) · tanθ,
+///              BIAS_MIN, BIAS_MAX)
+/// ```
+///
+/// `texel_world` = 该级联阴影图一个纹素的世界边长（米），
+/// `depth_window` = 该级联正交投影的深度窗口宽度（米，NDC 0..1 跨一个
+/// 窗口）——两者都由 [`cascade_fit_params`] 逐级联给出（级联越远纹素越
+/// 大、窗口越宽，比值随之变化，这正是「偏移量逐级联缩放」的载体）。
+pub fn shadow_bias_ndc(nol: f32, texel_world: f32, depth_window: f32) -> f32 {
+    let slope = SHADOW_SLOPE_SCALE * (texel_world / depth_window.max(1e-6)) * slope_tan(nol);
+    (SHADOW_BIAS_MIN + slope).clamp(SHADOW_BIAS_MIN, SHADOW_BIAS_MAX)
+}
+
+/// 方向光阴影的法线偏移量（世界米）：`NORMAL_SCALE · texel_world · (1 − NdotL)`，
+/// 上限 [`SHADOW_NORMAL_MAX_WORLD`]。
+pub fn shadow_normal_offset_world(nol: f32, texel_world: f32) -> f32 {
+    (SHADOW_NORMAL_SCALE * texel_world * (1.0 - nol.max(0.0))).min(SHADOW_NORMAL_MAX_WORLD)
+}
+
+/// 点光 cubemap 的纹素世界边长（米）：90° 面视锥摊在
+/// [`crate::pipeline::POINT_SHADOW_MAP_SIZE`] 个纹素上 ⇒ 距离 d 处
+/// `d · 2 / 512 = d / 256`。
+pub fn point_shadow_texel_world(dist: f32) -> f32 {
+    dist * 2.0 / crate::pipeline::POINT_SHADOW_MAP_SIZE as f32
+}
+
+/// 点光阴影的米制 bias——与 [`shadow_bias_ndc`] 同构，只是「深度」为
+/// 线性距离（米）而非 NDC：`clamp(MIN + SLOPE · texel_world · tanθ, MIN, MAX)`。
+/// 着色器侧把它除以 range 归一化到贴图存储的距离值域（口径与 v1 一致）。
+pub fn point_shadow_bias_meters(nol: f32, dist: f32) -> f32 {
+    let slope = POINT_SHADOW_SLOPE_SCALE * point_shadow_texel_world(dist) * slope_tan(nol);
+    (POINT_SHADOW_BIAS_MIN + slope).clamp(POINT_SHADOW_BIAS_MIN, POINT_SHADOW_BIAS_MAX)
+}
+
+/// 点光阴影的法线偏移量（世界米）。
+pub fn point_shadow_normal_offset_world(nol: f32, dist: f32) -> f32 {
+    (POINT_SHADOW_NORMAL_SCALE * point_shadow_texel_world(dist) * (1.0 - nol.max(0.0)))
+        .min(POINT_SHADOW_NORMAL_MAX_WORLD)
+}
+
+/// 点光阴影投射器的一个候选（选择键的输入）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointShadowCandidate {
+    /// 灯实体句柄的位模式（`Entity::to_bits`）——选择键的**最终**并列断言，
+    /// 保证全序与收集顺序无关。
+    pub entity_bits: u64,
+    /// 灯世界位置到相机 eye 的距离（米）。
+    pub eye_distance: f32,
+}
+
+/// 预算化点光阴影的**确定性选择键**（R61）。
+///
+/// 键 = （相机距离升序, 实体位模式升序）——距离越近的灯其阴影越可能落在
+/// 画面中心与近处（点光 cubemap 的角度分辨率与距离无关，屏幕空间重要性
+/// 却随距离迅速下降），距离并列时以实体位模式收尾使比较器成为**全序**：
+/// 结果只取决于灯集合本身，与查询 / 插入顺序无关（乱序插入的两次世界
+/// 选中同一批灯，`shadow_v2_render.rs` 的确定性测试守护）。
+///
+/// 返回选中候选在入参切片中的下标，已按选择键升序（= cubemap 数组槽位
+/// 序）。`candidates.len() <= budget` 时全选——单盏阴影场景因此与 v1
+/// 选中同一盏灯（v1 取查询序首盏；只有一盏时两者必然一致）。
+pub fn select_point_shadow_casters(
+    candidates: &[PointShadowCandidate],
+    budget: usize,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| {
+        candidates[a]
+            .eye_distance
+            .total_cmp(&candidates[b].eye_distance)
+            .then_with(|| candidates[a].entity_bits.cmp(&candidates[b].entity_bits))
+    });
+    order.truncate(budget);
+    order
+}
+
 /// 级联分割的 PFS（Practical Split Scheme）混合系数 λ：`split_i` 由
 /// 对数分割（近处密、远处疏，精度最优）与线性分割（均匀，远级联不至
 /// 过宽）按 `λ` 权重混合——0.6 是大场景下近级联分辨率与远级联覆盖的
@@ -151,6 +345,26 @@ pub fn snap_aabb_to_texels(min: Vec2, max: Vec2, map_size: u32) -> (Vec2, Vec2) 
     )
 }
 
+/// 单级联拟合的完整产物（R61）：光空间矩阵 + 阴影偏移 v2 需要的两个
+/// 世界尺度。
+///
+/// 矩阵与 R29 的 [`cascade_fit`] 返回值逐位相同（同一算式同一顺序）；
+/// 新增的两个尺度只服务于坡度缩放 bias 与法线偏移——**级联越远纹素世界
+/// 尺寸越大、深度窗口越宽**，两者相除得到该级联「每单位 tanθ 的 NDC
+/// 深度误差」，是偏移量逐级联缩放的唯一依据。
+#[derive(Clone, Copy, Debug)]
+pub struct CascadeFit {
+    /// 光空间视图投影矩阵（世界 → 本级联光源裁剪空间）。
+    pub view_proj: Mat4,
+    /// 一个阴影图纹素的世界边长（米）：XY 两轴取较大者（保守——3×3 PCF
+    /// 的偏移在 UV 两轴上同尺度，世界位移由较大的纹素主导），
+    /// 用纹素对齐**之后**的 AABB 跨度计算。
+    pub texel_world: f32,
+    /// 正交投影深度窗口宽度（米）：NDC 0..1 对应 `depth_window` 米，
+    /// 故世界偏移 → NDC 偏移的换算系数是 `1 / depth_window`。
+    pub depth_window: f32,
+}
+
 /// 单级联的正交拟合（CSM 核心，纯函数）：取相机视锥深度片
 /// `[z_start, z_end]`（沿相机 forward 的距离，正数）的 8 个角点，
 /// 变换到光空间求 AABB，纹素对齐 XY 后构造正交视图投影矩阵。
@@ -166,15 +380,18 @@ pub fn snap_aabb_to_texels(min: Vec2, max: Vec2, map_size: u32) -> (Vec2, Vec2) 
 ///   各外扩 `r`（`near = l_min − r`、`far = l_max + r`，`l` 为沿光方向
 ///   深度）。外扩保证切片内几何之外的遮挡物（如高塔向切片内投影）与
 ///   切片 XY 足印内的地面都落在深度窗口内；窗口宽 = 切片深度跨度 +
-///   2r，与 SHADOW_BIAS（NDC 常数偏移）相乘的世界偏移量因此有界。
-pub fn cascade_fit(
+///   2r，与常数偏移相乘的世界偏移量因此有界。
+///
+/// R61 起返回 [`CascadeFit`]（矩阵 + 两个世界尺度）；只要矩阵的调用方用
+/// [`cascade_fit`]（保持 R29 签名与返回值逐位不变）。
+pub fn cascade_fit_params(
     light_direction: Vec3,
     view: &Mat4,
     fov_y_radians: f32,
     aspect: f32,
     z_start: f32,
     z_end: f32,
-) -> Mat4 {
+) -> CascadeFit {
     let dir = light_direction.normalize_or_zero();
     // 上方向与光方向接近平行时换用 +X（与 shadow_view_proj 同规则）
     let up = if dir.y.abs() > 0.99 { Vec3::X } else { Vec3::Y };
@@ -206,7 +423,25 @@ pub fn cascade_fit(
     let near = -max.z - radius;
     let far = -min.z + radius;
     let proj = glam::camera::rh::proj::directx::orthographic(min.x, max.x, min.y, max.y, near, far);
-    proj * light_view
+    let span = max_xy - min_xy;
+    CascadeFit {
+        view_proj: proj * light_view,
+        texel_world: span.x.max(span.y) / SHADOW_MAP_SIZE as f32,
+        depth_window: far - near,
+    }
+}
+
+/// 单级联正交拟合（R29 签名，返回光空间矩阵）——[`cascade_fit_params`]
+/// 的薄包装，R61 之后生产路径改用后者（多取两个世界尺度）。
+pub fn cascade_fit(
+    light_direction: Vec3,
+    view: &Mat4,
+    fov_y_radians: f32,
+    aspect: f32,
+    z_start: f32,
+    z_end: f32,
+) -> Mat4 {
+    cascade_fit_params(light_direction, view, fov_y_radians, aspect, z_start, z_end).view_proj
 }
 
 /// 点光源组件。位置取自同一实体的 `GlobalTransform`（层级系统每帧更新）。
@@ -214,8 +449,11 @@ pub fn cascade_fit(
 /// 衰减模型：`saturate(1 - d/range)²`，在 `range` 处平滑归零，
 /// 颜色 × 强度决定亮度。超过 [`MAX_POINT_LIGHTS`] 的点光会被忽略。
 ///
-/// 阴影：v1 只允许**一盏**点光投射 cubemap 阴影——多盏开启时取查询
-/// 顺序中的第一盏并记录日志（cubemap 每灯 6 个 pass，成本高）。
+/// 阴影（R61 起为**预算化多盏**）：最多 [`POINT_SHADOW_BUDGET`] 盏
+/// `shadows == true` 的点光同时投射 cubemap 阴影，逐灯 6 个捕获 pass +
+/// 一张 512² 面；超出预算的灯由（相机距离升序, 实体位模式升序）选择键
+/// 裁掉并 `log::warn`（选择键定义见 [`select_point_shadow_casters`]）。
+/// 只有一盏开启时选中结果与 v1 的「查询序首盏」一致。
 #[derive(Clone, Copy, Debug, Component)]
 pub struct PointLight {
     /// 光的颜色（线性空间）。
@@ -224,7 +462,7 @@ pub struct PointLight {
     pub intensity: f32,
     /// 有效半径（世界单位），超出后无贡献。
     pub range: f32,
-    /// 是否投射 cubemap 阴影（仅查询顺序中第一盏生效）。
+    /// 是否投射 cubemap 阴影（预算 [`POINT_SHADOW_BUDGET`] 盏内生效）。
     pub shadows: bool,
 }
 
@@ -505,5 +743,201 @@ mod tests {
                 "亚纹素平移 {delta:?} 后 UV 漂移 {drift:.3} texel，超过 2 texel 上界（采样相位不稳定）"
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // R61：阴影偏移 v2（坡度缩放 bias + 法线偏移）与预算化选择键
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// `cascade_fit_params` 与 R29 的 `cascade_fit` 返回**同一矩阵**
+    /// （逐位）：R61 只多取两个世界尺度，拟合算式一个字节都没动。
+    #[test]
+    fn cascade_fit_params_preserves_matrix_bitwise() {
+        let dir = Vec3::new(-0.5, -1.0, -0.4);
+        let view = test_view(Vec3::new(2.0, 6.0, 10.0), Vec3::new(-3.0, 0.0, -20.0));
+        for (z0, z1) in [(0.1f32, 24.5f32), (24.5, 52.5), (52.5, 120.0)] {
+            let m = cascade_fit(dir, &view, std::f32::consts::FRAC_PI_4, 1.777_8, z0, z1);
+            let fit = cascade_fit_params(dir, &view, std::f32::consts::FRAC_PI_4, 1.777_8, z0, z1);
+            assert_eq!(
+                m.to_cols_array(),
+                fit.view_proj.to_cols_array(),
+                "R61 的拟合产物矩阵必须与 R29 逐位相同"
+            );
+        }
+    }
+
+    /// 级联越远 ⇒ 纹素世界尺寸越大、深度窗口越宽（逐级联缩放的物理
+    /// 依据）；texel 恰为「对齐后 XY 跨度 / 2048」（口径自洽）。
+    #[test]
+    fn cascade_fit_params_exposes_world_scales() {
+        let dir = Vec3::new(-0.5, -1.0, -0.4);
+        let view = test_view(Vec3::new(0.0, 5.0, 40.0), Vec3::new(0.0, 0.0, -15.0));
+        let fits: Vec<CascadeFit> = [(0.1f32, 24.5f32), (24.5, 52.5), (52.5, 120.0)]
+            .into_iter()
+            .map(|(z0, z1)| {
+                cascade_fit_params(dir, &view, std::f32::consts::FRAC_PI_4, 1.0, z0, z1)
+            })
+            .collect();
+        for w in fits.windows(2) {
+            assert!(
+                w[1].texel_world > w[0].texel_world,
+                "远级联纹素世界尺寸必须更大：{} vs {}",
+                w[1].texel_world,
+                w[0].texel_world
+            );
+            assert!(
+                w[1].depth_window > w[0].depth_window,
+                "远级联深度窗口必须更宽：{} vs {}",
+                w[1].depth_window,
+                w[0].depth_window
+            );
+        }
+        // 近级联纹素 ≈ 视锥切片 2048 分之一量级（36 m 级跨度 → ~17 mm）
+        assert!(
+            (0.005..0.05).contains(&fits[0].texel_world),
+            "近级联纹素世界尺寸 {} 应在毫米~厘米量级",
+            fits[0].texel_world
+        );
+        // 深度窗口恒正（bias 换算的分母）
+        assert!(fits.iter().all(|f| f.depth_window > 0.0));
+    }
+
+    /// `slope_tan` 的分段行为：端点、单调性、clamp（tan 发散被
+    /// SHADOW_TAN_MAX 截断，保证 `系数 × tan` 不产生 Inf/NaN）。
+    #[test]
+    fn slope_tan_is_monotonic_and_clamped() {
+        assert!(slope_tan(1.0) < 1e-3, "垂直入射时 tanθ 应趋于 0");
+        // 解析解对照：NdotL = 0.5 → tan(60°) = √3
+        assert!((slope_tan(0.5) - 3f32.sqrt()).abs() < 1e-5);
+        assert!(
+            (slope_tan(0.8) - 0.75).abs() < 1e-5,
+            "tan(acos(0.8)) = 0.75"
+        );
+        let mut prev = f32::INFINITY;
+        for i in 0..=20 {
+            let nol = i as f32 / 20.0;
+            let t = slope_tan(nol);
+            assert!(t <= prev, "tanθ 应随 NdotL 增大而减小：{nol} → {t}");
+            prev = t;
+        }
+        assert_eq!(slope_tan(0.0), SHADOW_TAN_MAX, "掠射极端应被 clamp");
+        assert!(slope_tan(-1.0).is_finite(), "负 NdotL 不得产生 NaN/Inf");
+    }
+
+    /// 方向光 bias：常数下限恒定成立（平地不复发 acne 的硬保证）、
+    /// 掠射角单调增长、上限封顶；法线偏移垂直入射归零、掠射增大且有界。
+    #[test]
+    fn shadow_bias_respects_floor_and_ceiling() {
+        let (texel, window) = (0.0175f32, 82.0f32); // 近级联量级
+        // 垂直入射 = 恰好常数下限（v1 的 0.0015 降到 0.0004）
+        assert_eq!(shadow_bias_ndc(1.0, texel, window), SHADOW_BIAS_MIN);
+        const { assert!(SHADOW_BIAS_MIN < SHADOW_BIAS_LEGACY) };
+        // 掠射角显著抬高 bias，但不超过上限
+        let grazing = shadow_bias_ndc(0.118, texel, window);
+        assert!(
+            grazing > SHADOW_BIAS_LEGACY,
+            "掠射角 bias {grazing} 应超过 v1 常数（否则压不住 acne）"
+        );
+        for i in 0..=100 {
+            let nol = i as f32 / 100.0;
+            let b = shadow_bias_ndc(nol, texel, window);
+            assert!((SHADOW_BIAS_MIN..=SHADOW_BIAS_MAX).contains(&b), "越界 {b}");
+        }
+        // 上限生效：极大纹素（远级联）+ 掠射
+        assert_eq!(shadow_bias_ndc(0.01, 4.0, 1.0), SHADOW_BIAS_MAX, "上限封顶");
+        // 法线偏移：垂直入射归零（接触阴影不浮起的硬保证）、掠射有界
+        assert_eq!(shadow_normal_offset_world(1.0, texel), 0.0);
+        assert!(
+            (shadow_normal_offset_world(0.5, texel) - 1.5 * texel * 0.5).abs() < 1e-9,
+            "偏移量 = 1.5 · texel · (1 − NdotL)"
+        );
+        assert_eq!(
+            shadow_normal_offset_world(0.0, 4.0),
+            SHADOW_NORMAL_MAX_WORLD,
+            "远级联上限"
+        );
+    }
+
+    /// 点光 bias/偏移：纹素世界尺寸 = d/256（90° 面 512 texel），
+    /// bias 以米为单位且下限/上限成立；归一化口径 = 除以 range。
+    #[test]
+    fn point_shadow_bias_scales_with_distance() {
+        assert!((point_shadow_texel_world(3.0) - 3.0 / 256.0).abs() < 1e-9);
+        const { assert!(POINT_SHADOW_BIAS_MIN < POINT_SHADOW_BIAS_LEGACY) };
+        // 垂直入射 = 常数下限
+        assert_eq!(point_shadow_bias_meters(1.0, 3.0), POINT_SHADOW_BIAS_MIN);
+        // 掠射角下 bias 增长且不超过上限
+        let grazing = point_shadow_bias_meters(0.118, 3.0);
+        assert!(grazing > POINT_SHADOW_BIAS_MIN);
+        assert!(grazing <= POINT_SHADOW_BIAS_MAX);
+        // 归一化：range = 12 时下限 bias 的归一化值 = 0.005/12
+        assert!(
+            (point_shadow_bias_meters(1.0, 3.0) / 12.0 - POINT_SHADOW_BIAS_MIN / 12.0).abs() < 1e-9
+        );
+        // 距离越远纹素越大 → bias 越大（同一入射角）
+        assert!(
+            point_shadow_bias_meters(0.3, 10.0) > point_shadow_bias_meters(0.3, 2.0),
+            "远距离纹素更大，bias 应随之增长"
+        );
+        assert_eq!(point_shadow_normal_offset_world(1.0, 5.0), 0.0);
+        assert!(point_shadow_normal_offset_world(0.0, 5.0) <= POINT_SHADOW_NORMAL_MAX_WORLD);
+    }
+
+    /// 预算选择键的确定性：同灯集合乱序插入 ⇒ 选中同一批灯（同一槽位
+    /// 序列）；距离并列由实体位模式收尾（全序）；预算内全选（单盏阴影
+    /// 与 v1 同灯）；超预算按距离裁掉远处的灯。NaN 距离也有确定位置
+    /// （total_cmp），不破坏全序。
+    #[test]
+    fn point_shadow_caster_selection_is_order_independent() {
+        let candidates = [
+            PointShadowCandidate {
+                entity_bits: 0x40,
+                eye_distance: 9.0,
+            },
+            PointShadowCandidate {
+                entity_bits: 0x10,
+                eye_distance: 3.0,
+            },
+            PointShadowCandidate {
+                entity_bits: 0x20,
+                eye_distance: 3.0,
+            },
+            PointShadowCandidate {
+                entity_bits: 0x30,
+                eye_distance: 7.5,
+            },
+            PointShadowCandidate {
+                entity_bits: 0x50,
+                eye_distance: 3.0,
+            },
+        ];
+        let chosen = select_point_shadow_casters(&candidates, 4);
+        // 距离升序 → 同距按位模式升序：3.0(0x10), 3.0(0x20), 3.0(0x50), 7.5(0x30)
+        assert_eq!(chosen, vec![1, 2, 4, 3]);
+        // 乱序插入：逆序 + 中间插入的两种排列必须得到同一批灯（同槽位序）
+        let mut reversed = candidates;
+        reversed.reverse();
+        assert_eq!(select_point_shadow_casters(&reversed, 4), vec![3, 2, 0, 1]);
+        let picked = |list: &[PointShadowCandidate], idx: &[usize]| -> Vec<u64> {
+            let mut v: Vec<u64> = idx.iter().map(|&i| list[i].entity_bits).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            picked(&candidates, &chosen),
+            picked(&reversed, &select_point_shadow_casters(&reversed, 4)),
+            "乱序插入必须选中同一批灯"
+        );
+        // 单盏：预算内全选 = v1 的「唯一一盏」
+        let single = [PointShadowCandidate {
+            entity_bits: 0x99,
+            eye_distance: 42.0,
+        }];
+        assert_eq!(
+            select_point_shadow_casters(&single, POINT_SHADOW_BUDGET),
+            vec![0]
+        );
+        // 空集合：无投射器（零开销默认路径）
+        assert!(select_point_shadow_casters(&[], POINT_SHADOW_BUDGET).is_empty());
     }
 }

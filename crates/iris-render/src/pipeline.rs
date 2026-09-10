@@ -16,7 +16,7 @@ pub const SHADOW_CASCADES: usize = 3;
 /// 留待后续路线。
 pub const SHADOW_DISTANCE: f32 = 120.0;
 
-/// 点光 cubemap 阴影贴图分辨率（每面边长；6 面 × 512² R32Float）。
+/// 点光 cubemap 阴影贴图分辨率（每面边长；每盏 6 面 × 512² R32Float）。
 pub const POINT_SHADOW_MAP_SIZE: u32 = 512;
 
 /// HDR 中间缓冲格式（线性、单采样，供色调映射 pass 采样）。
@@ -217,7 +217,8 @@ pub(crate) fn create_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
-            // 点光 cubemap 阴影贴图（R32Float 存归一化线性距离）。
+            // 点光 cubemap 阴影贴图**数组**（R61：R32Float 存归一化线性
+            // 距离；层序 = 槽位 × 6 面，槽位由确定性选择键分配）。
             // 采样复用 binding 2 的 NonFiltering 采样器：R32Float 双线性过滤
             // 需要 float32-filterable 扩展，不依赖；与方向光阴影一致。
             wgpu::BindGroupLayoutEntry {
@@ -225,7 +226,7 @@ pub(crate) fn create_pipeline(
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::Cube,
+                    view_dimension: wgpu::TextureViewDimension::CubeArray,
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                 },
                 count: None,
@@ -1672,5 +1673,62 @@ pub(crate) fn create_pipeline(
         ui_layout,
         particle_layout,
         decal_layout,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// **并行 Globals 布局的看门测试（R61 实测教训）**：`skybox.wgsl`
+    /// 为了让天空盒只读 `inv_view_proj` 而声明了一份自己的 `Globals`
+    /// 结构体——它是 standard.wgsl 布局的**前缀**，逐字段偏移必须一致，
+    /// 而数组型成员的长度会平移后面所有字段。R61 给 `PointLight` 加了
+    /// 逐灯阴影参数（2×vec4 → 3×vec4）时漏改这里，实测症状是**天空整体
+    /// 错色**（skybox 读到的 `inv_view_proj` 落在别的字段上），三条「阴影
+    /// 关闭」对照组 FNV 基线同时失守才定位到。此断言把这类「影子布局」
+    /// 耦合钉在源码层：改 standard.wgsl 的 PointLight 布局必须同步这里。
+    #[test]
+    fn skybox_globals_prefix_matches_standard_layout() {
+        let skybox = include_str!("../shaders/skybox.wgsl");
+        assert!(
+            skybox.contains("point_lights: array<vec4<f32>, 24>"),
+            "skybox.wgsl 的并行 Globals 必须与 standard.wgsl 的 PointLight（8 × 3×vec4 = 24）同步"
+        );
+        let standard = include_str!("../shaders/standard.wgsl");
+        assert!(
+            standard.contains("point_lights: array<PointLight, 8>"),
+            "standard.wgsl 的点光数组容量必须仍是 MAX_POINT_LIGHTS = 8"
+        );
+        // skybox 声明的字段顺序必须与 standard 的前缀一致（逐名核对）
+        let order = [
+            "view_proj",
+            "eye_pos",
+            "light_dir",
+            "light_color",
+            "ambient",
+            "point_count",
+            "point_lights",
+        ];
+        let body_of = |src: &str| -> String {
+            src.split("struct Globals {")
+                .nth(1)
+                .and_then(|s| s.split('}').next())
+                .expect("着色器应声明 Globals")
+                .to_string()
+        };
+        let skybox_body = body_of(skybox);
+        let standard_body = body_of(standard);
+        let find = |body: &str, from: usize, name: &str| {
+            body[from..]
+                .find(&format!("{name}:"))
+                .map(|i| from + i)
+                .unwrap_or_else(|| panic!("Globals 缺少字段 {name}"))
+        };
+        let mut cursor = (0usize, 0usize);
+        for field in order {
+            cursor = (
+                find(&skybox_body, cursor.0, field),
+                find(&standard_body, cursor.1, field),
+            );
+        }
     }
 }

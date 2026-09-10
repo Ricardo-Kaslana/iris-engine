@@ -20,7 +20,16 @@ use iris_render::prelude::*;
 /// R41 基线全帧像素 FNV-1a 64（改动落地前以同一场景实跑捕获；
 /// 场景 = 地面 + 砖色立方体 + 金属圆柱 + 默认 IBL / 阴影 / 侧光，
 /// 320×180，见 `r41_scene_world`）。
-const R41_BASELINE_HASH: u64 = 0x609b_2457_f4d5_cd82;
+///
+/// **R61 重锁**：0x609b_2457_f4d5_cd82 → 0xe51d_b127_6079_ce39。
+/// 归因证据（阴影 v2 的坡度缩放 bias + 法线偏移改变了阴影开启帧的
+/// 采样口径）：同场景 `DirectionalLight.shadows = false` 的对照组在
+/// R61 前后**逐位一致**（0x6a56_af90_bf4c_6686，见
+/// `tests/shadow_v2_render.rs::shadow_off_control_group_is_bit_identical_to_pre_r61`），
+/// 且 `Renderer::set_legacy_shadow_bias(true)` 逐位复现 R60 输出
+/// （`legacy_bias_mode_reproduces_r60_output_bitwise`）——本值的变化
+/// **只**来自阴影偏移口径，中性纹理路径未动（§4.7.2 / §8.8 的论证链不变）。
+const R41_BASELINE_HASH: u64 = 0xe51d_b127_6079_ce39;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

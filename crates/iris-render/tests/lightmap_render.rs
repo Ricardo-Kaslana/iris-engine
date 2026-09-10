@@ -20,7 +20,15 @@ use iris_render::prelude::*;
 /// R52b 基线全帧像素 FNV-1a 64（改动落地前以同一场景实跑捕获；
 /// 场景 = 室内盒（地板 + 两墙 + 遮挡柱）+ 侧向暖光 + 默认 IBL，
 /// 480×270，见 [`room_world`]）。
-const R52B_BASELINE_HASH: u64 = 0x3fe5_f3ff_00e0_f329;
+///
+/// **R61 重锁**：0x3fe5_f3ff_00e0_f329 → 0xf232_16a3_37fb_f385。
+/// 归因证据（同 `normal_render.rs` 的 R41 重锁）：本场景方向光默认
+/// `shadows = true`，逐像素阴影判定口径随阴影 v2 改变；同场景
+/// `shadows = false` 的对照组在 R61 前后逐位一致
+/// （0x8fbb_a702_069d_c4f5，见
+/// `tests/shadow_v2_render.rs::shadow_off_control_group_is_bit_identical_to_pre_r61`），
+/// 缺席光照贴图的原路径（`select` 掩码）一个字节未动。
+const R52B_BASELINE_HASH: u64 = 0xf232_16a3_37fb_f385;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
