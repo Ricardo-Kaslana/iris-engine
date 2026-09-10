@@ -206,6 +206,12 @@ impl OffscreenRenderer {
         &self.renderer
     }
 
+    /// 可变访问渲染器（帧间调节渲染器状态：`reset_taa`、`set_clear_color`
+    /// 等需要 `&mut` 的入口；测试与快照示例用）。
+    pub fn renderer_mut(&mut self) -> &mut Renderer {
+        &mut self.renderer
+    }
+
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
     }

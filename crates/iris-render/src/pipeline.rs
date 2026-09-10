@@ -89,6 +89,10 @@ pub(crate) struct PipelineBundle {
     /// FXAA 管线（R53）：全屏三角形 LDR sRGB 域边缘平滑，目标 =
     /// 最终颜色格式（blit 之后、UI 之前，见 `shaders/fxaa.wgsl`）。
     pub fxaa_pipeline: wgpu::RenderPipeline,
+    /// TAA 管线（R60）：链首 HDR 域时域累加，`taa_layout`（组 0 五
+    /// binding：参数 + 抖动色 + 采样器 + 深度副本 + 历史），目标 = 本帧
+    /// 历史槽（见 `shaders/taa.wgsl` 与 post.rs `encode_taa_pass`）。
+    pub taa_pipeline: wgpu::RenderPipeline,
     /// 遮挡查询代理管线（R53）：实例世界 AABB 盒、无片段阶段（深度只测
     /// 不写，查询计数由光栅化 + 深度测试产生），组 0 = 视图投影矩阵
     /// （`cascade_layout` 同源 64B uniform）。
@@ -112,6 +116,10 @@ pub(crate) struct PipelineBundle {
     /// 基础上多一路 binding 3 = 深度副本纹理（R32Float 非过滤——该格式
     /// 不可过滤，声明 filterable = false 不依赖 float32-filterable 扩展）。
     pub post_depth_layout: wgpu::BindGroupLayout,
+    /// TAA 组布局（R60）：`post_depth_layout` 的基础上再多一路
+    /// binding 4 = 上帧历史纹理（Rgba16Float，可过滤——历史重投影采样
+    /// 在亚纹素位置，线性过滤是其定义的一部分）。
+    pub taa_layout: wgpu::BindGroupLayout,
     /// UI 绑定组布局：binding 0 = 字形图集纹理、1 = 采样器、
     /// 2 = 屏幕尺寸 uniform（顶点阶段）。
     pub ui_layout: wgpu::BindGroupLayout,
@@ -1092,6 +1100,94 @@ pub(crate) fn create_pipeline(
     let motion_blur_pipeline =
         make_post_depth_pipeline("iris.pipeline.motion_blur", &motion_blur_shader, "fs_main");
 
+    // TAA（R60）：组布局在 post_depth_layout 基础上再加 binding 4 = 上帧
+    // 历史（Rgba16Float 可过滤）；目标 = 本帧历史槽（HDR 格式，与链上
+    // 其他中间 pass 同构）。编码走 post.rs 的 encode_taa_pass。
+    let taa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.taa"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/taa.wgsl").into()),
+    });
+    let taa_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.taa"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+        ],
+    });
+    let taa_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.taa.pipeline.layout"),
+        bind_group_layouts: &[Some(&taa_layout)],
+        immediate_size: 0,
+    });
+    let taa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.taa"),
+        layout: Some(&taa_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &taa_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &taa_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: post_target,
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
     // 场景深度副本管线（R43）：与阴影管线同构（R32Float 颜色附件存深度
     // 通道 + Depth32Float 深度附件 Less 测试 + cull None，绕开 DX12
     // depth-only 写入异常的既有方案），区别是存**线性视距**（clip.w）
@@ -1562,6 +1658,7 @@ pub(crate) fn create_pipeline(
         particle_alpha_pipeline,
         decal_pipeline,
         fxaa_pipeline,
+        taa_pipeline,
         occlusion_pipeline,
         globals_layout,
         cascade_layout,
@@ -1571,6 +1668,7 @@ pub(crate) fn create_pipeline(
         blit_layout,
         post_layout,
         post_depth_layout,
+        taa_layout,
         ui_layout,
         particle_layout,
         decal_layout,

@@ -132,7 +132,8 @@ pub mod prelude {
     };
     pub use crate::post::{
         BloomSettings, DepthOfFieldSettings, ExposureSettings, FxaaSettings, MotionBlurSettings,
-        VignetteSettings, resolve_focus_distance,
+        TaaSettings, VignetteSettings, halton, jitter_projection, resolve_focus_distance,
+        taa_jitter,
     };
     pub use crate::renderer::{
         CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,

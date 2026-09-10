@@ -1,9 +1,11 @@
 //! 后处理：设置资源 + 全屏 pass 串联框架 v1。
 //!
-//! 后处理链（编译期有序，详见 ARCHITECTURE §4.11）：
+//! 后处理链（编译期有序，详见 ARCHITECTURE §4.11 / §4.29）：
 //!
 //! ```text
 //! 主 HDR 解析缓冲（几何 + 天空 + 透明 + 粒子）
+//!   → TAA（可选，R60，链首，全分辨率）：投影抖动色 + 深度副本 + 历史
+//!     → 3×3 邻域钳制混合 → 新 HDR（写入本帧历史槽，下游链直接读它）
 //!   → 景深（DOF，可选，全分辨率）：按逐像素线性视距算 CoC → 12-tap
 //!     泊松盘 HDR 平均；需要主相机深度副本（scene_depth pass，同样可选）
 //!   → 运动模糊（MB，可选，全分辨率）：深度重建世界位 → 上帧相机重投影
@@ -15,9 +17,11 @@
 //!     纹理、FXAA 再写最终目标，缺席/关闭时 blit 直写目标、链逐位不变
 //! ```
 //!
-//! **TAA 不做**（未做清单，ARCHITECTURE §8.32）：时域抗锯齿需要历史
-//! 缓冲 + 投影抖动 + 运动向量整合三件套，与本链的单帧架构冲突，列为
-//! 后续候选而非遗漏。
+//! TAA（R60，详见 ARCHITECTURE §4.29）把 R53 时「三件套与单帧链架构
+//! 冲突」解开：状态严格收敛在链首单一 pass（双历史纹理 ping-pong +
+//! 帧计数器 + 上帧矩阵快照），链的其余部分保持无信号单帧 pass。
+//! `TaaSettings` **缺席 = 关**：不抖动任何矩阵、不分配历史纹理、链
+//! 命令流与 R59 逐位一致（零开销默认路径）。
 //!
 //! DOF / MB 排在泛光**之前**：焦外亮源与运动拖影都应在 HDR 线性域参与
 //! 亮度提取（泛光），先在物理域混合、后做镜头合成，与暗角先于曝光同理。
@@ -268,6 +272,24 @@ impl Default for FxaaSettings {
     }
 }
 
+/// TAA（时域抗锯齿）设置（R60）。后处理链首的 HDR 域时域累加：主相机
+/// 投影按 Halton(2,3) 8 点序列做亚像素抖动，TAA pass 用当前帧抖动色 +
+/// 深度副本 + 上帧历史做相机重投影与 3×3 邻域钳制混合（详见
+/// ARCHITECTURE §4.29 的六项设计裁决）。
+///
+/// **资源缺席语义**：未注册或 `enabled = false` 时整段跳过——不抖动任何
+/// 矩阵、不分配历史纹理、链命令流与无 TAA 帧逐位一致（零开销默认路径，
+/// 全部既有 GPU FNV 基线的兼容铁律）；`DefaultPlugins` 不注册本资源。
+///
+/// **诚实边界**（§8.36）：无逐物体 / 蒙皮运动向量——动态物体的鬼影由
+/// 邻域钳制压制不消除；相机切镜需宿主显式调 [`crate::renderer::Renderer::reset_taa`]
+/// （切镜阈值检测是内容启发式，拒绝清单）。
+#[derive(Clone, Copy, Debug, Default, iris_core::Resource)]
+pub struct TaaSettings {
+    /// 是否启用 TAA（`Default = false` = 关，与「缺席 = 关」语义一致）。
+    pub enabled: bool,
+}
+
 // ---------- pass 串联框架 ----------
 
 /// 后处理中间纹理的分辨率等级（相对主 HDR 解析缓冲）。
@@ -318,13 +340,16 @@ pub(crate) enum PostScratchRef {
     Full(PingPongSlot),
 }
 
-/// pass 源：主 HDR 解析缓冲或某个中间槽位。
+/// pass 源：主 HDR 解析缓冲、某个中间槽位，或 TAA 本帧历史输出。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PostInput {
     /// 主解析缓冲（几何 + 天空 + 透明 + 粒子的混合结果）。
     Scene,
     /// 中间纹理对的某个槽位。
     Scratch(PostScratchRef),
+    /// TAA 本帧输出（当前写半边的历史对纹理）。仅 TAA 开启时由
+    /// [`chain_source`] 产出——下游链的源从主解析缓冲切到这里。
+    TaaHistory,
 }
 
 /// 一对同规格 HDR 中间纹理（ping-pong）。纹理跨帧复用，只在首次使用
@@ -447,23 +472,35 @@ impl PostScratch {
     }
 }
 
-/// 一帧后处理编码期的视图解析表：主解析缓冲 + 分配器（借用）。
-/// [`encode_post_pass`] 据此把 [`PostInput`] / [`PostScratchRef`] 解析成
-/// 实际 `TextureView`。
+/// 一帧后处理编码期的视图解析表：主解析缓冲 + 分配器（借用）+ 可选的
+/// TAA 本帧输出视图。[`encode_post_pass`] 据此把 [`PostInput`] /
+/// [`PostScratchRef`] 解析成实际 `TextureView`。
 pub(crate) struct PostViews<'a> {
     scene: &'a wgpu::TextureView,
     scratch: &'a PostScratch,
+    /// TAA 本帧输出（当前写半边的历史纹理视图）；TAA 关闭时 `None`
+    /// （此时 [`PostInput::TaaHistory`] 不应出现在任何 pass 描述里）。
+    taa_history: Option<&'a wgpu::TextureView>,
 }
 
 impl<'a> PostViews<'a> {
-    pub(crate) fn new(scene: &'a wgpu::TextureView, scratch: &'a PostScratch) -> Self {
-        Self { scene, scratch }
+    pub(crate) fn new(
+        scene: &'a wgpu::TextureView,
+        scratch: &'a PostScratch,
+        taa_history: Option<&'a wgpu::TextureView>,
+    ) -> Self {
+        Self {
+            scene,
+            scratch,
+            taa_history,
+        }
     }
 
     fn input(&self, input: PostInput) -> Option<&wgpu::TextureView> {
         match input {
             PostInput::Scene => Some(self.scene),
             PostInput::Scratch(reference) => self.scratch.view(reference),
+            PostInput::TaaHistory => self.taa_history,
         }
     }
 }
@@ -561,6 +598,91 @@ pub(crate) fn encode_post_pass(
     pass.draw(0..3, 0..1);
 }
 
+/// TAA pass（R60）的编码描述。与 [`PostPassDesc`] 分立的原因：TAA 是链上
+/// 唯一**有状态**的 pass——读上帧历史 + 写本帧历史槽 + 三路输入纹理
+/// （抖动色 / 深度副本 / 历史），组 0 需要 5 个 binding（框架的
+/// `post_layout` / `post_depth_layout` 上限是 4）；编码样板仍收拢在
+/// [`encode_taa_pass`] 单点，不散落 renderer。
+pub(crate) struct TaaPassDesc<'a> {
+    /// pass 调试标签（`"iris.pass.taa"`）。
+    pub label: &'static str,
+    /// 全屏三角形管线（目标 = HDR 格式，`pipeline.rs` 的 `taa_pipeline`）。
+    pub pipeline: &'a wgpu::RenderPipeline,
+    /// 组 0 布局：uniform + 抖动色 + 采样器 + 深度副本（binding 3，非
+    /// 过滤）+ 历史（binding 4，过滤），见 `taa_layout`。
+    pub layout: &'a wgpu::BindGroupLayout,
+    /// 参数 uniform（144B `TaaParamsRaw`：本帧逆视图投影 + 上帧视图投影
+    /// + 标量）。
+    pub params: &'a wgpu::Buffer,
+    /// 线性采样器（历史重投影采样在亚纹素位置，Nearest 会量化回同纹素；
+    /// 链共享 `post_sampler` 是 Nearest，TAA 用专属线性档——FXAA 同款
+    /// 教训）。
+    pub sampler: &'a wgpu::Sampler,
+    /// 本帧抖动色源（主 HDR 解析缓冲）。
+    pub src: &'a wgpu::TextureView,
+    /// 主相机深度副本（R32Float 线性视距，`textureLoad` 读取）。
+    pub depth: &'a wgpu::TextureView,
+    /// 上帧历史（读半边）。
+    pub history: &'a wgpu::TextureView,
+    /// 本帧历史槽（写半边；下游链随即以 [`PostInput::TaaHistory`] 读它）。
+    pub dst: &'a wgpu::TextureView,
+}
+
+/// TAA pass 的描述 → 编码（有状态 pass 的唯一编码路径）。目标以清屏黑
+/// 开始（全屏三角形覆写整帧）。与 [`encode_post_pass`] 的差别仅在绑定
+/// 条目清单（5 binding）与目标视图（历史对写半边）。
+pub(crate) fn encode_taa_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    device: &wgpu::Device,
+    desc: TaaPassDesc<'_>,
+) {
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(desc.label),
+        layout: desc.layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: desc.params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(desc.src),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(desc.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(desc.depth),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(desc.history),
+            },
+        ],
+    });
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(desc.label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: desc.dst,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(desc.pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 /// 泛光模糊迭代轮数（每轮 = 水平 + 垂直两个 pass；3 轮在模糊半径与
 /// 带宽开销之间取中，为既有质量基线）。
 pub(crate) const BLOOM_BLUR_ROUNDS: usize = 3;
@@ -628,10 +750,72 @@ pub(crate) fn full_chain_slots(dof_on: bool, mb_on: bool, vignette_on: bool) -> 
     }
 }
 
+// ---------- TAA 纯函数（R60，离线单测见模块尾） ----------
+
+/// TAA 抖动序列的点数（Halton(2,3) 前 8 项；帧号模 8 索引）。
+pub const TAA_JITTER_POINTS: u64 = 8;
+
+/// Halton 低差异序列（radical inverse）：`index` 的 `base` 进制位序反转。
+/// `index = 0` 恒 0，从 1 起用（1/2, 1/3, …）。纯整数运算，确定性零依赖。
+pub fn halton(index: u32, base: u32) -> f32 {
+    let mut f = 1.0f32;
+    let mut r = 0.0f32;
+    let mut i = index;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
+}
+
+/// 第 `frame` 个 TAA 帧的亚像素抖动偏移（**纹素单位**，x/y 各自
+/// (Halton − 0.5) ∈ ±0.5，像素中心对称分布）。调用方换算到 NDC：
+/// `offset_px × (2/宽, 2/高)`。确定性：同帧号恒同偏移。
+pub fn taa_jitter(frame: u64) -> [f32; 2] {
+    let i = (frame % TAA_JITTER_POINTS) as u32 + 1;
+    [halton(i, 2) - 0.5, halton(i, 3) - 0.5]
+}
+
+/// 把 NDC 偏移加进投影矩阵：`clip.x' = clip.x + jx·clip.w`（row0 +=
+/// jx·row3，y 同理）。**必须作用于纯投影矩阵、再乘 view**——实现只更新
+/// [row0][col2] 一个元素，前提是 row3 = (0,0,±1,0)（透视投影的 w 行）；
+/// 对已合成 view 的矩阵该前提不成立，行运算也不再是纯 NDC 平移。
+/// 零偏移**原样返回**（不碰矩阵任何位——TAA 关闭路径逐位一致的保证）。
+///
+/// 元素下标备忘（glam 列主序，`axis` = 列）：row0 += jx·row3 展开后只有
+/// [row0][col2] 一个元素非零变化，系数取 [row3][col2] = `z_axis.w`
+/// （透视矩阵的 w 行 = (0,0,±1,0)，RH 即 −1）。NDC 位移有解析单测。
+///
+/// 抖动只作用于主相机投影（主 pass / scene_depth 副本 / 遮挡查询代理
+/// 与视锥剔除共用同一矩阵故一致抖动；CSM 光空间矩阵独立不抖动，
+/// ARCHITECTURE §4.29 裁决 2）。
+pub fn jitter_projection(proj: glam::Mat4, offset_ndc: glam::Vec2) -> glam::Mat4 {
+    if offset_ndc == glam::Vec2::ZERO {
+        return proj;
+    }
+    let mut m = proj;
+    m.z_axis.x += offset_ndc.x * proj.z_axis.w;
+    m.z_axis.y += offset_ndc.y * proj.z_axis.w;
+    m
+}
+
+/// 链源切换（TAA 开启时下游链的源从主解析缓冲切到本帧历史输出）。
+/// `head` = 全分辨率链的链头槽位（`None` = DOF/MB 均未入链）；TAA 开启
+/// 且链头为空时源 = TAA 输出。blit 的源同理（`blit_hdr` 槽位）。纯函数
+/// 单点定义，单测锁定「TAA 关 = 拓扑与 R59 逐位一致」。
+pub(crate) fn chain_source(head: Option<PingPongSlot>, taa_on: bool) -> PostInput {
+    match head {
+        Some(slot) => PostInput::Scratch(PostScratchRef::Full(slot)),
+        None if taa_on => PostInput::TaaHistory,
+        None => PostInput::Scene,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::{Mat4, Vec3};
+    use glam::{Mat4, Vec2, Vec3};
     use iris_core::hierarchy::propagate_transforms;
     use iris_core::prelude::{Entity, GlobalTransform, Transform, World};
 
@@ -875,5 +1059,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- TAA 纯函数（R60） ----
+
+    /// Halton 解析值对照（radical inverse 的手算锚点）。
+    #[test]
+    fn halton_matches_radical_inverse() {
+        assert_eq!(halton(0, 2), 0.0, "index 0 恒 0");
+        assert_eq!(halton(1, 2), 0.5, "1/2");
+        assert_eq!(halton(2, 2), 0.25, "1/4");
+        assert_eq!(halton(3, 2), 0.75, "3/4");
+        assert_eq!(halton(4, 2), 0.125, "1/8");
+        assert!((halton(1, 3) - 1.0 / 3.0).abs() <= 1e-7, "1/3");
+        assert!((halton(2, 3) - 2.0 / 3.0).abs() <= 1e-7, "2/3");
+        assert!((halton(3, 3) - 1.0 / 9.0).abs() <= 1e-7, "1/9");
+        assert!(
+            (halton(5, 3) - 7.0 / 9.0).abs() <= 1e-7,
+            "5 = 12₃ → 21 反转 = 2/3+1/9"
+        );
+    }
+
+    /// 抖动序列：8 点各自落回 ±0.5 纹素、两两不同、同帧号确定性复现、
+    /// 帧号模 8 回绕。
+    #[test]
+    fn taa_jitter_sequence_properties() {
+        let mut seen: Vec<((u32, u32), u64)> = Vec::new();
+        for frame in 0..TAA_JITTER_POINTS {
+            let j = taa_jitter(frame);
+            assert!(
+                j[0].abs() <= 0.5 && j[1].abs() <= 0.5,
+                "抖动偏移必须 within ±0.5 纹素，实际 {j:?}"
+            );
+            let key = (j[0].to_bits(), j[1].to_bits());
+            assert!(
+                !seen.iter().any(|(k, _)| *k == key),
+                "8 点必须两两不同：{frame} → {j:?}"
+            );
+            seen.push((key, frame));
+            assert_eq!(j, taa_jitter(frame + TAA_JITTER_POINTS), "模 8 回绕");
+        }
+        assert_eq!(seen.len() as u64, TAA_JITTER_POINTS);
+    }
+
+    /// jitter_projection：零偏移**逐位恒等**（TAA 关闭路径的兼容保证）；
+    /// 非零偏移使投影 NDC 精确位移 (jx, jy)（DirectX RH 透视，视空间点
+    /// (0,0,−5) 的基线 NDC = (0,0)）。
+    #[test]
+    fn jitter_projection_ndc_shift() {
+        let proj =
+            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), 1.0, 0.1, 100.0);
+        let zero = jitter_projection(proj, Vec2::ZERO);
+        assert_eq!(
+            zero.to_cols_array(),
+            proj.to_cols_array(),
+            "零偏移必须逐位恒等（不能出现 −0.0 位翻转）"
+        );
+        let point = Vec3::new(0.0, 0.0, -5.0);
+        let clip = proj * point.extend(1.0);
+        let base_ndc = Vec2::new(clip.x, clip.y) / clip.w;
+        assert!(
+            base_ndc.length() <= 1e-6,
+            "视轴点基线 NDC 应为 (0,0)，实际 {base_ndc}"
+        );
+        let j = Vec2::new(0.0012, -0.0008);
+        let clip_j = jitter_projection(proj, j) * point.extend(1.0);
+        let ndc_j = Vec2::new(clip_j.x, clip_j.y) / clip_j.w;
+        assert!(
+            (ndc_j - j).length() <= 1e-6,
+            "抖动后 NDC 位移必须精确等于偏移，实际 {ndc_j} vs {j}"
+        );
+        // 偏轴点同样整体平移（刚体 NDC 偏移，不缩放）
+        let off_axis = Vec3::new(0.7, -0.4, -5.0);
+        let c0 = proj * off_axis.extend(1.0);
+        let c1 = jitter_projection(proj, j) * off_axis.extend(1.0);
+        let d0 = Vec2::new(c0.x, c0.y) / c0.w;
+        let d1 = Vec2::new(c1.x, c1.y) / c1.w;
+        assert!((d1 - d0 - j).length() <= 1e-6, "偏轴点位移也应等于偏移");
+    }
+
+    /// 链源切换三态：有链头槽位时 TAA 状态无关（槽位优先）；链头为空
+    /// 且 TAA 开 → TAA 输出；全关 → 主解析缓冲（R59 拓扑原样）。
+    #[test]
+    fn chain_source_resolves_taa_head_and_scene() {
+        assert_eq!(
+            chain_source(Some(PingPongSlot::A), false),
+            PostInput::Scratch(PostScratchRef::Full(PingPongSlot::A))
+        );
+        assert_eq!(
+            chain_source(Some(PingPongSlot::B), true),
+            PostInput::Scratch(PostScratchRef::Full(PingPongSlot::B)),
+            "有链头时 TAA 不改变源（槽位优先）"
+        );
+        assert_eq!(chain_source(None, true), PostInput::TaaHistory);
+        assert_eq!(chain_source(None, false), PostInput::Scene);
     }
 }

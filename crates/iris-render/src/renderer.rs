@@ -415,7 +415,20 @@ pub struct Renderer {
     occ_frame: u64,
     /// 上一帧主相机视图投影（R43 运动模糊的重投影基准）。`None` = 尚未
     /// 渲染过任何帧（首帧）——MB 用当前帧矩阵补位，速度恒 0、原色透传。
+    /// TAA（R60）开启的帧保存的是**抖动后的**矩阵：下帧重投影需要的
+    /// 正是上一帧的实际渲染矩阵（历史由该矩阵光栅化而来）。
     prev_view_proj: Option<glam::Mat4>,
+    /// TAA 帧序号（R60）：Halton 抖动序列的索引（模 8）。只在实际渲染
+    /// 且 TAA 开启的帧自增——被早退跳过的帧不推进序列（与
+    /// `prev_view_proj` 的保存时机同一纪律）。
+    taa_frame: u64,
+    /// TAA 重置请求（R60）：`reset_taa()` 置位，下一帧 TAA pass 消费
+    /// （混合系数置 0 = 输出逐位等于当前帧）。分辨率变化 / 首次创建
+    /// 历史缓冲 / 关→开切换也会置位。
+    taa_reset_pending: bool,
+    /// 上一帧 TAA 是否开启（R60）：关→开切换帧强制重置（历史是旧的
+    /// 抖动序列与相机下的产物，不可信）。
+    taa_was_on: bool,
     /// UI 字形图集纹理（初始化时一次性构建；字段仅为保持 view 存活）。
     #[allow(dead_code)]
     ui_atlas: wgpu::Texture,
@@ -532,6 +545,24 @@ struct HdrTargets {
     /// FXAA 中间 LDR 缓冲（R53）：仅 `FxaaSettings` 开启时惰性创建
     /// （见 `ensure_fxaa_targets`）；关闭恒 `None`、blit 直写最终目标。
     fxaa: Option<FxaaTargets>,
+    /// TAA 历史缓冲（R60）：仅 `TaaSettings` 开启时惰性创建（见
+    /// `ensure_taa_targets`）；关闭恒 `None`——不抖动、不入链、与 R59
+    /// 命令流逐位一致（零开销默认路径）。随集合尺寸重建整体失效
+    /// （= 分辨率变化历史重置）。
+    taa: Option<TaaTargets>,
+}
+
+impl HdrTargets {
+    /// 一帧后处理编码期的视图解析表（主解析缓冲 + 中间纹理分配器 +
+    /// 可选的 TAA 本帧输出视图），供 post.rs 的统一编码函数把 pass
+    /// 描述解析成实际视图。TAA 开启时 `taa_history` = 本帧写半边的
+    /// 历史纹理视图（下游链的 `PostInput::TaaHistory` 据此解析）。
+    fn post_views<'a>(
+        &'a self,
+        taa_history: Option<&'a wgpu::TextureView>,
+    ) -> crate::post::PostViews<'a> {
+        crate::post::PostViews::new(&self.resolved_view, &self.post_scratch, taa_history)
+    }
 }
 
 /// 主相机场景深度副本（R43）：R32Float 单采样纹理（R = 线性视距）+
@@ -573,6 +604,27 @@ struct FxaaTargets {
     bind_group: wgpu::BindGroup,
 }
 
+/// TAA 历史缓冲（R60）：Rgba16Float 双纹理 ping-pong（TAA 读上帧写
+/// 本帧，下游链读本帧槽）+ 参数缓冲 + 专属线性采样器 + blit 接入绑定组
+/// （链尾直读 TAA 输出）。仅 `TaaSettings` 开启时创建（零开销默认路径）；
+/// 随 `HdrTargets` 尺寸重建整体失效重建 = 分辨率变化免费获得历史重置。
+/// TAA pass 自身的读取绑定组由 `encode_taa_pass` 按帧现建（框架惯例：
+/// 轻量句柄不值得跨帧缓存）。
+struct TaaTargets {
+    /// 双历史纹理本体保活（视图有效性依赖）。
+    #[allow(dead_code)]
+    hist: [wgpu::Texture; 2],
+    hist_views: [wgpu::TextureView; 2],
+    /// 144B 参数（TaaParamsRaw 布局；每帧有 TAA 时 write_buffer）。
+    params: wgpu::Buffer,
+    /// 线性采样器（历史重投影在亚纹素位置采样——FXAA 同款教训）。
+    #[allow(dead_code)]
+    sampler: wgpu::Sampler,
+    /// blit 接入绑定组 `[i]`：HDR 源 = hist[i]（TAA 开启且链上无其他
+    /// 全分辨率 pass 时 blit 直读 TAA 输出）。
+    blit_bgs: [wgpu::BindGroup; 2],
+}
+
 /// 遮挡查询的常驻 GPU 资源（R53，首次启用时惰性创建，见
 /// `ensure_occ_gpu`）。查询槽上限 = `wgpu::QUERY_SET_MAX_QUERIES`
 /// （4096）：超出部分不查询、恒可见（保守方向，见 occlusion.rs 限制③）。
@@ -611,14 +663,6 @@ struct OccInflight {
     frame: u64,
     /// `map_async` 完成信道（回调送达映射结果）。
     done: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-}
-
-impl HdrTargets {
-    /// 一帧后处理编码期的视图解析表（主解析缓冲 + 中间纹理分配器），
-    /// 供 post.rs 的统一编码函数把 pass 描述解析成实际视图。
-    fn post_views(&self) -> crate::post::PostViews<'_> {
-        crate::post::PostViews::new(&self.resolved_view, &self.post_scratch)
-    }
 }
 
 /// 与 WGSL `blit_params` 对齐（16 字节，POD）：后处理链共享合成参数。
@@ -668,6 +712,27 @@ const _: () = assert!(
     std::mem::size_of::<MbParamsRaw>() == 144,
     "MbParams 必须与 WGSL 布局一致"
 );
+
+/// 与 WGSL `TaaParams` 对齐（144 字节，POD）：TAA pass 参数（R60）。
+/// 当前帧逆视图投影（深度 → 世界位反投影，抖动后的矩阵——与深度副本
+/// 同源）+ 上一帧视图投影（历史重投影，即上一帧的实际渲染矩阵）+ 标量
+/// （历史权重 / 重置标志 / 深度→NDC z 的两个预计算系数，与 MB 同款）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TaaParamsRaw {
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    scalars: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<TaaParamsRaw>() == 144,
+    "TaaParams 必须与 WGSL 布局一致"
+);
+
+/// TAA 历史权重（混合 = current×0.1 + clamped_history×0.9）：收敛速度
+/// 与残影长度的经验折中（约 10 帧量级把过期历史衰减到 1/e）。
+const TAA_HISTORY_WEIGHT: f32 = 0.9;
 
 /// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
 /// 与全分辨率 A/B 槽变体惰性构建（`ensure_full_targets`，源 = 暗角 /
@@ -785,6 +850,10 @@ pub struct FrameStats {
     /// `instances` / `triangles_drawn`，其 draw call 已并入 `draw_calls`）。
     /// 与发射器池状态对账：= 各可见发射器 `live_count()` 之和。
     pub particles_drawn: u32,
+    /// 本帧 TAA 是否处于重置透传（R60，观测字段，不进任何排序键）：
+    /// 1 = 首帧启用 / 关→开切换 / 分辨率变化 / 显式 `reset_taa()` /
+    /// 无几何帧——该帧 TAA 输出逐位等于当前帧（无历史贡献）。关闭恒 0。
+    pub taa_reset: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -1926,6 +1995,9 @@ impl Renderer {
             occ_hidden: std::collections::HashSet::new(),
             occ_frame: 0,
             prev_view_proj: None,
+            taa_frame: 0,
+            taa_reset_pending: false,
+            taa_was_on: false,
             ui_atlas,
             ui_bind_group,
             ui_sampler,
@@ -2111,7 +2183,96 @@ impl Renderer {
             motion_blur_params,
             post_params,
             fxaa: None,
+            taa: None,
         });
+    }
+
+    /// TAA 历史缓冲按需资源（R60）：双 Rgba16Float 历史 ping-pong +
+    /// 参数缓冲 + 专属线性采样器 + 每半边一套读取 / blit 接入绑定组。
+    /// 仅 [`crate::post::TaaSettings`] 开启时在 `draw` 开头、`hdr` 不可
+    /// 变借用建立之前调用；首次创建（含分辨率变化后的重建）置位重置
+    /// 请求——新历史是零初始化纹理，首帧必须整体透传当前帧。关闭路径
+    /// 不触本函数（资源恒 `None`）。
+    fn ensure_taa_targets(&mut self, width: u32, height: u32) {
+        let hdr = self
+            .hdr
+            .as_mut()
+            .expect("draw 开头已 ensure_hdr_targets，HDR 中间缓冲必就绪");
+        if hdr.taa.is_some() {
+            return;
+        }
+        let device = &self.gpu.device;
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let make_hist = |label: &'static str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::pipeline::HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let hist = [make_hist("iris.taa.hist.0"), make_hist("iris.taa.hist.1")];
+        let hist_views = [
+            hist[0].create_view(&wgpu::TextureViewDescriptor::default()),
+            hist[1].create_view(&wgpu::TextureViewDescriptor::default()),
+        ];
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.taa.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.taa.params"),
+            size: std::mem::size_of::<TaaParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // TAA 读取绑定组由 encode_taa_pass 每帧按视图现建（框架惯例），
+        // 这里只预建 blit 接入组（HDR 源 = 历史半边；泛光恒半分辨率 A 槽）
+        let bloom_view = hdr
+            .post_scratch
+            .pair_views(crate::post::PostScale::Half)
+            .expect("半分辨率中间纹理对应已随集合创建")
+            .0;
+        let make_blit_bg = |hdr_view: &wgpu::TextureView| {
+            build_blit_bind_group(
+                device,
+                &self.bundle.blit_layout,
+                hdr_view,
+                bloom_view,
+                &hdr.post_sampler,
+                &hdr.post_params,
+            )
+        };
+        let blit_bgs = [make_blit_bg(&hist_views[0]), make_blit_bg(&hist_views[1])];
+        hdr.taa = Some(TaaTargets {
+            hist,
+            hist_views,
+            params,
+            sampler,
+            blit_bgs,
+        });
+        self.taa_reset_pending = true;
+    }
+
+    /// 显式请求 TAA 历史重置（R60）：下一帧 TAA pass 混合系数置 0、
+    /// 输出逐位等于当前帧（无历史贡献），再下一帧恢复正常累积。相机
+    /// 切镜 / 大幅传送 / 场景整体替换后由宿主调用——切镜阈值检测是
+    /// 内容启发式（拒绝清单），决策交给知道切镜时刻的一方。
+    pub fn reset_taa(&mut self) {
+        self.taa_reset_pending = true;
     }
 
     /// 暗角 / 景深 / 运动模糊任一开启时的按需资源：全分辨率中间纹理对
@@ -2505,6 +2666,17 @@ impl Renderer {
         if fxaa_on {
             self.ensure_fxaa_targets(width, height);
         }
+        // TAA（R60）：开启 = 主相机投影亚像素抖动 + 链首时域累加 pass；
+        // 缺席/关闭 = 不抖动、不入链，命令流与引入前逐位一致。资源分配
+        // 必须在 hdr 不可变借用建立之前（深度副本供重投影消费，与
+        // DOF/MB 共用同一份）。
+        let taa_on = world
+            .try_resource::<crate::post::TaaSettings>()
+            .is_some_and(|t| t.enabled);
+        if taa_on {
+            self.ensure_scene_depth(width, height);
+            self.ensure_taa_targets(width, height);
+        }
         // 遮挡剔除（R53）：开启语义、保守性论证与「读回迟到一帧 ⇒ 本帧
         // 不剔除」的回退见 occlusion.rs 模块文档。
         let occlusion_on = world
@@ -2539,7 +2711,11 @@ impl Renderer {
             }
         };
         let aspect = width as f32 / height.max(1) as f32;
-        let vp = glam::camera::rh::proj::directx::perspective(fov, aspect, z_near, z_far) * view;
+        // 投影与未抖动相机矩阵（TAA 关闭帧的最终矩阵；TAA 开启帧在下方
+        // 重置裁决后以抖动投影重算——抖动只作用于**纯投影**再乘 view，
+        // 对合成矩阵做行运算不是纯 NDC 平移，见 jitter_projection 文档）
+        let proj = glam::camera::rh::proj::directx::perspective(fov, aspect, z_near, z_far);
+        let vp_raw = proj * view;
         let light = world
             .try_resource::<DirectionalLight>()
             .map(|l| (*l).clone())
@@ -2569,8 +2745,38 @@ impl Renderer {
         let lightmap_store = world.try_resource::<LightmapStore>();
         // 运动模糊的重投影基准（R43）：上一帧主相机视图投影；首帧用当前
         // 帧矩阵补位（速度恒 0 → 原色透传）。保存时机在全部早退路径之后
-        // （被跳过的帧不产生「上一帧」）。
-        let prev_vp = self.prev_view_proj.unwrap_or(vp);
+        // （被跳过的帧不产生「上一帧」）。TAA 开帧保存抖动后矩阵（R60：
+        // 下帧重投影需要上一帧的实际渲染矩阵）。
+        let prev_vp = self.prev_view_proj.unwrap_or(vp_raw);
+        // TAA 帧序号推进与重置裁决（同一纪律：只在实际渲染的帧推进）。
+        // taa_index = 本帧的 Halton 槽位（自增前取值）；关→开切换与
+        // reset_taa() / 历史缓冲重建都置重置。**重置帧抖动置零**：该帧
+        // 输出 = 未抖动当前帧，与无 TAA 帧逐位一致（重置语义 = 透传）。
+        let taa_index = self.taa_frame;
+        let mut taa_reset_frame = false;
+        if taa_on {
+            self.taa_frame += 1;
+            taa_reset_frame = self.taa_reset_pending || !self.taa_was_on;
+            self.taa_reset_pending = false;
+            self.taa_was_on = true;
+        } else {
+            self.taa_was_on = false;
+        }
+        // 本帧相机矩阵定稿：Halton(2,3) 8 点序列按 TAA 帧号取模，偏移
+        // =（Halton − 0.5）纹素换算 NDC（±0.5 纹素）。关闭 / 重置帧 =
+        // 零偏移 = 矩阵逐位原样（jitter_projection 对零偏移原样返回）。
+        // 定稿后贯穿主 pass / 视锥剔除 / scene_depth / 遮挡查询代理 /
+        // MB / TAA（一致抖动，ARCHITECTURE §4.29 裁决 2）。
+        let taa_jitter_ndc = if taa_on && !taa_reset_frame {
+            let j = crate::post::taa_jitter(self.taa_frame - 1);
+            glam::Vec2::new(
+                j[0] * 2.0 / width.max(1) as f32,
+                j[1] * 2.0 / height.max(1) as f32,
+            )
+        } else {
+            glam::Vec2::ZERO
+        };
+        let vp = crate::post::jitter_projection(proj, taa_jitter_ndc) * view;
         self.prev_view_proj = Some(vp);
 
         // RT（R40）相机收集：全部 (ActiveCamera + RendersTo) 实体，数量上限
@@ -3739,14 +3945,15 @@ impl Renderer {
             triangles_drawn += 2 * particle_total;
             particles_drawn = particle_total;
         }
-        // 主相机场景深度副本 pass（R43）：仅 DOF / MB 启用时编码。把
-        // 不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件存线性
+        // 主相机场景深度副本 pass（R43）：仅 DOF / MB / TAA 启用时编码。
+        // 把不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件存线性
         // 视距（clip.w，见 scene_depth.wgsl 的插值推导），自带
         // Depth32Float 附件做最近面裁决——阴影的「深度写颜色 + 双附件」
         // 既有方案（主 pass 的深度附件是 MSAA 且无 TEXTURE_BINDING，
         // 不可直接采样，DX12 下 depth-only 采样另有写入异常的教训）。
         // 透明 / 贴花 / 粒子不进副本（半透明深度无定义，ARCHITECTURE §8）。
-        if (dof_on || mb_on) && opaque_total > 0 {
+        // TAA（R60）与 DOF/MB 共用同一份副本与本帧同一抖动矩阵。
+        if (dof_on || mb_on || taa_on) && opaque_total > 0 {
             let sd = self
                 .scene_depth
                 .as_ref()
@@ -3829,7 +4036,69 @@ impl Renderer {
                 }
             }
         }
-        // ---- 后处理链（ARCHITECTURE §4.11）：景深（可选）→ 运动模糊
+        // TAA pass（R60，链首）：抖动色 + 深度副本 + 上帧历史 → 3×3
+        // 邻域钳制混合 → 写入本帧历史槽（ping-pong 半边按 TAA 帧号奇偶
+        // 交替）。下游链经 `PostInput::TaaHistory` 直接读本帧输出（链源
+        // 切换由 chain_source 单点定义）。无几何帧（无深度副本支撑重
+        // 投影）整帧退化为透传：置重置标志，输出 = 当前帧。重置帧
+        // （首帧启用 / 切换 / 分辨率变化 / 显式 reset_taa）同样透传。
+        if taa_on {
+            if opaque_total == 0 {
+                taa_reset_frame = true;
+            }
+            let taa_t = hdr.taa.as_ref().expect("TAA 开启时应已创建历史缓冲");
+            let parity = (taa_index % 2) as usize;
+            // 深度 → NDC z 的两个预计算系数（与 MB 同款，DirectX [0,1] 约定）
+            let z_den = (z_far - z_near).max(1e-6);
+            self.gpu.queue.write_buffer(
+                &taa_t.params,
+                0,
+                bytemuck::bytes_of(&TaaParamsRaw {
+                    inv_view_proj: vp.inverse().to_cols_array_2d(),
+                    prev_view_proj: prev_vp.to_cols_array_2d(),
+                    scalars: [
+                        TAA_HISTORY_WEIGHT,
+                        if taa_reset_frame { 1.0 } else { 0.0 },
+                        z_far / z_den,
+                        z_near * z_far / z_den,
+                    ],
+                }),
+            );
+            let depth_view = &self
+                .scene_depth
+                .as_ref()
+                .expect("TAA 开启时应已创建深度副本")
+                .view;
+            crate::post::encode_taa_pass(
+                &mut encoder,
+                &self.gpu.device,
+                crate::post::TaaPassDesc {
+                    label: "iris.pass.taa",
+                    pipeline: &self.bundle.taa_pipeline,
+                    layout: &self.bundle.taa_layout,
+                    params: &taa_t.params,
+                    sampler: &taa_t.sampler,
+                    src: &hdr.resolved_view,
+                    depth: depth_view,
+                    history: &taa_t.hist_views[1 - parity],
+                    dst: &taa_t.hist_views[parity],
+                },
+            );
+        }
+        // 本帧 TAA 输出视图（下游链 PostInput::TaaHistory 的解析目标）；
+        // 关闭恒 None（该输入变体不应出现在任何 pass 描述里）。
+        let taa_curr_view: Option<&wgpu::TextureView> = if taa_on {
+            Some(
+                &hdr.taa
+                    .as_ref()
+                    .expect("TAA 开启时应已创建历史缓冲")
+                    .hist_views[(taa_index % 2) as usize],
+            )
+        } else {
+            None
+        };
+        // ---- 后处理链（ARCHITECTURE §4.11）：TAA（可选，链首）→ 景深
+        // （可选）→ 运动模糊
         // （可选）→ 泛光（半分辨率，可选）→ 暗角（全分辨率，强度 > 0 才
         // 入链）→ blit 色调映射（链的固定终点）。pass 编码统一走 post.rs
         // 的 encode_post_pass（描述 → 编码）。资源缺席语义：
@@ -3862,13 +4131,15 @@ impl Renderer {
             }),
         );
         // 全分辨率链（DOF / MB / 暗角）的槽位分配：纯函数单点定义（
-        // post.rs，离线单测守护拓扑不变量）
+        // post.rs，离线单测守护拓扑不变量）。TAA 开启不改变槽位拓扑，
+        // 只把「主解析缓冲」这一源整体替换为本帧 TAA 输出（chain_source
+        // 单点定义：有链头槽位取槽位，无链头时 TAA 开 = TAA 输出、关 =
+        // 主解析缓冲——R59 拓扑原样）。
         let slots = crate::post::full_chain_slots(dof_on, mb_on, vignette_strength > 0.0);
-        // 链头（泛光与暗角的源）：DOF/MB 输出槽或主解析缓冲
-        let head_input = match slots.head {
-            Some(slot) => crate::post::PostInput::Scratch(crate::post::PostScratchRef::Full(slot)),
-            None => crate::post::PostInput::Scene,
-        };
+        let scene_or_taa =
+            |slot: Option<crate::post::PingPongSlot>| crate::post::chain_source(slot, taa_on);
+        // 链头（泛光与暗角的源）：DOF/MB 输出槽、TAA 输出或主解析缓冲
+        let head_input = scene_or_taa(slots.head);
         // 景深（DOF）：主解析缓冲 → 全分辨率 A 槽。CoC 按逐像素线性视距
         // 计算，12-tap 泊松盘 HDR 平均；位于泛光之前（HDR 线性域——焦外
         // 亮源参与亮度提取更物理）。
@@ -3899,7 +4170,7 @@ impl Renderer {
                 .as_ref()
                 .expect("DOF 开启时应已创建深度副本")
                 .view;
-            let views = hdr.post_views();
+            let views = hdr.post_views(taa_curr_view);
             crate::post::encode_post_pass(
                 &mut encoder,
                 &self.gpu.device,
@@ -3910,7 +4181,8 @@ impl Renderer {
                     pipeline: &self.bundle.dof_pipeline,
                     layout: &self.bundle.post_depth_layout,
                     params: &hdr.dof_params,
-                    src: crate::post::PostInput::Scene,
+                    // 源 = TAA 输出（TAA 开，链首）或主解析缓冲（TAA 关）
+                    src: scene_or_taa(None),
                     dst: crate::post::PostScratchRef::Full(
                         slots.dof_dst.expect("DOF 开启时必有目标槽位"),
                     ),
@@ -3942,7 +4214,7 @@ impl Renderer {
                 .as_ref()
                 .expect("MB 开启时应已创建深度副本")
                 .view;
-            let views = hdr.post_views();
+            let views = hdr.post_views(taa_curr_view);
             crate::post::encode_post_pass(
                 &mut encoder,
                 &self.gpu.device,
@@ -3953,12 +4225,8 @@ impl Renderer {
                     pipeline: &self.bundle.motion_blur_pipeline,
                     layout: &self.bundle.post_depth_layout,
                     params: &hdr.motion_blur_params,
-                    src: match slots.mb_src {
-                        Some(slot) => {
-                            crate::post::PostInput::Scratch(crate::post::PostScratchRef::Full(slot))
-                        }
-                        None => crate::post::PostInput::Scene,
-                    },
+                    // 源 = DOF 输出槽（DOF 开）或链首（TAA 输出 / 主解析缓冲）
+                    src: scene_or_taa(slots.mb_src),
                     dst: crate::post::PostScratchRef::Full(
                         slots.mb_dst.expect("MB 开启时必有目标槽位"),
                     ),
@@ -3989,7 +4257,7 @@ impl Renderer {
                     .queue
                     .write_buffer(buffer, 0, bytemuck::bytes_of(&raw));
             }
-            let views = hdr.post_views();
+            let views = hdr.post_views(taa_curr_view);
             // 提取：链头（DOF/MB 输出槽或主解析缓冲）→ 半分辨率 A 槽
             crate::post::encode_post_pass(
                 &mut encoder,
@@ -4053,7 +4321,7 @@ impl Renderer {
                     _reserved: 0.0,
                 }),
             );
-            let views = hdr.post_views();
+            let views = hdr.post_views(taa_curr_view);
             crate::post::encode_post_pass(
                 &mut encoder,
                 &self.gpu.device,
@@ -4073,20 +4341,34 @@ impl Renderer {
             );
         }
         // 色调映射 blit：链尾输出 -> sRGB 输出。链尾 = 暗角输出（暗角开）
-        // 或 DOF/MB 输出槽（相机级效果开）或主解析缓冲（全关——默认绑定
-        // 组，与引入暗角前逐项一致）。全分辨率槽位的接入绑定组在
-        // ensure_full_targets 惰性构建、跨帧复用。
+        // 或 DOF/MB 输出槽（相机级效果开）或 TAA 输出（仅 TAA 开）或主
+        // 解析缓冲（全关——默认绑定组，与引入暗角前逐项一致）。源切换
+        // 统一走 chain_source；全分辨率槽位与 TAA 半边的接入绑定组惰性
+        // 构建、跨帧复用。
         {
-            let blit_bg = match slots.blit_hdr {
-                None => &hdr.blit_bind_group,
-                Some(crate::post::PingPongSlot::A) => hdr
+            let blit_bg = match scene_or_taa(slots.blit_hdr) {
+                crate::post::PostInput::Scene => &hdr.blit_bind_group,
+                crate::post::PostInput::Scratch(crate::post::PostScratchRef::Full(
+                    crate::post::PingPongSlot::A,
+                )) => hdr
                     .blit_full_a_bg
                     .as_ref()
                     .expect("全分辨率 A 槽 blit 接入绑定组应已惰性构建"),
-                Some(crate::post::PingPongSlot::B) => hdr
+                crate::post::PostInput::Scratch(crate::post::PostScratchRef::Full(
+                    crate::post::PingPongSlot::B,
+                )) => hdr
                     .blit_full_b_bg
                     .as_ref()
                     .expect("全分辨率 B 槽 blit 接入绑定组应已惰性构建"),
+                crate::post::PostInput::TaaHistory => {
+                    &hdr.taa.as_ref().expect("TAA 开启时应有历史缓冲").blit_bgs
+                        [(taa_index % 2) as usize]
+                }
+                // blit 的源恒全分辨率或主解析缓冲 / TAA 输出，半分辨率槽位
+                // 只服务泛光模糊链内部（拓扑由 full_chain_slots 保证）
+                crate::post::PostInput::Scratch(crate::post::PostScratchRef::Half(_)) => {
+                    panic!("blit 源不可能是半分辨率槽位（链拓扑契约破坏）")
+                }
             };
             // FXAA（R53）开启时 blit 改写中间 LDR 纹理（同格式、同管线、
             // 同绑定组——输出字节与直写最终目标一致），最终目标由紧随
@@ -4316,6 +4598,7 @@ impl Renderer {
         self.stats.instances = instances;
         self.stats.triangles_drawn = triangles_drawn;
         self.stats.particles_drawn = particles_drawn;
+        self.stats.taa_reset = u32::from(taa_on && taa_reset_frame);
         self.scratch = items;
         self.skinned_scratch = skinned;
         self.transparent_scratch = transparent;
