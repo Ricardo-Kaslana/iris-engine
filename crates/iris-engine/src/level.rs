@@ -127,7 +127,10 @@
 //! - 外置高度场文件（.r16 / PNG）与烘焙产物的 pack 打包工具链（产物经
 //!   [`AssetMount`](crate::vfs::AssetMount) 可读，打包入口未接）；
 //! - `level` 段无地形材质混合 / 植被散布（编辑器轮的地形笔刷数据）；
-//! - 光照探针 / 反射探针（§8.31①④ 的路线图项）不入档。
+//! - 光照探针（§8.31① 的路线图项）不入档；反射探针（R62a，§4.30）**同样
+//!   不入档**——`ReflectionProbe` 组件由宿主在运行时挂载并调用
+//!   `Renderer::bake_reflection_probe` 烘焙，关卡档既不写探针也不写探针
+//!   烘焙产物（持久化与 pack 集成是 R62a 拒绝清单里的后续轮项）。
 
 use std::collections::BTreeMap;
 use std::path::Path;

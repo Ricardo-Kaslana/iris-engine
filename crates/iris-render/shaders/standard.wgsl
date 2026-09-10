@@ -46,6 +46,24 @@ struct Globals {
     point_shadow_params: vec4<f32>,
 };
 
+// 反射探针（R62a）：逐探针上传的影响域与 cubemap 槽位。
+// 布局与 Rust 侧 `probe::ReflectionProbeRaw` 逐字段对齐（2×vec4 = 32 B）。
+struct ReflectionProbeGpu {
+    // xyz: 探针世界位置（影响域盒中心 = 实体原点），
+    // w: 过渡带宽度（米，域边界向内衰减到 0 的距离）
+    center_falloff: vec4<f32>,
+    // xyz: 影响域半边长（米），w: cubemap 数组槽位
+    extents_slot: vec4<f32>,
+};
+
+// 探针 uniform 块（独立缓冲 + 独立绑定槽，**不扩 Globals**——并行布局
+// 陷阱见 skybox.wgsl 的头注释）：x = 生效探针数（0 = 全部片元走全局 env），
+// w = 视差修正开关（1 = 生产路径；0 = 对照模式，见 set_legacy_probe_parallax）。
+struct ProbeParams {
+    count: vec4<f32>,
+    probes: array<ReflectionProbeGpu, 4>,
+};
+
 // 级联阴影参数（256 字节，POD；独立 uniform 缓冲，不占 Globals）。
 // 与 Rust 侧 CsmParamsRaw 逐字段对齐（array<mat4,3> = 192B + 4×vec4）。
 struct CsmParams {
@@ -107,6 +125,11 @@ const POINT_SHADOW_TEXEL_SCALE: f32 = 2.0 / 512.0;
 @group(0) @binding(7) var point_shadow_cube: texture_cube_array<f32>;
 // 级联阴影参数（排在现有最大 binding 7 之后，不扩 Globals）
 @group(0) @binding(8) var<uniform> csm: CsmParams;
+// 反射探针（R62a）：参数（binding 9）+ cubemap 数组（binding 10，层序 =
+// 槽位 × 6 + 面序，5 级 mip 与 env 同档）。采样复用 binding 6 的 Filtering
+// 采样器（Rgba16Float 可过滤）。两者同样排在最大 binding 之后、不扩 Globals。
+@group(0) @binding(9) var<uniform> probe_params: ProbeParams;
+@group(0) @binding(10) var probe_cube: texture_cube_array<f32>;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -360,6 +383,61 @@ fn shadow_factor(world_pos: vec3<f32>, n_geo: vec3<f32>, l: vec3<f32>) -> f32 {
     return mix(shaded, 1.0, select(0.0, 1.0, outside));
 }
 
+// ---- 反射探针（R62a）：影响域权重 + 视差修正（box projection）----
+//
+// 与 Rust 侧 `crate::probe::{influence_weight, parallax_direction}` 同一
+// 公式（解析单测锁定 Rust 版；此处逐行镜像），两者必须同步修改。
+
+// 影响域权重：逐轴 f_i = clamp((E_i − |p_i|) / falloff, 0, 1)，三轴乘积。
+// 域内（|p_i| ≤ E_i − falloff）恒 1；过渡带内随 |p_i| 线性降到 0；任一轴
+// 越界（|p_i| > E_i）⇒ 因子 0 ⇒ 乘积 0（域外必不生效）。falloff = 0 时
+// 退化为二值判定（不做除法，避免 0/0）。p = 片元 − 探针中心（盒轴对齐）。
+fn probe_weight(p: vec3<f32>, e: vec3<f32>, falloff: f32) -> f32 {
+    var w = 1.0;
+    for (var i = 0; i < 3; i = i + 1) {
+        let d = e[i] - abs(p[i]);
+        if (falloff > 0.0) {
+            w = w * clamp(d / falloff, 0.0, 1.0);
+        } else {
+            w = w * select(0.0, 1.0, d >= 0.0);
+        }
+    }
+    return w;
+}
+
+// 视差修正（经典 box projection）：把反射方向重定向到「从探针中心看向盒面
+// 出射点」的方向。射线 p + t·d 与盒 [−E, E] 逐轴求交：
+//   d_i ≠ 0 :  t_i = (sign(d_i)·E_i − p_i) / d_i
+//   d_i = 0 :  |p_i| ≤ E_i ⇒ 不约束；|p_i| > E_i ⇒ 射线恒在板外（无交点）
+//   t = min_i t_i，  q = p + t·d，  d' = normalize(q)
+// 盒外且射线背离盒（t ≤ 0）/ 平行失配 / 零方向 ⇒ 原样返回（该片元权重
+// 必为 0，由调用方回落到全局 env）。d_i 精确为 0 时不做除法（无 NaN）。
+fn box_project(d: vec3<f32>, p: vec3<f32>, e: vec3<f32>) -> vec3<f32> {
+    // 无交点哨兵：远大于任何真实盒出射参数（米制场景），不引入 Inf/NaN
+    let T_MAX = 1e30;
+    var t_min = T_MAX;
+    var miss = false;
+    for (var i = 0; i < 3; i = i + 1) {
+        let di = d[i];
+        if (di == 0.0) {
+            if (abs(p[i]) > e[i]) {
+                miss = true;
+            }
+            continue;
+        }
+        let bound = select(-e[i], e[i], di > 0.0);
+        t_min = min(t_min, (bound - p[i]) / di);
+    }
+    if (miss || t_min <= 0.0 || t_min >= T_MAX) {
+        return d;
+    }
+    let hit = p + t_min * d;
+    if (dot(hit, hit) <= 0.0) {
+        return d;
+    }
+    return normalize(hit);
+}
+
 // ---- 切线空间（R42）----
 
 // 片元 TBN（切线 → 世界）两路选择：
@@ -496,10 +574,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let nov = max(dot(n, v), 0.0);
     let f_amb = fresnel_schlick_roughness(nov, f0, roughness);
     let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);
-    let env_spec = textureSampleLevel(env_map, env_sampler, reflect(-v, n),
+    // 镜面反射方向（未修正）：探针的视差修正以它为入射射线方向
+    let spec_dir = reflect(-v, n);
+    let env_spec = textureSampleLevel(env_map, env_sampler, spec_dir,
                                       roughness * globals.env_params.x).rgb;
     let brdf = textureSample(brdf_lut, env_sampler, vec2<f32>(nov, roughness)).rg;
-    let ibl_env = (kd_amb * albedo * irradiance + env_spec * (f_amb * brdf.x + brdf.y))
+    // ---- 反射探针（R62a）：域内以探针 cubemap 取代全局 env 的镜面项 ----
+    // 逐探针算影响权重，取**严格更大**者 ⇒ 权重并列时先出现者胜出；uniform
+    // 数组由 CPU 按实体位模式升序排列 ⇒ 并列裁决 = 实体位模式小者（全序、
+    // 与查询 / 插入顺序无关）。拒绝清单：不做多探针加权混合（见 §8.37）。
+    let probe_count = u32(probe_params.count.x);
+    var best_w = 0.0;
+    var best_slot = 0;
+    var best_center = vec3<f32>(0.0, 0.0, 0.0);
+    var best_extents = vec3<f32>(1.0, 1.0, 1.0);
+    for (var i = 0u; i < probe_count; i = i + 1u) {
+        let p = probe_params.probes[i];
+        let w = probe_weight(in.world_pos - p.center_falloff.xyz,
+                             p.extents_slot.xyz, p.center_falloff.w);
+        if (w > best_w) {
+            best_w = w;
+            best_slot = i32(p.extents_slot.w);
+            best_center = p.center_falloff.xyz;
+            best_extents = p.extents_slot.xyz;
+        }
+    }
+    // 域外 / 无探针（count = 0）：spec 保持 env_spec 的**同一串位**——`select`
+    // 是纯值选择、分支不改变 env_spec 的计算 ⇒ 缺省路径与 R61 逐位一致
+    // （兼容硬约束的实现根据，GPU 全帧基线锁见 tests/probe_render.rs）。
+    var spec = env_spec;
+    if (best_w > 0.0) {
+        // 视差修正：反射射线与盒求交，按交点重定向后再采样（经典 box
+        // projection）。粗糙度 → mip 与 env 走**同一表达式**（同一套预滤波
+        // 链、同一 mip 语义），故粗糙度对比只取决于探针自身的内容。
+        // count.w = 视差修正开关（1 = 生产路径；0 = 对照模式，见
+        // Renderer::set_legacy_probe_parallax，仅供验收图与归因测试）。
+        var dir = spec_dir;
+        if (probe_params.count.w > 0.5) {
+            dir = box_project(spec_dir, in.world_pos - best_center, best_extents);
+        }
+        spec = textureSampleLevel(probe_cube, env_sampler, dir, best_slot,
+                                  roughness * globals.env_params.x).rgb;
+    }
+    let ibl_env = (kd_amb * albedo * irradiance + spec * (f_amb * brdf.x + brdf.y))
             * globals.env_params.y * ao;
 
     // 光照贴图间接项（R52c）：图集存**辐照度** E（天空 AO + 一次反弹
@@ -516,9 +633,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 「未挂光照贴图的场景渲染逐位不变」硬约束的实现根据，由
     // tests/lightmap_render.rs 的 FNV-1a 全帧基线锁看门。
     let ibl = select(ibl_env, ibl_lightmap, material.surface.w > 0.5);
+    // 光照贴图协同（R62a 闭合 §8.31④）：挂图集的实体其间接**漫反射**走
+    // 光照贴图、**镜面**走探针——补充项只在「有图集 且 有生效探针」时叠加。
+    // 无探针时这一项恒不执行 ⇒ 光照贴图实体仍然没有环境镜面（R52c 语义
+    // 与逐位兼容不变）；无图集时镜面已含在 ibl_env 里，不重复叠加。
+    // 乘 env 强度与 ao 的理由与 IBL 镜面项一致（探针取代的就是该项）。
+    var ibl_final = ibl;
+    if (material.surface.w > 0.5 && best_w > 0.0) {
+        ibl_final = ibl + spec * (f_amb * brdf.x + brdf.y) * globals.env_params.y * ao;
+    }
     // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
-    color = color + ibl
+    color = color + ibl_final
           + mix(albedo, f_env, metallic) * globals.ambient.rgb * ao
           + material.emissive.rgb;
 

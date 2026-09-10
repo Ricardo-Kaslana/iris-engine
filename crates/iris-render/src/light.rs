@@ -496,16 +496,29 @@ impl PointLight {
     /// ARCHITECTURE §4.7.1；翻转只翻 y 行，深度 z 与横向 u 均不受影响，
     /// 三角形环绕方向反转由阴影管线的 cull None 吸收）。
     pub fn face_view_proj(light_pos: Vec3, face: usize, range: f32) -> Mat4 {
-        let (dir, up) = POINT_SHADOW_FACES[face];
-        let view = glam::camera::rh::view::look_at_mat4(light_pos, light_pos + dir, up);
-        let proj = glam::camera::rh::proj::directx::perspective(
-            std::f32::consts::FRAC_PI_2,
-            1.0,
-            POINT_SHADOW_NEAR,
-            range,
-        );
-        Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) * (proj * view)
+        cube_face_view_proj(light_pos, face, POINT_SHADOW_NEAR, range)
     }
+}
+
+/// 立方体某一面的视图投影矩阵（点光阴影与反射探针捕获共用）：
+/// 90° 透视、宽高比 1，面序与观察方向取 [`POINT_SHADOW_FACES`]
+/// （wgpu 立方体贴图层序），返回矩阵已对 NDC y 取反。
+///
+/// **NDC y 翻转的推导**（R61，反射探针捕获同源复用）：wgpu 光栅化把
+/// NDC y=+1 写进贴图第 0 行，而 Cube 采样按 OpenGL 面内约定
+/// `t = (1 − dir_分量)/2` 查 texel——不翻转会让每个面的内容垂直镜像，
+/// 遮挡物落错 texel（详见 ARCHITECTURE §4.7.1）。翻转只翻 y 行，深度 z 与
+/// 横向 u 均不受影响，三角形环绕方向反转由调用方（cull None / 背面剔除
+/// 与本翻转的既有组合）吸收。
+///
+/// 天空盒射线重建同源：`inv(vp) * (ndc, 1, 1)` 恰为「该像素在立方体面上
+/// 的方向」——翻转在逆矩阵里被自动抵消，故捕获期的天空与几何严格自洽。
+pub fn cube_face_view_proj(center: Vec3, face: usize, near: f32, far: f32) -> Mat4 {
+    let (dir, up) = POINT_SHADOW_FACES[face];
+    let view = glam::camera::rh::view::look_at_mat4(center, center + dir, up);
+    let proj =
+        glam::camera::rh::proj::directx::perspective(std::f32::consts::FRAC_PI_2, 1.0, near, far);
+    Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) * (proj * view)
 }
 
 /// 点光 cubemap 阴影的面集：wgpu 立方体贴图 6 层的（观察方向， 上方向）。

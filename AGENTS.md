@@ -77,7 +77,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 - 断言用**精确值**（解析解对照、±1e-5 容差写明依据），不写「大于 0」式摆设断言。
 - GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。
 - should_panic 测试若依赖 `debug_assert!`，必须 `#[cfg(debug_assertions)]` 门控（R33/R38 各踩过一次 release 假失败）。
-- 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr 各踩过一次）。
+- 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline 三次：R62a 验收实测 `pid` 同名目录下两个并行测试线程，一方 `remove_dir_all` 删掉另一方正在读的文件 → 偶发 `NotFound`；唯一名 = 进程 id + 调用序计数）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试。
 
 ## 已知平台陷阱（改对应子系统前先读）

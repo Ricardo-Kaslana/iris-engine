@@ -40,6 +40,11 @@ use crate::occlusion::{
 };
 use crate::particles::{ParticleBlend, ParticleEmitter, ParticleInstance};
 use crate::pipeline::{SHADOW_CASCADES, create_pipeline};
+use crate::probe::{
+    MAX_REFLECTION_PROBES, PROBE_CAPTURE_FAR, PROBE_CAPTURE_NEAR, PROBE_MIP_COUNT, ProbeCandidate,
+    ProbeParamsRaw, ProbeStore, ReflectionProbe, ReflectionProbeRaw, distance_to_box,
+    fit_probe_shadow, select_active_probes,
+};
 use crate::rendertarget::{RenderTargetHandle, RenderTargetStore, RendersTo};
 use crate::skin::Skin;
 use crate::texture::{TextureHandle, TextureStore};
@@ -298,6 +303,18 @@ struct ShadowCandidateSlot {
     light_slot: usize,
 }
 
+/// 反射探针候选（R62a）：选择键 + uniform 上传所需的（中心 / 半边长 /
+/// 过渡带 / cubemap 槽位）。与 [`ShadowCandidateSlot`] 同款两阶段形态——
+/// 收集期按查询序填充，裁决在收集完成后由 [`select_active_probes`] 统一
+/// 做出（结果与查询序无关）。
+struct ProbeCandidateSlot {
+    key: ProbeCandidate,
+    center: Vec3,
+    extents: Vec3,
+    falloff: f32,
+    slot: usize,
+}
+
 /// 一帧内收集到的不透明绘制项：批键 + 实例数据 + 图集槽位。
 ///
 /// 只是 CPU 侧的收集 / 排序单元：上传走 `draw` 里另建的
@@ -412,6 +429,65 @@ pub struct Renderer {
     /// 教训；槽位之间互不共享——各自的灯位置 / range / 面矩阵都不同）。
     point_shadow_face_bufs: [wgpu::Buffer; POINT_SHADOW_BUDGET * 6],
     point_shadow_face_bgs: [wgpu::BindGroup; POINT_SHADOW_BUDGET * 6],
+    /// 反射探针参数 uniform（R62a，globals 组 binding 9）：生效探针数 +
+    /// 逐探针影响域 / cubemap 槽位。零值（count = 0）即「无探针」语义。
+    probe_params_buf: wgpu::Buffer,
+    /// 探针捕获期专用的**零值**参数缓冲（R62a）：捕获 pass 的片元着色器
+    /// 与主 pass 同一份 `standard.wgsl`，若绑主参数缓冲，捕获会把既有探针
+    /// 的反射再反射一次（自反馈）且与本帧选择状态耦合。绑一份恒零参数 +
+    /// 下面的哑 cubemap ⇒ 捕获的镜面恒走全局 env（语义正交、无自反馈）。
+    /// 字段仅为保活（绑定组另持内部引用）。
+    #[allow(dead_code)]
+    probe_capture_params_buf: wgpu::Buffer,
+    /// 反射探针 cubemap 数组（R62a）：Rgba16Float、`MAX × 6` 层、
+    /// [`PROBE_MIP_COUNT`] 级 mip（层序 = 槽位 × 6 + 面序，面序与
+    /// [`crate::light::cube_face_view_proj`] 配对）。所有探针共用一张数组，
+    /// 槽位由 [`ProbeStore`] 分配 ⇒ 绑定组只建一次、烘焙不重建。
+    probe_map: wgpu::Texture,
+    /// CubeArray 采样视图（globals 组 binding 10）。
+    probe_cube_view: wgpu::TextureView,
+    /// 捕获用的**共享原始立方体**（mip 0）：预滤波 pass 把源绑成采样纹理、
+    /// 把目标绑成颜色附件，同纹理既读又写会触发 wgpu 校验错误 ⇒ 捕获落在这
+    /// 张共享擦写立方体上，预滤波再写进 [`Self::probe_map`]。所有探针共用
+    /// （烘焙是一次性的，内容无需跨烘焙保留）。字段仅为保活。
+    #[allow(dead_code)]
+    probe_raw: wgpu::Texture,
+    probe_raw_cube_view: wgpu::TextureView,
+    probe_raw_face_views: [wgpu::TextureView; 6],
+    /// 捕获用的深度附件（Depth32Float × 6 层）——与主 pass 同款「颜色 +
+    /// 深度双附件」，保证重叠表面按最近面着色。字段仅为保活。
+    #[allow(dead_code)]
+    probe_raw_depth: wgpu::Texture,
+    probe_raw_depth_face_views: [wgpu::TextureView; 6],
+    /// 捕获期每面一份 Globals 缓冲 + 绑定组（R62a）：面矩阵 / 眼点逐面不同，
+    /// 一缓冲一面（同一 submit 内对同一缓冲的多次 write_buffer 会在执行前
+    /// 合并）。绑定组内的探针资源指向**哑资源 + 零参数**（见上）。
+    probe_face_globals_bufs: [wgpu::Buffer; 6],
+    probe_face_globals_bgs: [wgpu::BindGroup; 6],
+    /// 1×1 哑 cubemap 数组（捕获绑定组专用；内容永不被采样——捕获参数恒
+    /// count = 0）。纹理本体保活以维持视图有效。
+    #[allow(dead_code)]
+    probe_dummy_tex: wgpu::Texture,
+    /// 哑 cubemap 视图（捕获绑定组的 binding 10；字段仅为保活）
+    #[allow(dead_code)]
+    probe_dummy_view: wgpu::TextureView,
+    /// 捕获实例缓冲（独立于主帧实例缓冲：主缓冲带跨帧增量上传镜像
+    /// `last_instances`，复用会破坏其一致性）。
+    probe_instance_buf: Option<wgpu::Buffer>,
+    probe_instance_capacity: usize,
+    /// 探针烘焙登记表（实体位 → cubemap 槽位 + 是否已烘焙）。
+    probe_store: ProbeStore,
+    /// `probe_params_buf` 当前是否持有非零生效数：为真时下一帧即使没有生效
+    /// 探针也必须回写零值（否则退场的探针会滞留生效）。无探针场景恒 false
+    /// ⇒ 一次 write_buffer 都不发（命令流与 R61 逐位一致）。
+    probe_params_active: bool,
+    /// 视差修正**对照模式**（R62a，验收 / 归因专用）：`true` 时探针 uniform
+    /// 的视差开关置 0——采样方向不做 box projection（直接用反射方向），
+    /// 同一二进制内复现「无修正」的反射，供 `docs/reflection_probe.png`
+    /// 的左右面板对照与「修正确实把反射贴到盒几何上」的归因测试
+    /// （`tests/probe_render.rs` 用解析镜像位置断言两侧的像素落点）。
+    /// 生产路径恒 `false`。
+    legacy_probe_no_parallax: bool,
     /// 阴影偏移**对照模式**（R61，验收 / 归因专用）：`true` 时 uniform 写
     /// 回 v1 的常数 bias 并把坡度项与法线偏移的系数置零——同一二进制内
     /// 逐位复现 R60 的阴影采样行为，供验收图左右面板对照与「新技术确实
@@ -891,6 +967,10 @@ pub struct FrameStats {
     /// 排序键）：= 预算 [`POINT_SHADOW_BUDGET`] 内被选择键选中的
     /// `PointLight.shadows == true` 盏数，0 = 本帧无点光阴影 pass。
     pub point_shadow_casters: u32,
+    /// 本帧生效的反射探针数（R62a，观测字段，不进任何排序键）：= 已烘焙
+    /// 且在预算 [`MAX_REFLECTION_PROBES`] 内被选择键选中的探针数，0 =
+    /// 全部片元走全局 env（与 R61 逐位一致的路径）。
+    pub reflection_probes: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -942,14 +1022,36 @@ pub fn diff_changed_ranges(
 /// 重建本绑定组——初建（`Renderer::new`）与重烘重建（`ensure_environment`）
 /// 共用此逻辑，避免两处条目清单漂移。级联参数（binding 8）与级联矩阵
 /// 缓冲同属固定资源，一并写入。
+/// 全局绑定组里与反射探针相关的两路资源（R62a）：参数缓冲（binding 9）+
+/// cubemap 数组视图（binding 10）。
+///
+/// 打成一组传参，一是让 [`build_globals_bind_group`] 的实参数量保持在
+/// clippy 的 7 参数阈值内，二是让调用点一眼看出「探针资源是一组」——主视图
+/// 传真实资源，探针捕获的每面绑定组传**零参数 + 哑 cubemap**（自反馈说明
+/// 见 [`Renderer::bake_reflection_probe`]）。
+#[derive(Clone, Copy)]
+struct ProbeGlobalsResources<'a> {
+    params_buf: &'a wgpu::Buffer,
+    cube_view: &'a wgpu::TextureView,
+}
+
+/// 全局绑定组里的两张阴影贴图视图：方向光级联数组（binding 1）与点光
+/// cubemap 数组（binding 7）。同样打成一组传参（保持实参数量在 clippy
+/// 阈值内，且「阴影贴图是一组」在调用点一眼可见）。
+#[derive(Clone, Copy)]
+struct ShadowMapViews<'a> {
+    cascades: &'a wgpu::TextureView,
+    point_cube: &'a wgpu::TextureView,
+}
+
 fn build_globals_bind_group(
     gpu: &Gpu,
     bundle: &crate::pipeline::PipelineBundle,
     globals_buf: &wgpu::Buffer,
     csm_params_buf: &wgpu::Buffer,
-    shadow_map_view: &wgpu::TextureView,
-    point_shadow_cube_view: &wgpu::TextureView,
+    shadows: ShadowMapViews<'_>,
     env: &crate::environment::EnvironmentMaps,
+    probe: ProbeGlobalsResources<'_>,
 ) -> wgpu::BindGroup {
     let env_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("iris.env.sampler"),
@@ -979,7 +1081,7 @@ fn build_globals_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(shadow_map_view),
+                resource: wgpu::BindingResource::TextureView(shadows.cascades),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -1003,11 +1105,20 @@ fn build_globals_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: wgpu::BindingResource::TextureView(point_shadow_cube_view),
+                resource: wgpu::BindingResource::TextureView(shadows.point_cube),
             },
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: csm_params_buf.as_entire_binding(),
+            },
+            // 反射探针（R62a）：参数 + cubemap 数组（采样器复用 binding 6）
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: probe.params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(probe.cube_view),
             },
         ],
     })
@@ -1719,6 +1830,160 @@ impl Renderer {
             });
         // IBL 环境贴图一次性烘焙（供主 pass 的分割求和环境光采样）
         let env = crate::environment::bake_environment(&gpu);
+
+        // ---- 反射探针（R62a）----
+        // 探针 cubemap **数组**：Rgba16Float、MAX × 6 层、预滤波 mip 链与
+        // env 同档（PROBE_MIP_COUNT = ENV_MIP_COUNT）。层序 = 槽位 × 6 +
+        // 面序（面序与 cube_face_view_proj 的 POINT_SHADOW_FACES 配对）。
+        // 预算做成常量（同点光阴影）：层数在初始化固定，运行时调整需重建
+        // 纹理与全部面视图 / 绑定组，收益远小于复杂度。
+        let probe_map = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.probe.map"),
+            size: wgpu::Extent3d {
+                width: crate::probe::PROBE_MAP_SIZE,
+                height: crate::probe::PROBE_MAP_SIZE,
+                depth_or_array_layers: (MAX_REFLECTION_PROBES * 6) as u32,
+            },
+            mip_level_count: PROBE_MIP_COUNT,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let probe_cube_view = probe_map.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iris.probe.cube_array_view"),
+            dimension: Some(wgpu::TextureViewDimension::CubeArray),
+            ..Default::default()
+        });
+        // 捕获擦写立方体（mip 0）+ 深度附件：预滤波 pass 不能同纹理既读又写
+        // （源 = 采样纹理、目标 = 颜色附件），捕获因此落在共享擦写上。
+        // 探针 cubemap 的**写入**只经预滤波链（它在内部按 (mip, 面) 建视图），
+        // 故不为 probe_map 预制面视图。
+        let probe_raw = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.probe.raw"),
+            size: wgpu::Extent3d {
+                width: crate::probe::PROBE_MAP_SIZE,
+                height: crate::probe::PROBE_MAP_SIZE,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let probe_raw_cube_view = probe_raw.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iris.probe.raw_cube_view"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
+        let probe_raw_face_views = std::array::from_fn(|face| {
+            probe_raw.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("iris.probe.raw_face_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: face as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        let probe_raw_depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.probe.raw_depth"),
+            size: wgpu::Extent3d {
+                width: crate::probe::PROBE_MAP_SIZE,
+                height: crate::probe::PROBE_MAP_SIZE,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let probe_raw_depth_face_views = std::array::from_fn(|face| {
+            probe_raw_depth.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("iris.probe.raw_depth_face_view"),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: face as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        // 参数缓冲：主 pass 用（每帧按选择结果写入），捕获用（恒零，见字段注释）
+        let probe_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.probe.params"),
+            size: std::mem::size_of::<ProbeParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let probe_capture_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.probe.capture_params"),
+            size: std::mem::size_of::<ProbeParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(
+            &probe_params_buf,
+            0,
+            bytemuck::bytes_of(&ProbeParamsRaw::default()),
+        );
+        gpu.queue.write_buffer(
+            &probe_capture_params_buf,
+            0,
+            bytemuck::bytes_of(&ProbeParamsRaw::default()),
+        );
+        // 1×1 哑 cubemap：捕获绑定组的 binding 10 占位（内容永不被采样——
+        // 捕获参数恒 count = 0；见 probe_capture_params_buf 的字段注释）
+        let probe_dummy_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.probe.dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let probe_dummy_view = probe_dummy_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iris.probe.dummy_view"),
+            dimension: Some(wgpu::TextureViewDimension::CubeArray),
+            ..Default::default()
+        });
+        // 捕获期每面一份 Globals 缓冲 + 绑定组（面矩阵 / 眼点逐面不同）
+        let probe_face_globals_bufs: [wgpu::Buffer; 6] = std::array::from_fn(|_| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.probe.face_globals"),
+                size: std::mem::size_of::<GlobalsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        // 捕获绑定组：绑定 0..8 与主组同源（阴影贴图 / env / CSM / 点光阴影），
+        // 绑定 9/10 指向**哑资源 + 零参数**（捕获不做探针自反馈）
+        let probe_face_globals_bgs: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
+            build_globals_bind_group(
+                &gpu,
+                &bundle,
+                &probe_face_globals_bufs[face],
+                &csm_params_buf,
+                ShadowMapViews {
+                    cascades: &shadow_map_view,
+                    point_cube: &point_shadow_cube_view,
+                },
+                &env,
+                ProbeGlobalsResources {
+                    params_buf: &probe_capture_params_buf,
+                    cube_view: &probe_dummy_view,
+                },
+            )
+        });
+
         // 内置 0 号白色兜底纹理：材质未指定贴图时使用
         let white = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.texture.white"),
@@ -1953,9 +2218,15 @@ impl Renderer {
             &bundle,
             &globals_buf,
             &csm_params_buf,
-            &shadow_map_view,
-            &point_shadow_cube_view,
+            ShadowMapViews {
+                cascades: &shadow_map_view,
+                point_cube: &point_shadow_cube_view,
+            },
             &env,
+            ProbeGlobalsResources {
+                params_buf: &probe_params_buf,
+                cube_view: &probe_cube_view,
+            },
         );
         // 粒子相机 uniform + 绑定组（粒子管线的组 1；内容每帧有粒子时覆写）
         let particle_camera_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2026,6 +2297,24 @@ impl Renderer {
             point_shadow_depth_face_views,
             point_shadow_face_bufs,
             point_shadow_face_bgs,
+            probe_params_buf,
+            probe_capture_params_buf,
+            probe_map,
+            probe_cube_view,
+            probe_raw,
+            probe_raw_cube_view,
+            probe_raw_face_views,
+            probe_raw_depth,
+            probe_raw_depth_face_views,
+            probe_face_globals_bufs,
+            probe_face_globals_bgs,
+            probe_dummy_tex,
+            probe_dummy_view,
+            probe_instance_buf: None,
+            probe_instance_capacity: 0,
+            probe_store: ProbeStore::new(),
+            probe_params_active: false,
+            legacy_probe_no_parallax: false,
             legacy_shadow_bias: false,
             env,
             env_baked_generation: 0,
@@ -2096,9 +2385,15 @@ impl Renderer {
             &self.bundle,
             &self.globals_buf,
             &self.csm_params_buf,
-            &self.shadow_map_view,
-            &self.point_shadow_cube_view,
+            ShadowMapViews {
+                cascades: &self.shadow_map_view,
+                point_cube: &self.point_shadow_cube_view,
+            },
             &self.env,
+            ProbeGlobalsResources {
+                params_buf: &self.probe_params_buf,
+                cube_view: &self.probe_cube_view,
+            },
         );
     }
 
@@ -2337,6 +2632,486 @@ impl Renderer {
     /// 默认帧的输出与该开关不存在时逐位一致。
     pub fn set_legacy_shadow_bias(&mut self, legacy: bool) {
         self.legacy_shadow_bias = legacy;
+    }
+
+    /// 反射探针的视差修正**对照模式**（R62a，验收 / 归因专用）：`true` =
+    /// 关闭 box projection（探针采样直接用反射方向），用于验收图的左右面板
+    /// 对照与「修正确实改变采样几何」的归因。生产路径恒 `false`；本开关
+    /// 不改变探针的捕获 / 预滤波 / 选择裁决，只改采样方向的重定向。
+    pub fn set_legacy_probe_parallax(&mut self, legacy: bool) {
+        self.legacy_probe_no_parallax = legacy;
+    }
+
+    /// 该实体的反射探针是否已烘焙（观测口径，GPU 测试用）。
+    pub fn probe_is_baked(&self, entity: Entity) -> bool {
+        self.probe_store.slot_of(entity.to_bits()).is_some()
+    }
+
+    /// 已烘焙的反射探针数。
+    pub fn baked_probe_count(&self) -> usize {
+        self.probe_store.len()
+    }
+
+    /// 烘焙反射探针（R62a）：从实体当前世界位置向 6 面捕获场景 cubemap，
+    /// 再按 GGX 跑完整条预滤波 mip 链（复用 env 的 `fs_prefilter` 与同一
+    /// 粗糙度 → mip 映射）。`&mut self` 入口（与 [`Self::reset_taa`] 同款：
+    /// 需要分配 / 复用 GPU 资源）。
+    ///
+    /// # 捕获内容与取舍（决策点）
+    ///
+    /// **捕获含天空**：6 个面都先画一遍天空盒（复用 `skybox.wgsl` 与
+    /// `inv_view_proj` 射线重建，与主视口逐像素同源），再画不透明几何。
+    /// 与之相对的做法是「天空清成黑、盒外方向回落全局 env」，但那需要
+    /// **逐 texel 的有效性掩码 + 混合**（哪些 texel 打到了几何、哪些打到
+    /// 了空），且盒内本来能看到的天空（窗口 / 天窗）会丢失。含天空的产物
+    /// 是**完整辐射度函数**：域内任意方向的反射都有值，采样侧只需一次
+    /// `textureSampleLevel`，无需任何回退混合。代价写进诚实限制：探针烘焙
+    /// 与全局 env 的 `SkySource` generation 绑定——**换天空源后探针内容不再
+    /// 匹配**，需调用方重新烘焙（v1 不自动重烘，与不自动跟随场景变化同一
+    /// 条限制）。
+    ///
+    /// # 捕获内容清单
+    ///
+    /// - 方向光阴影：以**探针盒**做单级联拟合（[`fit_probe_shadow`]），
+    ///   渲染进主帧的级联槽 0 后供 6 面捕获采样——室内场景的太阳光因此
+    ///   被墙 / 天花板正确遮挡（否则封闭房间的地板会在探针里"晒到太阳"）。
+    ///   槽 0 是**临时借用**：主帧每帧重画级联，下一次 `draw` 即覆盖。
+    /// - 点光：按世界位置进入 uniform，但**阴影关闭**（探针域没有点光
+    ///   cubemap 的槽位归属，逐灯重捕获代价高）——诚实限制。
+    /// - 不画：透明 / 粒子 / 贴花（与点光阴影捕获同一取舍）。
+    /// - 探针自身不参与捕获（捕获绑定组绑零参数 + 哑 cubemap），避免
+    ///   「反射里看到反射」的自反馈。
+    ///
+    /// # 确定性
+    ///
+    /// 捕获是一次性的命令缓冲（阴影 pass → 6 面 → 预滤波 mip 链）单次
+    /// submit，输入只取世界状态（几何 + 光照 + 探针影响域）；同输入两次
+    /// 烘焙逐位一致（`tests/probe_render.rs` 双会话哈希锁）。
+    ///
+    /// 返回 `false`（并 `log::warn`）的情形：实体缺 [`ReflectionProbe`] /
+    /// `GlobalTransform`、影响域退化（半边长非正）、cubemap 槽位预算耗尽、
+    /// 世界缺 `MeshStore` / `MaterialStore`。
+    pub fn bake_reflection_probe(
+        &mut self,
+        world: &iris_core::world::World,
+        entity: Entity,
+    ) -> bool {
+        let Some(probe) = world.get::<ReflectionProbe>(entity).map(|p| *p) else {
+            log::warn!("实体 {entity:?} 没有 ReflectionProbe 组件，无法烘焙");
+            return false;
+        };
+        if !probe.is_valid() {
+            log::warn!(
+                "实体 {entity:?} 的 ReflectionProbe 影响域退化（half_extents = {:?}），跳过烘焙",
+                probe.half_extents
+            );
+            return false;
+        }
+        let Some(gt) = world.get::<GlobalTransform>(entity) else {
+            log::warn!("实体 {entity:?} 缺 GlobalTransform，无法确定探针位置");
+            return false;
+        };
+        let center = gt.position();
+        let Some(slot) = self.probe_store.ensure_slot(entity.to_bits()) else {
+            log::warn!("反射探针槽位预算 {MAX_REFLECTION_PROBES} 已用尽，实体 {entity:?} 未烘焙");
+            return false;
+        };
+        let (Some(mesh_store), Some(material_store)) = (
+            world.try_resource::<MeshStore>(),
+            world.try_resource::<MaterialStore>(),
+        ) else {
+            log::warn!("世界缺 MeshStore / MaterialStore 资源，反射探针无法捕获");
+            return false;
+        };
+        let texture_store = world.try_resource::<TextureStore>();
+        let lightmap_store = world.try_resource::<LightmapStore>();
+
+        // ---- 收集（6 面并集 = 完整球域 ⇒ 「全通过」视锥，逐面剔除零收益）
+        let frustum = Frustum::capture_all(center, PROBE_CAPTURE_FAR);
+        let mut items: Vec<DrawItem> = Vec::new();
+        let mut skinned: Vec<SkinnedItem> = Vec::new();
+        let mut transparent: Vec<TransparentItem> = Vec::new();
+        let mut transparent_skinned: Vec<TransparentSkinnedItem> = Vec::new();
+        // `view` 只被透明项排序用（v1 不画透明物），传单位矩阵并忽略其结果
+        collect_instances(
+            world,
+            &mesh_store,
+            &material_store,
+            &Mat4::IDENTITY,
+            center,
+            &frustum,
+            &mut items,
+            &mut skinned,
+            &mut transparent,
+            &mut transparent_skinned,
+        );
+        // 与主 pass 同款合批：不透明按 (网格, 材质) 键排序（同键区间一次 draw）
+        items.sort_by_key(|item| item.key);
+        let total = items.len();
+        let mut raws: Vec<InstanceRaw> = Vec::with_capacity(total + skinned.len());
+        raws.extend(items.iter().map(|item| item.instance));
+        raws.extend(skinned.iter().map(|item| item.instance));
+
+        // ---- GPU 资源懒上传（与 draw 步骤 4 同款；捕获用独立实例缓冲）----
+        for item in &items {
+            let key = item.key;
+            self.ensure_mesh(&mesh_store, MeshHandle((key >> 32) as u32));
+            self.ensure_material(
+                &material_store,
+                texture_store.as_deref(),
+                lightmap_store.as_deref(),
+                MaterialHandle(key as u32),
+                item.lightmap,
+            );
+        }
+        for item in &skinned {
+            self.ensure_mesh(&mesh_store, MeshHandle(item.mesh));
+            self.ensure_material(
+                &material_store,
+                texture_store.as_deref(),
+                lightmap_store.as_deref(),
+                MaterialHandle(item.material),
+                item.lightmap,
+            );
+        }
+        let mut joint_bytes: Vec<u8> = Vec::new();
+        for item in &skinned {
+            self.ensure_skin(item.skin_entity, item.joint_matrices.len());
+            joint_bytes.clear();
+            for m in &item.joint_matrices {
+                joint_bytes.extend_from_slice(bytemuck::bytes_of(&m.to_cols_array_2d()));
+            }
+            let skin = self
+                .skin_gpu
+                .get(&item.skin_entity)
+                .expect("蒙皮缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(&skin.joint_buf, 0, &joint_bytes);
+        }
+        self.ensure_probe_instance_capacity(raws.len());
+        if !raws.is_empty() {
+            let instance_buf = self
+                .probe_instance_buf
+                .as_ref()
+                .expect("捕获实例缓冲已就绪");
+            self.gpu
+                .queue
+                .write_buffer(instance_buf, 0, bytemuck::cast_slice(&raws));
+        }
+
+        // ---- 光照：方向光（含探针盒单级联阴影）+ 点光（无阴影）----
+        let light = world
+            .try_resource::<DirectionalLight>()
+            .map(|l| (*l).clone())
+            .unwrap_or_default();
+        let light_dir = (-light.direction).normalize_or_zero();
+        let env_intensity = world
+            .try_resource::<crate::environment::EnvironmentSettings>()
+            .map(|e| e.intensity.max(0.0))
+            .unwrap_or(1.0);
+        let mut point_lights = [PointLightRaw {
+            position: [0.0; 4],
+            color: [0.0; 4],
+            shadow: [0.0; 4],
+        }; MAX_POINT_LIGHTS];
+        let mut point_count = 0usize;
+        world.query::<(&GlobalTransform, &PointLight)>(|(gt, pl)| {
+            if point_count >= MAX_POINT_LIGHTS {
+                return;
+            }
+            let position = gt.position();
+            point_lights[point_count] = PointLightRaw {
+                position: [position.x, position.y, position.z, 0.0],
+                color: [
+                    pl.color.x * pl.intensity,
+                    pl.color.y * pl.intensity,
+                    pl.color.z * pl.intensity,
+                    pl.range,
+                ],
+                // 捕获不做点光阴影（诚实限制）：开关恒 0
+                shadow: [0.0, 0.0, 0.0, 0.0],
+            };
+            point_count += 1;
+        });
+        let fit = fit_probe_shadow(light.direction, center, probe.half_extents);
+        let shadow_enabled = light.shadows;
+        let legacy = self.legacy_shadow_bias;
+        for face in 0..6 {
+            let vp = crate::light::cube_face_view_proj(
+                center,
+                face,
+                PROBE_CAPTURE_NEAR,
+                PROBE_CAPTURE_FAR,
+            );
+            let raw = GlobalsRaw {
+                view_proj: vp.to_cols_array_2d(),
+                eye_pos: [center.x, center.y, center.z, 1.0],
+                light_dir: [light_dir.x, light_dir.y, light_dir.z, 0.0],
+                light_color: [
+                    light.color.x * light.intensity,
+                    light.color.y * light.intensity,
+                    light.color.z * light.intensity,
+                    0.0,
+                ],
+                ambient: [light.ambient.x, light.ambient.y, light.ambient.z, 0.0],
+                point_count: [point_count as f32, 0.0, 0.0, 0.0],
+                point_lights,
+                shadow_params: [
+                    1.0 / crate::pipeline::SHADOW_MAP_SIZE as f32,
+                    if legacy {
+                        SHADOW_BIAS_LEGACY
+                    } else {
+                        SHADOW_BIAS_MIN
+                    },
+                    SHADOW_STRENGTH,
+                    if shadow_enabled { 1.0 } else { 0.0 },
+                ],
+                env_params: [
+                    crate::environment::ENV_MIP_COUNT as f32 - 1.0,
+                    env_intensity,
+                    0.0,
+                    0.0,
+                ],
+                inv_view_proj: vp.inverse().to_cols_array_2d(),
+                // 无点光阴影：全局掩码 0，逐灯开关也恒 0
+                point_shadow_params: [
+                    0.0,
+                    POINT_SHADOW_BIAS_MIN,
+                    POINT_SHADOW_SLOPE_SCALE,
+                    POINT_SHADOW_NORMAL_SCALE,
+                ],
+            };
+            self.gpu.queue.write_buffer(
+                &self.probe_face_globals_bufs[face],
+                0,
+                bytemuck::bytes_of(&raw),
+            );
+        }
+        // 级联槽 0 = 探针盒拟合；splits 全为 +∞、cam_forward 置零 ⇒ 片元的
+        // 「view 深度」恒 0 < splits.x ⇒ 所有片元选级联 0（单级联语义）。
+        // 槽 1/2 填单位矩阵占位（该帧不会被选中，但 uniform 必须有定义）。
+        const PROBE_SPLIT_INFINITY: f32 = 1.0e30;
+        let csm_raw = CsmParamsRaw {
+            view_proj: [
+                fit.view_proj.to_cols_array_2d(),
+                Mat4::IDENTITY.to_cols_array_2d(),
+                Mat4::IDENTITY.to_cols_array_2d(),
+            ],
+            cam_forward: [0.0; 4],
+            splits: [
+                PROBE_SPLIT_INFINITY,
+                PROBE_SPLIT_INFINITY,
+                PROBE_SPLIT_INFINITY,
+                0.0,
+            ],
+            cascade_texel: [if legacy { 0.0 } else { fit.texel_world }, 0.0, 0.0, 0.0],
+            cascade_slope_k: [
+                if legacy {
+                    0.0
+                } else {
+                    fit.texel_world / fit.depth_window.max(1e-6)
+                },
+                0.0,
+                0.0,
+                0.0,
+            ],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.csm_params_buf, 0, bytemuck::bytes_of(&csm_raw));
+        let cascade_raw = CascadeParamsRaw {
+            view_proj: fit.view_proj.to_cols_array_2d(),
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.cascade_bufs[0], 0, bytemuck::bytes_of(&cascade_raw));
+
+        // ---- 编码：阴影 pass → 6 面捕获（天空 + 不透明）→ 预滤波 mip 链 ----
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("iris.probe.bake"),
+            });
+        if shadow_enabled && !items.is_empty() {
+            let instance_buf = self
+                .probe_instance_buf
+                .as_ref()
+                .expect("捕获实例缓冲已就绪");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.probe.shadow"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.shadow_color_views[0],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_depth_views[0],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.bundle.shadow_pipeline);
+            pass.set_bind_group(0, &self.cascade_bgs[0], &[]);
+            pass.set_vertex_buffer(1, instance_buf.slice(..));
+            let mut index = 0;
+            while index < total {
+                let key = items[index].key;
+                let count = run_length(&items, index);
+                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                let first = index as u32;
+                let last = (index + count) as u32;
+                pass.draw_indexed(0..mesh.num_indices, 0, first..last);
+                index += count;
+            }
+            if !skinned.is_empty() {
+                pass.set_pipeline(&self.bundle.skinned_shadow_pipeline);
+                pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, item) in skinned.iter().enumerate() {
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(1, &skin.bind_group, &[]);
+                    let base = (total + i) as u32;
+                    pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                }
+            }
+        }
+        if !items.is_empty() || !skinned.is_empty() {
+            let instance_buf = self
+                .probe_instance_buf
+                .as_ref()
+                .expect("捕获实例缓冲已就绪");
+            for face in 0..6 {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("iris.probe.capture"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.probe_raw_face_views[face],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // 清黑后立刻被天空覆盖：天空缺席（无 env）时也不会
+                            // 把未初始化内容带进预滤波
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.probe_raw_depth_face_views[face],
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                // 天空（含天空决策，见方法文档）：同一 skybox.wgsl，面矩阵的
+                // 逆给出该像素在立方体面上的方向
+                pass.set_pipeline(&self.bundle.probe_sky_pipeline);
+                pass.set_bind_group(0, &self.probe_face_globals_bgs[face], &[]);
+                pass.draw(0..3, 0..1);
+                // 不透明几何（捕获变体：单采样 Rgba16Float 目标 + cull None——
+                // 面矩阵的 NDC y 翻转会反转环绕方向，Back 剔除会剔错面）
+                pass.set_pipeline(&self.bundle.probe_capture_pipeline);
+                pass.set_bind_group(0, &self.probe_face_globals_bgs[face], &[]);
+                pass.set_vertex_buffer(1, instance_buf.slice(..));
+                let mut index = 0;
+                while index < total {
+                    let key = items[index].key;
+                    let lightmap = items[index].lightmap;
+                    let count = run_length(&items, index);
+                    let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                    let material = &self.material_gpu[&material_key(key as u32, lightmap)];
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+                    pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    let first = index as u32;
+                    let last = (index + count) as u32;
+                    pass.draw_indexed(0..mesh.num_indices, 0, first..last);
+                    index += count;
+                }
+                if !skinned.is_empty() {
+                    pass.set_pipeline(&self.bundle.probe_capture_skinned_pipeline);
+                    pass.set_vertex_buffer(2, instance_buf.slice(..));
+                    for (i, item) in skinned.iter().enumerate() {
+                        let mesh = &self.mesh_gpu[&item.mesh];
+                        let material =
+                            &self.material_gpu[&material_key(item.material, item.lightmap)];
+                        let skin = &self.skin_gpu[&item.skin_entity];
+                        pass.set_bind_group(1, &material.bind_group, &[]);
+                        pass.set_bind_group(2, &skin.bind_group, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+                        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
+                        pass.set_vertex_buffer(
+                            1,
+                            mesh.skin_buf
+                                .as_ref()
+                                .expect("蒙皮网格应有蒙皮属性缓冲")
+                                .slice(..),
+                        );
+                        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        let base = (total + i) as u32;
+                        pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                    }
+                }
+            }
+        }
+        // 预滤波：源 = 捕获擦写立方体（读 mip 0），目标 = 该探针槽位的 6 层
+        // mip 链（层基址 = 槽位 × 6）。与 env 同一条链、同一粗糙度映射。
+        crate::environment::encode_prefilter_chain(
+            &self.gpu,
+            &mut encoder,
+            &self.probe_raw_cube_view,
+            &self.probe_map,
+            (slot * 6) as u32,
+        );
+        self.gpu.queue.submit([encoder.finish()]);
+        log::info!(
+            "反射探针烘焙完成：实体 {entity:?} @ ({:.2}, {:.2}, {:.2})，影响域 ±({:.2}, {:.2}, {:.2})，\
+             槽位 {slot}，捕获 {} 个不透明实例 + {} 个蒙皮实例（{} 面 × {PROBE_MIP_COUNT} 级 mip）",
+            center.x,
+            center.y,
+            center.z,
+            probe.half_extents.x,
+            probe.half_extents.y,
+            probe.half_extents.z,
+            items.len(),
+            skinned.len(),
+            crate::probe::PROBE_MAP_SIZE
+        );
+        true
     }
 
     /// 暗角 / 景深 / 运动模糊任一开启时的按需资源：全分辨率中间纹理对
@@ -2981,6 +3756,71 @@ impl Renderer {
             }
         }
         let shadow_enabled = light.shadows;
+        // 反射探针（R62a）：收集「挂了组件**且已烘焙**（登记表命中）」的
+        // 探针，按（相机到影响域距离升序, 实体位模式升序）取预算内一批，
+        // 再按实体位模式升序填 uniform（= 着色器的 tie-break 序）。
+        // 未烘焙的探针不进 uniform ⇒ 着色路径与 R61 逐位一致（兼容硬约束）。
+        let mut probe_candidates: Vec<ProbeCandidateSlot> = Vec::new();
+        world.query::<(Entity, &GlobalTransform, &ReflectionProbe)>(|(e, gt, probe)| {
+            if !probe.is_valid() {
+                return; // 退化影响域（半边长非正 / 非有限）：不参与，见组件文档
+            }
+            let Some(slot) = self.probe_store.slot_of(e.to_bits()) else {
+                return; // 组件在场但未烘焙：静默走全局 env（缺席语义）
+            };
+            let center = gt.position();
+            probe_candidates.push(ProbeCandidateSlot {
+                key: ProbeCandidate {
+                    entity_bits: e.to_bits(),
+                    camera_distance: distance_to_box(eye, center, probe.half_extents),
+                },
+                center,
+                extents: probe.half_extents,
+                falloff: probe.falloff.max(0.0),
+                slot,
+            });
+        });
+        let probe_keys: Vec<ProbeCandidate> = probe_candidates.iter().map(|c| c.key).collect();
+        let probe_budget = probe_keys.len().min(MAX_REFLECTION_PROBES);
+        let probe_selected = select_active_probes(&probe_keys, MAX_REFLECTION_PROBES);
+        if probe_keys.len() > probe_budget {
+            log::warn!(
+                "有 {} 个已烘焙反射探针，超出预算 {MAX_REFLECTION_PROBES} 个，\
+                 已按（相机到影响域距离升序, 实体位模式升序）选择键取前 {probe_budget} 个",
+                probe_keys.len()
+            );
+        }
+        let mut probe_raws = [ReflectionProbeRaw::default(); MAX_REFLECTION_PROBES];
+        for (i, &candidate) in probe_selected.iter().enumerate() {
+            let c = &probe_candidates[candidate];
+            probe_raws[i] = ReflectionProbeRaw {
+                center_falloff: [c.center.x, c.center.y, c.center.z, c.falloff],
+                extents_slot: [c.extents.x, c.extents.y, c.extents.z, c.slot as f32],
+            };
+        }
+        self.stats.reflection_probes = probe_selected.len() as u32;
+        // 只在「本帧有生效探针」或「上一帧有（需回写零值让探针退场）」时写
+        // uniform：无探针场景一次 write_buffer 都不发，命令流与 R61 一致。
+        if !probe_selected.is_empty() || self.probe_params_active {
+            let raw = ProbeParamsRaw {
+                // w = 视差修正开关（对照模式置 0，见 set_legacy_probe_parallax）
+                count: [
+                    probe_selected.len() as f32,
+                    0.0,
+                    0.0,
+                    if self.legacy_probe_no_parallax {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                ],
+                probes: probe_raws,
+            };
+            self.gpu
+                .queue
+                .write_buffer(&self.probe_params_buf, 0, bytemuck::bytes_of(&raw));
+            self.probe_params_active = !probe_selected.is_empty();
+        }
         let env_intensity = world
             .try_resource::<crate::environment::EnvironmentSettings>()
             .map(|e| e.intensity.max(0.0))
@@ -4774,6 +5614,23 @@ impl Renderer {
         true
     }
 
+    /// 探针捕获实例缓冲容量复用（R62a）：独立于主帧实例缓冲——主缓冲带
+    /// 跨帧增量上传镜像（`last_instances`），捕获写入会破坏其一致性。
+    fn ensure_probe_instance_capacity(&mut self, needed: usize) {
+        if self.probe_instance_capacity >= needed {
+            return;
+        }
+        let capacity = (needed * 2).max(256);
+        self.probe_instance_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.probe.instances"),
+            size: (capacity * std::mem::size_of::<InstanceRaw>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        self.probe_instance_capacity = capacity;
+        log::debug!("探针捕获实例缓冲扩容至 {capacity} 实例");
+    }
+
     /// UI 顶点缓冲容量复用（与实例缓冲同款模式）：容量足够则零开销，
     /// 不足时按 2 倍扩容整体重建。
     fn ensure_ui_vertex_capacity(&mut self, needed: usize) {
@@ -4901,9 +5758,15 @@ impl Renderer {
             &self.bundle,
             &globals_buf,
             &self.csm_params_buf,
-            &self.shadow_map_view,
-            &self.point_shadow_cube_view,
+            ShadowMapViews {
+                cascades: &self.shadow_map_view,
+                point_cube: &self.point_shadow_cube_view,
+            },
             &self.env,
+            ProbeGlobalsResources {
+                params_buf: &self.probe_params_buf,
+                cube_view: &self.probe_cube_view,
+            },
         );
         // ACES 色调映射绑定组：hdr_view → color_view；bloom 槽绑定白色
         // 兜底纹素（泛光强度恒 0，着色器不采样）、采样器 / 参数为 RT 常值。

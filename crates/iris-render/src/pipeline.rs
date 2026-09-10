@@ -34,6 +34,9 @@ pub(crate) struct PipelineBundle {
     /// 透明蒙皮变体：组 2 绑定关节矩阵，混合语义同上。
     pub transparent_skinned_pipeline: wgpu::RenderPipeline,
     pub sky_pipeline: wgpu::RenderPipeline,
+    /// 反射探针捕获的天空盒变体（R62a）：与 [`Self::sky_pipeline`] 同
+    /// 着色器 / 同布局，仅采样数为 1（单采样立方体面目标）。
+    pub probe_sky_pipeline: wgpu::RenderPipeline,
     pub shadow_pipeline: wgpu::RenderPipeline,
     /// 阴影蒙皮变体（组 1 绑定关节矩阵，保证阴影随骨骼变形）。
     pub skinned_shadow_pipeline: wgpu::RenderPipeline,
@@ -71,6 +74,12 @@ pub(crate) struct PipelineBundle {
     pub rt_transparent_pipeline: wgpu::RenderPipeline,
     /// RT 透明蒙皮变体。
     pub rt_transparent_skinned_pipeline: wgpu::RenderPipeline,
+    /// 反射探针捕获的不透明几何管线（R62a）：单采样 + `front_face: Cw`
+    /// （捕获面矩阵的 NDC y 翻转会反转环绕方向，正面约定须同步翻转，
+    /// 否则剔除的是房间内壁而非外壳——见 `create_pipeline` 内的实测结论）。
+    pub probe_capture_pipeline: wgpu::RenderPipeline,
+    /// 反射探针捕获的蒙皮变体（组 2 绑定关节矩阵）。
+    pub probe_capture_skinned_pipeline: wgpu::RenderPipeline,
     /// RT 色调映射管线（Rgba8UnormSrgb 输出）：复用 blit 着色器做 ACES +
     /// 曝光、泛光强度恒 0（RT 无 bloom），把 RT 线性 HDR 中间缓冲 map 到
     /// RT 颜色纹理。
@@ -241,6 +250,33 @@ pub(crate) fn create_pipeline(
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size: None,
+                },
+                count: None,
+            },
+            // 反射探针参数（R62a，`ProbeParams`）：生效数 + 逐探针
+            // （中心 / 过渡带 / 半边长 / cubemap 槽位）。与 CSM 同样**不扩
+            // Globals**——并行布局陷阱（skybox.wgsl 自持 Globals 前缀声明）
+            // 因此完全不被触碰，且无探针时着色路径与 R61 逐位一致。
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 反射探针 cubemap **数组**（R62a）：Rgba16Float、层序 =
+            // 槽位 × 6 + 面序、5 级 mip（与 env 同档）。采样复用 binding 6
+            // 的 Filtering 采样器（Rgba16Float 可过滤，无需扩展）。
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::CubeArray,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
                 },
                 count: None,
             },
@@ -513,6 +549,85 @@ pub(crate) fn create_pipeline(
         1,
     );
 
+    // 反射探针捕获管线族（R62a）：单采样 + **front_face: Cw**。捕获的面矩阵
+    // 含 NDC y 翻转（Cube 采样约定要求，见 `light::cube_face_view_proj`），
+    // 而翻转会**反转三角形在帧缓冲空间的环绕方向**（y 翻转 = 屏幕空间定向
+    // 反转）⇒ 沿用 `Ccw` 会把正面判成背面、剔掉房间里朝内的墙面而渲染墙的
+    // 外侧（实测症状：探针被球壳包住时整张 cubemap 变成球内壁的暗灰，墙上
+    // 图案与自发光板全部消失）。把正面约定同步翻成 `Cw` 即恢复与主 pass
+    // 一致的剔除语义（房间内壁是正面、包住探针的壳体是背面），比阴影 pass
+    // 的「cull None 交给深度」更省片元。
+    let make_capture_pipeline = |label: &'static str,
+                                 entry_point: &'static str,
+                                 layout: &wgpu::PipelineLayout,
+                                 skinned: bool|
+     -> wgpu::RenderPipeline {
+        let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
+            &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::mesh::SkinVertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+                Some(crate::mesh::TANGENT_LAYOUT),
+                Some(crate::mesh::UV2_LAYOUT),
+            ]
+        } else {
+            &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+                Some(crate::mesh::TANGENT_LAYOUT),
+                Some(crate::mesh::UV2_LAYOUT),
+            ]
+        };
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                front_face: wgpu::FrontFace::Cw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let probe_capture_pipeline = make_capture_pipeline(
+        "iris.pipeline.probe_capture",
+        "vs_main",
+        &pipeline_layout,
+        false,
+    );
+    let probe_capture_skinned_pipeline = make_capture_pipeline(
+        "iris.pipeline.probe_capture_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+    );
+
     // 天空盒：全屏三角形按像素射线采样预滤波环境贴图 0 级 mip（= 原始天空）。
     // 主 pass 内最先绘制；深度只测不写（Always + write false），几何体随后覆盖。
     let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -560,6 +675,47 @@ pub(crate) fn create_pipeline(
             count: sample_count,
             ..Default::default()
         },
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 反射探针捕获的天空盒变体（R62a）：同一 `skybox.wgsl`、同一布局，
+    // 只把采样数改成 1（探针捕获目标是单采样 Rgba16Float 立方体面）。
+    // 复用同一着色器保证探针里的天空与主视口**逐像素同源**（同一
+    // `inv_view_proj` 射线重建 + 同一 env 0 级 mip 采样）。
+    let probe_sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.probe_sky"),
+        layout: Some(&sky_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &sky_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &sky_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
     });
@@ -1637,6 +1793,7 @@ pub(crate) fn create_pipeline(
         transparent_pipeline,
         transparent_skinned_pipeline,
         sky_pipeline,
+        probe_sky_pipeline,
         shadow_pipeline,
         skinned_shadow_pipeline,
         point_shadow_pipeline,
@@ -1654,6 +1811,8 @@ pub(crate) fn create_pipeline(
         rt_skinned_pipeline,
         rt_transparent_pipeline,
         rt_transparent_skinned_pipeline,
+        probe_capture_pipeline,
+        probe_capture_skinned_pipeline,
         rt_blit_pipeline,
         particle_additive_pipeline,
         particle_alpha_pipeline,

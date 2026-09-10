@@ -51,6 +51,13 @@
 //!   早退逐位透传；资源缺席关闭 = blit 直写目标、链逐位不变；
 //! - 纹理 BC1 GPU 压缩（确定性编码器 + 特性/对齐/不透明决策树，无特性
 //!   或 web 自动回退 RGBA8）与 CPU / GPU 内存占用统计；
+//! - 烘焙反射探针（R62a，`probe` 模块）：实体挂 `ReflectionProbe` 定义
+//!   局部**轴对齐长方体**影响域（+ 边界过渡带），`Renderer::bake_reflection_probe`
+//!   从探针位置 6 面捕获场景 cubemap（含天空、含探针盒单级联方向光阴影）
+//!   并按 GGX 预滤波成与 env 同档的 mip 链；片元在域内时镜面走探针 +
+//!   **视差修正**（反射射线 × 盒求交重定向，经典 box projection），域外 /
+//!   无探针回落全局 env；挂光照贴图的实体的镜面也由探针补回（闭合 §8.31④）。
+//!   无探针场景**逐位不变**（FNV-1a 全帧基线锁，见 `tests/probe_render.rs`）；
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
 
 pub mod animation;
@@ -74,6 +81,7 @@ pub mod offscreen;
 pub mod particles;
 pub mod pipeline;
 pub mod post;
+pub mod probe;
 pub mod renderer;
 pub mod rendertarget;
 pub mod skin;
@@ -142,6 +150,12 @@ pub mod prelude {
         BloomSettings, DepthOfFieldSettings, ExposureSettings, FxaaSettings, MotionBlurSettings,
         TaaSettings, VignetteSettings, halton, jitter_projection, resolve_focus_distance,
         taa_jitter,
+    };
+    pub use crate::probe::{
+        MAX_REFLECTION_PROBES, PROBE_CAPTURE_FAR, PROBE_CAPTURE_NEAR, PROBE_DEFAULT_FALLOFF,
+        PROBE_MAP_SIZE, PROBE_MIP_COUNT, ProbeCandidate, ProbeStore, ReflectionProbe,
+        distance_to_box, fit_probe_shadow, influence_weight, parallax_direction,
+        select_active_probes,
     };
     pub use crate::renderer::{
         CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,

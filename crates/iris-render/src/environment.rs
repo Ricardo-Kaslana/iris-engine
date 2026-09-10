@@ -560,6 +560,187 @@ pub(crate) fn bake_environment_from(gpu: &Gpu, source: &SkySourceKind) -> Enviro
     }
 }
 
+/// 把源立方体贴图（读其 0 级 mip）预滤波进目标立方体的整条 mip 链
+/// （R62a 反射探针复用同一条 GGX 预滤波链）。
+///
+/// 与 [`bake_environment_from`] 第 3 步**逐参数同源**：同一 `environment.wgsl`
+/// 的 `fs_prefilter`、同一 `full` 绑定布局、同一步长 256 B 的动态偏移
+/// uniform、同一「mip ⟷ 粗糙度 = mip / (mips − 1)」映射 ⇒ 探针与全局 env 的
+/// mip 语义严格一致（着色器侧同一句 `roughness × env_params.x`）。
+///
+/// 函数独立成体而不复用烘焙主流程，是为了**让 env 一次性烘焙路径零改动**
+/// （既有 GPU 帧基线以此为据，见 ARCHITECTURE §4.12）；探针在自己的命令
+/// 缓冲里调用它，捕获面与预滤波 mip 因此同批提交。
+///
+/// `source` 与 `target` 必须是**两张不同的纹理**：预滤波 pass 同时把源绑成
+/// 采样纹理、把目标绑成颜色附件，同纹理既读又写会触发 wgpu 校验错误
+/// （探针因此保留一张共享的「原始捕获」立方体，见 `renderer.rs`）。
+///
+/// `layer_base` = 目标立方体 6 面在纹理数组中的起始层（全局 env 传 0；
+/// 反射探针传 `槽位 × 6`——所有探针共用一张 cubemap 数组）。
+pub(crate) fn encode_prefilter_chain(
+    gpu: &Gpu,
+    encoder: &mut wgpu::CommandEncoder,
+    source: &wgpu::TextureView,
+    target: &wgpu::Texture,
+    layer_base: u32,
+) {
+    let device = &gpu.device;
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.environment.prefilter"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/environment.wgsl").into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.env.layout.prefilter"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::Cube,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("iris.env.prefilter.sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    // 每（mip, 面）一个 256B 参数槽（动态偏移对齐要求）
+    const STRIDE: u64 = 256;
+    let slots = (ENV_MIP_COUNT * 6) as usize;
+    let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("iris.env.prefilter.params"),
+        size: slots as u64 * STRIDE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut params_data = vec![0u8; slots * STRIDE as usize];
+    for mip in 0..ENV_MIP_COUNT {
+        for face in 0..6u32 {
+            let base = ((mip * 6 + face) as usize) * STRIDE as usize;
+            let roughness = mip as f32 / (ENV_MIP_COUNT - 1) as f32;
+            let bytes: [u8; 16] = bytemuck::cast([face as f32, roughness, 0.0, 0.0]);
+            params_data[base..base + 16].copy_from_slice(&bytes);
+        }
+    }
+    gpu.queue.write_buffer(&params_buf, 0, &params_data);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("iris.env.prefilter.bg"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &params_buf,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(16),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(source),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.env.pipeline.prefilter.layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.env.pipeline.prefilter.reuse"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_prefilter"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    for mip in 0..ENV_MIP_COUNT {
+        for face in 0..6u32 {
+            let view = target.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer_base + face,
+                array_layer_count: Some(1),
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.env.prefilter.pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[((mip * 6 + face) as usize * 256) as u32]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+    // params_buf / bind_group / pipeline 在本函数返回后即 drop：wgpu 对命令
+    // 缓冲引用到的资源持有内部引用计数，提交前不会被真正回收（与
+    // bake_environment_from 的局部资源同一约定）。
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

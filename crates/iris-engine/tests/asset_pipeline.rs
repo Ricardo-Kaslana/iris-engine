@@ -99,8 +99,17 @@ fn actor_glb() -> Vec<u8> {
 
 /// fixture 目录：写 GLB + manifest（support 优先级 0 先加载、actor 5
 /// 后加载、bc3 标志挂 actor），返回（目录, 文件已就绪）。
+///
+/// 目录名带**进程内调用序**：本二进制的两个测试并行线程运行，若共用
+/// `pid` 同名目录，一方末尾的 `remove_dir_all` 会删掉另一方仍在读取的
+/// 文件（偶发 `NotFound`，R62a 验收实测踩中一次）——与 gltf / hdr 临时
+/// 文件竞态同类（AGENTS.md「测试间共享文件名会竞态」第三案），按规约
+/// 用唯一名根治。
 fn fixture_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("iris-r59-pipeline-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("iris-r59-pipeline-{}-{seq}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("创建临时目录");
     std::fs::write(dir.join("actor.glb"), actor_glb()).expect("写 actor.glb");
     std::fs::write(dir.join("support.bin"), vec![7u8; 64]).expect("写 support.bin");
