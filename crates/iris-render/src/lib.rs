@@ -148,8 +148,8 @@ pub mod prelude {
     };
     pub use crate::post::{
         BloomSettings, DepthOfFieldSettings, ExposureSettings, FxaaSettings, MotionBlurSettings,
-        TaaSettings, VignetteSettings, halton, jitter_projection, resolve_focus_distance,
-        taa_jitter,
+        SsrSettings, TaaSettings, VignetteSettings, halton, jitter_projection,
+        resolve_focus_distance, ssr_edge_fade, ssr_roughness_fade, taa_jitter,
     };
     pub use crate::probe::{
         MAX_REFLECTION_PROBES, PROBE_CAPTURE_FAR, PROBE_CAPTURE_NEAR, PROBE_DEFAULT_FALLOFF,

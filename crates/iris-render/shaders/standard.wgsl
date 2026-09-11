@@ -130,6 +130,32 @@ const POINT_SHADOW_TEXEL_SCALE: f32 = 2.0 / 512.0;
 // 采样器（Rgba16Float 可过滤）。两者同样排在最大 binding 之后、不扩 Globals。
 @group(0) @binding(9) var<uniform> probe_params: ProbeParams;
 @group(0) @binding(10) var probe_cube: texture_cube_array<f32>;
+// SSR 上帧资源（R62b，排在探针之后、不扩 Globals 前缀——skybox.wgsl 的
+// 并行布局陷阱不触碰）：binding 11 = 上帧主解析缓冲帧尾副本（Rgba16Float，
+// 可过滤，命中后一次 textureSampleLevel 取反射色）；binding 12 = 上帧场景
+// 深度副本（R32Float 线性视距，textureLoad 读取——非过滤，与 DOF/MB 的
+// 深度副本同源同口径，步进中逐样本读，不用采样器）；binding 13 = SSR
+// 参数 uniform（flags.x = 0 时全部片元早退，缺席路径不执行任何步进）。
+// 上帧深度的「读后写」时序：本帧 scene_depth pass 编码在主 pass 之后，
+// 同一命令编码器内按序执行 ⇒ 主 pass 读到的恒为上一帧写入的内容
+// （ARCHITECTURE §4.31 裁决 2）。
+@group(0) @binding(11) var ssr_prev_color: texture_2d<f32>;
+@group(0) @binding(12) var ssr_prev_depth: texture_2d<f32>;
+
+// SSR 参数（96 B，POD；与 Rust 侧 SsrParamsRaw 逐字段对齐）。
+struct SsrParams {
+    // 上帧实际渲染矩阵（上帧快照，含 TAA 抖动——与 MB/TAA 的重投影基准
+    // 同源）：步进样本投影到上帧屏幕取深度 / 颜色
+    prev_view_proj: mat4x4<f32>,
+    // x: 本帧是否执行（0 = 首帧启用 / 关→开 / 分辨率变化 / 切镜 / 无几何
+    //    帧 ⇒ 整段跳过，与 SSR 关闭帧逐位一致）,
+    // y: 全局强度, z: 粗糙度早退阈值, w: 屏幕边缘衰减带宽（UV 比例）
+    flags: vec4<f32>,
+    // x: 步进最大距离（米）, y: 厚度容差（米）, z/w: 保留
+    extent: vec4<f32>,
+};
+
+@group(0) @binding(13) var<uniform> ssr: SsrParams;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -438,6 +464,133 @@ fn box_project(d: vec3<f32>, p: vec3<f32>, e: vec3<f32>) -> vec3<f32> {
     return normalize(hit);
 }
 
+// ---- SSR（R62b）：屏幕空间反射——前向片元内对上帧颜色/深度射线步进 ----
+//
+// 单一来源的合成公式（ARCHITECTURE §4.31 裁决 4，与 Rust 侧
+// `post::{ssr_roughness_fade, ssr_edge_fade}` 同一公式）：
+//
+//   spec_refl_w = spec × (f_amb·brdf.x + brdf.y)            // 既有探针/env 镜面项
+//   w_ssr       = roughness_fade(r) × edge_fade(uv) × 强度 × [命中]
+//   roughness_fade(r) = clamp((CUT − r)/(CUT − FLOOR), 0, 1)
+//   edge_fade(uv)     = clamp(min(u.x,1−u.x)/M) × clamp(min(u.y,1−u.y)/M)
+//   ssr_spec    = prev_color(uv_hit) × f_amb                 // BRDF 权 = 纯 Fresnel
+//   spec_refl_w ← mix(spec_refl_w, ssr_spec, w_ssr)          // 命中才执行
+//
+// 未命中 / 权重 0 ⇒ mix 不执行或取 0 ⇒ spec_refl_w 保持既有通路原串位
+// （缺省路径逐位一致：SSR 关闭时整段分支不进入，不执行任何步进算术）。
+
+// 线性步进步数：32 步 × 默认最大距离 12 m = 0.375 m 步长。穿越 0.2–0.5 m
+// 体块时的最大穿透深度 ≤ 一个步长（法向穿越），小于默认厚度 0.5 m ⇒ 不
+// 漏判；步数翻倍对薄体块收益递减、对片元成本线性（每步一次 mat4 乘 +
+// textureLoad），32 在两者间取中。
+const SSR_STEPS: u32 = 32u;
+// 命中后二分细化轮数：把命中精度从步长 0.375 m 收到 0.375/2⁶ ≈ 6 mm
+// （256 px 宽画面、3 m 距离下 ≈ 0.5 px——反射落点的像素级对齐由此保证）。
+const SSR_REFINE: u32 = 6u;
+// 粗糙度衰减带：≤ 0.25 全量、≥ 0.6 早退（早退依据：GGX lobe 半角 ~40°，
+// 单根镜像射线无法积分该宽度，且上帧颜色无预滤波 mip——直接采样是噪声；
+// 该段探针/env 预滤波已是正确估计，步进纯浪费）。与 Rust 侧
+// `post::SSR_ROUGH_FLOOR` 同值，同步修改。
+const SSR_ROUGH_FLOOR: f32 = 0.25;
+
+// 粗糙度衰减（CPU 镜像：post::ssr_roughness_fade）。带退化时不做除法。
+fn ssr_roughness_fade(r: f32, cutoff: f32) -> f32 {
+    if (cutoff <= SSR_ROUGH_FLOOR) {
+        return select(0.0, 1.0, r < cutoff);
+    }
+    return clamp((cutoff - r) / (cutoff - SSR_ROUGH_FLOOR), 0.0, 1.0);
+}
+
+// 屏幕边缘衰减（CPU 镜像：post::ssr_edge_fade）。命中点接近屏幕边缘时
+// 线性淡出——出屏方向的反射平滑过渡回探针/env，避免边界处突变。
+fn ssr_edge_fade(uv: vec2<f32>, margin: f32) -> f32 {
+    if (margin <= 0.0) {
+        return 1.0;
+    }
+    let fx = clamp(min(uv.x, 1.0 - uv.x) / margin, 0.0, 1.0);
+    let fy = clamp(min(uv.y, 1.0 - uv.y) / margin, 0.0, 1.0);
+    return fx * fy;
+}
+
+/// 世界坐标 → 上帧屏幕 UV + 线性视距（clip.w 与 scene_depth 副本的存储
+/// 口径同源，透视下 clip.w = 该点到相机的前向距离）。UV 约定与 MB/TAA
+/// 的重投影一致（blit 的 V 翻转：uv.y = −ndc.y × 0.5 + 0.5）。
+fn ssr_project(vp: mat4x4<f32>, world: vec3<f32>) -> vec4<f32> {
+    // 返回 (uv.xy, 0, w)；w = clip.w = 线性视距，w ≤ 0（上帧相机背后）
+    // 由调用方裁决
+    let clip = vp * vec4<f32>(world, 1.0);
+    let w = clip.w;
+    let uv = vec2<f32>(clip.x, -clip.y) / max(w, 1e-6) * 0.5 + vec2<f32>(0.5);
+    return vec4<f32>(uv, 0.0, w);
+}
+
+/// 屏幕空间射线步进：世界空间反射射线 `p(t) = world_pos + dir·t` 等分
+/// 线性步进，逐样本投影到上帧屏幕，与上帧深度副本（线性视距）比较；
+/// 「上帧表面在前、射线点在其后一个厚度以内」判穿越命中，随后在跨越
+/// 区间二分细化，末样本取上帧颜色。返回 vec4(rgb 反射色, w = 合成权重
+/// ——0 = 未命中 / 出屏 / 衰减殆尽)。
+///
+/// 确定性：全程无 RNG、无导数依赖（textureLoad + 命中后一次
+/// textureSampleLevel 显式 mip）——同输入逐位可复现。
+fn ssr_march(world_pos: vec3<f32>, dir: vec3<f32>, roughness: f32) -> vec4<f32> {
+    var result = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let vp = ssr.prev_view_proj;
+    let max_dist = max(ssr.extent.x, 1e-3);
+    let thickness = max(ssr.extent.y, 1e-3);
+    let step_len = max_dist / f32(SSR_STEPS);
+    // 首样本从半步长起步：t = 0 是片元自身（深度恰等于存储值，立即自命中）
+    var t_front = 0.5 * step_len;
+    var hit_uv = vec2<f32>(0.0, 0.0);
+    var hit = false;
+    for (var i = 0u; i < SSR_STEPS; i = i + 1u) {
+        let t = (f32(i) + 0.5) * step_len;
+        let s = ssr_project(vp, world_pos + dir * t);
+        // 上帧相机背后 / 出屏（含边缘衰减带宽外）⇒ 出屏方向，终止为未命中
+        if (s.w <= 1e-4 || s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0) {
+            break;
+        }
+        let dims = vec2<f32>(textureDimensions(ssr_prev_depth));
+        let px = clamp(vec2<i32>(s.xy * dims), vec2<i32>(0, 0), vec2<i32>(dims) - vec2<i32>(1, 1));
+        let stored = textureLoad(ssr_prev_depth, px, 0).r;
+        // 穿越判定：射线点已在上帧表面之后、且穿透不超过厚度容差
+        if (s.w > stored && s.w - stored <= thickness) {
+            // 二分细化 [t_front, t]：t_front 恒在前（stored ≥ 射线点）
+            var lo = t_front;
+            var hi = t;
+            for (var r = 0u; r < SSR_REFINE; r = r + 1u) {
+                let mid = 0.5 * (lo + hi);
+                let sm = ssr_project(vp, world_pos + dir * mid);
+                if (sm.w <= 1e-4) {
+                    break;
+                }
+                let pxm = clamp(
+                    vec2<i32>(sm.xy * dims),
+                    vec2<i32>(0, 0),
+                    vec2<i32>(dims) - vec2<i32>(1, 1),
+                );
+                let stored_m = textureLoad(ssr_prev_depth, pxm, 0).r;
+                if (sm.w > stored_m) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let t_hit = 0.5 * (lo + hi);
+            let s_hit = ssr_project(vp, world_pos + dir * t_hit);
+            hit = true;
+            hit_uv = s_hit.xy;
+            break;
+        }
+        t_front = t;
+    }
+    if (hit) {
+        let color = textureSampleLevel(ssr_prev_color, env_sampler, hit_uv, 0.0).rgb;
+        let fade = ssr_roughness_fade(roughness, ssr.flags.z) * ssr_edge_fade(hit_uv, ssr.flags.w);
+        result = vec4<f32>(color, fade);
+    }
+    return result;
+}
+
 // ---- 切线空间（R42）----
 
 // 片元 TBN（切线 → 世界）两路选择：
@@ -616,7 +769,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         spec = textureSampleLevel(probe_cube, env_sampler, dir, best_slot,
                                   roughness * globals.env_params.x).rgb;
     }
-    let ibl_env = (kd_amb * albedo * irradiance + spec * (f_amb * brdf.x + brdf.y))
+    // 镜面反射项的 BRDF 权重拆出为独立变量（与原行内表达式同串位——
+    // 同操作数同顺序，SSR 关闭路径逐位一致）：SSR 命中时按合成公式混入
+    // 上帧反射色（裁决 4，见 ssr_march 头注释）。
+    var spec_refl_w = spec * (f_amb * brdf.x + brdf.y);
+    if (ssr.flags.x > 0.5 && roughness < ssr.flags.z) {
+        let hit = ssr_march(in.world_pos, spec_dir, roughness);
+        if (hit.w > 0.0) {
+            spec_refl_w = mix(spec_refl_w, hit.rgb * f_amb, hit.w);
+        }
+    }
+    let ibl_env = (kd_amb * albedo * irradiance + spec_refl_w)
             * globals.env_params.y * ao;
 
     // 光照贴图间接项（R52c）：图集存**辐照度** E（天空 AO + 一次反弹
@@ -640,7 +803,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 乘 env 强度与 ao 的理由与 IBL 镜面项一致（探针取代的就是该项）。
     var ibl_final = ibl;
     if (material.surface.w > 0.5 && best_w > 0.0) {
-        ibl_final = ibl + spec * (f_amb * brdf.x + brdf.y) * globals.env_params.y * ao;
+        // spec_refl_w 已含 SSR 混合（如有）——光照贴图实体的环境镜面与
+        // IBL 实体走同一份镜面项
+        ibl_final = ibl + spec_refl_w * globals.env_params.y * ao;
     }
     // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);

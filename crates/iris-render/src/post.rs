@@ -272,6 +272,81 @@ impl Default for FxaaSettings {
     }
 }
 
+/// SSR（屏幕空间反射）设置（R62b）。前向片元内对**上一帧**的颜色与深度
+/// 做屏幕空间射线步进：命中 ⇒ 反射屏幕内内容（含动态物体与后摆进的
+/// 物体）；未命中 ⇒ 回退探针 / env（R62a 通路）。设计与裁决详见
+/// ARCHITECTURE §4.31。
+///
+/// **资源缺席语义**：未注册或 `enabled = false` 时整段关闭——不分配上帧
+/// 颜色副本、不编码额外 pass、不写 SSR 参数（着色器 `count = 0` 早退），
+/// 渲染与 R62a 逐位一致（零开销默认路径，全部既有 GPU FNV 基线原值）。
+///
+/// **重置语义**：首帧启用 / 关→开切换 / 分辨率变化 / 切镜（跟随
+/// [`crate::renderer::Renderer::reset_taa`]）⇒ 上帧资源无效 ⇒ 该帧整段
+/// 跳过，输出与 SSR 关闭帧逐位一致（`FrameStats::ssr_on` 观测字段）。
+#[derive(Clone, Copy, Debug, iris_core::Resource)]
+pub struct SsrSettings {
+    /// 是否启用 SSR（`Default = false` = 关，与「缺席 = 关」语义一致）。
+    pub enabled: bool,
+    /// 全局强度倍率（≥ 0；1.0 = 物理权重，粗糙度 / Fresnel / 边缘衰减
+    /// 全量生效）。
+    pub intensity: f32,
+    /// 步进最大距离（米）：反射射线的世界空间行程上限。
+    pub max_distance: f32,
+    /// 厚度容差（米）：穿越判定带宽——命中要求「上帧表面深度 < 射线点
+    /// 深度 ≤ 上帧表面深度 + 厚度」。过小则斜穿漏判，过大则薄墙前后混淆。
+    pub thickness: f32,
+    /// 屏幕边缘衰减带宽（UV 比例，0.1 = 四周 10% 内随接近边缘线性衰减
+    /// 到 0——命中点出屏方向淡出，避免屏幕边界处反射突然出现 / 消失）。
+    pub edge_margin: f32,
+    /// 粗糙度早退阈值（0..1）：粗糙度 ≥ 此值的片元不步进，直接走探针 /
+    /// env（GGX lobe 半角 ~40° 的单射线采样无意义 + 上帧颜色无预滤波
+    /// mip，步进纯浪费）。
+    pub roughness_cutoff: f32,
+}
+
+impl Default for SsrSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            intensity: 1.0,
+            max_distance: 12.0,
+            thickness: 0.5,
+            edge_margin: 0.1,
+            roughness_cutoff: 0.6,
+        }
+    }
+}
+
+/// [`SsrSettings::roughness_cutoff`] 之下 SSR 强度开始衰减的粗糙度下限
+/// （≤ 此值全量命中权重）。与 `standard.wgsl` 的 `SSR_ROUGH_FLOOR` 同值，
+/// 着色器侧逐行镜像，两者必须同步修改。
+pub const SSR_ROUGH_FLOOR: f32 = 0.25;
+
+/// 粗糙度衰减曲线（与 `standard.wgsl` 的 `ssr_roughness_fade` 同一公式，
+/// CPU 单测锁定，着色器侧逐行镜像）：
+/// `clamp((cutoff − r) / (cutoff − floor), 0, 1)`——
+/// `r ≤ floor` 全量 1（光滑面全量）、`r ≥ cutoff` 为 0（早退段）、中间
+/// 线性下降。`floor == cutoff` 时不做除法，退化为二值判定。
+pub fn ssr_roughness_fade(roughness: f32, floor: f32, cutoff: f32) -> f32 {
+    if cutoff <= floor {
+        return if roughness < cutoff { 1.0 } else { 0.0 };
+    }
+    ((cutoff - roughness) / (cutoff - floor)).clamp(0.0, 1.0)
+}
+
+/// 屏幕边缘衰减（与 `standard.wgsl` 的 `ssr_edge_fade` 同一公式，CPU
+/// 单测锁定，着色器侧逐行镜像）：命中点 UV 到四边的最近距离除以带宽
+/// 钳制到 [0, 1]，两轴相乘。`margin ≤ 0` 视为无衰减（恒 1）。
+pub fn ssr_edge_fade(uv: [f32; 2], margin: f32) -> f32 {
+    if margin <= 0.0 {
+        return 1.0;
+    }
+    let fx = (uv[0].min(1.0 - uv[0]) / margin).clamp(0.0, 1.0);
+    let fy = (uv[1].min(1.0 - uv[1]) / margin).clamp(0.0, 1.0);
+    fx * fy
+}
+
 /// TAA（时域抗锯齿）设置（R60）。后处理链首的 HDR 域时域累加：主相机
 /// 投影按 Halton(2,3) 8 点序列做亚像素抖动，TAA pass 用当前帧抖动色 +
 /// 深度副本 + 上帧历史做相机重投影与 3×3 邻域钳制混合（详见
@@ -1153,5 +1228,72 @@ mod tests {
         );
         assert_eq!(chain_source(None, true), PostInput::TaaHistory);
         assert_eq!(chain_source(None, false), PostInput::Scene);
+    }
+
+    // ---- SSR 纯函数（R62b，standard.wgsl 同名函数的 CPU 侧锚点） ----
+
+    /// 粗糙度衰减曲线三段：下限以下全量 1、上限以上 0、中间线性单调
+    /// 下降（中点恰 0.5）。早退阈值以上为 0 是「粗糙面不走步进」的
+    /// 权重侧保证（步进侧由着色器分支跳过）。
+    #[test]
+    fn ssr_roughness_fade_is_linear_between_floor_and_cutoff() {
+        let floor = SSR_ROUGH_FLOOR;
+        let cutoff = 0.6;
+        assert_eq!(ssr_roughness_fade(0.0, floor, cutoff), 1.0, "完全镜面全量");
+        assert_eq!(
+            ssr_roughness_fade(floor, floor, cutoff),
+            1.0,
+            "下限处恰全量"
+        );
+        assert_eq!(
+            ssr_roughness_fade(cutoff, floor, cutoff),
+            0.0,
+            "上限处恰归零"
+        );
+        assert_eq!(ssr_roughness_fade(1.0, floor, cutoff), 0.0, "上限以上恒 0");
+        assert_eq!(
+            ssr_roughness_fade((floor + cutoff) * 0.5, floor, cutoff),
+            0.5,
+            "中点线性中值"
+        );
+        // 单调不增：带内严格下降
+        let mut prev = 1.0;
+        let mut r = floor;
+        while r <= cutoff {
+            let v = ssr_roughness_fade(r, floor, cutoff);
+            assert!(v <= prev, "衰减必须单调不增：r = {r}");
+            assert!(v < prev || r <= floor, "带内必须严格下降：r = {r}");
+            prev = v;
+            r += 0.01;
+        }
+    }
+
+    /// 衰减带退化为二值（floor == cutoff）：阈值以下 1、以上 0，不产生
+    /// 除零。着色器分支同构。
+    #[test]
+    fn ssr_roughness_fade_degenerate_band_is_binary() {
+        assert_eq!(ssr_roughness_fade(0.3, 0.5, 0.5), 1.0, "阈值以下全量");
+        assert_eq!(ssr_roughness_fade(0.5, 0.5, 0.5), 0.0, "阈值处归零");
+        assert_eq!(ssr_roughness_fade(0.7, 0.5, 0.5), 0.0, "阈值以上归零");
+    }
+
+    /// 边缘衰减：屏中心恒 1、边线恰 0、带宽内线性、两轴相乘、负带宽 =
+    /// 无衰减。出屏方向淡出在 [0,1] 之外由着色器步进的出屏 break 兜底
+    /// （本函数只对 [0,1] 内的命中点定义）。
+    #[test]
+    fn ssr_edge_fade_anchors_and_axes() {
+        assert_eq!(ssr_edge_fade([0.5, 0.5], 0.1), 1.0, "屏中心无衰减");
+        assert_eq!(ssr_edge_fade([0.0, 0.5], 0.1), 0.0, "边线衰减到 0");
+        assert_eq!(ssr_edge_fade([0.5, 1.0], 0.1), 0.0);
+        assert_eq!(ssr_edge_fade([0.05, 0.5], 0.1), 0.5, "半带宽处线性中值");
+        assert_eq!(
+            ssr_edge_fade([0.05, 0.05], 0.1),
+            0.25,
+            "两轴相乘（角区衰减更快）"
+        );
+        assert_eq!(ssr_edge_fade([0.05, 0.5], 0.0), 1.0, "负 / 零带宽 = 无衰减");
+        assert_eq!(ssr_edge_fade([0.5, 0.5], 0.1), 1.0);
+        // 带宽外（距边 ≥ margin）恒全量
+        assert_eq!(ssr_edge_fade([0.11, 0.5], 0.1), 1.0);
     }
 }

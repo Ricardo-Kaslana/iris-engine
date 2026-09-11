@@ -537,6 +537,20 @@ pub struct Renderer {
     /// 上一帧 TAA 是否开启（R60）：关→开切换帧强制重置（历史是旧的
     /// 抖动序列与相机下的产物，不可信）。
     taa_was_on: bool,
+    /// SSR 常驻 GPU 资源（R62b，哑资源恒在——布局要求的 binding 占位）。
+    ssr: SsrGpu,
+    /// SSR 上帧资源是否有效（R62b）：上帧 SSR 开启且完成了场景深度副本
+    /// 与帧尾颜色副本 ⇒ 本帧可以步进。首帧启用 / 关→开 / 分辨率变化 /
+    /// 切镜（reset_taa 跟随）/ 上帧无不透明几何 时置 false ⇒ 该帧整段
+    /// 跳过（输出与 SSR 关闭帧逐位一致）。
+    ssr_prev_valid: bool,
+    /// 上一帧 SSR 是否开启（R62b）：关→开切换帧强制跳过（上帧资源是
+    /// 关闭语义下遗留的内容，不可信）。
+    ssr_was_on: bool,
+    /// SSR 参数缓冲是否处于「已写非零」状态（R62b）：缺席 / 关闭路径不
+    /// 发 write_buffer，退场的那一帧才回写零值（探针 params_active
+    /// 同款记账——关闭后残留 flags.x = 1 会拿陈旧上帧资源做步进）。
+    ssr_uniform_live: bool,
     /// UI 字形图集纹理（初始化时一次性构建；字段仅为保持 view 存活）。
     #[allow(dead_code)]
     ui_atlas: wgpu::Texture,
@@ -733,6 +747,42 @@ struct TaaTargets {
     blit_bgs: [wgpu::BindGroup; 2],
 }
 
+/// SSR 的常驻 GPU 资源（R62b）。布局要求的 binding 11/12/13 恒需合法
+/// 绑定，故哑资源（1×1 纹理 + 零参数缓冲）**始终存在**（探针的
+/// 「零参数 + 1×1 哑 cubemap」同款——缺席路径不分配任何大资源、着色器
+/// flags.x = 0 早退，渲染与 R62a 逐位一致）。真实资源只有上帧颜色副本
+/// 一张（`prev_color`，`SsrSettings` 首次开启时惰性分配）：上帧深度
+/// **复用现有单份 scene_depth 纹理**——scene_depth pass 编码在主 pass
+/// 之后（同一编码器按序执行），主 pass 读到的恒为上一帧内容，无需
+/// ping-pong（裁决 2 的偏离声明见 ARCHITECTURE §4.31）。
+struct SsrGpu {
+    /// 96B 参数（SsrParamsRaw 布局；主相机路径，SSR 活跃 / 重置帧都写）。
+    params_buf: wgpu::Buffer,
+    /// 96B 零参数（探针捕获面 / RT 相机绑定组专用——永不写，恒 flags = 0，
+    /// 捕获 / RT 片元不做 SSR）。
+    off_params_buf: wgpu::Buffer,
+    /// 1×1 哑颜色纹理 / 视图（prev_color 未创建时占位 binding 11）。
+    #[allow(dead_code)]
+    dummy_color: wgpu::Texture,
+    dummy_color_view: wgpu::TextureView,
+    /// 1×1 哑深度纹理 / 视图（占位 binding 12）。
+    #[allow(dead_code)]
+    dummy_depth: wgpu::Texture,
+    dummy_depth_view: wgpu::TextureView,
+    /// 上帧主解析缓冲的帧尾副本（一次 copy_texture_to_texture；仅 SSR
+    /// 开启时创建，尺寸随 HDR 集合）。`None` = 从未启用（哑纹理占位）。
+    prev_color: Option<SsrPrevColor>,
+    /// `prev_color` 当前尺寸（复用判定键）。
+    prev_size: (u32, u32),
+}
+
+/// 上帧颜色副本纹理 + 采样视图（本体保活字段仅供视图有效性依赖）。
+struct SsrPrevColor {
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
 /// 遮挡查询的常驻 GPU 资源（R53，首次启用时惰性创建，见
 /// `ensure_occ_gpu`）。查询槽上限 = `wgpu::QUERY_SET_MAX_QUERIES`
 /// （4096）：超出部分不查询、恒可见（保守方向，见 occlusion.rs 限制③）。
@@ -841,6 +891,23 @@ const _: () = assert!(
 /// TAA 历史权重（混合 = current×0.1 + clamped_history×0.9）：收敛速度
 /// 与残影长度的经验折中（约 10 帧量级把过期历史衰减到 1/e）。
 const TAA_HISTORY_WEIGHT: f32 = 0.9;
+
+/// 与 WGSL `SsrParams` 对齐（96 字节，POD）：SSR 步进参数（R62b）。
+/// 上一帧实际渲染矩阵（反射样本投影到上帧屏幕——与 MB/TAA 重投影基准
+/// 同源）+ 标量（执行开关 / 强度 / 粗糙度早退阈值 / 边缘衰减带宽 +
+/// 最大距离 / 厚度）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SsrParamsRaw {
+    prev_view_proj: [[f32; 4]; 4],
+    flags: [f32; 4],
+    extent: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<SsrParamsRaw>() == 96,
+    "SsrParams 必须与 WGSL 布局一致"
+);
 
 /// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
 /// 与全分辨率 A/B 槽变体惰性构建（`ensure_full_targets`，源 = 暗角 /
@@ -971,6 +1038,11 @@ pub struct FrameStats {
     /// 且在预算 [`MAX_REFLECTION_PROBES`] 内被选择键选中的探针数，0 =
     /// 全部片元走全局 env（与 R61 逐位一致的路径）。
     pub reflection_probes: u32,
+    /// 本帧 SSR 是否活跃步进（R62b，观测字段，不进任何排序键）：1 =
+    /// SSR 开启且上帧资源有效（片元内实际执行了屏幕空间步进）；0 = 关闭
+    /// 或重置帧（首帧启用 / 关→开 / 分辨率变化 / 切镜 / 上帧或本帧无不
+    /// 透明几何——该帧输出与 SSR 关闭帧逐位一致）。
+    pub ssr_on: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -1044,15 +1116,38 @@ struct ShadowMapViews<'a> {
     point_cube: &'a wgpu::TextureView,
 }
 
+/// 全局绑定组里的两路 uniform 缓冲：主 Globals（binding 0）+ 级联参数
+/// （binding 8）。打包成组与 [`ProbeGlobalsResources`] / [`ShadowMapViews`]
+/// 同款纪律——`build_globals_bind_group` 的实参数量保持在 clippy 的
+/// 7 参数阈值内（R62b 加入 SSR 三路资源后 grouping 是必需而非风格）。
+#[derive(Clone, Copy)]
+struct GlobalsBuffers<'a> {
+    globals: &'a wgpu::Buffer,
+    csm_params: &'a wgpu::Buffer,
+}
+
+/// 全局绑定组里的 SSR 三路资源（R62b）：参数缓冲（binding 13）+ 上帧
+/// 颜色副本视图（binding 11）+ 上帧深度副本视图（binding 12）。主视图
+/// 传真实资源；探针捕获面 / RT 相机的绑定组传**零参数 + 哑纹理**（捕获
+/// / RT 视口不做屏幕空间反射——上帧语义只对主相机成立，见 §4.31 裁决 2）。
+#[derive(Clone, Copy)]
+struct SsrGlobalsResources<'a> {
+    params_buf: &'a wgpu::Buffer,
+    color_view: &'a wgpu::TextureView,
+    depth_view: &'a wgpu::TextureView,
+}
+
 fn build_globals_bind_group(
     gpu: &Gpu,
     bundle: &crate::pipeline::PipelineBundle,
-    globals_buf: &wgpu::Buffer,
-    csm_params_buf: &wgpu::Buffer,
+    buffers: GlobalsBuffers<'_>,
     shadows: ShadowMapViews<'_>,
     env: &crate::environment::EnvironmentMaps,
     probe: ProbeGlobalsResources<'_>,
+    ssr: SsrGlobalsResources<'_>,
 ) -> wgpu::BindGroup {
+    let globals_buf = buffers.globals;
+    let csm_params_buf = buffers.csm_params;
     let env_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("iris.env.sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1119,6 +1214,21 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 10,
                 resource: wgpu::BindingResource::TextureView(probe.cube_view),
+            },
+            // SSR 上帧资源（R62b）：上帧颜色副本 + 上帧深度副本 + 参数
+            // （采样器复用 binding 6 的 Filtering 档——Rgba16Float 可过滤；
+            // 深度为 textureLoad 读取，不需要采样器）
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(ssr.color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(ssr.depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: ssr.params_buf.as_entire_binding(),
             },
         ],
     })
@@ -1955,6 +2065,70 @@ impl Renderer {
             dimension: Some(wgpu::TextureViewDimension::CubeArray),
             ..Default::default()
         });
+        // SSR 常驻资源（R62b）：1×1 哑纹理 + 双 96B 参数缓冲。布局要求
+        // binding 11/12/13 恒需合法绑定，哑资源始终存在（内容永不被采样
+        // ——flags = 0 时着色器整段早退）；真实上帧颜色副本由
+        // `ensure_ssr_prev_color` 在 `SsrSettings` 首次开启时惰性创建。
+        let make_ssr_params = |label: &'static str| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<SsrParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let ssr_params_buf = make_ssr_params("iris.ssr.params");
+        let ssr_off_params_buf = make_ssr_params("iris.ssr.params_off");
+        let ssr_dummy_color = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ssr.dummy_color"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ssr_dummy_color_view =
+            ssr_dummy_color.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr_dummy_depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ssr.dummy_depth"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ssr_dummy_depth_view =
+            ssr_dummy_depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr = SsrGpu {
+            params_buf: ssr_params_buf,
+            off_params_buf: ssr_off_params_buf,
+            dummy_color: ssr_dummy_color,
+            dummy_color_view: ssr_dummy_color_view,
+            dummy_depth: ssr_dummy_depth,
+            dummy_depth_view: ssr_dummy_depth_view,
+            prev_color: None,
+            prev_size: (0, 0),
+        };
+        // 主视图绑定组初建时的 SSR 三路：参数走**活跃**缓冲（此后由 draw
+        // 逐帧管理），颜色 / 深度此时只有哑纹理（prev_color / scene_depth
+        // 均未创建；二者就位时重建绑定组，见 draw 的接线）。
+        let ssr_main_res = SsrGlobalsResources {
+            params_buf: &ssr.params_buf,
+            color_view: &ssr.dummy_color_view,
+            depth_view: &ssr.dummy_depth_view,
+        };
         // 捕获期每面一份 Globals 缓冲 + 绑定组（面矩阵 / 眼点逐面不同）
         let probe_face_globals_bufs: [wgpu::Buffer; 6] = std::array::from_fn(|_| {
             gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1965,13 +2139,16 @@ impl Renderer {
             })
         });
         // 捕获绑定组：绑定 0..8 与主组同源（阴影贴图 / env / CSM / 点光阴影），
-        // 绑定 9/10 指向**哑资源 + 零参数**（捕获不做探针自反馈）
+        // 绑定 9/10 指向**哑资源 + 零参数**（捕获不做探针自反馈），
+        // SSR 三路同样走零参数 + 哑纹理（捕获不做屏幕空间反射）
         let probe_face_globals_bgs: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
             build_globals_bind_group(
                 &gpu,
                 &bundle,
-                &probe_face_globals_bufs[face],
-                &csm_params_buf,
+                GlobalsBuffers {
+                    globals: &probe_face_globals_bufs[face],
+                    csm_params: &csm_params_buf,
+                },
                 ShadowMapViews {
                     cascades: &shadow_map_view,
                     point_cube: &point_shadow_cube_view,
@@ -1980,6 +2157,11 @@ impl Renderer {
                 ProbeGlobalsResources {
                     params_buf: &probe_capture_params_buf,
                     cube_view: &probe_dummy_view,
+                },
+                SsrGlobalsResources {
+                    params_buf: &ssr.off_params_buf,
+                    color_view: &ssr.dummy_color_view,
+                    depth_view: &ssr.dummy_depth_view,
                 },
             )
         });
@@ -2216,8 +2398,10 @@ impl Renderer {
         let globals_bg = build_globals_bind_group(
             &gpu,
             &bundle,
-            &globals_buf,
-            &csm_params_buf,
+            GlobalsBuffers {
+                globals: &globals_buf,
+                csm_params: &csm_params_buf,
+            },
             ShadowMapViews {
                 cascades: &shadow_map_view,
                 point_cube: &point_shadow_cube_view,
@@ -2227,6 +2411,7 @@ impl Renderer {
                 params_buf: &probe_params_buf,
                 cube_view: &probe_cube_view,
             },
+            ssr_main_res,
         );
         // 粒子相机 uniform + 绑定组（粒子管线的组 1；内容每帧有粒子时覆写）
         let particle_camera_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2331,6 +2516,10 @@ impl Renderer {
             taa_frame: 0,
             taa_reset_pending: false,
             taa_was_on: false,
+            ssr,
+            ssr_prev_valid: false,
+            ssr_was_on: false,
+            ssr_uniform_live: false,
             ui_atlas,
             ui_bind_group,
             ui_sampler,
@@ -2378,13 +2567,16 @@ impl Renderer {
     }
 
     /// 重建全局绑定组。env 视图随每次环境重烘焙变化（旧视图随旧纹理销毁），
-    /// irradiance / prefiltered / brdf 三个视图引用必须同步更新。
+    /// irradiance / prefiltered / brdf 三个视图引用必须同步更新；SSR 的
+    /// 上帧颜色副本 / 场景深度副本就位或更换时同样经此重建（draw 接线）。
     fn rebuild_globals_bind_group(&mut self) {
         self.globals_bg = build_globals_bind_group(
             &self.gpu,
             &self.bundle,
-            &self.globals_buf,
-            &self.csm_params_buf,
+            GlobalsBuffers {
+                globals: &self.globals_buf,
+                csm_params: &self.csm_params_buf,
+            },
             ShadowMapViews {
                 cascades: &self.shadow_map_view,
                 point_cube: &self.point_shadow_cube_view,
@@ -2394,7 +2586,28 @@ impl Renderer {
                 params_buf: &self.probe_params_buf,
                 cube_view: &self.probe_cube_view,
             },
+            self.ssr_main_resources(),
         );
+    }
+
+    /// SSR 绑定资源的「主相机」形态（R62b）：活跃参数缓冲 + 真实上帧
+    /// 资源（尚未创建的一路回落哑纹理——flags = 0 时不会被采样；二者
+    /// 就位时由 draw 重建绑定组）。
+    fn ssr_main_resources(&self) -> SsrGlobalsResources<'_> {
+        SsrGlobalsResources {
+            params_buf: &self.ssr.params_buf,
+            color_view: self
+                .ssr
+                .prev_color
+                .as_ref()
+                .map(|p| &p.view)
+                .unwrap_or(&self.ssr.dummy_color_view),
+            depth_view: self
+                .scene_depth
+                .as_ref()
+                .map(|sd| &sd.view)
+                .unwrap_or(&self.ssr.dummy_depth_view),
+        }
     }
 
     /// 环境源失效检查：`SkySource` 资源的 generation 与缓存不同（资源缺席
@@ -2444,7 +2657,11 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: crate::pipeline::HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_SRC（R62b）：SSR 开启时帧尾 copy 到上帧颜色副本
+            //（未开启时该 usage 位无副作用）
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let msaa_view = msaa.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2612,6 +2829,12 @@ impl Renderer {
     /// 内容启发式（拒绝清单），决策交给知道切镜时刻的一方。
     pub fn reset_taa(&mut self) {
         self.taa_reset_pending = true;
+        // SSR 跟随（R62b）：reset_taa 的语义是「宿主宣告切镜」，切镜让
+        // 一切跨帧时域状态过期——TAA 历史与 SSR 的上帧颜色/深度同理
+        // （上帧是另一个场景）。下一帧 SSR 整段跳过（输出 = 关闭帧），
+        // 之后随帧尾副本恢复。成本是切镜帧的反射回退探针/env 一帧，
+        // 收益是杜绝「新场景地板反射旧场景」的一帧闪现。
+        self.ssr_prev_valid = false;
     }
 
     /// 切换阴影偏移口径到 **v1 对照模式**（R61，验收 / 归因口）。
@@ -3152,11 +3375,13 @@ impl Renderer {
     }
 
     /// 主相机场景深度副本的按需资源（R32Float 线性视距 + Depth32Float
-    /// 附件 + 相机矩阵 uniform 与绑定组）。仅 DOF / MB 启用时调用（
-    /// `draw` 开头、`hdr` 借用建立之前）；尺寸变化时整体重建。
-    fn ensure_scene_depth(&mut self, width: u32, height: u32) {
+    /// 附件 + 相机矩阵 uniform 与绑定组）。仅 DOF / MB / SSR 启用时调用
+    /// （`draw` 开头、`hdr` 借用建立之前）；尺寸变化时整体重建。返回本
+    /// 次调用是否（重）建了纹理——SSR 据此判断是否需要重建全局绑定组
+    /// （其 binding 12 指向本纹理的视图）。
+    fn ensure_scene_depth(&mut self, width: u32, height: u32) -> bool {
         if self.scene_depth.is_some() && self.scene_depth_size == (width, height) {
-            return;
+            return false;
         }
         let size = wgpu::Extent3d {
             width: width.max(1),
@@ -3211,6 +3436,36 @@ impl Renderer {
             params,
             bind_group,
         });
+        true
+    }
+
+    /// SSR 上帧颜色副本的按需资源（R62b）：主 HDR 解析缓冲的同尺寸副本
+    /// 纹理（COPY_DST | TEXTURE_BINDING），`SsrSettings` 首次开启时创建、
+    /// 分辨率变化时重建。返回本次是否（重）建——重建即「无上帧」（新
+    /// 纹理是空的），调用方据此置 `ssr_prev_valid = false`（重置语义）。
+    fn ensure_ssr_prev_color(&mut self, width: u32, height: u32) -> bool {
+        if self.ssr.prev_color.is_some() && self.ssr.prev_size == (width, height) {
+            return false;
+        }
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ssr.prev_color"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::pipeline::HDR_FORMAT,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ssr.prev_color = Some(SsrPrevColor { texture, view });
+        self.ssr.prev_size = (width.max(1), height.max(1));
+        true
     }
 
     pub fn set_clear_color(&mut self, color: wgpu::Color) {
@@ -3515,6 +3770,33 @@ impl Renderer {
         if taa_on {
             self.ensure_scene_depth(width, height);
             self.ensure_taa_targets(width, height);
+        }
+        // SSR（R62b）：开启 = 上帧颜色副本（惰性、随 HDR 尺寸）+ 复用
+        // 主相机深度副本；缺席/关闭 = 不分配、不写参数（零开销默认路径，
+        // 与 R62a 逐位一致）。分配必须在 hdr 不可变借用建立之前（与
+        // TAA/DOF/MB 同款纪律），并且**先于主 pass** 消费其视图。
+        let ssr_settings = world.try_resource::<crate::post::SsrSettings>().map(|s| *s);
+        let ssr_on = ssr_settings.is_some_and(|s| s.enabled);
+        let mut ssr_needs_globals_rebuild = false;
+        if ssr_on {
+            ssr_needs_globals_rebuild |= self.ensure_scene_depth(width, height);
+            ssr_needs_globals_rebuild |= self.ensure_ssr_prev_color(width, height);
+            // 重置裁决：关→开切换（上帧资源是关闭语义下的遗留）或任一
+            // 资源本次（重）建（新纹理是空的 / 尺寸变化）⇒ 上帧无效。
+            if !self.ssr_was_on || ssr_needs_globals_rebuild {
+                self.ssr_prev_valid = false;
+            }
+            self.ssr_was_on = true;
+        } else {
+            self.ssr_was_on = false;
+        }
+        // 本帧执行开关（重置语义：无效帧整段跳过 = 与 SSR 关闭帧逐位一致）；
+        // 切镜（reset_taa 跟随置位）已在上游把 ssr_prev_valid 清掉。
+        let ssr_active = ssr_on && self.ssr_prev_valid;
+        if ssr_needs_globals_rebuild {
+            // 上帧颜色副本 / 场景深度纹理的视图变化 ⇒ 全局绑定组的
+            // binding 11/12 需要重新指向（与 env 重烘同款重建路径）
+            self.rebuild_globals_bind_group();
         }
         // 遮挡剔除（R53）：开启语义、保守性论证与「读回迟到一帧 ⇒ 本帧
         // 不剔除」的回退见 occlusion.rs 模块文档。
@@ -4505,6 +4787,48 @@ impl Renderer {
                 .queue
                 .write_buffer(particle_buf, 0, bytemuck::cast_slice(&particle_instances));
         }
+        // SSR 参数（R62b）：上帧重投影矩阵（prev_vp = 上帧实际渲染矩阵，
+        // 与 MB/TAA 同源）+ 标量。`active = 0` 的帧（首帧启用 / 关→开 /
+        // 分辨率变化 / 切镜 / 上帧或本帧无不透明几何——深度副本没跑，
+        // 「上帧深度」语义不成立）整段跳过 ⇒ 输出与 SSR 关闭帧逐位一致。
+        // SSR 关闭路径不发 write_buffer；退场的那一帧回写零值（探针
+        // params_active 同款记账——残留 flags.x = 1 会拿陈旧资源步进）。
+        if ssr_on {
+            let ssr_cfg = ssr_settings.expect("ssr_on 蕴含资源在");
+            let active = ssr_active && opaque_total > 0;
+            self.gpu.queue.write_buffer(
+                &self.ssr.params_buf,
+                0,
+                bytemuck::bytes_of(&SsrParamsRaw {
+                    prev_view_proj: prev_vp.to_cols_array_2d(),
+                    flags: [
+                        if active { 1.0 } else { 0.0 },
+                        ssr_cfg.intensity.max(0.0),
+                        ssr_cfg.roughness_cutoff.clamp(0.0, 1.0),
+                        ssr_cfg.edge_margin.max(0.0),
+                    ],
+                    extent: [
+                        ssr_cfg.max_distance.max(1e-3),
+                        ssr_cfg.thickness.max(1e-3),
+                        0.0,
+                        0.0,
+                    ],
+                }),
+            );
+            self.ssr_uniform_live = true;
+            self.stats.ssr_on = if active { 1 } else { 0 };
+        } else if self.ssr_uniform_live {
+            self.gpu.queue.write_buffer(
+                &self.ssr.params_buf,
+                0,
+                bytemuck::bytes_of(&SsrParamsRaw {
+                    prev_view_proj: [[0.0; 4]; 4],
+                    flags: [0.0; 4],
+                    extent: [0.0; 4],
+                }),
+            );
+            self.ssr_uniform_live = false;
+        }
         // 主 pass：场景渲染到 HDR MSAA 中间缓冲，解析到单采样 HDR
         let hdr = self.hdr.as_ref().expect("HDR 中间缓冲已就绪");
         {
@@ -4930,15 +5254,20 @@ impl Renderer {
             triangles_drawn += 2 * particle_total;
             particles_drawn = particle_total;
         }
-        // 主相机场景深度副本 pass（R43）：仅 DOF / MB / TAA 启用时编码。
-        // 把不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件存线性
-        // 视距（clip.w，见 scene_depth.wgsl 的插值推导），自带
+        // 主相机场景深度副本 pass（R43）：仅 DOF / MB / TAA / SSR 启用时
+        // 编码。把不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件
+        // 存线性视距（clip.w，见 scene_depth.wgsl 的插值推导），自带
         // Depth32Float 附件做最近面裁决——阴影的「深度写颜色 + 双附件」
         // 既有方案（主 pass 的深度附件是 MSAA 且无 TEXTURE_BINDING，
         // 不可直接采样，DX12 下 depth-only 采样另有写入异常的教训）。
         // 透明 / 贴花 / 粒子不进副本（半透明深度无定义，ARCHITECTURE §8）。
         // TAA（R60）与 DOF/MB 共用同一份副本与本帧同一抖动矩阵。
-        if (dof_on || mb_on || taa_on) && opaque_total > 0 {
+        // SSR（R62b）同样消费它：本 pass 编码在主 pass **之后**，主 pass
+        // 的 SSR 步进读到的恒为上一帧内容（同编码器按序执行，§4.31 裁决
+        // 2 的「不 ping-pong」偏离）；SSR 开启但本帧无几何 ⇒ 副本没跑，
+        // 「上帧深度」作废（ssr_prev_valid 记账，下帧跳过）。深度着色只
+        // 用顶点变换，SSR 是否活跃不影响副本内容。
+        if (dof_on || mb_on || taa_on || ssr_on) && opaque_total > 0 {
             let sd = self
                 .scene_depth
                 .as_ref()
@@ -5556,6 +5885,35 @@ impl Renderer {
         }
         self.ui_scratch = ui_vertices;
         self.ui_image_scratch = ui_images;
+        // SSR 帧尾副本（R62b）：主解析缓冲（MSAA 解析 + 天空 + 透明 + 粒子
+        // 的最终结果）整张 copy 到上帧颜色副本——一次 copy_texture_to_
+        // texture，成本 = 带宽往返 2×W×H×8 B（1080p ≈ 33 MiB/帧）。仅 SSR
+        // 开启且本帧完成了场景深度副本时执行（两者凑齐，下一帧的「上帧」
+        // 才完整）；分辨率变化后的首帧 prev_color 重建为空纹理，同样不在
+        // 有效集合（重置语义）。
+        if ssr_on && opaque_total > 0 {
+            // 局部重借（此前的 hdr 借用早已结束；与 prev_color /
+            // ssr_prev_valid 是互斥字段借用）
+            let targets = self.hdr.as_ref().expect("HDR 中间缓冲已就绪");
+            let prev = self
+                .ssr
+                .prev_color
+                .as_ref()
+                .expect("SSR 开启时应已创建上帧颜色副本");
+            encoder.copy_texture_to_texture(
+                targets.resolved.as_image_copy(),
+                prev.texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: self.ssr.prev_size.0,
+                    height: self.ssr.prev_size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.ssr_prev_valid = true;
+        } else if ssr_on {
+            // SSR 开但本帧无几何：深度副本没跑，上帧资源不完整
+            self.ssr_prev_valid = false;
+        }
         self.gpu.queue.submit([encoder.finish()]);
         // 遮挡查询读回（R53）：提交后对映射区发起 map_async，回调经
         // 下一帧 draw 开头的 poll + try_recv 消费（缓冲在消费 unmap 前
@@ -5753,11 +6111,14 @@ impl Renderer {
         // RT 相机专用全局绑定组：与主全局组共享级联参数（CSM 仍按主相机
         // 拟合——RT 相机朝向不同时的 CSM 拟合是 v1 限制，见 rendertarget.rs
         // 与 ARCHITECTURE §8.20）、阴影贴图、IBL，仅视图投影 / 眼点不同。
+        // SSR 三路走零参数 + 哑纹理（RT 视口无上帧语义，见 §4.31 裁决 2）。
         let globals_bg = build_globals_bind_group(
             &self.gpu,
             &self.bundle,
-            &globals_buf,
-            &self.csm_params_buf,
+            GlobalsBuffers {
+                globals: &globals_buf,
+                csm_params: &self.csm_params_buf,
+            },
             ShadowMapViews {
                 cascades: &self.shadow_map_view,
                 point_cube: &self.point_shadow_cube_view,
@@ -5766,6 +6127,11 @@ impl Renderer {
             ProbeGlobalsResources {
                 params_buf: &self.probe_params_buf,
                 cube_view: &self.probe_cube_view,
+            },
+            SsrGlobalsResources {
+                params_buf: &self.ssr.off_params_buf,
+                color_view: &self.ssr.dummy_color_view,
+                depth_view: &self.ssr.dummy_depth_view,
             },
         );
         // ACES 色调映射绑定组：hdr_view → color_view；bloom 槽绑定白色

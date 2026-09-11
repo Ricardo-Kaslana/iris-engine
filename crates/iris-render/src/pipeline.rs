@@ -280,6 +280,42 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // SSR 上帧资源（R62b，R61/R62a 的「不扩 Globals 前缀」扩容先例：
+            // 排在现有最大 binding 之后追加，skybox.wgsl 的并行布局不受
+            // 影响）。11 = 上帧主解析缓冲帧尾副本（Rgba16Float 可过滤，
+            // 命中后一次采样取反射色）；12 = 上帧场景深度副本（R32Float
+            // 非过滤，步进中 textureLoad 逐样本读——不依赖
+            // float32-filterable 扩展）；13 = SSR 参数 uniform（96B）。
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 12,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 13,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
