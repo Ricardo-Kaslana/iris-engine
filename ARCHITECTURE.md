@@ -652,6 +652,59 @@ v1 诚实清单），本节是架构级摘要。
   编进命令数据，慎用闭包捕获可变外部状态（`iris-core/commands` 模块
   文档明文；iris-infiltration 的 ragdoll 命令只捕获确定性的值）。
 
+### 3.11 行为树 / 黑板 / 感知（iris-core/behavior + iris-core/perception，R65）
+
+敌人 AI 的游戏侧手写状态机在能力变多后必然爆炸（状态 × 转移的笛卡尔增长，
+最初评估的第二个瓶颈）。R65 在 iris-core 落一套最小骨架——**结构是纯数据、
+决策带记忆、通信只有黑板、感知是纯函数 + 事件**。语义规范全文 =
+`iris-core::behavior` / `iris-core::perception` 模块文档（含诚实限制清单），
+本节是架构级摘要。
+
+- **树的表示（数据结构而非 trait 对象）**：游戏侧用 `NodeSpec`（嵌套、可读）
+  写树，`BehaviorTree::new` **前序展开**成扁平 `Node` 数组（子节点只存
+  `NodeId` 下标）——运行期零动态分发、遍历期零分配、节点 id 构造期定死
+  （可序列化 = 结构即数据）；节点族八种：`Sequence` / `Selector` / `Parallel`
+  （成功数 × 失败数双阈值，**失败优先**）/ `Inverter` / `Repeat` / `Cooldown`
+  / `Condition` / `Action`。**装饰器只做三个**（拒绝清单挡掉全集）。叶子的
+  实现由游戏侧按**具名动作 id** 分发（`ActionId` = `&«q»static str` 新类型 +
+  `BehaviorContext` trait）——引擎不认识任何游戏动作，树里没有函数指针。
+- **children 是 Vec，遍历序 = 声明序**（下标升序）；需要按键序迭代的黑板用
+  `BTreeMap`（选型理由照 `broadphase.rs`）⇒「同输入两次 tick 逐位一致」由
+  构造保证（单测：逐节点状态表 + 黑板摘要 dump 对照）。
+- **tick 模型 = 带记忆**：`BehaviorState` 逐节点保存上帧状态；上帧 `Running`
+  的节点下帧**从记忆处恢复**（复合节点记「当前子游标」、`Repeat` 记已完成
+  次数、`Cooldown` 记剩余冷却、`Parallel` 记「本轮已终结子位图 + 本轮计数」），
+  不从头重新评估。每帧每代理 tick 一次，`dt` 由调用方给（通常来自 `Time`）——
+  引擎不为行为树提供内置系统，而是给系统体 `tick_behavior_agents`（Update
+  阶段并行系统，迭代序 = 实体 id 升序）：动作分发的上下文由游戏侧按实体构造。
+- **黑板 = 逐代理组件**：`Blackboard`（`BTreeMap<String, BlackValue>`，值五型
+  Bool / Float / Entity / Vec3 / Text）。**感知结果 → 黑板 → 动作是唯一通道**
+  （动作之间不走结构字段私运状态）；**不做跨代理共享黑板**——跨代理通信走
+  事件（共享状态会让确定性论证与生命周期双双失控）。
+- **感知 = 纯函数 + 组件 + 系统 + 事件**：`in_view_cone`（三维距离 + 水平
+  朝向的半角点积——`forward · (to_xz / dist) ≥ fov_cos`）、`has_line_of_sight`
+  （线段 × `StaticObstacle`，复用 physics 射线，旋转感知）、`can_see`（合成）、
+  `within_hearing`（纯距离、**无视线**——隔墙听得见是有意取舍）；`Perception`
+  组件把视距 / 半角余弦 / 听觉半径 / 眼位偏移**字段化**，`PerceptionTarget`
+  标记可感知目标；`perception_system` 扫描感知源 → 目标列表 → 与上帧差分 →
+  `Events<PerceptionEvent>`（Seen / Lost / Heard，双代缓冲先例见 §3.10）+ 运行态
+  写回。三份收集列表（静态体 / 感知源 / 目标）都按**实体 id 升序**处理 ⇒
+  输出与 spawn 顺序无关（单测：乱序 spawn 的两个世界归一后逐位一致）。
+- **生命周期与清理**：树运行态与黑板都在逐代理 `BehaviorAgent` 组件里——实体
+  despawn 时三者一起消亡（组件生命周期天然如此），无手工清理、无全局注册表。
+- **确定性论证**：决策路径上无哈希容器、无随机源、无时钟读取（时间只从 `dt`
+  进）；动作按声明序串行 tick（`Parallel` 是**语义**并行而非线程并行）；
+  浮点只在 `Cooldown` 里做「减法 + `max(0.0)`」。
+- **实战验收（iris-infiltration 守卫迁移）**：守卫驱动改写为行为树——顶层
+  Selector「击晕冻结 / 感知 + 决策」，决策 Selector「逃跑 → 追逐 → 支援 →
+  巡逻」（前两个演示能力默认关）。旧状态机四条分支**逐位等价**：迁移前后两个
+  场景（自动玩家全流程 2993 帧、发现 → 追逐 → 放弃 → 击晕 900 帧）的全状态
+  FNV 轨迹哈希逐位相同。两个演示能力（①逃跑：低血量 / 被逼近 → 远离玩家的
+  路点；②呼叫增援：发现玩家 → `GuardAlert` → 半径内守卫支援）是「树相对
+  状态机的扩展力」载荷：支援态**不进** `GuardState` 枚举，由黑板承载
+  （`guard.support_timer` / `guard.alert_pos`），轨迹与状态在
+  `crates/iris-infiltration/tests/guard_behavior.rs` 里以精确断言钉住。
+
 ## 4. 渲染管线（iris-render）
 
 ### 4.1 帧流程
@@ -4654,6 +4707,25 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     烘焙**（与 §4.24 同口径；切分点仍是逐探针独立）；⑨**探针自遮挡**：
     探针落在几何内部时烘出的是几何内部的辐照，需作者把探针放在空腔里；
     ⑩**超预算按实体位升序截断**（不做重要性排序）。
+
+41. **行为树 / 黑板 / 感知 v1 的诚实限制（R65）**——完整清单在
+    `iris-core/behavior.rs` 与 `iris-core/perception.rs` 模块文档，此处索引：
+    ①**不做** GOAP / 效用 AI / 层级 FSM、跨代理共享黑板、子树引用与热重载、
+    可视化调试器 / 编辑器集成、树序列化入关卡档（结构是纯数据，序列化留后续
+    轮）、装饰器全集（只 Inverter / Cooldown / Repeat 三个）、黑板键的编译期
+    校验（键是运行时字符串）；②`Condition` **只读**黑板（有状态的判断请写成
+    `Action`）；③无节点级「超时 / 重试预算」装饰器，需要时用 `Cooldown` +
+    黑板计时；④树不可变——运行期换树 = 换组件，且运行态与树**必须同源**
+    （不同源即 panic）；⑤`Parallel` 是**语义**并行，帧内仍按声明序串行 tick；
+    ⑥感知遮挡**只看静态体**（`effective_static` 口径：`is_static` / 无
+    `RigidBody` / `Kinematic`）——**动态刚体不挡视线**（v1 取舍：潜行玩法的掩体
+    应是设计物而非物理副产物）；⑦感知无扇形记忆 / 目标预测 / 声音优先级 /
+    多眼位 / 竖直扇形（朝向恒水平，俯仰靠 `eye_offset`），且 `heard` 没有对称
+    的「离开听觉」事件；⑧感知**不看碰撞组**（谁挂 `PerceptionTarget` 谁可被
+    感知）；⑨行为树的 `ActionId` 是运行时字符串——未知 id 在 debug 断言
+    （`debug_assert!`），release 下动作判失败 / 条件判假，无编译期校验；
+    ⑩`GuardCapabilities` 的两个演示能力默认关（缺席 = 旧行为），正式玩法启用
+    前需要重调自动玩家脚本与难度预算（本轮只做框架与演示验收）。
 
 ## 9. 关键设计取舍记录
 

@@ -71,9 +71,13 @@
 
 use glam::{Vec2, Vec3};
 
+use iris_core::behavior::{
+    ActionId, BehaviorAgent, BehaviorContext, BehaviorTree, Blackboard, BtStatus, NodeSpec,
+};
 use iris_core::character::{CharacterParams, move_and_slide_statics};
 use iris_core::nav::{NavGrid, NavGridParams};
-use iris_core::physics::{ColliderShape, segment_hits_shape};
+use iris_core::perception::{can_see, flat_statics};
+use iris_core::physics::{ColliderShape, StaticObstacle};
 
 // ---------------------------------------------------------------------------
 // 可调常量（pub：单测 / 插件层 / 文档共用同一事实来源）
@@ -114,6 +118,92 @@ pub const WAYPOINT_REACH: f32 = 0.35;
 pub const CORE_RADIUS: f32 = 1.2;
 /// 被发现次数上限：达到即告负。
 pub const MAX_DETECTIONS: u32 = 3;
+
+// ---- R65 行为树能力参数（演示能力默认关；见 [`GuardCapabilities`]）----
+
+/// 逃跑触发：血量 ≤ 此值即视为「低血量」（v1 无伤害系统，测试直接设
+/// [`Guard::health`]；正式玩法里留给后续轮的伤害/压制机制）。
+pub const FLEE_HEALTH: f32 = 0.35;
+/// 逃跑触发：被逼近 = 本帧看得见玩家且水平距离 ≤ 此值（米）。
+pub const FLEE_RADIUS: f32 = 4.5;
+/// 逃跑速度（米/秒）：与追逐同速——逃跑不能比追击慢。
+pub const FLEE_SPEED: f32 = CHASE_SPEED;
+/// 逃跑持续时长（秒）：触发后有粘性（恐慌语义）——途中转头看不见玩家
+/// 也不会立刻缩回巡逻（同时消除视线抖动引起的模式振荡）。
+pub const FLEE_SECS: f32 = 4.0;
+/// 增援呼叫半径（米）：发现者与接收者的**水平**距离上限。
+pub const REINFORCE_RADIUS: f32 = 12.0;
+/// 支援时长（秒）：到期自动回巡逻（无记忆的搜索点，v1 简化）。
+pub const REINFORCE_SECS: f32 = 8.0;
+/// 支援移动速度（米/秒）。
+pub const SUPPORT_SPEED: f32 = CHASE_SPEED;
+
+/// 黑板键：本帧是否看得见玩家（感知动作写、追逐/逃跑条件读——黑板是
+/// 感知与动作之间**唯一**的通信通道）。
+pub const BB_SEES: &str = "guard.sees";
+/// 黑板键：当前模式名（`patrol` / `chase` / `freeze` / `flee` / `support`）。
+pub const BB_MODE: &str = "guard.mode";
+/// 黑板键：支援剩余时长（秒；> 0 = 支援中）。
+pub const BB_SUPPORT_TIMER: &str = "guard.support_timer";
+/// 黑板键：支援目标点（世界坐标；警报发出时的玩家位置）。
+pub const BB_ALERT_POS: &str = "guard.alert_pos";
+/// 黑板键：逃跑剩余时长（秒；> 0 = 逃跑中——触发粘性，见 [`FLEE_SECS`]）。
+pub const BB_FLEE_TIMER: &str = "guard.flee_timer";
+
+/// 守卫行为树的模式名（黑板 `guard.mode` 的取值；诊断与测试断言用）。
+pub mod mode {
+    /// 巡逻。
+    pub const PATROL: &str = "patrol";
+    /// 追逐。
+    pub const CHASE: &str = "chase";
+    /// 击晕冻结。
+    pub const FREEZE: &str = "freeze";
+    /// 逃跑（能力①）。
+    pub const FLEE: &str = "flee";
+    /// 支援（能力②）。
+    pub const SUPPORT: &str = "support";
+}
+
+/// 守卫行为树的具名叶子 id（引擎不认识它们，游戏侧在这里登记）。
+pub mod action {
+    /// 条件：被击晕。
+    pub const STUNNED: &str = "guard.stunned";
+    /// 动作：冻结（v1 不醒来）。
+    pub const FREEZE: &str = "guard.freeze";
+    /// 动作：感知 → 警觉 → 满格发现。
+    pub const SENSE: &str = "guard.sense";
+    /// 条件：受威胁（能力①开启 且（低血量 或 被逼近））。
+    pub const THREATENED: &str = "guard.threatened";
+    /// 动作：逃跑。
+    pub const FLEE: &str = "guard.flee";
+    /// 条件：追逐中。
+    pub const CHASING: &str = "guard.chasing";
+    /// 动作：追逐。
+    pub const CHASE: &str = "guard.chase";
+    /// 条件：支援中（能力②开启 且 支援计时 > 0）。
+    pub const SUPPORTING: &str = "guard.supporting";
+    /// 动作：支援。
+    pub const SUPPORT: &str = "guard.support";
+    /// 条件：巡逻中。
+    pub const PATROLLING: &str = "guard.patrolling";
+    /// 动作：巡逻。
+    pub const PATROL: &str = "guard.patrol";
+}
+
+/// 守卫能力开关（**缺席语义 = 旧行为**）：默认全 `false` 时行为树只走
+/// 「击晕冻结 / 感知 / 追逐 / 巡逻」四条既有分支，逐位等价于 R35–R41 的
+/// 手写状态机；两个演示能力各自独立开关，测试与关卡可按需打开。
+///
+/// 这是「组件缺席语义」在纯核心里的等价物：守卫不是实体，开关就是字段；
+/// 默认构造 = 能力缺席 = 老玩家的既有体验不变。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuardCapabilities {
+    /// 逃跑（能力①，默认关）：低血量或被逼近时选择远离玩家的路点。
+    pub flee: bool,
+    /// 呼叫增援（能力②，默认关）：发现玩家时发 [`InfiltrationEvent::GuardAlert`]，
+    /// 半径内其他守卫进入支援态（黑板记支援计时与目标点）。
+    pub reinforcement: bool,
+}
 
 /// 角色控制器参数：引擎 [`CharacterParams::default`] 的俯视改版——
 /// 半径 0.4 / 半高 0.9 / 台阶 0.3 / 坡限 45° 保持缺省，**重力缩放 0**
@@ -334,6 +424,9 @@ pub enum InfiltrationEvent {
     },
     /// 玩家被发现（位置 = 玩家胶囊中心；count = 累计次数，1 起）。
     Detection { pos: Vec3, guard: usize, count: u32 },
+    /// 守卫呼叫增援（R65 能力②；位置 = 发现时的玩家位置，`from` = 发现者
+    /// 下标）。仅在发现者开启 [`GuardCapabilities::reinforcement`] 时产生。
+    GuardAlert { pos: Vec3, from: usize },
     /// 全核心到手 + 抵达出口（位置 = 玩家胶囊中心）。
     Victory { pos: Vec3 },
     /// 被发现满三次（位置 = 玩家胶囊中心）。
@@ -392,6 +485,10 @@ pub struct Guard {
     pub chase_timer: f32,
     /// 本帧实际移动速度（米/秒；供表现层混合空间参数，静止 = 0）。
     pub anim_speed: f32,
+    /// 能力开关（默认全关 = 旧行为；见 [`GuardCapabilities`]）。
+    pub capabilities: GuardCapabilities,
+    /// 血量 0..=1（v1 无伤害系统：仅逃跑条件使用；默认满血 1.0）。
+    pub health: f32,
 }
 
 impl Guard {
@@ -411,6 +508,8 @@ impl Guard {
             last_known: Vec3::ZERO,
             chase_timer: 0.0,
             anim_speed: 0.0,
+            capabilities: GuardCapabilities::default(),
+            health: 1.0,
         }
     }
 
@@ -451,14 +550,25 @@ pub struct InfiltrationState {
     pub plate_occupants: u32,
     /// 守卫（下标即 [`GUARD_ROUTES`] 下标）。
     pub guards: Vec<Guard>,
+    /// 守卫的行为树「大脑」（与 [`Self::guards`] **同下标一一对应**：树 +
+    /// 运行态 + 黑板三合一）。引擎的 [`BehaviorAgent`] 是逐代理组件；纯核心
+    /// 用平行 Vec 表达同一语义（索引即代理身份，长度不变式与 guards 同源）。
+    pub guard_brains: Vec<BehaviorAgent>,
     /// 对局累计时间（秒；`step` 累加，确定性）。
     pub elapsed: f32,
     /// 逻辑静态体（墙 + 关闭的压力门；开门时重建）。
     pub statics: Vec<(Vec3, ColliderShape)>,
+    /// 视线遮挡用的静态体快照（[`Self::statics`] 的 [`StaticObstacle`] 形式，
+    /// 恒等旋转）——与 statics **同源同序**：构造与 [`Self::press_plate`]
+    /// 重建时一并刷新，逐帧零分配。
+    pub vision_statics: Vec<StaticObstacle>,
     /// 导航图（启动 build 一次；开门时按引擎「便宜重建」姿势整图重建）。
     pub nav: NavGrid,
     /// 本帧事件列表（每帧 `step` 开头清空，见 [`InfiltrationEvent`]）。
     pub frame_events: Vec<InfiltrationEvent>,
+    /// 本帧产生的增援警报（守卫循环结束后统一派发 → **下一帧**在接收者
+    /// 黑板上生效；能力②关闭时恒空——见 [`Self::dispatch_alerts`]）。
+    pub pending_alerts: Vec<PendingAlert>,
     /// 自动玩家的路线点游标（脚本簿记，普通玩家不用；见 [`AutoPilot`]）。
     pub autopilot_route: usize,
 }
@@ -474,6 +584,15 @@ impl InfiltrationState {
     /// 两名守卫各就巡逻环 0 号位，导航图按「门关闭」构建。
     pub fn new() -> Self {
         let pos = SPAWN_FOOT + Vec3::new(0.0, HALF_HEIGHT, 0.0);
+        let statics = level_statics(false);
+        let nav = NavGrid::build(nav_params(), &statics);
+        let vision_statics = flat_statics(&statics);
+        // 同一棵树克隆给每名守卫（树是不可变纯数据），运行态与黑板各自独立
+        let tree = guard_behavior_tree();
+        let guards: Vec<Guard> = (0..GUARD_ROUTES.len()).map(Guard::new).collect();
+        let guard_brains: Vec<BehaviorAgent> = (0..GUARD_ROUTES.len())
+            .map(|_| BehaviorAgent::new(tree.clone()))
+            .collect();
         Self {
             phase: Phase::Playing,
             pos,
@@ -484,11 +603,14 @@ impl InfiltrationState {
             detections: 0,
             door_open: false,
             plate_occupants: 0,
-            guards: vec![Guard::new(0), Guard::new(1)],
+            guards,
+            guard_brains,
             elapsed: 0.0,
-            statics: level_statics(false),
-            nav: NavGrid::build(nav_params(), &level_statics(false)),
+            statics,
+            vision_statics,
+            nav,
             frame_events: Vec::new(),
+            pending_alerts: Vec::new(),
             autopilot_route: 0,
         }
     }
@@ -508,6 +630,37 @@ impl InfiltrationState {
         self.guards.iter().map(|g| g.alert).fold(0.0, f32::max)
     }
 
+    /// 派发本帧产生的增援警报：半径内**其他**守卫写入支援黑板键
+    /// （[`BB_SUPPORT_TIMER`] / [`BB_ALERT_POS`]），被派发者下一帧进入支援
+    /// 分支。语义细节：
+    /// - 只派发给开启 [`GuardCapabilities::reinforcement`] 且水平距离
+    ///   ≤ [`REINFORCE_RADIUS`] 的守卫（发现者自己除外——它在追逐）；
+    /// - 已在支援中的守卫**不被覆盖**（保留剩余时长与目标点，先到先得）；
+    /// - 派发序 = 警报产出序 × 守卫下标升序（确定性）。
+    fn dispatch_alerts(&mut self) {
+        if self.pending_alerts.is_empty() {
+            return;
+        }
+        let alerts = std::mem::take(&mut self.pending_alerts);
+        for alert in alerts {
+            for (index, guard) in self.guards.iter().enumerate() {
+                if index == alert.from || !guard.capabilities.reinforcement {
+                    continue;
+                }
+                let to = Vec2::new(guard.pos.x - alert.pos.x, guard.pos.z - alert.pos.z);
+                if to.length() > REINFORCE_RADIUS {
+                    continue;
+                }
+                let bb = &mut self.guard_brains[index].blackboard;
+                if bb.get_f32_or(BB_SUPPORT_TIMER, 0.0) > 0.0 {
+                    continue; // 已在支援：不打断
+                }
+                bb.set_f32(BB_SUPPORT_TIMER, REINFORCE_SECS);
+                bb.set_vec3(BB_ALERT_POS, alert.pos);
+            }
+        }
+    }
+
     /// 压力板被踩下（两条调用路径：纯逻辑的踩上距离判定 [`PLATE_RADIUS`]
     /// 与插件层从 ContactStarted 事件调用——幂等，单向闩锁开门）：静态体
     /// 重建（门移除）+ 导航图按引擎文档推荐的「便宜重建」姿势整图重建
@@ -518,6 +671,7 @@ impl InfiltrationState {
         }
         self.door_open = true;
         self.statics = level_statics(true);
+        self.vision_statics = flat_statics(&self.statics);
         self.nav = NavGrid::build(nav_params(), &self.statics);
         self.frame_events.push(InfiltrationEvent::PlatePressed {
             pos: Vec3::new(PLATE_POS.x, HALF_HEIGHT, PLATE_POS.y),
@@ -620,10 +774,15 @@ impl InfiltrationState {
             }
         }
 
-        // ---- 守卫：感知/警觉（用移动前的位姿——顺序是语义）→ 移动 ----
+        // ---- 守卫：感知/警觉（用移动前的位姿——顺序是语义）→ 移动。
+        // R65 起每名守卫 tick 自己的行为树一次（树见 [`guard_behavior_tree`]）----
         for index in 0..self.guards.len() {
             self.update_guard(index, dt);
         }
+
+        // ---- 增援派发（能力②，默认关）：本帧产生的警报在守卫循环结束后统一
+        // 派发，**下一帧生效**（事件驱动语义）。能力关时队列恒空 ⇒ 零影响 ----
+        self.dispatch_alerts();
 
         // ---- 发现满三次 → 告负 ----
         if self.detections >= MAX_DETECTIONS {
@@ -643,139 +802,443 @@ impl InfiltrationState {
         }
     }
 
-    /// 单名守卫的一帧：感知/警觉 → 状态迁移 → 寻路移动。
+    /// 单名守卫的一帧：**行为树 tick 一次**（R65 迁移，结构见
+    /// [`guard_behavior_tree`]）。旧状态机的四条分支（击晕冻结 / 感知警觉 /
+    /// 追逐 / 巡逻）逐位等价地落在树上；两个演示能力（逃跑 / 支援）默认关
+    /// （[`GuardCapabilities`] = 能力缺席 = 旧行为）。
+    ///
+    /// 借用结构（字段解构，照「系统用 `&World` + 两阶段」的纪律）：
+    /// `guards[index]` 交给上下文（动作要写位置 / 航点），`guard_brains[index]`
+    /// （树 + 运行态 + 黑板）交给 tick，`nav` / `vision_statics` / 玩家位姿
+    /// 只读共享——三者互不别名，借用检查器可验证。
     fn update_guard(&mut self, index: usize, dt: f32) {
-        let sees = self.guard_sees_player(index);
-        let (state, sees, player_pos) = {
-            let guard = &mut self.guards[index];
-            if guard.state == GuardState::Stunned {
-                return;
-            }
-            // 警觉：视锥内可见上升、不可见衰减
-            if sees {
-                guard.alert = (guard.alert + ALERT_RISE * dt).min(1.0);
-            } else {
-                guard.alert = (guard.alert - ALERT_DECAY * dt).max(0.0);
-            }
-            // 满格 → 发现：计数 + 事件 + 转追逐（警觉清零重新积累）
-            if guard.alert >= 1.0 {
-                guard.alert = 0.0;
-                guard.state = GuardState::Chase;
-                guard.last_known = self.pos;
-                guard.chase_timer = CHASE_MEMORY;
-                guard.repath_timer = 0.0;
-                guard.path.clear();
-                self.detections += 1;
-                self.frame_events.push(InfiltrationEvent::Detection {
-                    pos: self.pos,
-                    guard: index,
-                    count: self.detections,
-                });
-            }
-            (guard.state, sees, self.pos)
+        let InfiltrationState {
+            guards,
+            guard_brains,
+            nav,
+            vision_statics,
+            pos,
+            sneaking,
+            detections,
+            frame_events,
+            pending_alerts,
+            ..
+        } = self;
+        let view = GuardView {
+            player_pos: *pos,
+            sneaking: *sneaking,
+            nav,
+            statics: vision_statics,
         };
-        match state {
-            GuardState::Stunned => unreachable!("击晕守卫已在入口返回"),
-            GuardState::Chase => self.guard_chase(index, sees, player_pos, dt),
-            GuardState::Patrol => self.guard_patrol(index, dt),
-        }
+        let mut ctx = GuardCtx {
+            index,
+            guard: &mut guards[index],
+            view,
+            detections,
+            events: frame_events,
+            alerts: pending_alerts,
+        };
+        guard_brains[index].tick(&mut ctx, dt);
     }
 
-    /// 守卫视锥感知：距离（潜行减半）+ 视锥夹角 + 静态体线段遮挡。
-    /// 委托给自由函数 [`guard_sees`]（自动玩家复用同一套感知几何）。
-    fn guard_sees_player(&self, index: usize) -> bool {
-        guard_sees(&self.guards[index], self.pos, self.sneaking, &self.statics)
+    /// 守卫 `index` 本帧是否看得见玩家（视锥距离/半角 + 静态体遮挡）。
+    /// 委托给自由函数 [`guard_sees`]（自动玩家与单测复用同一套感知几何）——
+    /// 行为树里的感知动作走同一条路径（`GuardCtx::sense`）。
+    pub fn guard_sees_player(&self, index: usize) -> bool {
+        guard_sees(
+            &self.guards[index],
+            self.pos,
+            self.sneaking,
+            &self.vision_statics,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 守卫行为树（R65：数据驱动节点 + 黑板 + 感知事件的实战载荷）
+// ---------------------------------------------------------------------------
+
+/// 守卫行为树（结构 = 文档；引擎侧只提供节点语义，动作实现在本模块）：
+///
+/// ```text
+/// Selector                                     ← 优先级从上到下
+/// ├── Sequence[ Condition(guard.stunned),      ← 被击晕：冻结，不感知不移动
+/// │             Action(guard.freeze) ]            （v1 不醒来）
+/// └── Sequence[ Action(guard.sense),           ← 感知 → 警觉 →（满格）发现
+///               Selector[
+///                 ├── Sequence[ Condition(guard.threatened),  ← ①逃跑（默认关）
+///                 │             Action(guard.flee) ]
+///                 ├── Sequence[ Condition(guard.chasing),     ← 追击
+///                 │             Action(guard.chase) ]
+///                 ├── Sequence[ Condition(guard.supporting),  ← ②增援支援（默认关）
+///                 │             Action(guard.support) ]
+///                 └── Sequence[ Condition(guard.patrolling),  ← 巡逻（兜底）
+///                               Action(guard.patrol) ]
+///               ] ]
+/// ```
+///
+/// 「击晕」必须是最高优先级分支：旧实现在击晕时**直接返回**（不感知、不
+/// 移动），树上就是「条件命中即短路」的 Selector 语义——警觉不会为瘫倒的
+/// 守卫继续累积（否则会出现「躺着发现玩家」）。
+pub fn guard_behavior_tree() -> BehaviorTree {
+    BehaviorTree::new(NodeSpec::selector([
+        NodeSpec::sequence([
+            NodeSpec::condition(action::STUNNED),
+            NodeSpec::action(action::FREEZE),
+        ]),
+        NodeSpec::sequence([
+            NodeSpec::action(action::SENSE),
+            NodeSpec::selector([
+                NodeSpec::sequence([
+                    NodeSpec::condition(action::THREATENED),
+                    NodeSpec::action(action::FLEE),
+                ]),
+                NodeSpec::sequence([
+                    NodeSpec::condition(action::CHASING),
+                    NodeSpec::action(action::CHASE),
+                ]),
+                NodeSpec::sequence([
+                    NodeSpec::condition(action::SUPPORTING),
+                    NodeSpec::action(action::SUPPORT),
+                ]),
+                NodeSpec::sequence([
+                    NodeSpec::condition(action::PATROLLING),
+                    NodeSpec::action(action::PATROL),
+                ]),
+            ]),
+        ]),
+    ]))
+}
+
+/// 一次增援警报的派发请求（本帧产出 → 守卫循环结束后统一派发 → 下一帧生效）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PendingAlert {
+    /// 发现者下标（不给自己派发）。
+    pub from: usize,
+    /// 警报点（发现时的玩家位置）。
+    pub pos: Vec3,
+}
+
+/// 守卫循环期间**只读**的世界视图（玩家位姿 / 导航 / 视线静态体）。
+struct GuardView<'a> {
+    player_pos: Vec3,
+    sneaking: bool,
+    nav: &'a NavGrid,
+    statics: &'a [StaticObstacle],
+}
+
+/// 守卫行为树上下文：把具名叶子 id 映射到纯核心的状态操作。
+///
+/// 黑板**不**在这个结构里——它由 `BehaviorAgent::tick` 单独传入（逐代理），
+/// 于是「感知结果 → 黑板 → 动作」是唯一的通信通道（动作之间不通过结构
+/// 字段走私状态）。
+struct GuardCtx<'a> {
+    index: usize,
+    guard: &'a mut Guard,
+    view: GuardView<'a>,
+    detections: &'a mut u32,
+    events: &'a mut Vec<InfiltrationEvent>,
+    alerts: &'a mut Vec<PendingAlert>,
+}
+
+/// 模式切换：黑板记住上一帧的模式，切换时清空航点队列——路径是模式的私有
+/// 资源（巡逻 / 追逐 / 逃跑 / 支援各走各的航线，互不串味）。旧语义里
+/// 「转追逐 / 放弃追逐」本来就清路径，故对既有行为逐位无影响。
+fn enter_mode(guard: &mut Guard, bb: &mut Blackboard, mode: &str) {
+    if bb.get_text(BB_MODE) != Some(mode) {
+        guard.path.clear();
+        guard.path_index = 0;
+        bb.set_text(BB_MODE, mode);
+    }
+}
+
+/// 只写模式名（冻结分支保留既有航点，与旧实现「击晕不清路径」一致）。
+fn set_mode(bb: &mut Blackboard, mode: &str) {
+    if bb.get_text(BB_MODE) != Some(mode) {
+        bb.set_text(BB_MODE, mode);
+    }
+}
+
+/// 沿航点队列移动一步：返回是否恰好消费完队列（到点）。航点 y 恒 0
+/// （2.5D 导航语义）——移动时覆写为守卫自己的中心高度。旧
+/// `InfiltrationState::guard_advance` 的逐字搬运（逐位同源）。
+fn advance_along_path(guard: &mut Guard, speed: f32, dt: f32) -> bool {
+    let Some(&wp) = guard.path.get(guard.path_index) else {
+        guard.anim_speed = 0.0;
+        return false;
+    };
+    let target = Vec2::new(wp.x, wp.z);
+    let pos = Vec2::new(guard.pos.x, guard.pos.z);
+    let to = target - pos;
+    let dist = to.length();
+    let step = speed * dt;
+    if dist <= WAYPOINT_REACH.max(step) {
+        guard.pos.x = target.x;
+        guard.pos.z = target.y;
+        guard.path_index += 1;
+        guard.anim_speed = 0.0;
+        return guard.path_index >= guard.path.len();
+    }
+    let dir = to / dist;
+    guard.pos.x += dir.x * step;
+    guard.pos.z += dir.y * step;
+    guard.facing = (-dir.x).atan2(-dir.y);
+    guard.anim_speed = speed;
+    false
+}
+
+impl GuardCtx<'_> {
+    /// 感知 → 警觉 → 满格发现（旧 `update_guard` 前半段的逐位搬运）。
+    ///
+    /// 感知结果写进黑板（[`BB_SEES`]）——追逐 / 逃跑条件都从黑板读，
+    /// 动作之间不共享结构字段。
+    fn sense(&mut self, bb: &mut Blackboard, dt: f32) -> BtStatus {
+        let sees = guard_sees(
+            self.guard,
+            self.view.player_pos,
+            self.view.sneaking,
+            self.view.statics,
+        );
+        bb.set_bool(BB_SEES, sees);
+        let player_pos = self.view.player_pos;
+        let index = self.index;
+        let guard = &mut *self.guard;
+        if sees {
+            guard.alert = (guard.alert + ALERT_RISE * dt).min(1.0);
+        } else {
+            guard.alert = (guard.alert - ALERT_DECAY * dt).max(0.0);
+        }
+        if guard.alert >= 1.0 {
+            guard.alert = 0.0;
+            guard.state = GuardState::Chase;
+            guard.last_known = player_pos;
+            guard.chase_timer = CHASE_MEMORY;
+            guard.repath_timer = 0.0;
+            guard.path.clear();
+            *self.detections += 1;
+            let count = *self.detections;
+            self.events.push(InfiltrationEvent::Detection {
+                pos: player_pos,
+                guard: index,
+                count,
+            });
+            // 能力②：呼叫增援（默认关——关着就与旧行为逐位一致）
+            if guard.capabilities.reinforcement {
+                self.events.push(InfiltrationEvent::GuardAlert {
+                    pos: player_pos,
+                    from: index,
+                });
+                self.alerts.push(PendingAlert {
+                    from: index,
+                    pos: player_pos,
+                });
+            }
+        }
+        BtStatus::Success
+    }
+
+    /// 追逐：视线内刷新最后已知位置与记忆；按节拍重寻路；记忆耗尽回巡逻。
+    fn chase(&mut self, bb: &mut Blackboard, dt: f32) -> BtStatus {
+        let nav = self.view.nav;
+        let player_pos = self.view.player_pos;
+        let sees = bb.get_bool_or(BB_SEES, false);
+        let guard = &mut *self.guard;
+        enter_mode(guard, bb, mode::CHASE);
+        if sees {
+            guard.last_known = player_pos;
+            guard.chase_timer = CHASE_MEMORY;
+        } else {
+            guard.chase_timer -= dt;
+        }
+        guard.repath_timer -= dt;
+        if guard.repath_timer <= 0.0 {
+            let from = Vec3::new(guard.pos.x, 0.0, guard.pos.z);
+            let to = Vec3::new(guard.last_known.x, 0.0, guard.last_known.z);
+            if let Some(path) = nav.find_path(from, to) {
+                guard.path = path;
+                guard.path_index = 0;
+            }
+            guard.repath_timer = REPATH_INTERVAL;
+        }
+        if guard.chase_timer <= 0.0 {
+            guard.state = GuardState::Patrol;
+            guard.path.clear();
+            guard.anim_speed = 0.0;
+            return BtStatus::Success;
+        }
+        advance_along_path(guard, CHASE_SPEED, dt);
+        BtStatus::Success
     }
 
     /// 巡逻：朝当前路点 find_path 逐段走；到点后推进路线环。
-    fn guard_patrol(&mut self, index: usize, dt: f32) {
-        if self.guards[index].path.is_empty() {
-            let guard = &self.guards[index];
+    fn patrol(&mut self, bb: &mut Blackboard, dt: f32) -> BtStatus {
+        let nav = self.view.nav;
+        let guard = &mut *self.guard;
+        enter_mode(guard, bb, mode::PATROL);
+        if guard.path.is_empty() {
             let route = GUARD_ROUTES[guard.route_index];
             let target = route[guard.route_next.min(route.len() - 1)];
-            // 端点 y=0：find_path 只看 XZ，航点 y 覆写见 guard_advance
+            // 端点 y=0：find_path 只看 XZ，航点 y 覆写见 advance_along_path
             let from = Vec3::new(guard.pos.x, 0.0, guard.pos.z);
             let to = Vec3::new(target.x, 0.0, target.y);
-            match self.nav.find_path(from, to) {
+            match nav.find_path(from, to) {
                 Some(path) => {
-                    let guard = &mut self.guards[index];
                     guard.path = path;
                     guard.path_index = 0;
                 }
                 // 不可达（理论不可达：路点与导航图同源）：原地等待一帧
                 None => {
-                    self.guards[index].anim_speed = 0.0;
-                    return;
+                    guard.anim_speed = 0.0;
+                    return BtStatus::Success;
                 }
             }
         }
-        let arrived = self.guard_advance(index, PATROL_SPEED, dt);
+        let arrived = advance_along_path(guard, PATROL_SPEED, dt);
         if arrived {
-            let guard = &mut self.guards[index];
             guard.route_next = (guard.route_next + 1) % GUARD_ROUTES[guard.route_index].len();
             guard.path.clear();
         }
+        BtStatus::Success
     }
 
-    /// 追逐：视线内刷新最后已知位置与记忆；按节拍 find_path 重算；
-    /// 记忆耗尽回巡逻。
-    fn guard_chase(&mut self, index: usize, sees: bool, player_pos: Vec3, dt: f32) {
-        let give_up = {
-            let guard = &mut self.guards[index];
-            if sees {
-                guard.last_known = player_pos;
-                guard.chase_timer = CHASE_MEMORY;
-            } else {
-                guard.chase_timer -= dt;
+    /// 逃跑（能力①，默认关）：锁定「距玩家最远的巡逻路点」全速脱离；
+    /// 到达后重新评估（玩家可能在追，最远点会变）。
+    fn flee(&mut self, bb: &mut Blackboard, dt: f32) -> BtStatus {
+        let nav = self.view.nav;
+        let player_pos = self.view.player_pos;
+        let guard = &mut *self.guard;
+        enter_mode(guard, bb, mode::FLEE);
+        // 计时：首次进入盖章，其后逐帧递减（粘性由条件读同一键）
+        let remaining = bb.get_f32_or(BB_FLEE_TIMER, 0.0);
+        if remaining <= 0.0 {
+            bb.set_f32(BB_FLEE_TIMER, FLEE_SECS);
+        } else {
+            bb.set_f32(BB_FLEE_TIMER, (remaining - dt).max(0.0));
+        }
+        if guard.path.is_empty() {
+            let route = GUARD_ROUTES[guard.route_index];
+            let mut best = 0usize;
+            let mut best_distance = f32::NEG_INFINITY;
+            for (index, waypoint) in route.iter().enumerate() {
+                let dx = waypoint.x - player_pos.x;
+                let dz = waypoint.y - player_pos.z;
+                let distance = dx * dx + dz * dz;
+                // 严格更优才替换：并列取下标小者（确定性 tie-break）
+                if distance > best_distance {
+                    best_distance = distance;
+                    best = index;
+                }
             }
-            guard.repath_timer -= dt;
-            if guard.repath_timer <= 0.0 {
-                let from = Vec3::new(guard.pos.x, 0.0, guard.pos.z);
-                let to = Vec3::new(guard.last_known.x, 0.0, guard.last_known.z);
-                if let Some(path) = self.nav.find_path(from, to) {
+            let waypoint = route[best];
+            let from = Vec3::new(guard.pos.x, 0.0, guard.pos.z);
+            let to = Vec3::new(waypoint.x, 0.0, waypoint.y);
+            match nav.find_path(from, to) {
+                Some(path) => {
                     guard.path = path;
                     guard.path_index = 0;
                 }
-                guard.repath_timer = REPATH_INTERVAL;
+                None => {
+                    guard.anim_speed = 0.0;
+                    return BtStatus::Success;
+                }
             }
-            guard.chase_timer <= 0.0
-        };
-        if give_up {
-            let guard = &mut self.guards[index];
-            guard.state = GuardState::Patrol;
-            guard.path.clear();
-            guard.anim_speed = 0.0;
-            return;
         }
-        self.guard_advance(index, CHASE_SPEED, dt);
+        if advance_along_path(guard, FLEE_SPEED, dt) {
+            // 抵达安全点：清队列，下一帧按新位置重新评估最远路点
+            guard.path.clear();
+            guard.path_index = 0;
+        }
+        BtStatus::Success
     }
 
-    /// 沿航点队列移动一步：返回是否恰好消费完队列（到点）。
-    /// 航点 y 恒 0（2.5D 导航语义）——移动时覆写为守卫自己的中心高度。
-    fn guard_advance(&mut self, index: usize, speed: f32, dt: f32) -> bool {
-        let Some(&wp) = self.guards[index].path.get(self.guards[index].path_index) else {
-            self.guards[index].anim_speed = 0.0;
-            return false;
-        };
-        let guard = &mut self.guards[index];
-        let target = Vec2::new(wp.x, wp.z);
-        let pos = Vec2::new(guard.pos.x, guard.pos.z);
-        let to = target - pos;
-        let dist = to.length();
-        let step = speed * dt;
-        if dist <= WAYPOINT_REACH.max(step) {
-            guard.pos.x = target.x;
-            guard.pos.z = target.y;
-            guard.path_index += 1;
+    /// 支援（能力②，默认关）：朝警报点推进；计时到期清航点回巡逻。
+    fn support(&mut self, bb: &mut Blackboard, dt: f32) -> BtStatus {
+        let nav = self.view.nav;
+        let guard = &mut *self.guard;
+        enter_mode(guard, bb, mode::SUPPORT);
+        let remaining = bb.get_f32_or(BB_SUPPORT_TIMER, 0.0) - dt;
+        bb.set_f32(BB_SUPPORT_TIMER, remaining);
+        if remaining <= 0.0 {
+            guard.path.clear();
+            guard.path_index = 0;
             guard.anim_speed = 0.0;
-            return guard.path_index >= guard.path.len();
+            return BtStatus::Success;
         }
-        let dir = to / dist;
-        guard.pos.x += dir.x * step;
-        guard.pos.z += dir.y * step;
-        guard.facing = (-dir.x).atan2(-dir.y);
-        guard.anim_speed = speed;
-        false
+        if guard.path.is_empty() {
+            let target = bb.get_vec3(BB_ALERT_POS).unwrap_or(Vec3::ZERO);
+            let from = Vec3::new(guard.pos.x, 0.0, guard.pos.z);
+            let to = Vec3::new(target.x, 0.0, target.z);
+            match nav.find_path(from, to) {
+                Some(path) => {
+                    guard.path = path;
+                    guard.path_index = 0;
+                }
+                None => {
+                    guard.anim_speed = 0.0;
+                    return BtStatus::Success;
+                }
+            }
+        }
+        if advance_along_path(guard, SUPPORT_SPEED, dt) {
+            // 抵达警报点：原地搜索（等计时到期，或途中发现玩家转追逐）
+            guard.path.clear();
+            guard.path_index = 0;
+        }
+        BtStatus::Success
+    }
+}
+
+impl BehaviorContext for GuardCtx<'_> {
+    fn action(&mut self, id: ActionId, bb: &mut Blackboard, dt: f32) -> BtStatus {
+        match id.as_str() {
+            action::FREEZE => {
+                set_mode(bb, mode::FREEZE);
+                self.guard.anim_speed = 0.0;
+                BtStatus::Success
+            }
+            action::SENSE => self.sense(bb, dt),
+            action::CHASE => self.chase(bb, dt),
+            action::PATROL => self.patrol(bb, dt),
+            action::FLEE => self.flee(bb, dt),
+            action::SUPPORT => self.support(bb, dt),
+            other => {
+                debug_assert!(false, "守卫行为树出现了未登记的动作 id：{other}");
+                BtStatus::Failure
+            }
+        }
+    }
+
+    fn condition(&mut self, id: ActionId, bb: &Blackboard, _dt: f32) -> bool {
+        match id.as_str() {
+            action::STUNNED => self.guard.state == GuardState::Stunned,
+            action::THREATENED => {
+                if !self.guard.capabilities.flee {
+                    return false; // 能力缺席 = 旧行为（绝不进入逃跑分支）
+                }
+                // 粘性：逃跑一旦开始就持续 FLEE_SECS（见常量文档）
+                if bb.get_f32_or(BB_FLEE_TIMER, 0.0) > 0.0 {
+                    return true;
+                }
+                let low_health = self.guard.health <= FLEE_HEALTH;
+                let approached = bb.get_bool_or(BB_SEES, false)
+                    && Vec2::new(
+                        self.view.player_pos.x - self.guard.pos.x,
+                        self.view.player_pos.z - self.guard.pos.z,
+                    )
+                    .length()
+                        <= FLEE_RADIUS;
+                low_health || approached
+            }
+            action::CHASING => self.guard.state == GuardState::Chase,
+            action::SUPPORTING => {
+                self.guard.capabilities.reinforcement && bb.get_f32_or(BB_SUPPORT_TIMER, 0.0) > 0.0
+            }
+            action::PATROLLING => self.guard.state == GuardState::Patrol,
+            other => {
+                debug_assert!(false, "守卫行为树出现了未登记的条件 id：{other}");
+                false
+            }
+        }
     }
 }
 
@@ -840,31 +1303,26 @@ pub const AUTOPILOT_ROUTE: &[Vec2] = &[
 /// 守卫视锥感知（自由函数，守卫 AI 与自动玩家共用同一套感知几何）：
 /// 距离（潜行减半）+ 视锥夹角 + 静态体线段遮挡。眼位 = 守卫头顶
 /// （y 1.4），目标 = 玩家胸口（y 0.9）——内墙高 2.5 m 恒挡线，门开即透明。
+///
+/// R65 起几何判定委托给引擎纯函数 [`can_see`]（`perception` 模块）：视锥的
+/// 距离/半角运算序与 R35–R41 的手写实现**逐位同源**（同为
+/// `Vec2::new(to.x, to.z) / dist` 归一 + 三维距离判界），遮挡复用同一条
+/// `segment_hits_shape_rotated`（恒等旋转 = 旧 `segment_hits_shape`）。
+/// `statics` 是 [`InfiltrationState::vision_statics`]（恒等旋转快照）。
 pub fn guard_sees(
     guard: &Guard,
     player_pos: Vec3,
     sneaking: bool,
-    statics: &[(Vec3, ColliderShape)],
+    statics: &[StaticObstacle],
 ) -> bool {
     let eye = Vec3::new(guard.pos.x, 1.4, guard.pos.z);
     let chest = Vec3::new(player_pos.x, 0.9, player_pos.z);
-    let to_player = chest - eye;
-    let dist = to_player.length();
     let max = if sneaking {
         SNEAK_VIEW_DISTANCE
     } else {
         VIEW_DISTANCE
     };
-    if !(1e-4..=max).contains(&dist) {
-        return false;
-    }
-    let dir_xz = Vec2::new(to_player.x, to_player.z) / dist;
-    if guard.forward().dot(dir_xz) < FOV_COS {
-        return false;
-    }
-    statics
-        .iter()
-        .all(|&(pos, ref shape)| segment_hits_shape(eye, chest, pos, shape).is_none())
+    can_see(eye, chest, guard.forward(), max, FOV_COS, statics)
 }
 
 /// 脚本化自动玩家：恒定潜行 + 逐路线点直走 + **视线避让**。规则：
@@ -899,7 +1357,7 @@ impl AutoPilot {
         // 视线避让（见类型文档）：被巡逻守卫看见 → 朝反方向撤退
         for guard in &state.guards {
             if guard.state == GuardState::Patrol
-                && guard_sees(guard, state.pos, true, &state.statics)
+                && guard_sees(guard, state.pos, true, &state.vision_statics)
             {
                 let guard_xz = Vec2::new(guard.pos.x, guard.pos.z);
                 move_dir = (pos - guard_xz).normalize_or_zero();

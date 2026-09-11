@@ -1154,6 +1154,7 @@ fn run_infiltration(world: &World) {
                 Some(("EXFILTRATION COMPLETE", [0.4, 1.0, 0.6, 1.0]))
             }
             InfiltrationEvent::Defeat { .. } => Some(("MISSION FAILED", [1.0, 0.3, 0.3, 1.0])),
+            // R65 增援警报不设横幅（它是 AI 间通信，玩家侧的反馈是守卫动起来）
             _ => None,
         };
         if let Some((text, color)) = banner {
@@ -1217,6 +1218,9 @@ fn run_infiltration(world: &World) {
                 InfiltrationEvent::DoorOpened { pos } => spatial(&assets.door, pos, 0.35),
                 InfiltrationEvent::GuardStunned { pos, .. } => spatial(&assets.stun, pos, 0.4),
                 InfiltrationEvent::Detection { pos, .. } => spatial(&assets.alarm, pos, 0.45),
+                // R65：增援呼叫复用警报音（音量略低，空间位置 = 发现点）——
+                // 能力②默认关，正式玩法开启后玩家能从声音听出「有人在喊人」
+                InfiltrationEvent::GuardAlert { pos, .. } => spatial(&assets.alarm, pos, 0.3),
                 InfiltrationEvent::Victory { pos } => spatial(&assets.victory, pos, 0.5),
                 InfiltrationEvent::Defeat { pos } => spatial(&assets.defeat, pos, 0.5),
             }

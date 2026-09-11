@@ -14,6 +14,7 @@
 // 让 `#[derive(Component)]` 生成的 `::iris_core::...` 路径在本 crate 内部测试同样可用。
 extern crate self as iris_core;
 
+pub mod behavior;
 pub mod broadphase;
 pub mod character;
 pub mod commands;
@@ -24,6 +25,7 @@ pub mod hierarchy;
 pub mod instant;
 pub mod name;
 pub mod nav;
+pub mod perception;
 pub mod physics;
 pub mod query;
 pub mod ragdoll;
@@ -40,6 +42,10 @@ pub use iris_macros::{Component, Event, Resource};
 
 pub mod prelude {
     // 同名 trait 与派生宏分属不同命名空间，可同时导出：
+    pub use crate::behavior::{
+        ActionId, BehaviorAgent, BehaviorContext, BehaviorState, BehaviorTree, BlackValue,
+        Blackboard, BtStatus, Node, NodeId, NodeSpec, ParallelPolicy, tick_behavior_agents,
+    };
     // `use iris_core::prelude::*;` 后即可直接 `#[derive(Component)]`
     pub use crate::character::{
         CharacterOutput, CharacterParams, move_and_slide, move_and_slide_statics,
@@ -54,6 +60,10 @@ pub mod prelude {
     pub use crate::instant::Instant;
     pub use crate::name::Name;
     pub use crate::nav::{NavGrid, NavGridParams};
+    pub use crate::perception::{
+        Perception, PerceptionEvent, PerceptionTarget, can_see, flat_statics, has_line_of_sight,
+        in_view_cone, perception_system, within_hearing,
+    };
     pub use crate::physics::{
         BodyType, Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker,
         DistanceJoint, PHYSICS_GRAVITY, RigidBody, StaticObstacle, SwingJoint, TargetJoint,

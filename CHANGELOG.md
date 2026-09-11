@@ -4,6 +4,54 @@
 版本遵守 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 ## [Unreleased]
+### Added（R65：行为树 + 黑板 + 感知事件——AI 上限，路线图 v4 · W7 首轮）
+
+敌人 AI 的游戏侧手写状态机在能力变多后必然爆炸（状态 × 转移的笛卡尔增长，
+最初评估的第二个瓶颈）。R65 在 iris-core 落引擎级最小骨架，并以
+iris-infiltration 守卫迁移做实战验收：**结构是纯数据、决策带记忆、通信只有
+黑板、感知是纯函数 + 事件**。设计记录 ARCHITECTURE §3.11（新增）、诚实限制
+§8.41（新增）。**不做任何 git 写操作；既有测试零改动全过。**
+
+- **新模块 `iris-core/behavior`**（零渲染依赖）：`BehaviorTree` = `NodeSpec`
+  嵌套规格**前序展开**成扁平 `Node` 数组（子节点只存 `NodeId` 下标——运行期
+  零动态分发、遍历期零分配、结构可序列化）；节点族八种（`Sequence` /
+  `Selector` / `Parallel` 成功数×失败数双阈值失败优先 / `Inverter` / `Repeat`
+  / `Cooldown` / `Condition` / `Action`），叶子由游戏侧按**具名动作 id**
+  （`ActionId` = `&'static str` 新类型）经 `BehaviorContext` 分发，引擎不认识
+  任何游戏动作；`BehaviorState` 逐节点记忆 ⇒ 上帧 `Running` 的节点下帧**从
+  记忆处恢复**（复合子游标 / 重复计数 / 剩余冷却 / 并行已终结位图）；
+  `Blackboard`（`BTreeMap<String, BlackValue>`，值五型）是感知与动作之间**唯一**
+  的通信通道，不做跨代理共享；`BehaviorAgent` = 树 + 运行态 + 黑板三合一组件
+  （despawn 即消亡，无手工清理）；系统体 `tick_behavior_agents`（Update 阶段
+  并行系统，迭代序 = 实体 id 升序）。
+- **新模块 `iris-core/perception`**：纯函数 `in_view_cone`（三维距离 + 水平朝向
+  半角点积）/ `has_line_of_sight`（线段 × `StaticObstacle`，复用 physics 射线）
+  / `can_see` / `within_hearing`（纯距离、无视线——隔墙听得见是有意取舍）+
+  `Perception` / `PerceptionTarget` 组件（视距 / 半角余弦 / 听觉半径 / 眼位
+  偏移字段化）+ `perception_system`（扫描 → 差分 → `Events<PerceptionEvent>`
+  Seen / Lost / Heard（双代缓冲先例）+ 运行态写回）；三份收集列表按实体 id
+  升序 ⇒ 输出与 spawn 顺序无关。
+- **iris-infiltration 守卫迁移（行为等价硬验收）**：守卫驱动改写为行为树
+  （顶层 Selector「击晕冻结 / 感知 + 决策」，决策 Selector「逃跑 → 追逐 →
+  支援 → 巡逻」）；**迁移前后全状态轨迹 FNV 哈希逐位相同**——两个场景：自动
+  玩家全流程 2993 帧（`c71ed50cf49c6d8c`）与发现 → 追逐 → 放弃 → 击晕 900 帧
+  （`8a0d0798f55ec8f2`），覆盖玩家运动 / 巡逻 / 警觉 / 发现 / 重寻路 / 放弃 /
+  击晕冻结 / 开门 / 拾取 / 胜利全分支。
+- **两个演示能力（默认关 = 能力缺席即旧行为）**：①**逃跑**（低血量 `health ≤
+  FLEE_HEALTH` 或被逼近「看得见且 ≤ `FLEE_RADIUS`」→ 走到距玩家最远的巡逻
+  路点，`FLEE_SECS` 粘性防视线抖动振荡）；②**呼叫增援**（发现玩家 →
+  `InfiltrationEvent::GuardAlert` → 半径内其他守卫进入支援态；支援态**不进**
+  `GuardState` 枚举，由黑板 `guard.support_timer` / `guard.alert_pos` 承载——
+  这正是行为树相对状态机的扩展力）。轨迹与状态断言在新增
+  `crates/iris-infiltration/tests/guard_behavior.rs`（7 项，含乱序 spawn / 同输入
+  逐位确定性 / 树结构优先级钉住）。
+- **测试**：iris-core 新增 29 项（节点语义逐条 / Running 记忆恢复 / 黑板键序
+  与类型语义 / 构造期 fail-loud / 同输入双跑逐位 / ECS 乱序 spawn；感知纯函数
+  解析对照（锥内 / 锥外 / 闭边界 / 遮挡 / 旋转感知 / 听觉半径）+ 差分
+  Seen→Lost→再 Seen + 双代窗口 + 乱序 spawn 无关），iris-infiltration 新增
+  7 项；六项门禁全绿（debug / release 全量 + native / wasm clippy）。
+
+
 ### Added（R64：光照探针 GI——烘焙 irradiance 探针云 + 四面体重心插值，路线图 v4 · W6）
 
 补上**间接漫反射**的最后一块拼图：光照贴图（R52c）只服务静态几何、反射

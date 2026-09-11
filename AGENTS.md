@@ -11,7 +11,7 @@ crate 布局（依赖自上而下）：
 | crate | 职责 |
 |---|---|
 | `iris-macros` | Component/Resource derive |
-| `iris-core` | ECS / 调度 / 层级 / 时间 / 物理（旋转胶囊/约束/接触事件）/ 角色 / NavGrid 导航 / ragdoll / 事件（零渲染依赖） |
+| `iris-core` | ECS / 调度 / 层级 / 时间 / 物理（旋转胶囊/约束/接触事件）/ 角色 / NavGrid 导航 / ragdoll / 事件 / **行为树 + 黑板 + 感知（R65）**（零渲染依赖） |
 | `iris-platform` | winit 窗口 + 输入 |
 | `iris-audio` | 混音纯函数核心 + cpal 设备薄壳（wasm 无设备自动降级）+ OGG/Vorbis 流式（symphonia）+ 音乐总线 + 混响区 |
 | `iris-render` | wgpu 渲染：PBR + 法线/ORM、CSM + 点光预算化阴影、TAA、烘焙 GI（光照贴图）、反射探针 + SSR、heightmap 地形、粒子、贴花、后处理链（DOF/MB/泛光/FXAA）、动画 v4、GLB、RTT、遮挡剔除 |
@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1110 / release 1108**（每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1146 / release 1144**（每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -138,11 +138,13 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-11 更新）
 
-- 测试基线 debug 1110 / release 1108；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1146 / release 1144；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v4**（上限跃迁：工具链 × 视觉 × AI × 完整 Assault）：
   - W5 内容产能 ✅：R57 关卡格式 v2、R58a/b 编辑器、R59 资产管线（BC3/manifest/动画注册表）
   - W6 视觉上限：R60 TAA ✅、R61 阴影 v2 ✅、R62a/b 反射探针+SSR ✅；剩 **R63 材质上限**（预积分皮肤 SSS）、R64 光照探针 GI（可选）
-  - W7 AI 与战斗手感：R65 行为树、R66 帧数据战斗、R67 战斗相机（未开工）
+  - W7 AI 与战斗手感：R65 行为树 ✅（行为树 / 黑板 / 感知事件落 iris-core，
+    iris-infiltration 守卫迁移验收——迁移前后轨迹 FNV 逐位相同）；剩 R66 帧数据
+    战斗、R67 战斗相机（未开工）
   - W8 完整 Assault（游戏七，dogfooding 纪律）：R68–R71（未获用户「OK」不开工）
   - W9 收官：R55 生产化、R56 发布 0.1（语义版本/docs.rs/CHANGELOG 发布段）
 - 休眠项（可插队）：手柄输入（**用户明确暂缓**）、Android、wasm 深化、GPU 粒子拖尾、水面、载具、本地化。

@@ -20,7 +20,13 @@
 //!   导航 + `UiClickEvent` 消费）+ 主 HUD；
 //! - **距离关节（R36）**：设施门洞里的「弹簧门」——`DistanceJoint` 把
 //!   门板拉回关闭位（玩家运动学胶囊真实推开自动回弹；青色微发光配色
-//!   区别于墙，「可推开」的视觉提示）。
+//!   区别于墙，「可推开」的视觉提示）；
+//! - **行为树 + 黑板 + 感知（R65）**：守卫驱动从手写状态机迁移到引擎行为树
+//!   （`iris_core::behavior`）——结构见 [`logic::guard_behavior_tree`]：「击晕
+//!   冻结 / 感知 → 逃跑 → 追逐 → 支援 → 巡逻」；感知几何走引擎纯函数
+//!   `iris_core::perception::can_see`（与迁移前的实现逐位同源）；两个演示
+//!   能力（逃跑 / 呼叫增援）默认关（[`logic::GuardCapabilities`] 缺席 = 旧
+//!   行为），轨迹与状态断言见 `tests/guard_behavior.rs`。
 //!
 //! 结构（iris-game / iris-arena / iris-bastion / iris-ascent 同款分层）：
 //! - [`logic`]：纯逻辑状态机（关卡写死、事件自带世界坐标、逐位确定性；
@@ -44,21 +50,27 @@
 //! 操作：WASD 移动（相机固定俯角，屏幕系 = 世界系）、Shift 潜行、
 //! E 背后击晕、Esc 暂停菜单。
 //!
-//! # 本轮纪律
+//! # 引擎依赖与纪律
 //!
 //! 游戏轮不改引擎（dogfooding 纪律）：接入中发现的引擎摩擦全部记入
-//! `ARCHITECTURE.md` §8 摩擦清单，绕行写在本 crate 内。
+//! `ARCHITECTURE.md` §8 摩擦清单，绕行写在本 crate 内。R65 是例外——那一轮
+//! 是**引擎轮的实战验收**：守卫驱动迁移到 `iris-core` 的行为树 / 黑板 / 感知
+//! 事件，游戏侧同步改动，行为等价的证据是「迁移前后全状态轨迹 FNV 逐位相同」
+//! （见 `crates/iris-infiltration/tests/` 与 ARCHITECTURE §3.11）。
 
 pub mod logic;
 pub mod plugin;
 
 pub use logic::{
-    ALERT_DECAY, ALERT_RISE, AUTOPILOT_ROUTE, AutoPilot, CHARACTER, CHASE_MEMORY, CHASE_SPEED,
-    CORE_RADIUS, CORES, DOOR, EXIT_CENTER, EXIT_HALF, FOV_COS, GUARD_ROUTES, Guard, GuardState,
-    HALF_HEIGHT, InfiltrationEvent, InfiltrationInput, InfiltrationState, MAX_DETECTIONS,
-    MOVE_SPEED, NAV_AGENT_RADIUS, NAV_BOUNDS_MAX, NAV_BOUNDS_MIN, NAV_CELL_SIZE, PATROL_SPEED,
-    PLATE_POS, PLATE_RADIUS, Phase, REPATH_INTERVAL, SNEAK_SPEED, SNEAK_VIEW_DISTANCE, SPAWN_FOOT,
-    STUN_BEHIND_COS, STUN_RADIUS, VIEW_DISTANCE, WALLS, Wall, run_until,
+    ALERT_DECAY, ALERT_RISE, AUTOPILOT_ROUTE, AutoPilot, BB_ALERT_POS, BB_MODE, BB_SEES,
+    BB_SUPPORT_TIMER, CHARACTER, CHASE_MEMORY, CHASE_SPEED, CORE_RADIUS, CORES, DOOR, EXIT_CENTER,
+    EXIT_HALF, FLEE_HEALTH, FLEE_RADIUS, FLEE_SPEED, FOV_COS, GUARD_ROUTES, Guard,
+    GuardCapabilities, GuardState, HALF_HEIGHT, InfiltrationEvent, InfiltrationInput,
+    InfiltrationState, MAX_DETECTIONS, MOVE_SPEED, NAV_AGENT_RADIUS, NAV_BOUNDS_MAX,
+    NAV_BOUNDS_MIN, NAV_CELL_SIZE, PATROL_SPEED, PLATE_POS, PLATE_RADIUS, PendingAlert, Phase,
+    REINFORCE_RADIUS, REINFORCE_SECS, REPATH_INTERVAL, SNEAK_SPEED, SNEAK_VIEW_DISTANCE,
+    SPAWN_FOOT, STUN_BEHIND_COS, STUN_RADIUS, SUPPORT_SPEED, VIEW_DISTANCE, WALLS, Wall, action,
+    guard_behavior_tree, mode, run_until,
 };
 pub use plugin::{
     ALERT_TEXT_NAME, BANNER_TEXT_NAME, BannerTimer, CORES_TEXT_NAME, InfiltrationAssets,
