@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1064 / release 1062**（每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1081 / release 1079**（每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -80,7 +80,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 - 断言用**精确值**（解析解对照、±1e-5 容差写明依据），不写「大于 0」式摆设断言；**有效性断言要可判别**（R53/R60 的指标学教训：指标要在分布高端区分、ROI 避开混淆源）。
 - GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿、debug 反而通过——各测自建渲染器的每帧 poll 同步循环互相争用）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。
 - should_panic 测试若依赖 `debug_assert!`，必须 `#[cfg(debug_assertions)]` 门控（R33/R38 各踩过一次 release 假失败）。
-- 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline 三次：R62a 验收实测 `pid` 同名目录下两个并行测试线程，一方 `remove_dir_all` 删掉另一方正在读的文件 → 偶发 `NotFound`；唯一名 = 进程 id + 调用序计数）。
+- 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline/edit_headless 四次：R62a 验收 `pid` 同名目录下并行测试线程互删文件；R63 验收 editor 测试只在 pid 后**无调用序计数**——Windows 复用历史运行 pid 时 `create_dir_all` 命中旧目录 ⇒ `loaded = true` / 陈旧产物失配，debug 时序不同侥幸通过、release 才炸；唯一名 = 进程 id + 调用序计数，缺一不可）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试；渲染器按**句柄值**缓存 GPU 资源——同一渲染器上渲染「同句柄不同内容」的多个世界会串味（R53/R62 两次踩到），跨世界对照必须各用独立渲染器。
 - **偶发失败 = 真 bug 信号**（本仓库沉淀的铁律）：Duration 舍入、临时文件竞态、浮点边界（R39 盒面 1e-4 容差）、uv_sphere 极点退化三角（R58b）、u8 关节蒙皮被拒（R59 规范笔误）都是这么抓到的。不重跑通过就放过；归因要查到机制，「Windows/环境问题」是排除项不是首选解释。
 
@@ -138,7 +138,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-11 更新）
 
-- 测试基线 debug 1064 / release 1062；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1081 / release 1079；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v4**（上限跃迁：工具链 × 视觉 × AI × 完整 Assault）：
   - W5 内容产能 ✅：R57 关卡格式 v2、R58a/b 编辑器、R59 资产管线（BC3/manifest/动画注册表）
   - W6 视觉上限：R60 TAA ✅、R61 阴影 v2 ✅、R62a/b 反射探针+SSR ✅；剩 **R63 材质上限**（预积分皮肤 SSS）、R64 光照探针 GI（可选）

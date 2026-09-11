@@ -42,9 +42,19 @@ use iris_engine::prelude::*;
 // 测试台
 // ---------------------------------------------------------------------------
 
-/// 唯一临时目录（进程 id 防并行竞态）。
+/// 唯一临时目录（进程 id + 进程内调用序计数）。
+///
+/// **只用 pid 会撞上历史运行的残留目录**：测试不在结束时清目录，
+/// Windows 复用 pid 后 `create_dir_all` 命中旧目录 ⇒ `open_level`
+/// 报 `loaded = true`、陈旧烘焙产物失配——R63 验收实测 release 挂
+/// 4 项（debug 时序不同侥幸通过）。加调用序计数后需「同 pid 且同
+/// 调用序」才可能撞（与 AGENTS.md 临时文件唯一名规约一致，第三案
+/// asset_pipeline 同款修法）。
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("iris-editor-{tag}-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("iris-editor-{tag}-{}-{seq}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("临时目录可建");
     dir
 }

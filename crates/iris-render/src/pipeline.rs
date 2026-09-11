@@ -392,6 +392,23 @@ pub(crate) fn create_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 预积分皮肤 SSS LUT（R63）：Rgba16Float 64×64 常驻纹理
+            // （u = NdotL、v = 曲率包裹参数，程序化生成见 `sss.rs`）。
+            // 追加在现有最大 binding 之后（R61/R62a/R62b 扩容先例），
+            // 采样复用 binding 6 的 ClampToEdge 双线性采样器——材质组
+            // 不新增采样器槽位。绑定组布局变更不影响任何着色器输出：
+            // 全部既有材质的 `material.sss.x = 0`（uniform 缺省）⇒
+            // 片元 SSS 分支整段不进入。
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
         ],
     });
 

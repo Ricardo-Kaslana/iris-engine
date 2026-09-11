@@ -8,6 +8,10 @@
 // slope_tan / shadow_factor / 点光循环的注释），常数 bias 只作下限。
 // 渲染在线性 HDR 空间，色调映射由 blit pass 完成。
 // 实例化绘制：每个实例携带模型矩阵（4 个 vec4 列）与法线矩阵（3 个 vec4 列）。
+// R63 起带**预积分皮肤次表面散射**：肤质材质（material.sss.x > 0）的直射
+// 漫反射改用 (NdotL × 曲率) 预积分 LUT 的包裹值——光软化终结线并渗入
+// 背光侧（见 sss_diffuse）。缺省材质（strength = 0）走原路径，一个算术
+// 都不多做。
 
 struct PointLight {
     // xyz: 世界位置
@@ -88,6 +92,10 @@ struct MaterialParams {
     // x: metallic, y: roughness, z: 绝缘体反射率基准 F0,
     // w: 光照贴图掩码（R52c，1 = 间接光取光照贴图、0 = 取 IBL 环境）
     surface: vec4<f32>,
+    // x: 预积分 SSS 强度（R63，0 = 关闭——片元分支整段跳过），
+    // y: 曲率包裹参数 t ∈ [0, 1]（CPU 侧 sss::wrap_param 换算好），
+    // z/w: 保留。与 Rust 侧 MaterialRaw 逐字段对齐（64 B）。
+    sss: vec4<f32>,
 };
 
 // ---- 阴影偏移 v2 的着色器侧常量（R61，与 light.rs 同名常量一一对应）----
@@ -175,6 +183,11 @@ struct SsrParams {
 // ⇒ 间接项走 select 的 IBL 分支（不做任何算术，逐位等于 R52b）。
 @group(1) @binding(5) var lightmap_texture: texture_2d<f32>;
 @group(1) @binding(6) var lightmap_sampler: sampler;
+// 预积分皮肤 SSS LUT（R63）：Rgba16Float 64×64 常驻纹理，u = NdotL
+// （纹素中心对齐）、v = 曲率包裹参数，RGB 同值（可当图看）、A = 1。
+// 采样复用 binding 6 的 ClampToEdge 双线性采样器（LUT 坐标恒在 [0,1]，
+// Repeat 会在端点混入对侧纹素）。生成式与精度依据见 `sss.rs` 模块文档。
+@group(1) @binding(7) var sss_lut: texture_2d<f32>;
 // 蒙皮：关节矩阵（vs_skinned 专用；vs_main 静态不使用，
 // 因此常规管线的 layout 无需 group 2）
 @group(2) @binding(0) var<storage, read> joint_mats: array<mat4x4<f32>>;
@@ -322,6 +335,81 @@ fn pbr_light(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
     // 能量守恒：漫反射扣除菲涅尔反射占比，金属无漫反射
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
     return (kd * albedo / 3.14159265 + specular) * radiance * nol;
+}
+
+// ---- 预积分皮肤次表面散射（R63，Penner 2011 预积分近似的引擎实现）----
+//
+// 积分式、精度依据与调参指引见 Rust 侧 `iris_render::sss` 模块文档
+// （LUT 在那里程序化生成并上传）；此处是 GPU 侧的消费端，两个纯函数
+// （sss_uv / sss_diffuse）与 `sss.rs` 的 `lut_uv` / `ndotl_response`
+// 逐式对应，**必须同步修改**。
+
+// LUT 边长（与 `sss::SSS_LUT_SIZE` 同值。WGSL 无「Rust 常量导入」，
+// 靠这条注释 + 两侧单测（Rust 侧 lut_uv / GPU 侧验收图断言）看门）。
+const SSS_LUT_SIZE: f32 = 64.0;
+
+/// 归一化坐标（几何 NdotL、曲率包裹参数 t）→ LUT 采样坐标（CPU 镜像：
+/// `sss::lut_uv`）。**纹素中心对齐**：`idx = coord·(N−1)`、`uv = (idx+0.5)/N`
+/// ——`c = ±1` / `t = 1` 恰好落在首末纹素中心，端点无插值截断（LUT 的
+/// `W(1) = 1 / W(−1) = 0` 因此逐位精确，全照面不会被抹暗）。
+fn sss_uv(ndotl: f32, curvature: f32) -> vec2<f32> {
+    let idx = vec2<f32>(ndotl * 0.5 + 0.5, curvature) * (SSS_LUT_SIZE - 1.0);
+    return (idx + vec2<f32>(0.5)) / SSS_LUT_SIZE;
+}
+
+/// 直射漫反射的 **SSS 补项**：漫反射的 NdotL 由几何值换成球冠预积分值
+/// `W = LUT(NdotL, 曲率)`，补项 = `kd · albedo/π · radiance · (nol_sss − nol)`，
+/// 其中 `nol_sss = mix(nol, W, strength)`（strength ∈ [0,1] 线性混合）。
+///
+/// **为什么是「相加的补项」而不是把 `nol` 直接替换进 `pbr_light`**：
+/// 1. **镜面项必须留在几何 NdotL 上**——皮下散射是漫反射现象，高光仍
+///    遵守几何反射定律（改 `pbr_light` 内部会让高光在背光侧凭空出现）；
+/// 2. **零值可证**：调用点在 `if (material.sss.x > 0.0)` 内（uniform
+///    条件 ⇒ 无分支发散），strength ≤ 0 时整段不执行——比
+///    `mix(a, b, 0) = a·1 + b·0` 的浮点恒等式论证更强（后者在 `a = −0.0`
+///    时会翻符号，见 material.rs 模块文档的兼容铁律）。
+///
+/// **金属自动归零**：能量权重 `(1 − metallic)`，metallic = 1 ⇒ 权重 = 0
+/// ⇒ 补项恒为 ±0.0，**无需额外分支**；GPU 测试以「metallic = 1 时
+/// strength 0/1 整帧逐位一致」作硬断言。
+///
+/// **能量权重为什么不是 `kd = (1 − F)(1 − metallic)`（R63 实测教训）**：
+/// 初版按 `kd` 写（与 `pbr_light` 的能量守恒式同源），需要在补项里重算
+/// `h = normalize(v + l)` 与 `fresnel_schlick(voh, f0)`——这三个子表达式
+/// 与 `pbr_light` 完全重合，**改变了编译器在 `pbr_light` 内的公共子表达式
+/// 消除 / 内联决策，进而改变其浮点收缩（FMA）选择**：实测
+/// `tests/shadow_v2_render.rs::legacy_bias_mode_reproduces_r60_output_bitwise`
+/// 的接触阴影对照场景有 **3 个字节 ±1 LSB** 的漂移（320×180×4 中的 3 个
+/// 通道，都在接触阴影边缘——PCF 比较的临界像素）。该漂移与 SSS 逻辑无关
+/// （strength = 0 时补项根本不执行），纯属着色器代码增量的编译期副作用。
+/// 去掉复用（权重只留 `1 − metallic`）后该基线**逐位复原**（实测）。
+/// 代价：绝缘体的漫反射能量权重比 `kd` 高约 4%（F0 = 0.04 起）——对
+/// 「包裹补项」这种近似项完全在噪声量级，且换来**默认路径的编译期稳定**。
+/// **教训**：新增直射项时不要在辅助函数里重算 `pbr_light` 的子表达式，
+/// 否则会以「±1 LSB 基线漂移」的形式付出代价。
+///
+/// **阴影协同（乘位论证）**：调用方传入的 `radiance` 已经乘过阴影因子
+/// ——方向光是 `light_color × shadow_factor`（级联 CSM + 3×3 PCF），
+/// 点光是 `light_color × atten × shadow`（cubemap）——补项与主体项
+/// **消费同一个已乘完阴影的辐亮度**，不存在第二条绕过阴影的路径。
+/// 投影阴影内 radiance = 0 ⇒ 补项 = 0（背光侧的包裹**绝不晒穿投影阴影**）；
+/// 点光分支里 `dist < light.color.w` 的窗口衰减同理（补项不越过光源
+/// 有效半径）。GPU 测试断言「阴影区像素与 strength 无关（逐位）」。
+fn sss_diffuse(n: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
+               albedo: vec3<f32>, metallic: f32,
+               strength: f32, curvature: f32) -> vec3<f32> {
+    // **LUT 的 u 轴吃带符号的 NdotL**（[−1, 1] → [0, 1]），不是 max(·, 0)
+    // 之后的几何 nol：背光侧的负值正是「光包裹进来」的自变量，clamp 到 0
+    // 会把整个背光面采样到 LUT 的 c = 0 那一列（常数 0.18），包裹形状退化
+    // 成一块平顶——R63 落地时的实测症状（剖面在背光侧恒为常数）。
+    let ndotl = dot(n, l);
+    let nol = max(ndotl, 0.0);
+    // textureSampleLevel（显式 mip）不依赖屏幕导数 ⇒ 在材质级分支内合法。
+    let wrapped = textureSampleLevel(sss_lut, lightmap_sampler,
+                                     sss_uv(ndotl, curvature), 0.0).r;
+    let nol_sss = mix(nol, wrapped, strength);
+    // 能量权重只留 (1 − metallic)：不重算 normalize(v+l)/Schlick（见上）
+    return (1.0 - metallic) * albedo / 3.14159265 * radiance * (nol_sss - nol);
 }
 
 /// `tan(acos(NdotL))` 的保守取值（clamp 到 SHADOW_TAN_MAX）。
@@ -667,6 +755,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sun = shadow_factor(in.world_pos, n_geo, l);
     let radiance = globals.light_color.rgb * sun;
     var color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
+    // 预积分 SSS 补项（R63）：radiance 已含 CSM 阴影因子 ⇒ 阴影内补项为 0。
+    if (material.sss.x > 0.0) {
+        color = color + sss_diffuse(n, l, radiance, albedo, metallic,
+                                    material.sss.x, material.sss.y);
+    }
 
     // 点光：物理平方衰减 + range 平滑窗口；投影灯（预算内多盏）各自受
     // 自己的 cubemap 阴影调制
@@ -715,6 +808,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let atten = (window * window) / max(dist * dist, 0.01);
             let pl = light.color.rgb * atten * shadow;
             color = color + pbr_light(n, v, lp, pl, albedo, f0, metallic, roughness);
+            // 预积分 SSS 补项（R63）：点光同样适用——终结线软化是方向
+            // 无关的漫反射现象，且 pl 已含距离窗口衰减与 cubemap 阴影，
+            // 补项自动继承两者（阴影内 / 有效半径外为 0）。成本 = 每盏
+            // 生效光源多一次 64×64 LUT 采样（显式 mip、常驻缓存）。
+            if (material.sss.x > 0.0) {
+                color = color + sss_diffuse(n, lp, pl, albedo, metallic,
+                                            material.sss.x, material.sss.y);
+            }
         }
     }
 

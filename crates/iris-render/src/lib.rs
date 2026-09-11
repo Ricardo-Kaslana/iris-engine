@@ -85,6 +85,7 @@ pub mod probe;
 pub mod renderer;
 pub mod rendertarget;
 pub mod skin;
+pub mod sss;
 pub mod surface;
 pub mod terrain;
 pub mod texture;

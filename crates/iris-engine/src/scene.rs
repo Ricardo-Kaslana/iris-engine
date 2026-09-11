@@ -628,6 +628,13 @@ impl PrimitiveSection {
 ///
 /// 法线 / ORM 槽是 v2 新增（v1 只写基色路径，两槽恒 `None` = 中性纹理
 /// 路径）——旧档直读零变化，旧档重存字节级不变（两槽 `None` 时省略）。
+///
+/// 预积分 SSS 两字段（`subsurface_strength` / `subsurface_scale`）是
+/// **R63 在 v2 内的增量**：容器带 `#[serde(default)]` ⇒ 旧档（无这两字段）
+/// 反序列化得引擎缺省（强度 0 = 关闭）；缺省值时 `skip_serializing_if`
+/// 省略 ⇒ 旧档重存**逐字节不变**，`SCENE_FORMAT_VERSION` 保持 2 不动
+/// （新字段是「可选增量」而非「新版本」——旧引擎读到新档也只会忽略未知
+/// 字段，不会走错版本迁移）。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct MaterialSection {
@@ -643,6 +650,17 @@ pub struct MaterialSection {
     /// 序列化省略不透明（旧场景文件往返字节级不变，见下方断言函数）。
     #[serde(skip_serializing_if = "alpha_mode_is_opaque")]
     pub alpha_mode: AlphaMode,
+    /// 预积分皮肤 SSS 强度（R63，0..1）。**缺省 0 = 关闭 ⇒ 序列化省略**
+    /// ——v2 旧档（无该字段）反序列化得缺省、重存后仍不含该字段（往返
+    /// 逐字节不变，[\`SCENE_FORMAT_VERSION\`] 保持 2）。
+    #[serde(skip_serializing_if = "sss_strength_is_default")]
+    pub subsurface_strength: f32,
+    /// 预积分 SSS 曲率尺度半径（R63，世界单位 / 米）：缺省
+    /// （[\`iris_render::sss::SSS_DEFAULT_SCALE\`]）时省略。与强度**各自
+    /// 独立**判定——强度 0 但尺度非缺省时仍写出来（关掉 SSS 不该丢失
+    /// 已调好的尺度参数，重新开启时观感连续）。
+    #[serde(skip_serializing_if = "sss_scale_is_default")]
+    pub subsurface_scale: f32,
 }
 
 impl Default for MaterialSection {
@@ -656,6 +674,8 @@ impl Default for MaterialSection {
             normal_texture: None,
             orm_texture: None,
             alpha_mode: AlphaMode::Opaque,
+            subsurface_strength: MaterialDef::default().subsurface_strength,
+            subsurface_scale: MaterialDef::default().subsurface_scale,
         }
     }
 }
@@ -664,6 +684,16 @@ impl Default for MaterialSection {
 /// 旧场景（无该字段）重存后文件保持不含该字段（往返字节级稳定）。
 fn alpha_mode_is_opaque(mode: &AlphaMode) -> bool {
     matches!(mode, AlphaMode::Opaque)
+}
+
+/// `subsurface_strength` 的序列化省略条件：0（关闭 = 引擎缺省，与 `MaterialDef::default()` 同源）。
+fn sss_strength_is_default(strength: &f32) -> bool {
+    *strength == MaterialDef::default().subsurface_strength
+}
+
+/// `subsurface_scale` 的序列化省略条件：引擎缺省尺度。
+fn sss_scale_is_default(scale: &f32) -> bool {
+    *scale == MaterialDef::default().subsurface_scale
 }
 
 impl MaterialSection {
@@ -684,6 +714,8 @@ impl MaterialSection {
             normal_texture,
             orm_texture,
             alpha_mode: self.alpha_mode,
+            subsurface_strength: self.subsurface_strength,
+            subsurface_scale: self.subsurface_scale,
         }
     }
 
@@ -716,6 +748,8 @@ impl MaterialSection {
             normal_texture,
             orm_texture,
             alpha_mode: def.alpha_mode,
+            subsurface_strength: def.subsurface_strength,
+            subsurface_scale: def.subsurface_scale,
         }
     }
 }
@@ -1011,8 +1045,13 @@ type MaterialKey = (
     Option<TextureHandle>,
     Option<TextureHandle>,
     AlphaMode,
+    u32,
+    u32,
 );
 
+/// **去重键必须覆盖全部字段**：漏一个字段会让「只差该字段」的两个材质
+/// 被合并成同一句柄（R63 的 SSS 参数就是这样一对——同一几何的皮肤与
+/// 盔甲只差 `subsurface_*`）。新增字段时同步在此追加。
 fn material_key(def: &MaterialDef) -> MaterialKey {
     (
         def.base_color.map(f32::to_bits),
@@ -1023,6 +1062,8 @@ fn material_key(def: &MaterialDef) -> MaterialKey {
         def.normal_texture,
         def.orm_texture,
         def.alpha_mode,
+        def.subsurface_strength.to_bits(),
+        def.subsurface_scale.to_bits(),
     )
 }
 
@@ -2695,6 +2736,149 @@ mod tests {
             .clone();
         assert_eq!(def_b.alpha_mode, AlphaMode::Blend, "往返后仍为 Blend");
         assert_eq!(def_b.base_color, [0.6, 0.8, 1.0, 0.4]);
+    }
+
+    /// 预积分 SSS 序列化（R63）：旧档（无两字段）加载回退引擎缺省 =
+    /// 关闭；缺省值 save 时**双省略**（旧档重存逐字节不变）；
+    /// 显式参数写出且 save ↔ load 往返保持；强度 0 + 非缺省尺度时
+    /// **只写尺度**（关闭不丢调参）；只差 SSS 的两个材质**不被去重合并**。
+    #[test]
+    fn subsurface_legacy_default_and_roundtrip() {
+        // 旧格式：无两字段 → 引擎缺省（强度 0 = 关闭）
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "legacy_sss.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [0.92, 0.72, 0.62, 1.0] }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.subsurface_strength, 0.0, "旧档缺字段 = 关闭");
+        assert_eq!(def.subsurface_scale, iris_render::sss::SSS_DEFAULT_SCALE);
+        let out = test_dir().join("legacy_sss_out.json");
+        save_scene(&mut world, &out).expect("保存旧档");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            !text.contains("subsurface"),
+            "缺省 SSS 必须双省略，旧档重存字节级不变"
+        );
+
+        // 新格式：显式皮肤参数 → 加载并往返保持
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "sss_skin.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "sphere", "radius": 0.5 } },
+                    "material": { "color": [0.92, 0.72, 0.62, 1.0],
+                                  "subsurface_strength": 0.85,
+                                  "subsurface_scale": 0.25 }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.subsurface_strength, 0.85);
+        assert_eq!(def.subsurface_scale, 0.25);
+        let out_a = test_dir().join("sss_skin_out.json");
+        save_scene(&mut world, &out_a).expect("保存 SSS 场景");
+        let text = std::fs::read_to_string(&out_a).unwrap();
+        assert!(text.contains(r#""subsurface_strength": 0.85"#));
+        assert!(
+            text.contains(r#""subsurface_scale": 0.25"#),
+            "非缺省尺度必须写出（0.1 是缺省，会被省略）：{text}"
+        );
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out_a).expect("二次加载");
+        let handle_b = *world_b.get::<MaterialHandle>(entities_b[0]).unwrap();
+        let def_b = world_b
+            .resource::<MaterialStore>()
+            .get(handle_b)
+            .unwrap()
+            .clone();
+        assert_eq!(def_b.subsurface_strength, 0.85, "往返后强度保持");
+        assert_eq!(def_b.subsurface_scale, 0.25, "往返后尺度保持");
+
+        // 强度非缺省 + 尺度取缺省：只写强度（尺度是引擎缺省 ⇒ 省略）
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "sss_strength_only.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [1.0, 1.0, 1.0, 1.0],
+                                  "subsurface_strength": 0.6 }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.subsurface_scale, iris_render::sss::SSS_DEFAULT_SCALE);
+        let out_d = test_dir().join("sss_strength_only_out.json");
+        save_scene(&mut world, &out_d).expect("保存强度场景");
+        let text = std::fs::read_to_string(&out_d).unwrap();
+        assert!(text.contains(r#""subsurface_strength": 0.6"#));
+        assert!(
+            !text.contains("subsurface_scale"),
+            "缺省尺度必须省略：{text}"
+        );
+
+        // 强度 0 + 非缺省尺度：只写尺度（关闭不丢已调好的调参）
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "sss_scale_only.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [1.0, 1.0, 1.0, 1.0], "subsurface_scale": 0.3 }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.subsurface_strength, 0.0);
+        assert_eq!(def.subsurface_scale, 0.3);
+        let out_c = test_dir().join("sss_scale_only_out.json");
+        save_scene(&mut world, &out_c).expect("保存尺度场景");
+        let text = std::fs::read_to_string(&out_c).unwrap();
+        assert!(text.contains(r#""subsurface_scale": 0.3"#));
+        assert!(!text.contains("subsurface_strength"), "强度缺省必须省略");
+
+        // 去重键覆盖 SSS：只差 SSS 的两个实体必须拿到不同材质句柄
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "sss_dedup.scene.json",
+            r#"{ "entities": [
+                    { "mesh": { "primitive": { "kind": "cube" } },
+                      "material": { "color": [0.9, 0.7, 0.6, 1.0] } },
+                    { "mesh": { "primitive": { "kind": "cube" } },
+                      "material": { "color": [0.9, 0.7, 0.6, 1.0],
+                                    "subsurface_strength": 1.0 } }
+                ] }"#,
+        );
+        let h0 = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let h1 = *world.get::<MaterialHandle>(entities[1]).unwrap();
+        assert_ne!(
+            h0, h1,
+            "只差 SSS 参数的材质不得被去重合并（material_key 必须覆盖新字段）"
+        );
     }
 
     /// 错误 Display 风格与 GltfError 一致（含上下文、可作 dyn Error）。

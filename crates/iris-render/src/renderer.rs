@@ -148,7 +148,7 @@ const _: () = assert!(
 /// 阴影暗部保留的光照比例（0 = 全黑阴影，1 = 无阴影）。
 const SHADOW_STRENGTH: f32 = 0.45;
 
-/// 与 WGSL `MaterialParams` 结构对齐（48 字节，POD）。
+/// 与 WGSL `MaterialParams` 结构对齐（64 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialRaw {
@@ -156,7 +156,16 @@ struct MaterialRaw {
     emissive: [f32; 4],
     // metallic, roughness, reflectance(F0), 光照贴图掩码（R52c，0/1）
     surface: [f32; 4],
+    // x: 预积分 SSS 强度（R63，0 = 关闭——着色器分支整段跳过），
+    // y: 曲率包裹参数 t ∈ [0, 1]（CPU 由 sss::wrap_param 换算好，
+    //    着色器不做除法），z/w: 保留
+    sss: [f32; 4],
 }
+
+const _: () = assert!(
+    std::mem::size_of::<MaterialRaw>() == 64,
+    "MaterialParams 必须与 WGSL 布局一致（R63 起 64 B）"
+);
 
 struct GpuMesh {
     vertex_buf: wgpu::Buffer,
@@ -384,8 +393,15 @@ pub struct Renderer {
     lightmap_dummy_tex: wgpu::Texture,
     lightmap_dummy_view: wgpu::TextureView,
     /// 光照贴图采样器（R52c，双线性 + ClampToEdge）：兜底黑纹理与全部
-    /// 真实图集共用一份（寻址 / 过滤参数与图集尺寸无关）。
+    /// 真实图集共用一份（寻址 / 过滤参数与图集尺寸无关）。**R63 起预积分
+    /// SSS LUT 也复用它**（同样 ClampToEdge 双线性，材质组不新增采样器槽位）。
     lightmap_sampler: wgpu::Sampler,
+    /// 预积分皮肤 SSS LUT（R63，常驻）：`Rgba16Float` 64×64，程序化生成
+    /// （`sss::lut_half_bytes`，纯函数 + 无 RNG）。纹理本体保活以维持
+    /// view 有效；尺寸与纹素中心对齐口径见 `sss.rs` 模块文档。
+    #[allow(dead_code)]
+    sss_lut_tex: wgpu::Texture,
+    sss_lut_view: wgpu::TextureView,
     /// 渲染目标（R40）GPU 缓存：句柄 → 颜色 / 深度 / HDR / 绑定组 /
     /// 专用全局与实例缓冲。按句柄惰性创建、跨帧持有（尺寸不变时零重建）。
     render_target_gpu: HashMap<u32, GpuRenderTarget>,
@@ -2301,6 +2317,45 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        // 预积分皮肤 SSS LUT（R63，常驻）：64×64 Rgba16Float，程序化生成
+        // （纯函数，无 RNG；同输入两次生成逐位同一输出——单测锁定）。
+        // 初始化时一次性上传：LUT 与场景无关，没有「按需生成 / 热替换」
+        // 语义（LUT 运行时热替换在拒绝清单里）。行步长 = 64 × 8 B
+        // （queue.write_texture 无 256 字节对齐要求）。
+        let sss_lut_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.sss.lut"),
+            size: wgpu::Extent3d {
+                width: crate::sss::SSS_LUT_SIZE,
+                height: crate::sss::SSS_LUT_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &sss_lut_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &crate::sss::lut_half_bytes(crate::sss::SSS_LUT_SIZE),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(crate::sss::SSS_LUT_SIZE * 8),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: crate::sss::SSS_LUT_SIZE,
+                height: crate::sss::SSS_LUT_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        let sss_lut_view = sss_lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
         // UI 字形图集：初始化时一次性构建并上传。单一纹理同时服务矩形
         // （0 号格纯白块）与文本（字形 texel，白色 + alpha=行位码），
         // 使 UI 全部内容共享单管线单纹理单 draw。采样器 Nearest：
@@ -2466,6 +2521,8 @@ impl Renderer {
             lightmap_dummy_tex,
             lightmap_dummy_view,
             lightmap_sampler,
+            sss_lut_tex,
+            sss_lut_view,
             render_target_gpu: HashMap::new(),
             rt_blit_sampler,
             rt_post_params_buf,
@@ -6886,6 +6943,11 @@ impl Renderer {
         // 掩码只在图集**确实已上传**时置 1：悬垂句柄（ensure_lightmap 只
         // 告警）保持 0 ⇒ 间接光退回 IBL，而不是被黑纹理抹成零。
         let mask = f32::from(self.lightmap_gpu.contains_key(&lightmap));
+        // 预积分 SSS（R63）：强度 clamp 到 [0, 1]；曲率尺度**在 CPU 换算**
+        // 成 LUT 的 v 坐标（`sss::wrap_param`，纯函数 + 单测锁定调参表）
+        // ——片元侧不做除法，也不做非法的尺度判定。强度 0 时 y 的取值
+        // 无关紧要（着色器分支不进入），但仍按同一公式算，保证同一材质
+        // 在任意强度下的 v 坐标一致（无「先开后关再开」的坐标跳变）。
         let raw = MaterialRaw {
             base_color: def.base_color,
             emissive: def.emissive,
@@ -6894,6 +6956,12 @@ impl Renderer {
                 def.roughness.clamp(0.0, 1.0),
                 0.04, // 绝缘体反射率基准（glTF 规范约定值）
                 mask,
+            ],
+            sss: [
+                def.subsurface_strength.clamp(0.0, 1.0),
+                crate::sss::wrap_param(def.subsurface_scale),
+                0.0,
+                0.0,
             ],
         };
         let params_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -6939,6 +7007,12 @@ impl Renderer {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::Sampler(&self.lightmap_sampler),
+                    },
+                    // 预积分 SSS LUT（R63，常驻纹理）：全部材质绑定同一份
+                    // ——是否消费由 `material.sss.x > 0` 决定。
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(&self.sss_lut_view),
                     },
                 ],
             });

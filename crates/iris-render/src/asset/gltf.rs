@@ -981,6 +981,12 @@ impl GltfLoader {
                     },
                     normal_texture: None,
                     orm_texture: None,
+                    // 预积分 SSS（R63）：glTF 核心规范与既有扩展（KHR_*）
+                    // 都没有次表面参数，导入一律取引擎缺省 = 关闭
+                    // （subsurface_strength 0 ⇒ 渲染与 R62b 逐位一致）。
+                    // 需要 SSS 的调用方在导入后覆写 MaterialDef 字段。
+                    subsurface_strength: MaterialDef::default().subsurface_strength,
+                    subsurface_scale: MaterialDef::default().subsurface_scale,
                 };
                 // 法线贴图（R42）：线性数据贴图
                 if let Some(info) = &mat.normal_texture {

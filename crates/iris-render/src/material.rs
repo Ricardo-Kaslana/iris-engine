@@ -32,6 +32,16 @@
 //! 标量 × orm.b)`——与 glTF 规范的 factor × texel 语义一致；无 ORM 贴图
 //! 时采样值为 1，退化为纯标量（见上）。AO 只乘环境项（IBL + 常量补光），
 //! 不乘直接光。
+//!
+//! # 预积分皮肤 SSS（R63）
+//!
+//! [`MaterialDef::subsurface_strength`] / [`MaterialDef::subsurface_scale`]
+//! 是 R63 新增的**直射漫反射**包裹参数，缺省 `0.0 / 0.1`。**兼容铁律**：
+//! 强度缺省 0 时着色器的 SSS 分支（`if (material.sss.x > 0.0)`，uniform
+//! 条件）整段不进入——不比 `x·1.0 + y·0.0`，而是**根本不执行任何算术**
+//! （R52c `select` 先例的强化形态：「把逐位不变交给语言语义，而不是浮点
+//! 恒等式」）。故全部既有材质（`..MaterialDef::default()` 构造）渲染结果
+//! 与 R62b **逐位一致**，由既有 GPU FNV 基线原值通过看门。
 
 use crate::texture::TextureHandle;
 
@@ -79,6 +89,18 @@ pub struct MaterialDef {
     pub orm_texture: Option<TextureHandle>,
     /// 透明模式：`Opaque` 走不透明主 pass，`Blend` 走透明 pass（见 `AlphaMode`）。
     pub alpha_mode: AlphaMode,
+    /// 预积分皮肤次表面散射强度（R63，0..1）。**缺省 0 = 关闭**：直射
+    /// 漫反射与引入本字段前**逐位一致**（着色器整段分支不进入，无任何
+    /// 算术）；1 = 漫反射的 NdotL 完全取预积分 LUT 值（光包裹进终结线
+    /// 背光侧）。中间值线性混合。只在直射漫反射项生效——镜面、IBL /
+    /// 光照贴图间接项、自发光都不受影响；金属（metallic = 1）经
+    /// `kd = (1 − F)(1 − metallic)` 权重自动归零。见 `crate::sss`。
+    pub subsurface_strength: f32,
+    /// 预积分 SSS 的曲率尺度半径（R63，世界单位 / 米）：**半径越小（越
+    /// 弯曲）包裹越强**，映射 `t = clamp(0.05 / scale, 0, 1)`（见
+    /// [`crate::sss::wrap_param`] 的调参表）。缺省 0.1 m = 头 / 前臂
+    /// 量级（t = 0.5）。只在 `subsurface_strength > 0` 时被消费。
+    pub subsurface_scale: f32,
 }
 
 impl Default for MaterialDef {
@@ -92,6 +114,8 @@ impl Default for MaterialDef {
             normal_texture: None,
             orm_texture: None,
             alpha_mode: AlphaMode::Opaque,
+            subsurface_strength: 0.0,
+            subsurface_scale: crate::sss::SSS_DEFAULT_SCALE,
         }
     }
 }
@@ -137,6 +161,15 @@ impl MaterialDef {
     /// （`CpuTexture.srgb == false`），R = AO / G = 粗糙度 / B = 金属度。
     pub fn with_orm(mut self, tex: TextureHandle) -> Self {
         self.orm_texture = Some(tex);
+        self
+    }
+
+    /// 开启预积分皮肤 SSS（builder 风格，R63）。`strength` 自动 clamp 到
+    /// [0, 1]，`scale` 为曲率尺度半径（米，越小包裹越强——见
+    /// [`crate::sss::wrap_param`]）。
+    pub fn with_subsurface(mut self, strength: f32, scale: f32) -> Self {
+        self.subsurface_strength = strength.clamp(0.0, 1.0);
+        self.subsurface_scale = scale;
         self
     }
 }
@@ -243,5 +276,40 @@ mod tests {
         assert_eq!(def.orm_texture, Some(TextureHandle(9)));
         assert_eq!(def.metallic, 1.0, "builder 不得改写其他字段");
         assert_eq!(def.roughness, 0.35);
+    }
+
+    /// 预积分 SSS 参数（R63）：缺省 = 关闭（强度 0）+ 头 / 前臂量级曲率
+    /// 尺度；builder 链式设定且强度自动 clamp（越界输入不产生未定义效果）。
+    #[test]
+    fn subsurface_defaults_off_and_builder_clamps() {
+        let def = MaterialDef::default();
+        assert_eq!(def.subsurface_strength, 0.0, "缺省 0 = 关闭（逐位兼容）");
+        assert_eq!(def.subsurface_scale, crate::sss::SSS_DEFAULT_SCALE);
+        assert_eq!(crate::sss::wrap_param(def.subsurface_scale), 0.5);
+        // 便捷构造器不携带 SSS（solid / metal / glass 全部关闭）
+        for d in [
+            MaterialDef::solid(1.0, 0.5, 0.4, 1.0),
+            MaterialDef::metal(1.0, 1.0, 1.0, 0.3),
+            MaterialDef::glass(1.0, 1.0, 1.0, 0.4),
+        ] {
+            assert_eq!(d.subsurface_strength, 0.0);
+        }
+        let skin = MaterialDef::solid(0.92, 0.72, 0.62, 1.0).with_subsurface(0.85, 0.1);
+        assert_eq!(skin.subsurface_strength, 0.85);
+        assert_eq!(skin.subsurface_scale, 0.1);
+        assert_eq!(
+            MaterialDef::solid(1.0, 1.0, 1.0, 1.0)
+                .with_subsurface(3.0, 0.1)
+                .subsurface_strength,
+            1.0,
+            "强度越界必须 clamp 到 1"
+        );
+        assert_eq!(
+            MaterialDef::solid(1.0, 1.0, 1.0, 1.0)
+                .with_subsurface(-2.0, 0.1)
+                .subsurface_strength,
+            0.0,
+            "负强度必须 clamp 到 0（= 关闭，绝不产生负光）"
+        );
     }
 }
