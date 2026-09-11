@@ -3,10 +3,16 @@
 use glam::{Mat3, Mat4};
 use iris_core::prelude::Transform;
 
-/// GPU 实例数据（112 字节，POD）。
+/// GPU 实例数据（128 字节，POD）。
 ///
 /// `model` 为列主序 4x4 模型矩阵；`normal` 为模型矩阵逆转置的 3x3
 /// 法线矩阵（每列补零填充到 vec4，规避 WGSL 对齐陷阱）。
+///
+/// `probe` = 光照探针间接辐照（R64）：`xyz` 存 **E/π**（与
+/// `irradiance_map` 采样值同口径，着色器零换算）、`w` = 标志位
+/// （0 = 探针缺席，走原全局 env 路径）。**缺席时逐位恒零** ⇒ 着色器的
+/// `select` 取到的仍是纹理采样值的同一串位（兼容铁律，见
+/// [`crate::irradiance`] 模块文档）。
 ///
 /// `PartialEq` 供渲染器帧级实例比对（增量上传）使用：逐字段 IEEE 相等。
 /// 矩阵含 NaN 时恒判不等 → 退化为每帧重传，不影响正确性；−0.0 与 0.0
@@ -16,6 +22,8 @@ use iris_core::prelude::Transform;
 pub struct InstanceRaw {
     pub model: [[f32; 4]; 4],
     pub normal: [[f32; 4]; 3],
+    /// 光照探针间接辐照（R64）：xyz = E/π、w = 标志位（0 = 缺席）。
+    pub probe: [f32; 4],
 }
 
 impl InstanceRaw {
@@ -58,6 +66,12 @@ impl InstanceRaw {
                 shader_location: 9,
                 format: wgpu::VertexFormat::Float32x4,
             },
+            // 光照探针载荷（R64，loc14）：xyz = E/π、w = 标志位
+            wgpu::VertexAttribute {
+                offset: 112,
+                shader_location: 14,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 
@@ -76,7 +90,17 @@ impl InstanceRaw {
                 [nc[1][0], nc[1][1], nc[1][2], 0.0],
                 [nc[2][0], nc[2][1], nc[2][2], 0.0],
             ],
+            probe: [0.0; 4],
         }
+    }
+
+    /// 注入光照探针载荷（R64）：`xyz` = E/π、`w` = 标志位。
+    ///
+    /// 缺席（无探针集 / 实体挂了光照贴图 / 插值不可用）时传 `[0.0; 4]`：
+    /// 着色器 `select` 会返回全局 env 采样值的同一串位 ⇒ 逐位兼容。
+    pub fn with_probe(mut self, probe: [f32; 4]) -> Self {
+        self.probe = probe;
+        self
     }
 
     /// 从本地变换构造实例数据（等价于 `from_matrix(transform.matrix())`）。

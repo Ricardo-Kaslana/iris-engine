@@ -4,6 +4,40 @@
 版本遵守 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 ## [Unreleased]
+### Added（R64：光照探针 GI——烘焙 irradiance 探针云 + 四面体重心插值，路线图 v4 · W6）
+
+补上**间接漫反射**的最后一块拼图：光照贴图（R52c）只服务静态几何、反射
+探针 / SSR 只服务镜面，动态物体的间接漫反射此前只能吃全局 IBL 的天空辐照
+（室内阴影里的角色被天空色污染成冷蓝）。R64 烘焙**irradiance 探针云**并在
+运行时按位置做**四面体内重心插值**，取代无光照贴图实体的全局 env 漫反射项。
+
+- **新模块 `iris-render/irradiance»**（纯 CPU，零 GPU 依赖）：`IrradianceProbe»
+  组件 + `bake_irradiance_probes» / `install_irradiance_probes» +
+  `IrradianceProbeSet» 资源 + `Tetrahedralization» 纯函数；自研**确定性
+  Delaunay 四面体化**（增量 Bowyer-Watson：BFS 连通空腔 + 幽灵胞元凸包接入 +
+  最胖初始单纯形 + 三线性哈希抖动 ±1e-6 + 抖动幅度阶梯重试），零第三方依赖。
+- **烘焙源复用 `bake_sample»**（与光照贴图同一 BVH / 采样 / 三项口径），存
+  `BakeSample::indirect»（天空含 AO + 一次反弹含色溢）⇒ 与光照贴图视觉同源是
+  机制保证；**探针朝向 = 六轴平均**（无方向 RGB 标量的方向零阶平均，对均匀场
+  精确）。
+- **求值 = 逐实体 CPU 侧**（实体根 `GlobalTransform» 位置 → 一次插值 →
+  实例载荷），**拒绝逐片元 GPU 插值**（成本差 4–5 个数量级，箱庭尺度的角色
+  本来就是逐实体常数）。
+- **注入载体 `InstanceRaw::probe»**（128 B/实例，顶点属性 loc14，显存 +16 B/实例）：
+  xyz 存 E/π（与 `irradiance_map» 采样值同口径 ⇒ 着色器零换算）、w = 标志位；
+  `standard.wgsl» 的间接漫反射项写成
+  `select(env_irradiance, in.probe.rgb, in.probe.w > 0.5)»。
+- **兼容铁律**：探针资源缺席 / 空集 / 实体挂光照贴图 ⇒ 载荷恒 `[0,0,0,0]»，
+  `select» 返回纹理采样值的**同一串位**——全部既有 GPU FNV 基线**原值通过**
+  （本轮不重锁），新增两条 R63 场景基线锁（无贴图 / 有贴图）。
+- **验收图** `docs/light_probes.png»（4 排 × 2 列：①室内阴影区角色 关|开
+  ②亮区|阴影区 ③与静态光照贴图的融合（近景）④探针布置可视化），由
+  `examples/light_probe_snapshot.rs» 生成（内含硬断言，跨运行逐字节一致）。
+  实测角色亮度 200.5 → 143.8（72%）、蓝红偏置向房间参考收敛、角色外像素变化 0。
+- **诚实限制**（§8.40）：逐片元插值 / SH 方向性探针 / 可见性加权 / 磁盘持久化 /
+  编辑器集成 / 动态重烘焙（拒绝清单）；几何为「真值 ± 1 µm」（抖动法固有）；
+  极扁平点云可能整体退化为空结构（阶梯重试后回退全局 env）；包外无距离衰减。
+
 
 ### Added（R63：预积分皮肤次表面散射——材质上限，路线图 v4 · W6）
 

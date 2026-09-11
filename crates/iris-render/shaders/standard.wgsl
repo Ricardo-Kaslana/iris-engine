@@ -209,6 +209,9 @@ struct VertexInput {
     // 光照贴图 UV（loc13，独立顶点缓冲；网格无 UV2 时绑零填充垫，配合
     // material.surface.w = 0 的掩码，采样结果被 select 丢弃）
     @location(13) uv2: vec2<f32>,
+    // 光照探针间接辐照（R64，实例属性 loc14）：xyz = E/π（与 irradiance_map
+    // 采样值同口径）、w = 标志位（0 = 探针缺席 ⇒ 走原全局 env 路径）
+    @location(14) probe: vec4<f32>,
 };
 
 // 阴影投影改在片元做（按 view 深度选级联后乘该级联矩阵），
@@ -224,6 +227,8 @@ struct VertexOutput {
     // 光照贴图图集坐标（R52c，插值后直接采样——图集坐标是仿射量，
     // 透视正确插值由硬件的 1/w 校正照常处理）
     @location(4) uv2: vec2<f32>,
+    // 光照探针载荷（R64）：逐实例常数，插值天然不变（四个顶点同值）
+    @location(5) probe: vec4<f32>,
 };
 
 @vertex
@@ -238,6 +243,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.uv = in.uv;
     out.tangent = vec4<f32>(normal_mat * in.tangent.xyz, in.tangent.w);
     out.uv2 = in.uv2;
+    out.probe = in.probe;
     return out;
 }
 
@@ -255,6 +261,7 @@ struct SkinnedVertexInput {
     @location(9) normal2: vec4<f32>,
     @location(12) tangent: vec4<f32>,
     @location(13) uv2: vec2<f32>,
+    @location(14) probe: vec4<f32>,
     @location(10) joints: vec4<u32>,
     @location(11) weights: vec4<f32>,
 };
@@ -281,6 +288,7 @@ fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     out.uv = in.uv;
     out.tangent = vec4<f32>(normal_mat * (skin_nrm * in.tangent.xyz), in.tangent.w);
     out.uv2 = in.uv2;
+    out.probe = in.probe;
     return out;
 }
 
@@ -824,7 +832,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // AO（orm.r）乘环境项：IBL 与美术补光都被遮蔽削弱，直接光不乘
     // （物理上 AO 描述小尺度互遮蔽的环境光损失）。中性 ORM 时 ao = 1.0，
     // x·1.0 = x 逐位精确 = R41 行为。
-    let irradiance = textureSampleLevel(irradiance_map, env_sampler, n, 0.0).rgb;
+    // ---- 光照探针（R64）：逐实体插值的间接漫反射辐照，取代全局 env 采样 ----
+    // 载荷存的就是 E/π（与 irradiance_map 同口径）⇒ 着色器零换算，只是把
+    // 采样值整项换掉。select 是**纯值选择、不做任何算术** ⇒ 标志位 0 时返回
+    // 值与引入本槽位前是**同一串位**（R52c 先例：把逐位不变交给语言语义，
+    // 而不是浮点恒等式）。探针缺席 / 空集 / 实体挂光照贴图（CPU 侧直接不发
+    // 标志位）⇒ 走原全局 env 路径，全部既有 FNV 基线原值通过。
+    let env_irradiance = textureSampleLevel(irradiance_map, env_sampler, n, 0.0).rgb;
+    let irradiance = select(env_irradiance, in.probe.rgb, in.probe.w > 0.5);
     let nov = max(dot(n, v), 0.0);
     let f_amb = fresnel_schlick_roughness(nov, f0, roughness);
     let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);

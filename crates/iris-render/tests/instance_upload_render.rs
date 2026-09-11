@@ -61,10 +61,15 @@ fn static_scene_skips_instance_upload() {
         baseline.instance_upload_bytes > 0,
         "首帧必须上传实例（缓冲初建后无镜像可比）"
     );
+    // R64：实例布局随光照探针载荷扩到 128 B（«InstanceRaw» +vec4 probe）；
+    // 这里改成按 size_of 计算，避免以后布局再变时又要改常量（本轮的唯一
+    // 既有测试改动，已在 REPORT 的偏离声明里列明）。
+    let stride = std::mem::size_of::<iris_render::prelude::InstanceRaw>() as u64;
+    assert_eq!(stride, 128, "实例布局 = 模型 64B + 法线 48B + 探针 16B");
     assert_eq!(
         baseline.instance_upload_bytes,
-        baseline.instances as u64 * 112,
-        "首帧上传字节数应为全量（实例数 × 112B）"
+        baseline.instances as u64 * stride,
+        "首帧上传字节数应为全量（实例数 × {stride}B）"
     );
 
     // 第 2、3 帧：内容与上帧逐项一致 → 零上传，且像素与首帧完全一致

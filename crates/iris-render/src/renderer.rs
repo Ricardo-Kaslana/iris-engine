@@ -26,6 +26,7 @@ use crate::context::Gpu;
 use crate::decal::{Decal, DecalInstanceRaw, PROXY_INDEX_COUNT, PROXY_INDICES, PROXY_POSITIONS};
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
+use crate::irradiance::IrradianceProbeSet;
 use crate::light::{
     DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY, POINT_SHADOW_BIAS_MIN,
     POINT_SHADOW_BUDGET, POINT_SHADOW_NORMAL_SCALE, POINT_SHADOW_SLOPE_SCALE, PointLight,
@@ -1365,6 +1366,12 @@ fn skin_world_aabb(
 /// 合批键 / 剔除包围体 / 三角形统计（蒙皮路径同口径，LOD 高低模各自
 /// 带蒙皮属性）。`eye` 由调用方从解析后的相机传入（资源相机 / 实体挂载
 /// 相机同源）。
+/// **光照探针（R64）**：世界带 [`IrradianceProbeSet`] 资源时，对**无光照
+/// 贴图**的实体按实体根 [`GlobalTransform`] 位置做一次四面体重心插值，
+/// 结果写进实例载荷 `InstanceRaw::probe`（xyz = E/π、w = 标志位）；
+/// 资源缺席 / 空集 / 实体挂图集 ⇒ 载荷恒零（着色器走原全局 env 路径，
+/// 逐位不变）。逐实体 CPU 侧求值（不做逐片元 GPU 插值）的理由见
+/// [`crate::irradiance`] 模块文档。
 /// **光照贴图解析（R52c）**：挂 [`LightmapBinding`] 的实体取其图集句柄，
 /// 但只在三个条件齐备时生效——世界有 [`LightmapStore`] 资源、句柄在目录内、
 /// 解析出的网格带 UV2（[`MeshData::uv2`](crate::mesh::MeshData)）；任一不
@@ -1420,6 +1427,20 @@ fn collect_instances(
         }
         handle
     };
+    // 光照探针集（R64）：CPU 侧逐实体插值 → 实例载荷（E/π + 标志位）。
+    // 资源缺席 / 空集 ⇒ 恒 [0; 4]（着色器 select 取 env 采样值的同一串位）。
+    // **光照贴图优先**：挂图集的实体走 R52c 的逐 texel 分支，CPU 侧就不再发
+    // 标志位（两道保险：着色器那里 select 也是整项替换）。
+    let probes = world.try_resource::<IrradianceProbeSet>();
+    let probe_payload = |position: Vec3, lightmap: u32| -> [f32; 4] {
+        if lightmap != NO_LIGHTMAP {
+            return [0.0; 4];
+        }
+        match probes.as_deref() {
+            Some(set) => set.instance_payload(position),
+            None => [0.0; 4],
+        }
+    };
     // 全部蒙皮实体位标识（含被剔除的）：普通路径据此跳过，避免同实体
     // 被两条路径重复处理（剔除计数 / 绘制都只算一次）
     let mut skinned_entities: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -1458,12 +1479,14 @@ fn collect_instances(
             culled += 1;
             return;
         }
+        let lightmap = resolve_lightmap(e.to_bits(), m);
         let item = SkinnedItem {
             skin_entity: e.to_bits(),
             mesh: m.0,
             material: mat.0,
-            lightmap: resolve_lightmap(e.to_bits(), m),
-            instance: InstanceRaw::from_matrix(model),
+            lightmap,
+            instance: InstanceRaw::from_matrix(model)
+                .with_probe(probe_payload(gt.position(), lightmap)),
             joint_matrices,
         };
         if alpha_of(material_store, *mat) == AlphaMode::Blend {
@@ -1526,18 +1549,22 @@ fn collect_instances(
         }
         let key = ((m.0 as u64) << 32) | mat.0 as u64;
         if alpha_of(material_store, *mat) == AlphaMode::Blend {
-            // 透明项不解析光照贴图（v1 限制，见 lightmap.rs 模块文档）
+            // 透明项不解析光照贴图（v1 限制，见 lightmap.rs 模块文档）⇒ 探针
+            // 直接适用（透明实体同样无贴图，吃的是 env 漫反射项）
             transparent.push(TransparentItem {
                 key,
                 depth: view_depth(view, mesh_store, m, model),
                 entity: e.to_bits(),
-                instance: InstanceRaw::from_matrix(model),
+                instance: InstanceRaw::from_matrix(model)
+                    .with_probe(probe_payload(gt.position(), NO_LIGHTMAP)),
             });
         } else {
+            let lightmap = resolve_lightmap(e.to_bits(), m);
             items.push(DrawItem {
                 key,
-                instance: InstanceRaw::from_matrix(model),
-                lightmap: resolve_lightmap(e.to_bits(), m),
+                instance: InstanceRaw::from_matrix(model)
+                    .with_probe(probe_payload(gt.position(), lightmap)),
+                lightmap,
                 entity: e.to_bits(),
             });
         }

@@ -58,7 +58,20 @@
 //!   **视差修正**（反射射线 × 盒求交重定向，经典 box projection），域外 /
 //!   无探针回落全局 env；挂光照贴图的实体的镜面也由探针补回（闭合 §8.31④）。
 //!   无探针场景**逐位不变**（FNV-1a 全帧基线锁，见 `tests/probe_render.rs`）；
-//! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer`）。
+//! - 光照探针 GI（R64，`irradiance» 模块）：烘焙 irradiance 探针云 + 四面体
+//!   重心插值——`IrradianceProbe» 组件定义探针位置（取 `GlobalTransform»），
+//!   `bake_irradiance_probes» 逐探针复用 `bake_sample»（六轴平均，与光照贴图
+//!   同口径的间接辐照）并做**自研确定性 Delaunay 四面体化**（增量
+//!   Bowyer-Watson：BFS 连通空腔 + 幽灵胞元凸包接入 + 最胖初始单纯形 +
+//!   三线性哈希抖动 ±1e-6 + 抖动幅度阶梯重试），运行时对**无光照贴图实体**
+//!   按位置插值（逐实体 CPU 侧，拒绝逐片元）注入实例载荷
+//!   `InstanceRaw::probe»（xyz = E/π、w = 标志位）；着色器以
+//!   `select(env_irradiance, in.probe.rgb, in.probe.w > 0.5)» 取代全局 env 的
+//!   漫反射辐照。探针缺席 / 空集 / 实体挂光照贴图 ⇒ 载荷恒零 ⇒ **逐位不变**
+//!   （全部既有 FNV 基线原值通过，见 `tests/irradiance_render.rs»）；
+//!   包外取最近凸包面投影（连续延拓）。语义：静态漫反射 = 光照贴图 /
+//!   动态漫反射 = 探针 / 镜面 = 反射探针 → SSR → env。
+//! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer»）。
 
 pub mod animation;
 pub mod asset;
@@ -72,6 +85,7 @@ pub mod foot_ik;
 pub mod frustum;
 pub mod hand_ik;
 pub mod instance;
+pub mod irradiance;
 pub mod light;
 pub mod lightmap;
 pub mod material;
@@ -126,6 +140,11 @@ pub mod prelude {
     pub use crate::frustum::Frustum;
     pub use crate::hand_ik::{HandIk, IkTarget, update_hand_ik};
     pub use crate::instance::InstanceRaw;
+    pub use crate::irradiance::{
+        IrradianceProbe, IrradianceProbeInstall, IrradianceProbeSet, MAX_IRRADIANCE_PROBES,
+        PROBE_AXES, ProbeBakeStats, TetraStats, TetraValidation, Tetrahedralization,
+        bake_irradiance_probes, install_irradiance_probes,
+    };
     pub use crate::light::{
         CascadeFit, DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY,
         POINT_SHADOW_BIAS_MIN, POINT_SHADOW_BUDGET, POINT_SHADOW_FACES, PointLight,
