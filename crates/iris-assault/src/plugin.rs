@@ -96,6 +96,10 @@ use crate::textures;
 
 /// 角色 GLB 在 pack 内的条目路径。
 pub const GLB_ENTRY: &str = "models/assault_bot.glb";
+/// 庭院视觉 GLB 在 pack 内的条目路径（程序化建筑）。
+pub const COURTYARD_ENTRY: &str = "models/assault_courtyard.glb";
+/// pack 缺失时的庭院 GLB 回退路径。
+pub const COURTYARD_FALLBACK: &str = "assets/assault_courtyard.glb";
 /// 氛围 OGG 在 pack 内的条目路径。
 pub const AMBIENCE_ENTRY: &str = "audio/ambience.ogg";
 /// pack 缺失时的 GLB 文件回退路径（仓库相对，经 [`asset_path`] 解析）。
@@ -527,6 +531,83 @@ fn build_courtyard(world: &mut World) {
     load_scene(world, &path).unwrap_or_else(|err| {
         panic!("庭院关卡档 {} 加载失败：{err}", path.display());
     });
+    // 关卡档的可见图元（地面 / 墙 / 柱 / 喷泉）是**碰撞 + 灯光 + 粒子**的
+    // 载体；视觉由程序化建筑 GLB 承担——GLB 装配成功后把档里的图元隐藏
+    // （「可见性级联」只影响绘制，碰撞体 / 点光 / 粒子发射器照旧生效）。
+    // 加载失败则保持档的图元可见：降级成「能玩的旧庭院」而不是空场。
+    if spawn_courtyard_visual(world) {
+        hide_level_primitives(world);
+    }
+}
+
+/// 关卡档里被程序化建筑取代的可见图元（**不含**点光与粒子发射器）。
+const LEVEL_PRIMITIVE_NAMES: [&str; 12] = [
+    "assault/ground",
+    "assault/wall/0",
+    "assault/wall/1",
+    "assault/wall/2",
+    "assault/wall/3",
+    "assault/pillar/0",
+    "assault/pillar/1",
+    "assault/pillar/2",
+    "assault/pillar/3",
+    "assault/fountain",
+    "assault/fountain/water",
+    "assault/fountain/spout",
+];
+
+/// 按名隐藏关卡档的可见图元（缺席只告警：视觉替换不完整但游戏照跑）。
+fn hide_level_primitives(world: &mut World) {
+    for name in LEVEL_PRIMITIVE_NAMES {
+        match world.entity_named(name) {
+            Some(entity) => set_subtree_hidden(world, entity, true),
+            None => log::warn!("AssaultPlugin：关卡档缺少图元 {name}——视觉替换不完整"),
+        }
+    }
+}
+
+/// 装配庭院视觉 GLB（pack 内条目优先，文件回退）。返回是否成功。
+fn spawn_courtyard_visual(world: &mut World) -> bool {
+    let mount_bytes = world
+        .try_resource::<AssetMount>()
+        .and_then(|mount| mount.read(COURTYARD_ENTRY).ok());
+    let result = match mount_bytes {
+        Some(bytes) => {
+            log::info!("AssaultPlugin：庭院 GLB 经 pack 挂载加载（{COURTYARD_ENTRY}）");
+            spawn_gltf_instance_from_bytes(world, bytes).map_err(|err| err.to_string())
+        }
+        None => {
+            let path = asset_path(COURTYARD_FALLBACK);
+            log::warn!(
+                "AssaultPlugin：pack 内无 {COURTYARD_ENTRY}，回退文件 {}",
+                path.display()
+            );
+            spawn_gltf_instance(world, &path).map_err(|err| err.to_string())
+        }
+    };
+    match result {
+        Ok(instance) => {
+            let nodes = instance.node_entities.len();
+            // 显式挂 Visibility：**同时完成组件注册**——下面的
+            // hide_level_primitives 靠 set_subtree_hidden 插入 Visibility，
+            // 而 &World 无法注册新组件类型（未注册时插入静默失败，旧图元
+            // 继续渲染并与新建筑 z-fighting——实测踩坑）
+            let root = world.spawn((
+                Name("assault/courtyard-visual".to_string()),
+                Transform::IDENTITY,
+                Visibility::VISIBLE,
+            ));
+            for visual in instance.roots {
+                world.add_child(root, visual);
+            }
+            log::info!("AssaultPlugin：庭院视觉已装配（{nodes} 个节点）");
+            true
+        }
+        Err(err) => {
+            log::warn!("AssaultPlugin：庭院视觉 GLB 加载失败（{err}）——保持关卡档图元");
+            false
+        }
+    }
 }
 
 /// 组装一名角色（玩家或敌人共用）：根（逻辑位置）→ 模型（GLB 经 pack
@@ -661,18 +742,17 @@ fn assemble_animated_character(
     // `GltfBuilder::material_textured`，PNG 内嵌 data URI）——「加载后克隆
     // 材质挂纹理」的绕行删除。此处克隆只为改 base_color（同资产两阵营），
     // 通道句柄沿用加载器解析出的那份。
+    // 敌人配色：整具身体是**一张**蒙皮网格（挂在模型根节点上），逐骨覆写
+    // 的老路径（R48 时网格逐骨挂）已无对象——改为对模型根的 primitive 乘
+    // 一个暖色因子。乘法而非替换：图集里已有材质层次，替换会把布料 / 钢刃 /
+    // 皮革压成同一块红（第一版实测）。
     if !is_player {
-        for name in [
-            sk::names::PELVIS,
-            sk::names::TORSO,
-            sk::names::CHEST,
-            sk::names::L_THIGH,
-            sk::names::R_THIGH,
-            sk::names::L_SHIN,
-            sk::names::R_SHIN,
-        ] {
-            recolor_primitives(world, bone(world, model, name), [0.44, 0.13, 0.11]);
-        }
+        recolor_primitives(world, Some(model), [1.0, 0.42, 0.36]);
+        recolor_primitives(
+            world,
+            bone(world, model, sk::names::RIFLE),
+            [1.0, 0.42, 0.36],
+        );
     }
 
     // ---- 上半身播放器（空子实体）：动作剪辑 + 骨骼遮罩（R46）----

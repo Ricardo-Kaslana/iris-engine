@@ -25,7 +25,7 @@
 use iris_engine::prelude::CpuTexture;
 
 /// splitmix64 终结函数（无状态哈希；与引擎 `texture.rs` 同源同式）。
-fn mix64(mut z: u64) -> u64 {
+pub(crate) fn mix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -33,12 +33,12 @@ fn mix64(mut z: u64) -> u64 {
 }
 
 /// 哈希到 [0, 1) 的浮点（第 24..48 位段——比低 8 位细腻、比全 64 位便宜）。
-fn hash01(seed: u64) -> f32 {
+pub(crate) fn hash01(seed: u64) -> f32 {
     ((mix64(seed) >> 24) & 0xff_ffff) as f32 / 0x100_0000 as f32
 }
 
 /// smoothstep（`t²(3−2t)`，两端钳制）。
-fn smooth(t: f32) -> f32 {
+pub(crate) fn smooth(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -47,7 +47,11 @@ fn smooth(t: f32) -> f32 {
 ///
 /// `sample(u, v)` 返回高度（值域不限，差分只看变化率）；`bump` 为法线
 /// 强度（中心差分步长系数，与引擎 `brick_normal_orm` 同语义）。
-fn normal_from_height(size: u32, bump: f32, sample: impl Fn(f32, f32) -> f32) -> Vec<u8> {
+pub(crate) fn normal_from_height(
+    size: u32,
+    bump: f32,
+    sample: impl Fn(f32, f32) -> f32,
+) -> Vec<u8> {
     let eps = 1.0 / size as f32;
     let step = 1.5 * eps;
     let mut out = Vec::with_capacity((size * size * 4) as usize);

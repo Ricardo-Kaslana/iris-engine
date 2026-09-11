@@ -54,6 +54,8 @@
 //! `AnimationPlayer` 写入的节点集不相交，组合姿势（跑动中挥砍 / 瞄准
 //! 不打断腿）由这一划分保证。
 
+use glam::{Mat4, Vec3};
+
 /// 模型根节点（插件层在此挂朝向旋转与模型局部 y 偏移）。
 pub const ROOT: usize = 0;
 /// 骨盆（下半身剪辑的根：位移 bob / 摇摆挂这里）。
@@ -184,6 +186,79 @@ pub const NAMES: [&str; NODE_COUNT] = [
     names::FOREGRIP,
 ];
 
+/// 关节局部平移（下标 → 相对父节点的平移，米；[`ROOT`] 为原点）。
+///
+/// 与上面的节点树图逐行对应，是**资产生成器与蒙皮绑定姿势的共同来源**：
+/// 生成器按本表声明节点 `at`，蒙皮逆绑定矩阵由 [`bind_pose_world`]
+/// 推出——两处不可能漂移。
+pub const BONE_LOCAL: [[f32; 3]; NODE_COUNT] = [
+    [0.0, 0.0, 0.0],     // 0  root
+    [0.0, 0.95, 0.0],    // 1  pelvis
+    [0.0, 0.28, 0.0],    // 2  torso
+    [0.0, 0.30, 0.0],    // 3  chest
+    [0.0, 0.32, 0.0],    // 4  head
+    [-0.17, -0.05, 0.0], // 5  l_thigh
+    [0.0, -0.45, 0.0],   // 6  l_shin
+    [0.0, -0.45, 0.0],   // 7  l_foot
+    [0.17, -0.05, 0.0],  // 8  r_thigh
+    [0.0, -0.45, 0.0],   // 9  r_shin
+    [0.0, -0.45, 0.0],   // 10 r_foot
+    [-0.34, 0.22, 0.0],  // 11 l_upperarm
+    [0.0, -0.32, 0.0],   // 12 l_forearm
+    [0.0, -0.30, 0.0],   // 13 l_hand
+    [0.34, 0.22, 0.0],   // 14 r_upperarm
+    [0.0, -0.32, 0.0],   // 15 r_forearm
+    [0.0, -0.30, 0.0],   // 16 r_hand
+    [0.0, -0.02, 0.0],   // 17 sword（右手子节点）
+    [0.0, -0.42, 0.0],   // 18 sword_blade
+    [0.15, 0.10, -0.28], // 19 rifle（胸子节点）
+    [0.0, -0.05, 0.12],  // 20 rifle_grip（IkTarget）
+    [0.0, -0.03, -0.18], // 21 foregrip（IkTarget）
+];
+
+/// 父节点下标（[`ROOT`] 自指；恒有 `BONE_PARENT[i] < i` ⇒ 可一趟前序合成）。
+pub const BONE_PARENT: [usize; NODE_COUNT] = [
+    0,  // 0  root（自指）
+    0,  // 1  pelvis
+    1,  // 2  torso
+    2,  // 3  chest
+    3,  // 4  head
+    1,  // 5  l_thigh
+    5,  // 6  l_shin
+    6,  // 7  l_foot
+    1,  // 8  r_thigh
+    8,  // 9  r_shin
+    9,  // 10 r_foot
+    3,  // 11 l_upperarm
+    11, // 12 l_forearm
+    12, // 13 l_hand
+    3,  // 14 r_upperarm
+    14, // 15 r_forearm
+    15, // 16 r_hand
+    16, // 17 sword
+    17, // 18 sword_blade
+    3,  // 19 rifle
+    19, // 20 rifle_grip
+    19, // 21 foregrip
+];
+
+/// 绑定姿势下各关节的**模型空间**矩阵（纯平移层级，一趟前序合成）。
+///
+/// 蒙皮逆绑定矩阵 = 本表逐项的逆（[`Mat4::inverse`]）；网格顶点写在本表
+/// 定义的模型空间里。
+pub fn bind_pose_world() -> [Mat4; NODE_COUNT] {
+    let mut out = [Mat4::IDENTITY; NODE_COUNT];
+    for index in 0..NODE_COUNT {
+        let local = Mat4::from_translation(Vec3::from(BONE_LOCAL[index]));
+        out[index] = if index == ROOT {
+            local
+        } else {
+            out[BONE_PARENT[index]] * local
+        };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +298,41 @@ mod tests {
         assert!((pelvis_y - thigh_drop - bone - bone).abs() < 1e-6);
         // 上身挂在骨盆上：躯干 0.28 + 胸 0.30 + 头 0.32 ≈ 全高 1.85
         assert!((pelvis_y + 0.28 + 0.30 + 0.32 - 1.85).abs() < 1e-6);
+    }
+
+    /// 骨架表自洽（[`BONE_LOCAL`] / [`BONE_PARENT`]）：父下标恒小于子
+    /// 下标（一趟前序合成的前提）、根自指；腿链贴地与全高不变量由**表**
+    /// 推出而非手工常数——网格生成器与蒙皮绑定姿势共用同一张表。
+    #[test]
+    fn bone_table_is_topologically_ordered_and_reaches_ground() {
+        assert_eq!(BONE_PARENT[ROOT], ROOT, "根节点自指");
+        for (index, parent) in BONE_PARENT.iter().enumerate().skip(1) {
+            assert!(*parent < index, "节点 {index} 的父下标应小于自身");
+        }
+        let world = bind_pose_world();
+        let ankle = world[L_FOOT].w_axis.truncate();
+        assert!(
+            ankle.y.abs() < 1e-6,
+            "静止踝关节应贴地，实际 y = {}",
+            ankle.y
+        );
+        assert!((ankle.x + 0.17).abs() < 1e-6, "左踝 x 应为 -0.17");
+        assert!(
+            (world[R_FOOT].w_axis.truncate().x - 0.17).abs() < 1e-6,
+            "右踝 x 应为 0.17"
+        );
+        let head = world[HEAD].w_axis.truncate();
+        assert!((head.y - 1.85).abs() < 1e-6, "头关节 y 应为 1.85");
+        let shoulder = world[L_UPPERARM].w_axis.truncate();
+        assert!((shoulder.y - 1.75).abs() < 1e-6, "肩关节 y 应为 1.75");
+        assert!((shoulder.x + 0.34).abs() < 1e-6, "左肩 x 应为 -0.34");
+        let grip = world[RIFLE_GRIP].w_axis.truncate();
+        assert!(
+            (grip.x - 0.15).abs() < 1e-6
+                && (grip.y - 1.58).abs() < 1e-6
+                && (grip.z + 0.16).abs() < 1e-6
+        );
+        let foregrip = world[FOREGRIP].w_axis.truncate();
+        assert!((foregrip.z + 0.46).abs() < 1e-6, "护木挂点 z 应为 -0.46");
     }
 }

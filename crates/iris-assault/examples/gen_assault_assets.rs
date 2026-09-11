@@ -2,22 +2,24 @@
 //! （[`GltfBuilder`] 构造，骨架下标与节点名 = [`iris_assault::skeleton`]
 //! 单一事实来源）+ **R45** pack 打包（GLB + 氛围 OGG → `assets/assault.ipak`）。
 //!
-//! # 骨架装配契约
+//! # 骨架装配契约（视觉升级轮：单张蒙皮网格）
 //!
-//! **网格直接挂骨节点**（`node.with_mesh`）——加载器会为每个 primitive
-//! 生成独立的子实体（持 MeshHandle / MaterialHandle），骨节点本身保持
-//! 下标与 `skeleton.rs` 一致（22 节点）；网格若做成独立子节点会引入 20
-//! 个额外节点、把骨架下标全部错位（开发实录）。节点**名**取自骨架表
-//! [`sk::NAMES`](iris_assault::skeleton::NAMES)，运行期装配（IK 链 /
-//! 挂点 / 配色）按名寻骨（打磨 VI 摩擦⑥）；[`bone`] 内断言「声明顺序 =
-//! 骨架表下标」，两侧不同步在生成当场就爆炸，而不是留到下帧画面。
+//! **22 个骨节点 + 1 个网格节点**：网格挂 `root` 节点（`with_mesh` +
+//! `attach_skin`），顶点权重指向关节表——节点总数仍是 22，动画通道下标 /
+//! `AnimationMask` / 按名寻骨三条装配路径全部不变，而形变从「逐骨刚性挂
+//! 块」升级为 **GPU 线性混合蒙皮**（关节处平滑过渡、装备随骨刚性跟随）。
 //!
-//! # 写实材质（R42，打磨 VI 摩擦③ 闭合）
+//! 节点位置取自 [`sk::BONE_LOCAL`](iris_assault::skeleton::BONE_LOCAL)、
+//! 名取自 [`sk::NAMES`](iris_assault::skeleton::NAMES)——骨架表是唯一
+//! 事实来源，生成器只做「按表声明 + 断言下标」，两侧不同步在生成当场就
+//! 爆炸（断言消息含节点名），而不是留到下帧画面。
 //!
-//! 布料褶皱与刀身划痕的**法线 / ORM 通道直接写进 GLB**
-//! （`GltfBuilder::material_textured`，像素 PNG 内嵌 data URI）——R48 的
-//! 「加载后克隆 `MaterialDef` + `with_normal/with_orm`」绕行删除，插件层
-//! 只剩敌我 `base_color` 配色覆写。
+//! # 材质（单材质 + 程序化图集）
+//!
+//! 整具角色（身体 / 护甲 / 皮革 / 钢刃 / 面罩玻璃 / 枪械）共用**一张**
+//! 1024² 图集（[`soldier_tex`](iris_assault::soldier_tex)）：16 个 256²
+//! 分区逐纹素表达金属度 / 粗糙度，法线与 ORM 通道随 GLB 内嵌
+//! （`GltfBuilder::material_textured`）。单网格单材质 = **单次 draw**。
 //!
 //! # 音频条目（R44 / 打磨 VI 摩擦④）
 //!
@@ -41,13 +43,66 @@
 //! ```
 
 use glam::{EulerRot, Quat};
+use iris_assault::scenery_tex::Surface;
 use iris_assault::skeleton as sk;
-use iris_assault::textures;
+use iris_assault::{scenery, scenery_tex, soldier, soldier_tex};
 use iris_engine::gltf_builder::{AnimChannel, GltfBuilder, GltfMaterialTextures, GltfNodeDesc};
 use iris_engine::pack::PackWriter;
 // 渲染层类型全部经引擎门面取用（打磨 VI 摩擦② 闭合：本 crate 不再直依
 // iris-render）
-use iris_engine::prelude::{AnimationInterpolation, AnimationPath, MeshData, Vertex, primitives};
+use iris_engine::prelude::{AnimationInterpolation, AnimationPath};
+
+/// 构造庭院 GLB：程序化建筑几何（铺地 / 墙 / 壁龛 / 石柱 / 喷泉 / 火盆 /
+/// 旗帜 / 木门）按材质分组，每材质一张独立贴图（可平铺）。
+fn build_courtyard_glb() -> Vec<u8> {
+    let mut builder = GltfBuilder::new();
+    // ---- 材质：每材质一组（贴图材质走 material_textured，纯参数材质走 material）----
+    let mut material_index = Vec::new();
+    for surface in Surface::ALL {
+        let params = scenery_tex::surface_params(surface);
+        let index = if surface.size() == 0 {
+            builder.material(
+                params.base_color,
+                params.metallic,
+                params.roughness,
+                params.emissive,
+            )
+        } else {
+            let tex = scenery_tex::surface_texture(surface);
+            builder.material_textured(
+                params.base_color,
+                params.metallic,
+                params.roughness,
+                params.emissive,
+                GltfMaterialTextures {
+                    base_color: Some(tex.base),
+                    normal: tex.normal,
+                    orm: tex.orm,
+                },
+            )
+        };
+        material_index.push((surface, index));
+    }
+    // ---- 网格 + 节点（每个材质一个顶层节点）----
+    let courtyard = scenery::build_courtyard();
+    println!(
+        "庭院几何：{} 三角形 / {} 材质分组",
+        scenery::triangle_count(&courtyard),
+        courtyard.groups.len()
+    );
+    for (order, (surface, mesh)) in courtyard.groups.iter().enumerate() {
+        let material = material_index
+            .iter()
+            .find(|(s, _)| s == surface)
+            .unwrap_or_else(|| panic!("材质 {surface:?} 未登记"))
+            .1;
+        let name = format!("courtyard/{surface:?}");
+        let mesh_index = builder.mesh(&name, mesh, material);
+        let node = builder.node(GltfNodeDesc::new(name).with_mesh(mesh_index));
+        assert_eq!(node, order, "节点声明顺序应与材质分组序一致");
+    }
+    builder.build_glb()
+}
 
 fn main() {
     let glb = build_soldier_glb();
@@ -62,10 +117,21 @@ fn main() {
     // ---- R45：pack 打包（GLB + 氛围 OGG → 单文件归档）----
     let ambience = find_ambience_ogg().expect("未找到 OGG 氛围源（引擎音频 fixture）");
     let ambience_bytes = std::fs::read(&ambience).expect("读 OGG 氛围源");
+    // ---- 庭院视觉 GLB（程序化建筑）----
+    let courtyard_glb = build_courtyard_glb();
+    std::fs::write("assets/assault_courtyard.glb", &courtyard_glb).expect("写入庭院 GLB");
+    println!(
+        "已生成 assets/assault_courtyard.glb（{} 字节）",
+        courtyard_glb.len()
+    );
+
     let mut writer = PackWriter::new();
     writer
         .add("models/assault_bot.glb", glb.clone())
         .expect("GLB 条目");
+    writer
+        .add("models/assault_courtyard.glb", courtyard_glb.clone())
+        .expect("庭院 GLB 条目");
     writer
         .add("audio/ambience.ogg", ambience_bytes.clone())
         .expect("OGG 条目");
@@ -99,273 +165,68 @@ fn quat(rx: f32, ry: f32, rz: f32) -> [f32; 4] {
     [q.x, q.y, q.z, q.w]
 }
 
-/// 以自身中心为原点的缩放立方体（可再整体平移——脚掌等偏心部件）。
-fn scaled_cube(sx: f32, sy: f32, sz: f32, offset: [f32; 3]) -> MeshData {
-    let cube = primitives::cube();
-    let mut data = MeshData::default();
-    for v in &cube.vertices {
-        data.vertices.push(Vertex {
-            position: [
-                v.position[0] * sx + offset[0],
-                v.position[1] * sy + offset[1],
-                v.position[2] * sz + offset[2],
-            ],
-            normal: v.normal,
-            uv: v.uv,
-        });
-    }
-    data.indices = cube.indices.clone();
-    data
-}
-
-/// 竖直圆柱段（沿 -Y 下垂的肢体段：中心下移 `length`/2）。
-fn limb_cylinder(radius: f32, length: f32) -> MeshData {
-    let mut cyl = primitives::cylinder(radius, length, 10);
-    for v in cyl.vertices.iter_mut() {
-        v.position[1] -= length * 0.5;
-    }
-    cyl
-}
-
-/// 声明骨节点并把网格**直接挂上**（装配契约见模块文档）——加载器拆出的
-/// primitive 子实体持材质，骨节点保持骨架表下标。
+/// 构造士兵 GLB：22 骨节点 + 1 张蒙皮网格 + 单材质图集，10 剪辑（下半身 3 + 上半身 7）。
 ///
-/// 节点名取骨架表 [`sk::NAMES`]（打磨 VI 摩擦⑥：生成器与插件层共用一张
-/// 名字表，运行期按名寻骨的键与资产侧不可能分叉）。**声明顺序即下标**：
-/// 与本表给定的下标不一致时当场 panic（错位过去只能靠 headless 守护测试
-/// 事后爆炸，见 §8.26⑥）。
-fn bone(
-    builder: &mut GltfBuilder,
-    parent: usize,
-    index: usize,
-    at: [f32; 3],
-    data: &MeshData,
-    material: usize,
-) -> usize {
-    let name = sk::NAMES[index];
-    let mesh = builder.mesh(name, data, material);
-    let node = builder.node(GltfNodeDesc::new(name).at(at).with_mesh(mesh));
-    builder.add_child(parent, node);
-    assert_eq!(
-        node, index,
-        "节点声明顺序（{node}）与骨架表下标（{index} = {name}）错位——生成器与 `skeleton.rs` 不同步"
-    );
-    node
-}
-
-/// 构造士兵 GLB：22 节点人形（骨架表见 `iris_assault::skeleton`）+
-/// 10 剪辑（下半身 3 + 上半身 7）。
+/// 网格几何与蒙皮权重来自 `iris_assault::soldier`（程序化人形 + 装备 + 武器），材质图集来自
+/// `iris_assault::soldier_tex`；本函数只负责按骨架表声明节点、装配蒙皮与剪辑数据。
 fn build_soldier_glb() -> Vec<u8> {
     let mut builder = GltfBuilder::new();
 
-    // ---- 材质（R42 写实通道**随 GLB 自带**：打磨 VI 摩擦③ 闭合，
-    // 插件层的「加载后克隆材质挂纹理」绕行删除）----
-    // 布料对（身体 / 裤子共用）与划痕金属对（刀身）都是本 crate 的纯函数
-    // 生成器产物；builder 按像素内容去重，两材质共用同一张图只嵌一份。
-    // 因子与 ORM 像素是**相乘**关系（glTF factor × texel），故粗糙度 /
-    // 金属度因子保留 R48 的标量值即得同一种材质观感。
-    let (cloth_normal, cloth_orm) = textures::cloth_normal_orm(128, 0x00C1_0711);
-    let cloth = || GltfMaterialTextures {
-        normal: Some(cloth_normal.clone()),
-        orm: Some(cloth_orm.clone()),
-        ..Default::default()
-    };
-    let (scratch_normal, scratch_orm) = textures::scratched_metal_normal_orm(128, 0xD00D_FEED);
-    let body_mat = builder.material_textured([0.30, 0.33, 0.38, 1.0], 0.0, 0.8, None, cloth());
-    let pants_mat = builder.material_textured([0.20, 0.20, 0.23, 1.0], 0.0, 0.85, None, cloth());
-    let helmet_mat = builder.material([0.42, 0.40, 0.37, 1.0], 0.4, 0.5, None);
-    let blade_mat = builder.material_textured(
-        [0.82, 0.84, 0.88, 1.0],
+    // ---- 材质：单材质 + 士兵图集（base / normal / ORM 三通道）----
+    // 整具角色（身体 + 装备 + 刀 + 枪）共用一张 1024² 图集：16 个分区逐
+    // 纹素表达金属度 / 粗糙度（材质多样性），单网格单材质 = 单次 draw。
+    let atlas = soldier_tex::soldier_atlas(soldier_tex::ATLAS_SEED);
+    let material = builder.material_textured(
+        [1.0, 1.0, 1.0, 1.0],
         1.0,
-        0.22,
+        1.0,
         None,
         GltfMaterialTextures {
-            normal: Some(scratch_normal),
-            orm: Some(scratch_orm),
-            ..Default::default()
+            base_color: Some(atlas.base),
+            normal: Some(atlas.normal),
+            orm: Some(atlas.orm),
         },
     );
-    let guard_mat = builder.material([0.15, 0.13, 0.12, 1.0], 0.3, 0.6, None);
-    let rifle_mat = builder.material([0.12, 0.13, 0.14, 1.0], 0.7, 0.4, None);
 
-    // ---- 骨架（节点声明顺序 = skeleton.rs 下标契约，`bone` 内断言；
-    // 节点名取骨架表 NAMES，网格即骨节点）----
-    let root = builder.node(GltfNodeDesc::new(sk::names::ROOT));
-    let pelvis = bone(
-        &mut builder,
-        root,
-        sk::PELVIS,
-        [0.0, 0.95, 0.0],
-        &scaled_cube(0.36, 0.24, 0.24, [0.0, 0.0, 0.0]),
-        pants_mat,
+    // ---- 蒙皮网格：一张（22 骨 + 1 个网格节点 = 骨架下标契约不变）----
+    let soldier = soldier::build_soldier_mesh();
+    println!(
+        "士兵网格：{} 顶点 / {} 三角形 / {} 关节",
+        soldier.mesh.vertices.len(),
+        soldier.mesh.indices.len() / 3,
+        soldier.inverse_bind.len()
     );
-    let torso = bone(
-        &mut builder,
-        pelvis,
-        sk::TORSO,
-        [0.0, 0.28, 0.0],
-        &scaled_cube(0.40, 0.30, 0.24, [0.0, 0.0, 0.0]),
-        body_mat,
-    );
-    let chest = bone(
-        &mut builder,
-        torso,
-        sk::CHEST,
-        [0.0, 0.30, 0.0],
-        &scaled_cube(0.44, 0.32, 0.26, [0.0, 0.0, 0.0]),
-        body_mat,
-    );
-    let _head = bone(
-        &mut builder,
-        chest,
-        sk::HEAD,
-        [0.0, 0.32, 0.0],
-        &scaled_cube(0.22, 0.26, 0.24, [0.0, 0.12, 0.0]),
-        helmet_mat,
-    );
+    let mesh = builder.mesh("soldier", &soldier.mesh, material);
 
-    // 腿（下垂 -Y；脚掌朝 -Z、踝下偏心）
-    let l_thigh = bone(
-        &mut builder,
-        pelvis,
-        sk::L_THIGH,
-        [-0.17, -0.05, 0.0],
-        &limb_cylinder(0.09, 0.45),
-        pants_mat,
-    );
-    let l_shin = bone(
-        &mut builder,
-        l_thigh,
-        sk::L_SHIN,
-        [0.0, -0.45, 0.0],
-        &limb_cylinder(0.07, 0.45),
-        pants_mat,
-    );
-    let _l_foot = bone(
-        &mut builder,
-        l_shin,
-        sk::L_FOOT,
-        [0.0, -0.45, 0.0],
-        &scaled_cube(0.14, 0.10, 0.30, [0.0, -0.05, -0.06]),
-        guard_mat,
-    );
-    let r_thigh = bone(
-        &mut builder,
-        pelvis,
-        sk::R_THIGH,
-        [0.17, -0.05, 0.0],
-        &limb_cylinder(0.09, 0.45),
-        pants_mat,
-    );
-    let r_shin = bone(
-        &mut builder,
-        r_thigh,
-        sk::R_SHIN,
-        [0.0, -0.45, 0.0],
-        &limb_cylinder(0.07, 0.45),
-        pants_mat,
-    );
-    let _r_foot = bone(
-        &mut builder,
-        r_shin,
-        sk::R_FOOT,
-        [0.0, -0.45, 0.0],
-        &scaled_cube(0.14, 0.10, 0.30, [0.0, -0.05, -0.06]),
-        guard_mat,
-    );
-
-    // 双臂（下垂 -Y；肩挂胸两侧）
-    let l_upperarm = bone(
-        &mut builder,
-        chest,
-        sk::L_UPPERARM,
-        [-0.34, 0.22, 0.0],
-        &limb_cylinder(0.075, 0.32),
-        body_mat,
-    );
-    let l_forearm = bone(
-        &mut builder,
-        l_upperarm,
-        sk::L_FOREARM,
-        [0.0, -0.32, 0.0],
-        &limb_cylinder(0.06, 0.30),
-        body_mat,
-    );
-    let _l_hand = bone(
-        &mut builder,
-        l_forearm,
-        sk::L_HAND,
-        [0.0, -0.30, 0.0],
-        &scaled_cube(0.09, 0.20, 0.09, [0.0, -0.08, 0.0]),
-        guard_mat,
-    );
-    let r_upperarm = bone(
-        &mut builder,
-        chest,
-        sk::R_UPPERARM,
-        [0.34, 0.22, 0.0],
-        &limb_cylinder(0.075, 0.32),
-        body_mat,
-    );
-    let r_forearm = bone(
-        &mut builder,
-        r_upperarm,
-        sk::R_FOREARM,
-        [0.0, -0.32, 0.0],
-        &limb_cylinder(0.06, 0.30),
-        body_mat,
-    );
-    let r_hand = bone(
-        &mut builder,
-        r_forearm,
-        sk::R_HAND,
-        [0.0, -0.30, 0.0],
-        &scaled_cube(0.09, 0.20, 0.09, [0.0, -0.08, 0.0]),
-        guard_mat,
-    );
-
-    // 刀：格挡段挂手，刃段挂格挡（跟随手骨——非 IK 对象）
-    let sword = bone(
-        &mut builder,
-        r_hand,
-        sk::SWORD,
-        [0.0, -0.02, 0.0],
-        &scaled_cube(0.17, 0.05, 0.06, [0.0, 0.0, 0.0]),
-        guard_mat,
-    );
-    let _sword_blade = bone(
-        &mut builder,
-        sword,
-        sk::SWORD_BLADE,
-        [0.0, -0.42, 0.0],
-        &scaled_cube(0.045, 0.78, 0.11, [0.0, 0.0, 0.0]),
-        blade_mat,
-    );
-
-    // 步枪：枪身挂胸（手 IK 追握把 / 护木——挂点不在手骨链子树内）
-    let rifle = bone(
-        &mut builder,
-        chest,
-        sk::RIFLE,
-        [0.15, 0.10, -0.28],
-        &scaled_cube(0.06, 0.11, 0.58, [0.0, 0.0, -0.05]),
-        rifle_mat,
-    );
-    let _rifle_grip = bone(
-        &mut builder,
-        rifle,
-        sk::RIFLE_GRIP,
-        [0.0, -0.10, 0.12],
-        &scaled_cube(0.05, 0.15, 0.07, [0.0, -0.06, 0.0]),
-        guard_mat,
-    );
-    // 护木：纯标记节点（无网格）
-    let _foregrip = {
-        let node = builder.node(GltfNodeDesc::new(sk::names::FOREGRIP).at([0.0, -0.03, -0.18]));
-        builder.add_child(rifle, node);
-        assert_eq!(node, sk::FOREGRIP, "护木声明顺序与骨架表错位");
-        node
-    };
+    // ---- 骨架节点：位置取 skeleton::BONE_LOCAL（单一事实来源）----
+    // 网格挂 ROOT 节点（**不是**逐骨挂网格）：节点总数仍是 22，动画通道
+    // 下标、动画遮罩、按名寻骨三条装配路径全部不变；形变交给 GPU 蒙皮。
+    // 步枪：**独立刚性网格**挂 RIFLE 节点（节点局部坐标系，无蒙皮）——
+    // 「敌人不带枪」仍是 set_subtree_hidden(RIFLE) 一句，蒙皮升级没破坏它
+    let rifle_mesh = builder.mesh("rifle", &soldier::build_rifle_mesh(), material);
+    let mut joints = Vec::with_capacity(sk::NODE_COUNT);
+    for index in 0..sk::NODE_COUNT {
+        let mut desc = GltfNodeDesc::new(sk::NAMES[index]).at(sk::BONE_LOCAL[index]);
+        if index == sk::ROOT {
+            desc = desc.with_mesh(mesh);
+        } else if index == sk::RIFLE {
+            desc = desc.with_mesh(rifle_mesh);
+        }
+        let node = builder.node(desc);
+        assert_eq!(
+            node,
+            index,
+            "节点声明顺序（{node}）与骨架表下标（{index} = {}）错位——生成器与 skeleton.rs 不同步",
+            sk::NAMES[index]
+        );
+        if index != sk::ROOT {
+            builder.add_child(sk::BONE_PARENT[index], node);
+        }
+        joints.push(node);
+    }
+    // 蒙皮：关节表 = 22 骨，逆绑定矩阵 = 绑定姿势逐项求逆（skeleton 表推出）
+    let skin = builder.skin("soldier_skin", &joints, &soldier.inverse_bind);
+    builder.attach_skin(sk::ROOT, skin);
 
     // ---- 下半身剪辑（通道只写 LOWER_BODY 节点）----
 

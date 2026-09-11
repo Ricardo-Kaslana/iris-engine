@@ -64,9 +64,14 @@
 //! `focus_target`、`node_entity_by_name`、example 命名约定），本 crate
 //! 不再保留 R48 的四处绕行代码。
 
+pub mod geom;
 pub mod logic;
 pub mod plugin;
+pub mod scenery;
+pub mod scenery_tex;
 pub mod skeleton;
+pub mod soldier;
+pub mod soldier_tex;
 pub mod textures;
 
 pub use logic::{
