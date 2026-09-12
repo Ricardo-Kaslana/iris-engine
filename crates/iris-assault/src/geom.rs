@@ -31,7 +31,7 @@
 //! - 蒙皮权重最多 4 骨（与引擎 SkinVertex 一致）；链混合是「相邻两骨
 //!   平滑混合」，不做球形衰减 / 双四元数 / 体积保持。
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 use iris_engine::prelude::{MeshData, SkinVertex, Vertex};
 
 /// 主轴（UV 投影与柱面映射的基准）。
@@ -388,6 +388,13 @@ impl Assembly {
             piece.mesh.skin.is_none(),
             "部件网格不应自带 skin（权重由 Piece 承载，装配期统一写入）"
         );
+        // 部件自检：闭合壳的有向体积必须为正（法线朝外的又一重保险——
+        // 放样 / 旋转体 / 超椭球已在生成器里统一纠向，这里挡的是新原语与新调用）。
+        debug_assert!(
+            signed_volume(&piece.mesh) > 0.0,
+            "部件法线朝内（有向体积 {}）；闭合壳须外向",
+            signed_volume(&piece.mesh)
+        );
         let base = self.vertices.len() as u32;
         for (vertex, weights) in piece.mesh.vertices.iter().zip(&piece.weights) {
             assert!(
@@ -484,6 +491,8 @@ pub fn superellipsoid(half: Vec3, n: f32, seg_u: u32, seg_v: u32) -> MeshData {
             }
         }
     }
+    // 超椭球以原点为中心；极点环的退化边跳过判向后仍有侧面可用
+    orient_outward(&mut mesh, |_, _| Vec3::ZERO);
     smooth_normals(&mut mesh);
     mesh
 }
@@ -527,15 +536,66 @@ impl Section {
 
     /// 环上一点（超椭圆参数化）。
     fn point(&self, theta: f32) -> Vec3 {
+        self.point_at(theta, 0.0)
+    }
+
+    /// 环上一点并向截面中心内缩 `inset`（弧形壳的内表面用：两半轴各减
+    /// `inset`，非严格等距偏移但视觉等价，且不会有自交风险）。
+    pub fn point_at(&self, theta: f32, inset: f32) -> Vec3 {
         let power = 2.0 / self.exponent;
         let (sin_t, cos_t) = theta.sin_cos();
-        let x = self.half_right * cos_t.signum() * cos_t.abs().powf(power);
-        let y = self.half_up * sin_t.signum() * sin_t.abs().powf(power);
+        let half_right = (self.half_right - inset).max(1e-4);
+        let half_up = (self.half_up - inset).max(1e-4);
+        let x = half_right * cos_t.signum() * cos_t.abs().powf(power);
+        let y = half_up * sin_t.signum() * sin_t.abs().powf(power);
         self.center + self.right * x + self.up * y
     }
 }
 
 /// 沿截面序列放样成闭合管；`caps` = 两端封盖（截面中心 + 环的三角扇）。
+/// 闭合壳的环绕方向自检：首个有效面的法线若不背离参考中心，则**整体翻转**索引。
+///
+/// 放样 / 旋转体的环绕方向取决于「截面基 (right, up) 与行方向是否成右手系」
+/// （right × up = 行方向），而这是**调用方**给的——写反的壳在光照下整片发灰、
+/// 背面剔除后直接看不见。实测整身有 20 个部件踩了这个坑（鞋楦三件、双肩三角肌、
+/// 双掌鱼际、头盔耳罩、脸侧滤罐、腰侧挂具、腕环……），且**左右两侧未必同病**
+/// （镜像部件的行方向相反）。与其在几十个调用点各写一遍「截面顺序要反着排」，
+/// 不如在这里统一兜住——与 arc_shell 同一策略，调用方不必操心。
+///
+/// 用三角形重心判向（极点扇面的首顶点在轴上，用顶点会退化成零向量而漏判）；
+/// 整壳环绕一致，故翻转全部三角形即可。
+fn orient_outward(mesh: &mut MeshData, center_of: impl Fn(usize, Vec3) -> Vec3) {
+    let mut inverted = false;
+    for triangle in mesh.indices.chunks_exact(3) {
+        let i0 = triangle[0] as usize;
+        let p0 = Vec3::from(mesh.vertices[i0].position);
+        let p1 = Vec3::from(mesh.vertices[triangle[1] as usize].position);
+        let p2 = Vec3::from(mesh.vertices[triangle[2] as usize].position);
+        let face = (p1 - p0).cross(p2 - p0);
+        if face.length_squared() <= 1e-18 {
+            continue;
+        }
+        let centroid = (p0 + p1 + p2) / 3.0;
+        let radial = centroid - center_of(i0, centroid);
+        if radial.length_squared() <= 1e-12 {
+            continue;
+        }
+        // 端面（法线与径向近乎垂直，如旋转体的封口圆盘）判不出朝向，跳过：
+        // 拿它下结论会把整个壳翻反（侧面螺栓的圆盘端面正是如此）。
+        let alignment = radial.dot(face) / (radial.length() * face.length());
+        if alignment.abs() < 0.25 {
+            continue;
+        }
+        inverted = alignment < 0.0;
+        break;
+    }
+    if inverted {
+        for triangle in mesh.indices.chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+    }
+}
+
 pub fn loft(sections: &[Section], segments: u32, caps: bool) -> MeshData {
     assert!(sections.len() >= 2, "放样至少两个截面");
     assert!(segments >= 3, "分段数太小");
@@ -584,6 +644,11 @@ pub fn loft(sections: &[Section], segments: u32, caps: bool) -> MeshData {
             }
         }
     }
+    // 封盖之后再定环绕方向：封盖的索引序是跟着**原始**环序写的，
+    // 若在封盖前翻转，盖面会与侧面反向（漏盖内翻）。
+    orient_outward(&mut mesh, |index, _| {
+        sections[(index / row).min(sections.len() - 1)].center
+    });
     smooth_normals(&mut mesh);
     mesh
 }
@@ -669,6 +734,8 @@ pub fn lathe(profile: &[(f32, f32)], segments: u32) -> MeshData {
             }
         }
     }
+    // 旋转体的参考中心 = 同高度处的轴点（轮廓序反了照样兜住）
+    orient_outward(&mut mesh, |_, point| Vec3::new(0.0, point.y, 0.0));
     smooth_normals(&mut mesh);
     mesh
 }
@@ -773,9 +840,476 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+// ---------------------------------------------------------------------------
+// 硬表面基本体（视觉上限轮）：倒角板 / 凸棱柱 / 弧形壳 / 折线扫掠
+//
+// 超椭球是**平滑法线**的圆角盒——做护甲板读作「软胶疙瘩」。硬表面装备需要
+// 三条：①面与面之间**顶点分裂**（法线硬边，棱上有高光）；②45° 倒角（棱上一条
+// 连续高光带，这是「金属板」而非「塑料块」的视觉签名）；③可包覆身体的**弧形壳**。
+// 本节的四个生成器专供这三条，与既有生成器共用同一套 UV / 权重 / 装配管线。
+// ---------------------------------------------------------------------------
+
+/// 闭合网格的有符号体积（∑ (p₀ × p₁) · p₂ / 6，原点在体内时正 = 外向环绕）。
+///
+/// 用于自检环绕方向：硬表面基本体若整体反绕，法线会全部朝内——表现为
+/// 「装备发黑、像被掏空」，且在暗场景里极难定位。
+fn signed_volume(mesh: &MeshData) -> f32 {
+    let mut sum = 0.0f32;
+    for triangle in mesh.indices.chunks_exact(3) {
+        let p0 = Vec3::from(mesh.vertices[triangle[0] as usize].position);
+        let p1 = Vec3::from(mesh.vertices[triangle[1] as usize].position);
+        let p2 = Vec3::from(mesh.vertices[triangle[2] as usize].position);
+        sum += p0.cross(p1).dot(p2);
+    }
+    sum / 6.0
+}
+
+/// 推入一个**顶点分裂**的四边形（`hint` 指体外，环绕方向不合就翻）。
+/// 分裂顶点 = 平滑法线无法跨面平均 ⇒ 硬边；这是硬表面与超椭球的根本区别。
+fn push_hard_quad(mesh: &mut MeshData, corners: [Vec3; 4], hint: Vec3) {
+    let normal = (corners[1] - corners[0]).cross(corners[3] - corners[0]);
+    let order: [usize; 4] = if normal.dot(hint) < 0.0 {
+        [0, 3, 2, 1]
+    } else {
+        [0, 1, 2, 3]
+    };
+    let base = mesh.vertices.len() as u32;
+    for &index in &order {
+        mesh.vertices.push(Vertex {
+            position: corners[index].into(),
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// 推入一个顶点分裂的三角形（同样按 `hint` 定环绕）。
+fn push_hard_triangle(mesh: &mut MeshData, corners: [Vec3; 3], hint: Vec3) {
+    let normal = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
+    let order: [usize; 3] = if normal.dot(hint) < 0.0 {
+        [0, 2, 1]
+    } else {
+        [0, 1, 2]
+    };
+    let base = mesh.vertices.len() as u32;
+    for &index in &order {
+        mesh.vertices.push(Vertex {
+            position: corners[index].into(),
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+        });
+    }
+    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+/// 倒角板：轴对齐盒 + 45° 倒角（6 面 / 12 棱条 / 8 角片），面与棱**顶点全部分裂**。
+///
+/// `bevel` 为倒角宽度（0 < bevel < min(half) / 2）。96 顶点 / 44 三角形——
+/// 与一颗 12×9 的超椭球同量级，但读作机加工件而非橡皮块。
+pub fn plate(half: Vec3, bevel: f32) -> MeshData {
+    let min = half.x.min(half.y).min(half.z);
+    assert!(min > 0.0, "半轴必须为正");
+    // 约束是「倒角后内盒不退化为零」：bevel < min(half) 即可（= min 时某个面缩成一点、
+    // 三角形退化）。小件（扣具 / 导轨）常给到 min 的一半以上，故不设更紧的上限。
+    assert!(
+        bevel > 0.0 && bevel < min,
+        "倒角宽度须在 (0, min(half)) 内（bevel={bevel}, min={min}）"
+    );
+    let inner = half - Vec3::splat(bevel);
+    let mut mesh = MeshData::default();
+    let axis = |i: usize, v: f32| {
+        let mut out = Vec3::ZERO;
+        out[i] = v;
+        out
+    };
+    // 6 个面（每面 4 顶点，顶点分裂 ⇒ 面内法线常量）
+    for a in 0..3 {
+        let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+        for sign in [-1.0f32, 1.0] {
+            let center = axis(a, sign * half[a]);
+            let u = axis(b, inner[b]);
+            let v = axis(c, inner[c]);
+            push_hard_quad(
+                &mut mesh,
+                [
+                    center - u - v,
+                    center + u - v,
+                    center + u + v,
+                    center - u + v,
+                ],
+                axis(a, sign),
+            );
+        }
+    }
+    // 12 条棱（沿第三条轴拉伸的 45° 倒角条）
+    for a in 0..3 {
+        for b in a + 1..3 {
+            let c = 3 - a - b;
+            for sa in [-1.0f32, 1.0] {
+                for sb in [-1.0f32, 1.0] {
+                    let p1 = axis(a, sa * half[a]) + axis(b, sb * inner[b]);
+                    let p2 = axis(a, sa * inner[a]) + axis(b, sb * half[b]);
+                    let dz = axis(c, inner[c]);
+                    let hint = (axis(a, sa) + axis(b, sb)).normalize();
+                    push_hard_quad(&mut mesh, [p1 - dz, p2 - dz, p2 + dz, p1 + dz], hint);
+                }
+            }
+        }
+    }
+    // 8 个角片
+    for sx in [-1.0f32, 1.0] {
+        for sy in [-1.0f32, 1.0] {
+            for sz in [-1.0f32, 1.0] {
+                let hint = Vec3::new(sx, sy, sz);
+                let p = Vec3::new(sx * half.x, sy * inner.y, sz * inner.z);
+                let q = Vec3::new(sx * inner.x, sy * half.y, sz * inner.z);
+                let r = Vec3::new(sx * inner.x, sy * inner.y, sz * half.z);
+                push_hard_triangle(&mut mesh, [p, q, r], hint);
+            }
+        }
+    }
+    smooth_normals(&mut mesh);
+    debug_assert!(signed_volume(&mesh) > 0.0, "倒角板环绕方向反了");
+    mesh
+}
+
+/// 凸棱柱：XY 平面凸多边形沿 ±Z 拉伸，侧面与端盖顶点分裂（硬边）。
+///
+/// 轮廓须**凸**（端盖用质心扇三角化；凹轮廓会自交，故断言拒绝）。环绕方向
+/// 自动归一（面积符号为负则反转顶点序），故调用方给顺时针或逆时针都行。
+pub fn prism(outline: &[Vec2], half_depth: f32) -> MeshData {
+    assert!(outline.len() >= 3, "棱柱轮廓至少三点");
+    assert!(half_depth > 0.0, "棱柱半厚必须为正");
+    let mut points = outline.to_vec();
+    let area2: f32 = (0..points.len())
+        .map(|i| {
+            let a = points[i];
+            let b = points[(i + 1) % points.len()];
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    assert!(area2.abs() > 1e-9, "棱柱轮廓退化（面积为零）");
+    if area2 < 0.0 {
+        points.reverse();
+    }
+    let count = points.len();
+    for i in 0..count {
+        let a = points[i];
+        let b = points[(i + 1) % count];
+        let c = points[(i + 2) % count];
+        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        assert!(cross >= -1e-6, "棱柱轮廓必须为凸（第 {i} 点处凹陷）");
+    }
+    let centroid = points.iter().copied().sum::<Vec2>() / count as f32;
+    let mut mesh = MeshData::default();
+    for (z, hint) in [(half_depth, Vec3::Z), (-half_depth, -Vec3::Z)] {
+        let center = Vec3::new(centroid.x, centroid.y, z);
+        for i in 0..count {
+            let a = points[i];
+            let b = points[(i + 1) % count];
+            push_hard_triangle(
+                &mut mesh,
+                [center, Vec3::new(a.x, a.y, z), Vec3::new(b.x, b.y, z)],
+                hint,
+            );
+        }
+    }
+    for i in 0..count {
+        let a = points[i];
+        let b = points[(i + 1) % count];
+        let edge = b - a;
+        let hint = Vec3::new(edge.y, -edge.x, 0.0).normalize_or_zero();
+        let hint = if hint.length_squared() < 0.5 {
+            Vec3::new(a.x - centroid.x, a.y - centroid.y, 0.0).normalize()
+        } else {
+            hint
+        };
+        push_hard_quad(
+            &mut mesh,
+            [
+                Vec3::new(a.x, a.y, -half_depth),
+                Vec3::new(b.x, b.y, -half_depth),
+                Vec3::new(b.x, b.y, half_depth),
+                Vec3::new(a.x, a.y, half_depth),
+            ],
+            hint,
+        );
+    }
+    smooth_normals(&mut mesh);
+    debug_assert!(signed_volume(&mesh) > 0.0, "棱柱环绕方向反了");
+    mesh
+}
+
+/// 弧形壳的一行：截面 + 该行的角度区间（弧度，绕截面的 `right` → `up` 方向）。
+#[derive(Clone, Copy, Debug)]
+pub struct ArcRow {
+    /// 该行截面。
+    pub section: Section,
+    /// 起始角。
+    pub start: f32,
+    /// 结束角（大于 `start`；差值 ≈ 2π 视为闭合环）。
+    pub end: f32,
+}
+
+impl ArcRow {
+    /// 构造。
+    pub fn new(section: Section, start: f32, end: f32) -> Self {
+        assert!(end > start, "弧形行的结束角必须大于起始角");
+        Self {
+            section,
+            start,
+            end,
+        }
+    }
+}
+
+/// 弧形壳：一行行截面沿角度区间张开，再**向内偏移 `thickness`** 生成内表面，
+/// 四条边界封边 ⇒ 闭合实体。
+///
+/// 这是护甲板 / 头盔 / 护胫 / 腰带 / 靴筒的通用形态：外内表面顶点**共享**
+/// （沿弧与沿轮廓平滑），封边顶点**分裂**（边缘硬边），于是「贴合身体的曲面
+/// + 一圈锐利包边」——正是现代单兵装具的读法。
+///
+/// 各行可给不同角度区间（做上窄下宽的甲片），但闭合性必须一致（要么都是
+/// 闭合环、要么都是开弧）。环绕方向由首个四边形的几何自动判定，调用方不必操心。
+pub fn arc_shell(rows: &[ArcRow], segments: u32, thickness: f32) -> MeshData {
+    assert!(rows.len() >= 2, "弧形壳至少两行");
+    assert!(segments >= 2, "分段数太小");
+    assert!(thickness > 0.0, "壳厚必须为正");
+    let is_closed = |row: &ArcRow| (row.end - row.start) >= std::f32::consts::TAU - 1e-3;
+    let closed = is_closed(&rows[0]);
+    assert!(
+        rows.iter().all(|row| is_closed(row) == closed),
+        "各行的闭合性必须一致（要么都是闭合环、要么都是开弧）"
+    );
+    let rows_count = rows.len();
+    let columns = if closed {
+        segments as usize
+    } else {
+        segments as usize + 1
+    };
+    let theta =
+        |row: &ArcRow, j: usize| row.start + (row.end - row.start) * j as f32 / segments as f32;
+    // 两张网格的位置先全算出来：封边既要读两侧位置、又要同时写 mesh
+    let mut positions: Vec<Vec3> = Vec::with_capacity(rows_count * columns * 2);
+    for inset in [0.0f32, thickness] {
+        for row in rows {
+            for j in 0..columns {
+                positions.push(row.section.point_at(theta(row, j), inset));
+            }
+        }
+    }
+    let outer = |i: usize, j: usize| i * columns + j;
+    let inner = |i: usize, j: usize| rows_count * columns + i * columns + j;
+    let next = |j: usize| {
+        if closed { (j + 1) % columns } else { j + 1 }
+    };
+    let mut mesh = MeshData::default();
+    for position in &positions {
+        mesh.vertices.push(Vertex {
+            position: (*position).into(),
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+        });
+    }
+    let face = |a: usize, b: usize, c: usize| {
+        (positions[b] - positions[a]).cross(positions[c] - positions[a])
+    };
+    let flip = face(outer(0, 0), outer(1, 0), outer(1, next(0)))
+        .dot(positions[outer(0, 0)] - rows[0].section.center)
+        < 0.0;
+    let mut push_quad = |a: usize, b: usize, c: usize, d: usize, reversed: bool| {
+        let (a, b, c, d) = (a as u32, b as u32, c as u32, d as u32);
+        if reversed {
+            mesh.indices.extend_from_slice(&[a, d, c, a, c, b]);
+        } else {
+            mesh.indices.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    };
+    for i in 0..rows_count - 1 {
+        for j in 0..segments as usize {
+            let j1 = next(j);
+            push_quad(
+                outer(i, j),
+                outer(i + 1, j),
+                outer(i + 1, j1),
+                outer(i, j1),
+                flip,
+            );
+            // 内表面：与外表面对应的角点序相同、环绕相反 ⇒ 法线朝轴心
+            push_quad(
+                inner(i, j),
+                inner(i + 1, j),
+                inner(i + 1, j1),
+                inner(i, j1),
+                !flip,
+            );
+        }
+    }
+    // 封边（顶点分裂 ⇒ 与内外表面之间是硬边）
+    let tangent = |row: &ArcRow, at: f32| {
+        let eps = 1e-3f32;
+        row.section.point_at(at + eps, 0.0) - row.section.point_at(at - eps, 0.0)
+    };
+    if !closed {
+        let last = columns - 1;
+        for i in 0..rows_count - 1 {
+            let start_hint = -tangent(&rows[i], rows[i].start);
+            push_hard_quad(
+                &mut mesh,
+                [
+                    positions[outer(i, 0)],
+                    positions[outer(i + 1, 0)],
+                    positions[inner(i + 1, 0)],
+                    positions[inner(i, 0)],
+                ],
+                start_hint,
+            );
+            let end_hint = tangent(&rows[i], rows[i].end);
+            push_hard_quad(
+                &mut mesh,
+                [
+                    positions[outer(i, last)],
+                    positions[outer(i + 1, last)],
+                    positions[inner(i + 1, last)],
+                    positions[inner(i, last)],
+                ],
+                end_hint,
+            );
+        }
+    }
+    let row_hint = |i: usize| rows[i + 1].section.center - rows[i].section.center;
+    for (i, hint) in [
+        (0usize, -row_hint(0)),
+        (rows_count - 1, row_hint(rows_count - 2)),
+    ] {
+        for j in 0..segments as usize {
+            let j1 = next(j);
+            push_hard_quad(
+                &mut mesh,
+                [
+                    positions[outer(i, j)],
+                    positions[outer(i, j1)],
+                    positions[inner(i, j1)],
+                    positions[inner(i, j)],
+                ],
+                hint,
+            );
+        }
+    }
+    smooth_normals(&mut mesh);
+    let volume = signed_volume(&mesh);
+    debug_assert!(volume > 0.0, "弧形壳环绕方向反了（体积 {volume}）");
+    mesh
+}
+
+/// 折线扫掠：剖面沿三维折线扫过，**平行传输框架**避免扭转（背带 / 下巴带 /
+/// 枪背带 / 鞋带 / 线缆）。
+///
+/// 剖面 `(t, 半宽, 半高, 指数)`，`t ∈ [0,1]` 是**弧长比例**（不是控制点比例，
+/// 故控制点疏密不影响剖面分布）。两端封盖。折线不得有零长段（断言）。
+pub fn sweep(
+    path: &[Vec3],
+    profile: &[(f32, f32, f32, f32)],
+    segments: u32,
+    up_hint: Vec3,
+) -> MeshData {
+    assert!(path.len() >= 2, "扫掠路径至少两点");
+    assert!(profile.len() >= 2, "剖面至少两点");
+    let mut arc = vec![0.0f32];
+    for window in path.windows(2) {
+        let distance = (window[1] - window[0]).length();
+        assert!(distance > 1e-6, "扫掠路径存在零长段");
+        arc.push(arc[arc.len() - 1] + distance);
+    }
+    let total = arc[arc.len() - 1];
+    let mut frames: Vec<(Vec3, Vec3, Vec3)> = Vec::with_capacity(path.len());
+    for index in 0..path.len() {
+        let tangent = if index == 0 {
+            (path[1] - path[0]).normalize()
+        } else if index == path.len() - 1 {
+            (path[index] - path[index - 1]).normalize()
+        } else {
+            (path[index + 1] - path[index - 1]).normalize()
+        };
+        let (right, up) = match frames.last() {
+            None => {
+                let hint = if up_hint.cross(tangent).length_squared() < 1e-8 {
+                    Vec3::X
+                } else {
+                    up_hint
+                };
+                let right = hint.cross(tangent).normalize();
+                (right, tangent.cross(right).normalize())
+            }
+            Some(&(right, _, previous)) => {
+                let rotation = Quat::from_rotation_arc(previous, tangent);
+                let right = (rotation * right).normalize();
+                (right, tangent.cross(right).normalize())
+            }
+        };
+        frames.push((right, up, tangent));
+    }
+    let sections: Vec<Section> = profile
+        .iter()
+        .map(|&(t, half_right, half_up, exponent)| {
+            let distance = t.clamp(0.0, 1.0) * total;
+            let mut index = path.len() - 2;
+            for k in 0..path.len() - 1 {
+                if distance <= arc[k + 1] {
+                    index = k;
+                    break;
+                }
+            }
+            let span = arc[index + 1] - arc[index];
+            let f = ((distance - arc[index]) / span).clamp(0.0, 1.0);
+            let (right, up, _) = frames[index];
+            Section::new(
+                path[index].lerp(path[index + 1], f),
+                right,
+                up,
+                half_right,
+                half_up,
+                exponent,
+            )
+        })
+        .collect();
+    loft(&sections, segments, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 环绕方向自检：截面序反着排（镜像部件的行方向相反）也产出外向壳。
+    ///
+    /// 这条不变量此前靠「调用方记得反着排截面」维持，整身实测漏了 20 个部件
+    /// （鞋楦三件、双肩三角肌、双掌鱼际、头盔耳罩、脸侧滤罐……）。现在由
+    /// loft / lathe / 超椭球在生成期按几何纠向，本测试把该行为钉死：同一几何
+    /// 的两个截面序都应给出**正**有向体积，且体积相等（只差索引序）。
+    #[test]
+    fn primitive_orientation_is_independent_of_input_order() {
+        let section =
+            |y: f32| Section::new(Vec3::new(0.0, y, 0.0), Vec3::X, Vec3::Z, 0.08, 0.06, 2.4);
+        let up = loft(&[section(0.0), section(0.1), section(0.2)], 12, true);
+        let down = loft(&[section(0.2), section(0.1), section(0.0)], 12, true);
+        let (a, b) = (signed_volume(&up), signed_volume(&down));
+        assert!(a > 0.0 && b > 0.0, "两个截面序都应外向：{a} / {b}");
+        assert!((a - b).abs() < 1e-6, "同一几何的体积应相等：{a} vs {b}");
+        let profile: [(f32, f32); 4] = [(0.0, -0.05), (0.04, -0.03), (0.04, 0.03), (0.0, 0.05)];
+        let reversed: Vec<(f32, f32)> = profile.iter().rev().copied().collect();
+        let (c, d) = (
+            signed_volume(&lathe(&profile, 12)),
+            signed_volume(&lathe(&reversed, 12)),
+        );
+        assert!(c > 0.0 && d > 0.0, "旋转体两个轮廓序都应外向：{c} / {d}");
+        assert!(
+            (c - d).abs() < 1e-6,
+            "旋转体同一几何的体积应相等：{c} vs {d}"
+        );
+    }
 
     fn bits(mesh: &MeshData) -> Vec<u32> {
         let mut out = Vec::new();
@@ -959,5 +1493,224 @@ mod tests {
         for v in &piece.mesh.vertices {
             assert!((Vec3::from(v.normal).length() - 1.0).abs() < 1e-4);
         }
+    }
+    #[test]
+    fn plate_faces_are_flat_and_solid_is_positive() {
+        let half = Vec3::new(0.06, 0.09, 0.03);
+        let mesh = plate(half, 0.006);
+        assert_eq!(mesh.vertices.len(), 96, "6 面 + 12 棱 + 8 角，顶点全分裂");
+        assert_eq!(mesh.indices.len() / 3, 44, "12 + 24 + 8 三角形");
+        assert!(signed_volume(&mesh) > 0.0, "环绕方向应为外向");
+        for v in &mesh.vertices {
+            let p = Vec3::from(v.position);
+            assert!(p.x.abs() <= half.x + 1e-6);
+            assert!(p.y.abs() <= half.y + 1e-6);
+            assert!(p.z.abs() <= half.z + 1e-6);
+        }
+        for triangle in mesh.indices.chunks_exact(3) {
+            let point = |i: u32| Vec3::from(mesh.vertices[i as usize].position);
+            let face = (point(triangle[1]) - point(triangle[0]))
+                .cross(point(triangle[2]) - point(triangle[0]));
+            assert!(face.length() > 1e-9, "退化三角形");
+            let face = face.normalize();
+            for &index in triangle {
+                let n = Vec3::from(mesh.vertices[index as usize].normal);
+                assert!(
+                    n.dot(face) > 0.9999,
+                    "硬表面三角形的顶点法线应等于面法线（点积 {}）",
+                    n.dot(face)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prism_volume_matches_analytic_and_normalizes_winding() {
+        // 等腰梯形（凸）：下底 0.10 / 上底 0.06 / 高 0.08
+        let outline = [
+            Vec2::new(-0.05, -0.04),
+            Vec2::new(0.05, -0.04),
+            Vec2::new(0.03, 0.04),
+            Vec2::new(-0.03, 0.04),
+        ];
+        let half_depth = 0.02f32;
+        let mesh = prism(&outline, half_depth);
+        let area = 0.5 * (0.10 + 0.06) * 0.08;
+        let expected = area * 2.0 * half_depth;
+        let volume = signed_volume(&mesh);
+        assert!(
+            (volume - expected).abs() < expected * 1e-5,
+            "棱柱体积 {volume} 应等于解析值 {expected}"
+        );
+        let mut reversed = outline;
+        reversed.reverse();
+        let flipped = prism(&reversed, half_depth);
+        assert!(
+            signed_volume(&flipped) > 0.0,
+            "顺时针输入应自动归一为外向环绕"
+        );
+        assert_eq!(bits(&mesh), bits(&flipped), "顶点序归一后应逐位一致");
+    }
+
+    #[test]
+    fn arc_shell_is_closed_and_matches_analytic_volume() {
+        // 90° 圆弧壳：半径 0.30、厚 0.02、高 0.20（中径 × 弧长 × 厚 × 高）
+        let radius = 0.3f32;
+        let thickness = 0.02f32;
+        let rows: Vec<ArcRow> = [0.0f32, 0.10, 0.20]
+            .iter()
+            .map(|&y| {
+                ArcRow::new(
+                    Section::new(
+                        Vec3::new(0.0, y, 0.0),
+                        Vec3::X,
+                        Vec3::Z,
+                        radius,
+                        radius,
+                        2.0,
+                    ),
+                    0.0,
+                    std::f32::consts::FRAC_PI_2,
+                )
+            })
+            .collect();
+        let mesh = arc_shell(&rows, 48, thickness);
+        let inner_radius = radius - thickness;
+        let expected = 0.5
+            * (radius * radius - inner_radius * inner_radius)
+            * std::f32::consts::FRAC_PI_2
+            * 0.20;
+        let volume = signed_volume(&mesh);
+        assert!(
+            (volume - expected).abs() < expected * 0.01,
+            "弧形壳体积 {volume} 应接近解析值 {expected}"
+        );
+        // 外表面（共享顶点）平滑 / 封边（分裂顶点）硬边——两者必须同时存在
+        let mut flat = 0usize;
+        let mut smooth = 0usize;
+        for triangle in mesh.indices.chunks_exact(3) {
+            let point = |i: u32| Vec3::from(mesh.vertices[i as usize].position);
+            let face = (point(triangle[1]) - point(triangle[0]))
+                .cross(point(triangle[2]) - point(triangle[0]))
+                .normalize();
+            let hard = triangle
+                .iter()
+                .all(|&index| Vec3::from(mesh.vertices[index as usize].normal).dot(face) > 0.9999);
+            if hard {
+                flat += 1;
+            } else {
+                smooth += 1;
+            }
+        }
+        assert!(
+            flat > 0 && smooth > 0,
+            "应为「曲面 + 硬封边」（flat={flat}, smooth={smooth}）"
+        );
+        // 闭合环：整圈 2π，体积 = π(R² − r²) × 高
+        let ring: Vec<ArcRow> = [0.0f32, 0.20]
+            .iter()
+            .map(|&y| {
+                ArcRow::new(
+                    Section::new(
+                        Vec3::new(0.0, y, 0.0),
+                        Vec3::X,
+                        Vec3::Z,
+                        radius,
+                        radius,
+                        2.0,
+                    ),
+                    0.0,
+                    std::f32::consts::TAU,
+                )
+            })
+            .collect();
+        let ring_mesh = arc_shell(&ring, 64, thickness);
+        let inner = radius - thickness;
+        let ring_expected = std::f32::consts::PI * (radius * radius - inner * inner) * 0.20;
+        let ring_volume = signed_volume(&ring_mesh);
+        assert!(
+            (ring_volume - ring_expected).abs() < ring_expected * 0.01,
+            "闭合环体积 {ring_volume} 应接近解析值 {ring_expected}"
+        );
+    }
+
+    #[test]
+    fn sweep_maps_profile_to_arc_length() {
+        let path = [
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -0.5),
+            Vec3::new(0.4, 0.0, -0.5),
+        ];
+        let profile: Vec<(f32, f32, f32, f32)> = vec![
+            (0.0, 0.05, 0.05, 2.0),
+            (0.5, 0.012, 0.012, 2.0),
+            (1.0, 0.05, 0.05, 2.0),
+        ];
+        let mesh = sweep(&path, &profile, 12, Vec3::Y);
+        assert_eq!(mesh.vertices.len(), 3 * 12 + 2, "三截面 × 12 段 + 两端盖心");
+        // 顶点到折线的距离不超过剖面最大半径
+        let distance = |p: Vec3| {
+            path.windows(2)
+                .map(|w| {
+                    let d = w[1] - w[0];
+                    let t = (p - w[0]).dot(d) / d.length_squared();
+                    (p - (w[0] + d * t.clamp(0.0, 1.0))).length()
+                })
+                .fold(f32::MAX, f32::min)
+        };
+        for v in &mesh.vertices {
+            let d = distance(Vec3::from(v.position));
+            assert!(d <= 0.05 + 1e-5, "顶点离路径 {d} 超出剖面半径");
+        }
+        // 剖面 t = 0.5 落在**弧长中点**（z ≈ −0.45），而不是控制点中点（z = −0.25）
+        let middle = Vec3::new(0.0, 0.0, -0.45);
+        let nearest = mesh
+            .vertices
+            .iter()
+            .map(|v| (Vec3::from(v.position) - middle).length())
+            .fold(f32::MAX, f32::min);
+        assert!(
+            nearest < 0.02,
+            "t=0.5 截面应在弧长中点，最近顶点距离 {nearest}"
+        );
+    }
+
+    #[test]
+    fn hard_surface_generators_are_deterministic_bitwise() {
+        let half = Vec3::new(0.05, 0.08, 0.02);
+        assert_eq!(bits(&plate(half, 0.005)), bits(&plate(half, 0.005)));
+        let outline = [
+            Vec2::new(-0.05, -0.04),
+            Vec2::new(0.05, -0.04),
+            Vec2::new(0.03, 0.04),
+        ];
+        assert_eq!(bits(&prism(&outline, 0.02)), bits(&prism(&outline, 0.02)));
+        let rows = [
+            ArcRow::new(
+                Section::new(Vec3::new(0.0, 0.0, 0.0), Vec3::X, Vec3::Z, 0.2, 0.15, 2.4),
+                0.4,
+                2.2,
+            ),
+            ArcRow::new(
+                Section::new(Vec3::new(0.0, 0.1, 0.0), Vec3::X, Vec3::Z, 0.18, 0.13, 2.4),
+                0.4,
+                2.2,
+            ),
+        ];
+        assert_eq!(
+            bits(&arc_shell(&rows, 16, 0.01)),
+            bits(&arc_shell(&rows, 16, 0.01))
+        );
+        let path = [
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.2, 0.1),
+            Vec3::new(0.2, 0.2, 0.1),
+        ];
+        let profile: Vec<(f32, f32, f32, f32)> =
+            vec![(0.0, 0.02, 0.02, 2.0), (1.0, 0.02, 0.02, 2.0)];
+        assert_eq!(
+            bits(&sweep(&path, &profile, 10, Vec3::Y)),
+            bits(&sweep(&path, &profile, 10, Vec3::Y))
+        );
     }
 }

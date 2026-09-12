@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1172 / release 1170**（每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1178 / release 1176**（每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -138,7 +138,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-11 更新）
 
-- 测试基线 debug 1172 / release 1170；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1178 / release 1176；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v4**（上限跃迁：工具链 × 视觉 × AI × 完整 Assault）：
   - W5 内容产能 ✅：R57 关卡格式 v2、R58a/b 编辑器、R59 资产管线（BC3/manifest/动画注册表）
   - W6 视觉上限：R60 TAA ✅、R61 阴影 v2 ✅、R62a/b 反射探针+SSR ✅；剩 **R63 材质上限**（预积分皮肤 SSS）、R64 光照探针 GI（可选）

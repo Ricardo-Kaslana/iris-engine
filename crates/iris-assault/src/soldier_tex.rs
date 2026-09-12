@@ -1,7 +1,7 @@
 //! 士兵材质图集（程序化 · 确定性 · 单材质单 draw）。
 //!
 //! 角色的**全部**外观（布料 / 护甲 / 皮革 / 钢 / 玻璃 / 织带 / 橡胶）压进
-//! 一张 `1024²` 图集的 16 个 256² 分区，配 base / normal / ORM 三张
+//! 一张 `512²` 图集的 16 个 128² 分区，配 base / normal / ORM 三张
 //! 纹理、一个材质：整具角色（含刀与枪）是一张蒙皮网格 = **一次 draw**。
 //! 分区制是「单材质」与「材质多样性」的和解：金属度 / 粗糙度由 ORM 图的
 //! **逐纹素**值表达（glTF 规范允许，引擎按 texel 采样），故钢刃、玻璃面罩、
@@ -19,6 +19,12 @@
 //!   ~11 m）不可辨；
 //! - 法线由高度场中心差分而来（与引擎 `brick_normal_orm` 同口径），
 //!   故凹凸与颜色是同一个高度场的两个投影，不存在手绘法线的「假细节」；
+//! - **法线坡度的量纲（本轮修）**：高度差分取「跨 2 纹素的高度差」，**不除以 UV
+//!   步长**。除之则坡度被放大 ~32 倍（分区只有 128 纹素），法线贴图全饱和 ⇒
+//!   渲染成「砂纸 / 木纹」；`bump` 的语义是「高度差 → 法线倾斜」的增益。
+//! - **规则图案在 128² 分区上必然摩尔纹化**：织物 / 皮革走大尺度噪声（折痕 +
+//!   细绒），织纹只留幅度 8% 的斜向细纹；旧版正交正弦斜纹在柱面 UV 下读作
+//!   「蛇皮 / 向日葵」。
 //! - 未做 mipmap（引擎纹理路径 v1 限制）：远处细密织纹会有轻微闪烁，由
 //!   TAA 压制。
 
@@ -147,13 +153,13 @@ impl Surface {
     pub fn sample(self, u: f32, v: f32, seed: u64) -> MaterialSample {
         let s = seed ^ (self.index() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         match self {
-            Surface::ClothTorso => cloth(u, v, s, [0.118, 0.130, 0.088], 24.0, 0.55),
-            Surface::ClothPants => cloth(u, v, s, [0.070, 0.074, 0.078], 28.0, 0.40),
+            Surface::ClothTorso => cloth(u, v, s, [0.118, 0.130, 0.088], 11.0, 0.55),
+            Surface::ClothPants => cloth(u, v, s, [0.070, 0.074, 0.078], 13.0, 0.40),
             Surface::Armor => armor(u, v, s),
             Surface::Helmet => painted_metal(u, v, s),
             Surface::Leather => leather(u, v, s, [0.120, 0.072, 0.038], 9.0),
             // 战靴偏棕（与缠柄胶带的近黑拉开距离：两者亮度接近，靠色相区分）
-            Surface::Boot => leather(u, v, s, [0.066, 0.050, 0.037], 14.0),
+            Surface::Boot => leather(u, v, s, [0.086, 0.065, 0.048], 14.0),
             Surface::Blade => blade(u, v, s),
             Surface::Gunmetal => gunmetal(u, v, s),
             Surface::Grip => grip_tape(u, v, s),
@@ -163,7 +169,7 @@ impl Surface {
             Surface::Webbing => webbing(u, v, s),
             Surface::Rubber => rubber(u, v, s),
             Surface::Undersuit => undersuit(u, v, s),
-            Surface::Pouch => cloth(u, v, s, [0.150, 0.130, 0.088], 32.0, 0.75),
+            Surface::Pouch => cloth(u, v, s, [0.108, 0.094, 0.064], 15.0, 0.75),
         }
     }
 }
@@ -209,16 +215,19 @@ fn build_atlas(size: u32, seed: u64) -> SoldierAtlas {
                 (srgb[2] * 255.0 + 0.5) as u8,
                 255,
             ]);
-            // 法线：分区内绕回的中心差分（步长落在本分区内，不跨区取样）
-            let step = 1.0 / tile as f32;
+            // 法线：分区内绕回的中心差分（步长落在本分区内，不跨区取样）。
+            //
+            // **量纲陷阱（本轮修）**：坡度取「跨 2 纹素的高度差」，不再除以 UV 步长。
+            // 高度场值域 0..1、分区仅 128 纹素 ⇒ 除以 2*step 会把坡度放大 ~32 倍，
+            // 法线贴图全饱和（每纹素随机倾斜 45°+），渲染出来就是「砂纸 / 木纹」；
+            // 现在的 bump = 「高度差 → 法线倾斜」的增益，1.0 约对应 45°。
+            let step = 2.0 / tile as f32;
             let x0 = wrap_tile(u - step);
             let x1 = wrap_tile(u + step);
             let y0 = wrap_tile(v - step);
             let y1 = wrap_tile(v + step);
-            let dhdu = (surface.sample(x1, v, seed).height - surface.sample(x0, v, seed).height)
-                / (2.0 * step);
-            let dhdv = (surface.sample(u, y1, seed).height - surface.sample(u, y0, seed).height)
-                / (2.0 * step);
+            let dhdu = surface.sample(x1, v, seed).height - surface.sample(x0, v, seed).height;
+            let dhdv = surface.sample(u, y1, seed).height - surface.sample(u, y0, seed).height;
             let bump = sample.bump;
             let len = (dhdu * dhdu * bump * bump + dhdv * dhdv * bump * bump + 1.0).sqrt();
             let n = [-dhdu * bump / len, -dhdv * bump / len, 1.0 / len];
@@ -310,21 +319,24 @@ pub fn ridged(u: f32, v: f32, freq: u32, octaves: u32, seed: u64) -> f32 {
 // ---------------------------------------------------------------------------
 
 /// 织物：经纬交织（两个正交正弦的乘积）+ 纤维绒面 + 大尺度脏污。
+/// 战斗服布料：**无规则图案**的软织物（大尺度折痕 + 细绒 + 污渍）。
+///
+/// 第一版用两组正交正弦做斜纹，在 128² 分区 + 柱面 UV 下读作「蛇皮 / 向日葵」
+/// ——规则图案落在近 Nyquist 的频率上必然摩尔纹化。织物在游戏视距下的正确
+/// 读法是**统计性的**：折痕走大尺度噪声，织纹只留极轻的各向异性细纹；
+/// 法线强度随之压到 0.30（第一版 1.3 的「砂纸」感）。
 fn cloth(u: f32, v: f32, seed: u64, base: [f32; 3], threads: f32, dirt: f32) -> MaterialSample {
     let tau = std::f32::consts::TAU;
-    // 斜纹（twill）：两组斜向线交织——正交正弦在 UV 柱面投影下会退化成
-    // 一圈圈横纹（第一版预览的「瓦楞纸」感），斜向纹样没有这个问题
+    let fold = fbm(u, v, 3, 4, seed ^ 0x11);
+    let grime = fbm(u, v, 5, 4, seed ^ 0x22);
+    let fuzz = fbm(u, v, 18, 3, seed ^ 0x33);
+    // 织纹：幅度 8% 的斜向细纹，只在掠射角下提供「这是布不是塑料」的暗示
     let warp = ((u + v) * threads * tau).sin() * 0.5 + 0.5;
     let weft = ((u - v) * threads * tau).sin() * 0.5 + 0.5;
-    let weave = (warp * weft).sqrt();
-    let fuzz = fbm(u, v, 16, 3, seed ^ 0x11);
-    let grime = fbm(u, v, 4, 5, seed ^ 0x22);
-    // 织纹权重下调 + 大尺度色斑：织物在游戏视距下应是「有质感的布」，
-    // 不是瓦楞纸（第一版 0.55 权重 + bump 2.6 的教训）
-    let patch = fbm(u, v, 2, 4, seed ^ 0x33);
-    let height = weave * 0.30 + fuzz * 0.40 + grime * 0.30;
-    let shade = (0.86 + 0.14 * (1.0 - grime)) * (0.90 + 0.20 * patch);
-    let wear = 1.0 + 0.08 * (fuzz - 0.5);
+    let weave = ((warp * weft).sqrt() - 0.5) * 0.16 + 0.5;
+    let height = fold * 0.52 + grime * 0.26 + fuzz * 0.14 + (weave - 0.5) * 0.08;
+    let shade = (0.95 + 0.05 * (1.0 - grime)) * (0.93 + 0.14 * fold);
+    let wear = 1.0 + 0.04 * (fuzz - 0.5);
     MaterialSample::new(
         [
             base[0] * shade * wear,
@@ -332,10 +344,10 @@ fn cloth(u: f32, v: f32, seed: u64, base: [f32; 3], threads: f32, dirt: f32) -> 
             base[2] * shade * wear,
         ],
         height,
-        1.3,
+        0.90,
         (0.80 + 0.12 * grime + 0.05 * dirt).min(1.0),
         0.0,
-        0.86 + 0.14 * weave,
+        0.90 + 0.10 * fold,
     )
 }
 
@@ -346,17 +358,17 @@ fn armor(u: f32, v: f32, seed: u64) -> MaterialSample {
     let wear = fbm(u, v, 6, 4, seed ^ 0x33);
     let worn = smooth((wear - 0.62) / 0.16);
     let base = [
-        0.078 + 0.105 * worn + 0.030 * dents,
-        0.084 + 0.115 * worn + 0.032 * dents,
-        0.094 + 0.130 * worn + 0.034 * dents,
+        0.074 + 0.038 * worn + 0.018 * dents,
+        0.080 + 0.042 * worn + 0.020 * dents,
+        0.088 + 0.046 * worn + 0.022 * dents,
     ];
     let height = dents * 0.6 + (1.0 - scratches) * 0.25 + 0.15;
     MaterialSample::new(
         base,
         height,
-        2.2,
+        0.85,
         (0.38 + 0.26 * scratches + 0.16 * worn).min(1.0),
-        0.86 - 0.08 * worn,
+        0.32 - 0.04 * worn,
         0.88 + 0.12 * dents,
     )
 }
@@ -366,8 +378,8 @@ fn painted_metal(u: f32, v: f32, seed: u64) -> MaterialSample {
     let chips = fbm(u, v, 9, 4, seed ^ 0x41);
     let rough_paint = fbm(u, v, 20, 3, seed ^ 0x42);
     let chipped = smooth((chips - 0.76) / 0.14);
-    let paint = [0.108, 0.118, 0.100];
-    let steel = [0.255, 0.265, 0.280];
+    let paint = [0.112, 0.122, 0.100];
+    let steel = [0.300, 0.312, 0.330];
     let base = [
         paint[0] * (1.0 - chipped) + steel[0] * chipped,
         paint[1] * (1.0 - chipped) + steel[1] * chipped,
@@ -376,44 +388,49 @@ fn painted_metal(u: f32, v: f32, seed: u64) -> MaterialSample {
     MaterialSample::new(
         base,
         chips * 0.8 + 0.2,
-        1.8,
+        0.90,
         0.54 - 0.18 * chipped + 0.10 * rough_paint,
         0.12 + 0.78 * chipped,
         0.90 + 0.10 * chips,
     )
 }
 
-/// 皮革（腰带 / 挂具 / 战靴）：脊状颗粒 + 折痕。
+/// 皮革（腰带 / 挂具 / 战靴）：柔和粒面 + 折痕。
+///
+/// 第一版用 Ridged 噪声做粒面，在 128² 下是锐利高频 ⇒ 靴子读作树皮。
+/// 皮革的正确读法是「大面积平滑 + 稀疏深折痕」。
 fn leather(u: f32, v: f32, seed: u64, base: [f32; 3], grain: f32) -> MaterialSample {
-    let cells = ridged(u, v, grain as u32, 4, seed ^ 0x51);
-    let creases = ridged(u, v, 3, 3, seed ^ 0x52);
-    let rub = fbm(u, v, 5, 4, seed ^ 0x53);
-    let height = cells * 0.75 + creases * 0.25;
-    let shade = 0.72 + 0.28 * (0.5 + 0.5 * creases) * (0.7 + 0.3 * rub);
+    let cells = fbm(u, v, grain as u32, 4, seed ^ 0x51);
+    let creases = fbm(u, v, 3, 3, seed ^ 0x52);
+    let rub = fbm(u, v, 6, 4, seed ^ 0x53);
+    // 高度场向**细粒**倾斜：低频折痕占比过大（0.40）时，法线贴图在近景会读成
+    // 「大块斑纹」（靴子特写实测像玳瑁皮），而皮革的正确读法是「均匀细粒 + 稀疏折痕」。
+    let height = cells * 0.62 + creases * 0.22 + rub * 0.16;
+    let shade = 0.92 + 0.08 * (0.4 + 0.6 * creases) * (0.85 + 0.15 * rub);
     MaterialSample::new(
         [base[0] * shade, base[1] * shade, base[2] * shade],
         height,
-        3.0,
+        0.55,
         (0.42 + 0.25 * (1.0 - rub) + 0.10 * cells).min(1.0),
         0.0,
-        0.80 + 0.20 * height,
+        0.86 + 0.14 * height,
     )
 }
 
 /// 刀身钢：纵向拉丝 + 稀疏崩口。
 fn blade(u: f32, v: f32, seed: u64) -> MaterialSample {
-    let brush = scratch_field_v(u, v, 220, seed ^ 0x61);
+    let brush = scratch_field_v(u, v, 120, seed ^ 0x61);
     let wide = fbm(u, v, 2, 4, seed ^ 0x62);
     let nick = smooth((fbm(u, v, 40, 2, seed ^ 0x63) - 0.86) / 0.06);
     let base = [
-        0.700 + 0.085 * wide - 0.18 * nick,
-        0.720 + 0.085 * wide - 0.18 * nick,
-        0.750 + 0.085 * wide - 0.18 * nick,
+        0.480 + 0.070 * wide - 0.14 * nick,
+        0.495 + 0.070 * wide - 0.14 * nick,
+        0.515 + 0.070 * wide - 0.14 * nick,
     ];
     MaterialSample::new(
         base,
         brush * 0.5 + wide * 0.5 - nick * 0.6,
-        1.6,
+        0.70,
         (0.10 + 0.14 * brush + 0.20 * nick).min(1.0),
         1.0,
         0.94 + 0.06 * wide,
@@ -422,19 +439,21 @@ fn blade(u: f32, v: f32, seed: u64) -> MaterialSample {
 
 /// 枪械金属：磷化黑 + 细划痕 + 轻微哑光。
 fn gunmetal(u: f32, v: f32, seed: u64) -> MaterialSample {
-    let fine = fbm(u, v, 28, 3, seed ^ 0x71);
+    let fine = fbm(u, v, 14, 3, seed ^ 0x71);
     let scratches = scratch_field(u, v, 40, seed ^ 0x72);
+    // 磷化黑（均值约 0.035 线性）——护甲钢是 0.081，两者若同亮度则
+    // 「护甲 / 枪械」在整身像里读作同一材质（tiles_are_visually_distinct 实测距离 1.65）。
     let base = [
-        0.028 + 0.020 * fine,
-        0.030 + 0.021 * fine,
-        0.033 + 0.022 * fine,
+        0.026 + 0.018 * fine,
+        0.028 + 0.019 * fine,
+        0.032 + 0.021 * fine,
     ];
     MaterialSample::new(
         base,
         fine * 0.6 + (1.0 - scratches) * 0.4,
-        2.2,
-        (0.36 + 0.18 * scratches).min(1.0),
-        0.88,
+        0.70,
+        (0.40 + 0.20 * scratches).min(1.0),
+        0.55,
         0.90 + 0.10 * fine,
     )
 }
@@ -443,15 +462,15 @@ fn gunmetal(u: f32, v: f32, seed: u64) -> MaterialSample {
 fn grip_tape(u: f32, v: f32, seed: u64) -> MaterialSample {
     let band = ((u + v) * 9.0).fract();
     let ridge = 1.0 - (2.0 * band - 1.0).abs();
-    let rib = ((v * 90.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let rib = ((v * 26.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
     let dirt = fbm(u, v, 6, 3, seed ^ 0x81);
     let height = ridge * 0.7 + rib * 0.3;
     let base = [0.052, 0.049, 0.043];
-    let shade = 0.65 + 0.35 * (0.5 + 0.5 * ridge) * (0.8 + 0.2 * dirt);
+    let shade = 0.78 + 0.22 * (0.5 + 0.5 * ridge) * (0.88 + 0.12 * dirt);
     MaterialSample::new(
         [base[0] * shade, base[1] * shade, base[2] * shade],
         height,
-        2.8,
+        0.60,
         0.78 + 0.10 * dirt,
         0.0,
         0.82 + 0.18 * height,
@@ -464,12 +483,12 @@ fn glove(u: f32, v: f32, seed: u64) -> MaterialSample {
     let cell = 3.0;
     let (cx, cy) = ((u * cell).fract() - 0.5, (v * cell).fract() - 0.5);
     let pad = smooth(1.0 - (cx * cx + cy * cy).sqrt() / 0.42);
-    let base = [0.038, 0.038, 0.042];
-    let shade = 0.8 + 0.35 * pad + 0.2 * (grain - 0.5);
+    let base = [0.072, 0.070, 0.066];
+    let shade = 0.88 + 0.20 * pad + 0.10 * (grain - 0.5);
     MaterialSample::new(
         [base[0] * shade, base[1] * shade, base[2] * shade],
         grain * 0.4 + pad * 0.9,
-        3.4,
+        0.80,
         (0.44 + 0.18 * (1.0 - pad)).min(1.0),
         0.0,
         0.84 + 0.16 * pad.max(grain),
@@ -479,7 +498,7 @@ fn glove(u: f32, v: f32, seed: u64) -> MaterialSample {
 /// 黄铜饰件：亮铜 + 氧化暗斑。
 fn trim(u: f32, v: f32, seed: u64) -> MaterialSample {
     let patina = fbm(u, v, 7, 4, seed ^ 0xa1);
-    let fine = fbm(u, v, 30, 2, seed ^ 0xa2);
+    let fine = fbm(u, v, 15, 2, seed ^ 0xa2);
     let base = [
         0.26 * (0.7 + 0.5 * patina),
         0.18 * (0.7 + 0.5 * patina),
@@ -488,8 +507,8 @@ fn trim(u: f32, v: f32, seed: u64) -> MaterialSample {
     MaterialSample::new(
         base,
         patina * 0.7 + fine * 0.3,
-        2.0,
-        0.22 + 0.35 * (1.0 - patina),
+        1.00,
+        0.30 + 0.32 * (1.0 - patina),
         1.0,
         0.90 + 0.10 * patina,
     )
@@ -497,15 +516,15 @@ fn trim(u: f32, v: f32, seed: u64) -> MaterialSample {
 
 /// 尼龙织带：横向罗纹 + 编织细纹。
 fn webbing(u: f32, v: f32, seed: u64) -> MaterialSample {
-    let rib = ((v * 34.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let rib = ((v * 14.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
     let weave = fbm(u, v, 24, 2, seed ^ 0xb1);
     let height = rib * 0.7 + weave * 0.3;
-    let base = [0.088, 0.076, 0.050];
-    let shade = 0.75 + 0.25 * rib;
+    let base = [0.098, 0.086, 0.058];
+    let shade = 0.86 + 0.14 * (0.4 + 0.6 * weave) * (0.85 + 0.15 * rib);
     MaterialSample::new(
         [base[0] * shade, base[1] * shade, base[2] * shade],
         height,
-        2.4,
+        0.70,
         0.74 + 0.12 * weave,
         0.0,
         0.86 + 0.14 * rib,
@@ -514,16 +533,16 @@ fn webbing(u: f32, v: f32, seed: u64) -> MaterialSample {
 
 /// 橡胶：细密颗粒。
 fn rubber(u: f32, v: f32, seed: u64) -> MaterialSample {
-    let bumps = fbm(u, v, 48, 3, seed ^ 0xc1);
+    let bumps = fbm(u, v, 22, 3, seed ^ 0xc1);
     let base = [
-        0.020 + 0.014 * bumps,
-        0.020 + 0.014 * bumps,
-        0.021 + 0.014 * bumps,
+        0.034 + 0.018 * bumps,
+        0.034 + 0.018 * bumps,
+        0.036 + 0.018 * bumps,
     ];
     MaterialSample::new(
         base,
         bumps,
-        3.0,
+        0.80,
         0.90 - 0.06 * bumps,
         0.0,
         0.88 + 0.12 * bumps,
@@ -532,16 +551,16 @@ fn rubber(u: f32, v: f32, seed: u64) -> MaterialSample {
 
 /// 内衬紧身衣：细针织（斜向小格）。
 fn undersuit(u: f32, v: f32, seed: u64) -> MaterialSample {
-    let knit = ((u * 70.0 + v * 70.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
-    let knit2 = ((u * 70.0 - v * 70.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let knit = ((u * 22.0 + v * 22.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let knit2 = ((u * 22.0 - v * 22.0) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
     let fuzz = fbm(u, v, 20, 3, seed ^ 0xd1);
     let height = knit * knit2 * 0.7 + fuzz * 0.3;
-    let base = [0.032, 0.034, 0.038];
-    let shade = 0.8 + 0.3 * height;
+    let base = [0.046, 0.049, 0.055];
+    let shade = 0.88 + 0.16 * height;
     MaterialSample::new(
         [base[0] * shade, base[1] * shade, base[2] * shade],
         height,
-        2.4,
+        0.70,
         0.66 + 0.12 * fuzz,
         0.05,
         0.84 + 0.16 * height,
