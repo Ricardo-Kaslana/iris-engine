@@ -28,6 +28,11 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Entity, Quat, Transform, World};
 use iris_render::prelude::*;
 
+/// 七项测试各自建渲染器、共用单 GPU 适配器，并行会互相争用直至停顿
+/// （R62b 同款形态，debug 下亦复现两次）——文件内互斥串行化（参照
+/// `ssr_render.rs::GPU_SERIAL`），标准门禁命令默认可靠。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ═══════════════════════════════════════════════════════════════════════
 // 基线常量（全部为 R61 改动落地**之前**的旧代码实跑捕获）
 // ═══════════════════════════════════════════════════════════════════════
@@ -412,6 +417,7 @@ fn over_budget_scene() -> World {
 /// 像素零触碰（本轮全部 FNV 基线重锁的归因前提）。
 #[test]
 fn shadow_off_control_group_is_bit_identical_to_pre_r61() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 180) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -466,6 +472,7 @@ fn shadow_off_control_group_is_bit_identical_to_pre_r61() {
 /// 又踩过一次——共用渲染器时接触阴影场景的哈希对不上 R60，拆开即逐位一致）。
 #[test]
 fn legacy_bias_mode_reproduces_r60_output_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut grazing_renderer) = OffscreenRenderer::new(320, 180) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -541,6 +548,7 @@ fn acne_pixels(with_shadows: &[u8], without_shadows: &[u8]) -> usize {
 /// 个。断言同时钉住「旧口径确实有 acne」（否则测试退化）与「新口径归零」。
 #[test]
 fn slope_scaled_bias_removes_grazing_plane_acne() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 180) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -637,6 +645,7 @@ fn contact_gap_pixels(px: &[u8], w: u32, h: u32) -> f32 {
 /// ③ **不浮起**：v2 的阴影根部亮带 ≤ 4 px（法线偏移没有把接触阴影推走）。
 #[test]
 fn contact_shadow_stays_attached_for_low_caster() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(640, 360) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -707,6 +716,7 @@ fn darkened_mask(on: &[u8], off: &[u8], w: u32, h: u32) -> (usize, f32) {
 /// ④ `FrameStats.point_shadow_casters` 逐帧报告 0/1/1/2。
 #[test]
 fn two_point_lights_cast_independent_shadows() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(384, 216) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -766,6 +776,7 @@ fn two_point_lights_cast_independent_shadows() {
 /// （选择键不依赖查询序 ⇒ 同灯集合必得同结果）。
 #[test]
 fn point_shadow_budget_caps_casters_deterministically() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 180) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -788,6 +799,7 @@ fn point_shadow_budget_caps_casters_deterministically() {
 /// 帧内相机与物体都在动（阴影贴图、级联拟合、选择键每帧重算）。
 #[test]
 fn shadow_v2_sessions_are_bitwise_identical() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     const FRAMES: u32 = 30;
     let scene = |frame: u32| {
         let mut world = two_casters_scene(CasterMode::Both);

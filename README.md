@@ -246,7 +246,7 @@ flowchart TB
 ```
 iris-engine/
 ├── assets/              # 示例资产（cube.gltf + cube0.bin + sunset.hdr + arena.scene.json，gen_asset 生成；collect_arena.scene.json / arena_battle.scene.json 为手写关卡，assault_courtyard.level.json 为 R57 关卡档 v2（assault 庭院静态世界），enemy_worm.glb 由 gen_asset 生成）
-├── crates/
+├── crates/              # 引擎 crate
 │   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
 │   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞（benches/ criterion 基准 + tests/budgets.rs release 预算门禁）
 │   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
@@ -254,13 +254,14 @@ iris-engine/
 │   ├── iris-audio/      # 软件混音器、WAV / OGG 加载、流式音乐总线、混响、程序化音效、cpal 设备层
 │   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 关卡格式 v2（level）+ 示例
 │   │   └── examples/    # cube / orbit / model / instanced / offscreen / gen_asset / gltf_snapshot / shadow_snapshot / csm_snapshot / point_shadow_snapshot / bloom_snapshot / hdr_snapshot / ui_snapshot / audio_snapshot / skin_snapshot / game_snapshot / arena_snapshot / physics_snapshot / culling_bench / memory_bench / scene_snapshot / particle_snapshot / web（wasm 专用入口，见「Web 构建」）
-│   ├── iris-game/       # 引擎下游示范游戏 I：第三人称限时收集（见「用 Iris 做的游戏」）
-│   ├── iris-arena/      # 引擎下游示范游戏 II：波次生存竞技场（同上）
-│   ├── iris-bastion/    # 引擎下游示范游戏 III：塔防 Iris Bastion（同上）
-│   ├── iris-ascent/     # 引擎下游示范游戏 IV：3D 平台跳跃 Iris Ascent（同上）
-│   ├── iris-infiltration/ # 引擎下游示范游戏 V：第三人称潜入 Iris Infiltration（同上）
-│   ├── iris-assault/    # 引擎下游示范游戏 VI：写实战斗庭院 Iris Assault（同上）
 │   └── iris-editor/     # 关卡摆放编辑器（R58a 最小 MVP：命令层 edit + 交互壳 shell，见「关卡编辑器」）
+├── games/               # 引擎下游示范游戏（dogfooding，见「用 Iris 做的游戏」）
+│   ├── iris-game/       # I：第三人称限时收集
+│   ├── iris-arena/      # II：波次生存竞技场
+│   ├── iris-bastion/    # III：塔防 Iris Bastion
+│   ├── iris-ascent/     # IV：3D 平台跳跃 Iris Ascent
+│   ├── iris-infiltration/ # V：第三人称潜入 Iris Infiltration
+│   └── iris-assault/    # VI：写实战斗庭院 Iris Assault
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -450,7 +451,7 @@ UI 与菜单框架实测（R41，`docs/ui_menu.png`）：3D 背景之上叠加**
 把 R21–R25 的五个新能力（射线拾取 / 蒙皮剔除统计 / 透明材质 / 粒子 / 空间
 音频）当载荷整体压榨一轮。
 
-### I. Iris Collect（`crates/iris-game`）——第三人称限时收集
+### I. Iris Collect（`games/iris-game`）——第三人称限时收集
 
 **Dogfooding I**——10 枚金币、60 秒倒计时、围墙竞技场、跳跃拾取、HUD、
 程序化音效。
@@ -485,7 +486,7 @@ cargo run -p iris-game --release   # 玩游戏（WASD 移动 / Space 跳跃）
 cargo run --example game_snapshot --release   # 双时刻离屏验收图
 ```
 
-### II. Iris Arena（`crates/iris-arena`）——波次生存竞技场
+### II. Iris Arena（`games/iris-arena`）——波次生存竞技场
 
 **Dogfooding II**——俯视 3/4 视角竞技场：WASD 移动（屏幕相对 + 贴墙滑行）、
 **Shift 冲刺**（0.15 s 高速 + 0.25 s 无敌帧）、**自动开火**（每 0.25 s 朝
@@ -530,7 +531,7 @@ cargo run -p iris-arena --release   # 玩游戏（WASD 移动 / Shift 冲刺 / �
 cargo run -p iris-engine --example arena_snapshot --release   # 双时刻离屏验收图
 ```
 
-### III. Iris Bastion（`crates/iris-bastion`）——俯视塔防
+### III. Iris Bastion（`games/iris-bastion`）——俯视塔防
 
 **Dogfooding III**——俯视固定视角塔防：敌人沿 7 段 6 弯的航点折线进攻路径
 末端的核心，玩家用击杀所得积分在 20×14 的 1×1 m 网格上放塔——**哨兵**
@@ -580,7 +581,7 @@ cargo run -p iris-bastion --release                  # 玩游戏（鼠标选格 
 cargo run -p iris-bastion --example bastion_snapshot --release   # 中期战局离屏验收帧
 ```
 
-### IV. Iris Ascent（`crates/iris-ascent`）——3D 平台跳跃
+### IV. Iris Ascent（`games/iris-ascent`）——3D 平台跳跃
 
 **Dogfooding IV**——第三人称线性上升关卡：角色沿悬浮台地（0.28 m 台阶）
 → 大球坡面（R = 14，走落 + 球顶定点跳）→ **四段跳板弹射**（竖直冲量
@@ -665,7 +666,7 @@ cargo run -p iris-ascent --release                  # 玩游戏（WASD 移动 / 
 cargo run -p iris-ascent --example ascent_snapshot --release   # 中段战局离屏验收帧
 ```
 
-### V. Iris Infiltration（`crates/iris-infiltration`）——第三人称潜入
+### V. Iris Infiltration（`games/iris-infiltration`）——第三人称潜入
 
 **Dogfooding V**——俯视偏斜 45° 第三人称的 24×18 m 单层设施潜入：玩家从
 走廊西端潜入，绕过两名巡逻守卫取 3 个数据核心，抵达出口获胜；被发现 3 次
@@ -749,7 +750,7 @@ cargo run -p iris-infiltration --release                  # 玩游戏（WASD 移
 cargo run -p iris-infiltration --example infiltration_snapshot --release   # 中段战局离屏验收帧
 ```
 
-### VI. Iris Assault（`crates/iris-assault`）——写实战斗庭院
+### VI. Iris Assault（`games/iris-assault`）——写实战斗庭院
 
 **Dogfooding VI（写实路线垂直切片）**——20×14 m 战斗庭院：黄昏斜阳下的
 砖围墙、四角石柱与中央喷泉（圆障碍），持刀 + 步枪的玩家与 4 名持刀敌人

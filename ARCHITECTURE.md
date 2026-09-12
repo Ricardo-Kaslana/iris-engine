@@ -14,20 +14,23 @@
 
 ## 2. Crate 划分与依赖方向
 
-```text
-iris-macros (proc-macro)      iris-audio（纯音频库，零 iris 依赖）
-    ↑                              ↑
-iris-core ──── iris-platform       │
-    ↑              ↑               │
-iris-render ───────┘               │
-    ↑                              │
-iris-engine（门面，用户唯一入口）────┘
-    ↑
-iris-game（下游示范游戏 I）── iris-arena（下游示范游戏 II）
-          └── iris-bastion（下游示范游戏 III）── iris-ascent（下游示范游戏 IV）
-                              └── iris-infiltration（下游示范游戏 V）
-                                  └── iris-assault（下游示范游戏 VI）
-                                      └── iris-editor（关卡摆放编辑器，R58a 工具 crate）
+```
+├── crates/              # 引擎 crate
+│   ├── iris-macros/     # 过程宏：#[derive(Component / Resource / Event)]
+│   ├── iris-core/       # ECS、调度、变换层级、时间、事件、物理与碰撞
+│   ├── iris-render/     # wgpu 渲染器、glTF 管线、离屏渲染
+│   ├── iris-platform/   # 窗口配置、键鼠输入
+│   ├── iris-audio/      # 软件混音器、WAV / OGG 加载、流式音乐总线、混响、程序化音效、cpal 设备层
+│   ├── iris-engine/     # App 门面、插件系统、主循环、场景序列化 + 关卡格式 v2（level）+ 示例
+│   │   └── examples/    # 示例
+│   └── iris-editor/     # 关卡摆放编辑器
+└── games/               # 引擎下游示范游戏
+    ├── iris-game/       # I：第三人称限时收集
+    ├── iris-arena/      # II：波次生存竞技场
+    ├── iris-bastion/    # III：塔防 Iris Bastion
+    ├── iris-ascent/     # IV：3D 平台跳跃 Iris Ascent
+    ├── iris-infiltration/ # V：第三人称潜入 Iris Infiltration
+    └── iris-assault/    # VI：写实战斗庭院 Iris Assault
 ```
 
 - **iris-macros**：`#[derive(Component / Resource / Event)]`。通过 `extern crate self as iris_core`
@@ -734,7 +737,7 @@ v1 诚实清单），本节是架构级摘要。
   路点；②呼叫增援：发现玩家 → `GuardAlert` → 半径内守卫支援）是「树相对
   状态机的扩展力」载荷：支援态**不进** `GuardState` 枚举，由黑板承载
   （`guard.support_timer` / `guard.alert_pos`），轨迹与状态在
-  `crates/iris-infiltration/tests/guard_behavior.rs` 里以精确断言钉住。
+  `games/iris-infiltration/tests/guard_behavior.rs` 里以精确断言钉住。
 
 ## 4. 渲染管线（iris-render）
 

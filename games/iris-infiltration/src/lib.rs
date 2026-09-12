@@ -56,7 +56,7 @@
 //! `ARCHITECTURE.md` §8 摩擦清单，绕行写在本 crate 内。R65 是例外——那一轮
 //! 是**引擎轮的实战验收**：守卫驱动迁移到 `iris-core` 的行为树 / 黑板 / 感知
 //! 事件，游戏侧同步改动，行为等价的证据是「迁移前后全状态轨迹 FNV 逐位相同」
-//! （见 `crates/iris-infiltration/tests/` 与 ARCHITECTURE §3.11）。
+//! （见 `games/iris-infiltration/tests/` 与 ARCHITECTURE §3.11）。
 
 pub mod logic;
 pub mod plugin;

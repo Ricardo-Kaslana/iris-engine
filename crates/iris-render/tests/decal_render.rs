@@ -25,6 +25,11 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Entity, GlobalTransform, Transform, World};
 use iris_render::prelude::*;
 
+/// 七项测试各自建渲染器、共用单 GPU 适配器，并行时实测段错误
+/// （0xc0000005，与 shadow_v2/transparent 的并行停顿同一病灶）——
+/// 文件内互斥串行化（参照 `ssr_render.rs::GPU_SERIAL`）。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 端盖相对被贴表面的向相机侧抬升量（米）——共面深度的浮点裕量，
 /// 见模块文档。
 const CAP_EPSILON: f32 = 0.002;
@@ -206,6 +211,7 @@ fn first_decal_entity(world: &World) -> Entity {
 /// 端盖朝向错误或投影矩阵组装错误，采样点的格色 / 区域颜色必然错位。
 #[test]
 fn decal_projects_checkerboard_onto_plane() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -254,6 +260,7 @@ fn decal_projects_checkerboard_onto_plane() {
 /// 渲染的边缘 texel 拉伸）或盒裁剪失效，环带必出现非绿像素。
 #[test]
 fn decal_clips_at_box_boundary() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -319,6 +326,7 @@ fn decal_clips_at_box_boundary() {
 /// sRGB 任一环节偏差都会超出容差。
 #[test]
 fn decal_alpha_blend_is_exact() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let alpha = 128.0f32 / 255.0;
     // 待测场景：α=128/255 纯红贴花 on 绿地面
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
@@ -375,6 +383,7 @@ fn decal_alpha_blend_is_exact() {
 /// α' = (128/255)×0.5。单点断言（±2/255，参考渲染法）。
 #[test]
 fn decal_tint_multiplies_color_and_alpha() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let alpha = (128.0f32 / 255.0) * 0.5; // tex.a × tint.a
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
@@ -430,6 +439,7 @@ fn decal_tint_multiplies_color_and_alpha() {
 /// 透明之后，合成变为 decal ∘ glass ∘ wall（r 通道 0.5 vs 0.25），断言必挂。
 #[test]
 fn decal_draws_before_transparent_geometry() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let a = 0.5f32;
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
@@ -538,6 +548,7 @@ fn decal_draws_before_transparent_geometry() {
 /// 的贴花正常入画并计入统计。
 #[test]
 fn hidden_decals_are_skipped_with_ancestor_cascade() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     // --- 自身 HIDDEN：贴花不出现、不计剔除 ---
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
@@ -608,6 +619,7 @@ fn hidden_decals_are_skipped_with_ancestor_cascade() {
 /// 剔除计数）；加一枚贴花后统计恰好 +1 批 / +1 实例 / +4 三角形。
 #[test]
 fn scene_without_decals_matches_pre_decal_stats() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;

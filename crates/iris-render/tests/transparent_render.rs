@@ -30,6 +30,11 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Transform, World};
 use iris_render::prelude::*;
 
+/// 五项测试各自建渲染器、共用单 GPU 适配器，并行会互相争用直至停顿
+/// （全量门禁实测：单测 18 分钟零推进）——文件内互斥串行化（参照
+/// `ssr_render.rs::GPU_SERIAL`），标准门禁命令默认可靠。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 测试用自发光强度：ACES 压缩后各通道仍可分辨（>40/255 间隔）。
 const E: f32 = 2.0;
 /// 透明板混合系数。
@@ -108,6 +113,7 @@ fn assert_pixel_near(got: [i32; 3], want: [i32; 3], tol: i32, what: &str) {
 /// 绘制或透明未画都会显著偏离参考值。
 #[test]
 fn transparent_blends_over_opaque_geometry() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     // 待测场景：红不透明在后 + 蓝透明在前
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
@@ -168,6 +174,7 @@ fn transparent_blends_over_opaque_geometry() {
 /// 互换，参考断言必然失败；其余任何非 back-to-front 排列同理偏离。
 #[test]
 fn transparent_sorts_back_to_front() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -236,6 +243,7 @@ fn transparent_sorts_back_to_front() {
 ///     无关，断言不依赖并列深度时的实体序）。
 #[test]
 fn transparent_depth_test_on_write_off() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     // (a) 三层合成：红(近 z=1) over 绿(z=-1) over 不透明蓝(z=-3)
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
@@ -342,6 +350,7 @@ fn transparent_depth_test_on_write_off() {
 /// 在透明 / 不透明版下定义不同，见模块文档）。
 #[test]
 fn transparent_geometry_casts_no_shadow() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let render = |alpha_mode: AlphaMode, shadows: bool| {
         // 闭包返回 Option，无 GPU 适配器经 `?` 提前返回 None（调用方优雅跳过）
         let mut renderer = OffscreenRenderer::new(256, 256)?;
@@ -422,6 +431,7 @@ fn transparent_geometry_casts_no_shadow() {
 /// run），5 实例 60 三角形全部计入统计。
 #[test]
 fn transparent_run_batches_same_key() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;

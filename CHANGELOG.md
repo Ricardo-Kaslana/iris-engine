@@ -5,6 +5,31 @@
 
 ## [Unreleased]
 
+### Changed（仓库结构：六个 dogfooding 游戏 crate 迁入根级 `games/`）
+
+`iris-game / iris-arena / iris-bastion / iris-ascent / iris-infiltration / iris-assault`
+从 `crates/` 迁出到工作区根下的 `games/`，引擎 crate 与游戏 crate 在目录层面
+分离（`git mv`，文件内容除文档注释中的路径提法外零改动）。纯结构变更：
+
+- workspace `members` 与 `workspace.dependencies` 的路径同步改为 `games/...`；
+- 资产解析不受影响——`iris_engine::asset_path` 的工作区根来自 **iris-engine
+  自身** `CARGO_MANIFEST_DIR` 上溯两级（`crates/iris-engine` 未动），与游戏
+  crate 位置无关；`iris-assault` 音频 fixture 的 `../../crates/...` 回退在新
+  布局下（`games/iris-assault` 上溯两级）仍指向工作区根，无需修改；
+- README 六个游戏小节、ARCHITECTURE 路径提法、iris-infiltration 文档注释
+  同步更新；CHANGELOG 历史条目中的旧路径保留（历史记录不改写）。
+
+### Fixed（测试基建：三个 GPU 套件补文件内串行互斥 `GPU_SERIAL`）
+
+全量门禁复跑中三个 iris-render 测试套件在**同文件多测试并行**下共用单 GPU
+适配器互相争用（R62b 记录过的病灶，本轮在 debug 下首次复现，症状谱更宽）：
+`shadow_v2_render` 两轮自旋 10 分钟零推进、`transparent_render` 空转 18 分钟、
+`decal_render` 直接段错误（0xc0000005）。归因证据：`shadow_v2_render` 串行
+单跑 7 项仅 10.1 秒全过；cargo test 的测试二进制之间本就串行执行，争用只来自
+同文件并行。按 R62b 既定修法给三个文件加 `static GPU_SERIAL: Mutex<()>`
+（参照 `ssr_render.rs`），修复后全量 debug 门禁一次通过（1178 passed 与基线
+一致）。测试代码断言逻辑零改动。
+
 ### Changed（角色建模迭代轮二：四肢塑形 + 关节铰接 + 头面重建）
 
 上一轮把「手足」推到可用，本轮按用户给定次序补齐**四肢 → 躯体 → 关节 → 衣物 →
@@ -103,6 +128,7 @@
 诚实限制（未变）：图集仍是 512²（16 × 128² 分区、无 mipmap）；头部与面部本轮
 **未动**（排在用户给定次序的最后，下一轮处理）；布料没有姿态空间褶皱，关节弯曲
 仍靠权重混合与装备遮挡。
+
 ### Changed（视觉上限轮：Iris Assault 角色与庭院重建——程序化蒙皮人形 + 程序化建筑庭院）
 
 把「写实战斗庭院」的**内容侧**推到引擎当前能力的上限：角色从 22 个骨节点上

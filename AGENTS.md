@@ -17,7 +17,7 @@ crate 布局（依赖自上而下）：
 | `iris-render` | wgpu 渲染：PBR + 法线/ORM、CSM + 点光预算化阴影、TAA、烘焙 GI（光照贴图）、反射探针 + SSR、heightmap 地形、粒子、贴花、后处理链（DOF/MB/泛光/FXAA）、动画 v4、GLB、RTT、遮挡剔除 |
 | `iris-engine` | 插件编排（DefaultPlugins）/ App / 场景与**关卡格式 v2** / GltfBuilder / pack 打包 / AssetMount / manifest 优先级异步加载 / 演出时间线 / UI 菜单 / Settings / GLB 动画注册表 |
 | `iris-editor` | 关卡摆放编辑器（**编辑命令层 + 交互壳分离**——命令层全部可 headless 单测；undo / 光源编辑 / 烘焙入口 / 导航可视化） |
-| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` `iris-assault` | 六个 dogfooding 游戏（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
+| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` `iris-assault` | 六个 dogfooding 游戏，位于根级 `games/`（引擎 crate 在 `crates/`，目录分离）（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
 
 **架构与特性全景唯一权威是 `ARCHITECTURE.md`**（§1–§8），改任何子系统前先读对应章节；`§8 已知限制` 是诚实清单，别把已声明的限制当 bug 修。历史脉络（逐轮做了什么）在 `CHANGELOG.md` 与 git log，不依赖会话记忆。
 
@@ -78,7 +78,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ## 测试规约
 
 - 断言用**精确值**（解析解对照、±1e-5 容差写明依据），不写「大于 0」式摆设断言；**有效性断言要可判别**（R53/R60 的指标学教训：指标要在分布高端区分、ROI 避开混淆源）。
-- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿、debug 反而通过——各测自建渲染器的每帧 poll 同步循环互相争用）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。
+- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿；后续复测发现 debug 同样会挂——shadow_v2_render 两轮自旋 10 分钟零推进，transparent_render 空转 18 分钟、decal_render 直接段错误 0xc0000005——症状谱：**自旋挂死 / 空转死等 / 驱动侧段错误**，同一病灶）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。新写 GPU 套件时直接带上互斥，别等挂了再补。cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。
 - should_panic 测试若依赖 `debug_assert!`，必须 `#[cfg(debug_assertions)]` 门控（R33/R38 各踩过一次 release 假失败）。
 - 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline/edit_headless 四次：R62a 验收 `pid` 同名目录下并行测试线程互删文件；R63 验收 editor 测试只在 pid 后**无调用序计数**——Windows 复用历史运行 pid 时 `create_dir_all` 命中旧目录 ⇒ `loaded = true` / 陈旧产物失配，debug 时序不同侥幸通过、release 才炸；唯一名 = 进程 id + 调用序计数，缺一不可）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试；渲染器按**句柄值**缓存 GPU 资源——同一渲染器上渲染「同句柄不同内容」的多个世界会串味（R53/R62 两次踩到），跨世界对照必须各用独立渲染器。
