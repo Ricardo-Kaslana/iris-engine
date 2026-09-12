@@ -16,3 +16,7 @@ assets/JingLiu_*.glb
 # 删除会丢用户实际编辑内容，故仅忽略——infiltration_settings.json 同款先例）
 /assets/editor_mvp.level.json
 /assets/editor_mvp.level.ilm
+
+.atomcode
+.mcp.json
+.zcode
