@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "iris-arena"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "iris-ascent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "iris-assault"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "iris-audio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "criterion",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "iris-bastion"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1063,7 +1063,7 @@ dependencies = [
 
 [[package]]
 name = "iris-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "glam",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "iris-editor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "iris-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "env_logger",
  "glam",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "iris-game"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "iris-infiltration"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glam",
  "iris-core",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "iris-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "iris-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iris-core",
  "log",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "iris-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "criterion",

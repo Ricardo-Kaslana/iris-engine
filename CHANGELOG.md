@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-12
+
 ### Changed（仓库结构：六个 dogfooding 游戏 crate 迁入根级 `games/`）
 
 `iris-game / iris-arena / iris-bastion / iris-ascent / iris-infiltration / iris-assault`
