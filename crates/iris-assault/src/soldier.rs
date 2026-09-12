@@ -93,6 +93,36 @@ fn limb(a: Vec3, b: Vec3, profile: &[(f32, f32, f32, f32)], segments: u32) -> Me
     geom::tube(a, b, profile, segments, Vec3::Z)
 }
 
+/// 带**前后 / 左右偏移**的肢体放样：剖面 `(t, 半宽 X, 半深 Z, 指数, 左偏 X, 后偏 Z)`。
+///
+/// 与 [`limb`] 的唯一区别是最后两个数：每一行的截面中心可以离开 `a → b` 轴线。
+/// 真实的四肢不是锥管——股四头肌前凸、腘绳肌后鼓、腓肠肌在后、踝上收成跟腱，
+/// 侧影的每一处起伏都在前后方向上。轴竖直（向下）时局部基 = (+X, +Z)，故
+/// `ox` 沿 X、`oz` 沿 Z；**角色面朝 −Z ⇒ `oz > 0` 是向身后**。
+fn limb_shaped(
+    a: Vec3,
+    b: Vec3,
+    profile: &[(f32, f32, f32, f32, f32, f32)],
+    segments: u32,
+) -> MeshData {
+    assert!(profile.len() >= 2, "剖面至少两点");
+    let axis = (b - a).normalize();
+    let hint = if Vec3::Z.cross(axis).length_squared() < 1e-8 {
+        Vec3::X
+    } else {
+        Vec3::Z
+    };
+    let right = hint.cross(axis).normalize();
+    let up = axis.cross(right).normalize();
+    let sections: Vec<Section> = profile
+        .iter()
+        .map(|&(t, hx, hz, e, ox, oz)| {
+            Section::new(a + (b - a) * t + right * ox + up * oz, right, up, hx, hz, e)
+        })
+        .collect();
+    geom::loft(&sections, segments, true)
+}
+
 /// 沿 Z 轴放样（枪管 / 靴楦）：剖面 `(t, 半宽 X, 半高 Y, 指数)`。
 fn bore(a: Vec3, b: Vec3, profile: &[(f32, f32, f32, f32)], segments: u32) -> MeshData {
     geom::tube(a, b, profile, segments, Vec3::Y)
@@ -198,7 +228,9 @@ pub fn build_soldier_mesh() -> SoldierMesh {
     push_legs(&rig, &mut assembly);
     push_arms(&rig, &mut assembly);
     push_head(&rig, &mut assembly);
+    push_joints(&rig, &mut assembly);
     push_fabric(&rig, &mut assembly);
+    push_uniform(&rig, &mut assembly);
     push_gear(&mut assembly);
     push_sword(&rig, &mut assembly);
     let inverse_bind = rig.world.iter().map(|m| m.inverse()).collect();
@@ -269,25 +301,27 @@ fn arm_chain(rig: &Rig, upper: usize, fore: usize, hand: usize) -> Vec<ChainBone
 /// 才没有「断肩」。
 fn push_torso(rig: &Rig, assembly: &mut Assembly) {
     let cloth = Surface::ClothTorso.tile();
-    let sections: Vec<(f32, f32, f32, f32)> = vec![
-        (0.858, 0.102, 0.088, 2.2),
-        (0.898, 0.146, 0.110, 2.3),
-        (0.958, 0.162, 0.118, 2.4),
-        (1.030, 0.150, 0.108, 2.4),
-        (1.100, 0.134, 0.098, 2.3),
-        (1.180, 0.141, 0.103, 2.3),
-        (1.270, 0.158, 0.113, 2.4),
-        (1.360, 0.176, 0.122, 2.4),
-        (1.450, 0.190, 0.127, 2.5),
-        (1.530, 0.196, 0.126, 2.5),
-        (1.600, 0.197, 0.121, 2.6),
-        (1.655, 0.181, 0.109, 2.6),
-        (1.700, 0.126, 0.093, 2.5),
-        (1.734, 0.084, 0.079, 2.3),
+    // 剖面五元组：(y, 半宽 X, 半深 Z, 指数, 前后偏移 z)。角色面朝 −Z ⇒ 负值向身前。
+    // 臀后凸、腰内收、胸椎后凸、胸骨前凸——侧影的 S 曲线全靠截面中心偏移
+    let sections: [(f32, f32, f32, f32, f32); 14] = [
+        (0.858, 0.102, 0.088, 2.2, 0.000),
+        (0.898, 0.146, 0.110, 2.3, 0.008),
+        (0.958, 0.162, 0.118, 2.4, 0.006),
+        (1.030, 0.150, 0.108, 2.4, -0.002),
+        (1.100, 0.134, 0.098, 2.3, -0.004),
+        (1.180, 0.141, 0.103, 2.3, -0.002),
+        (1.270, 0.158, 0.113, 2.4, 0.002),
+        (1.360, 0.176, 0.122, 2.4, 0.001),
+        (1.450, 0.190, 0.127, 2.5, -0.004),
+        (1.530, 0.196, 0.126, 2.5, -0.006),
+        (1.600, 0.197, 0.121, 2.6, -0.004),
+        (1.655, 0.181, 0.109, 2.6, 0.000),
+        (1.700, 0.126, 0.093, 2.5, 0.004),
+        (1.734, 0.084, 0.079, 2.3, 0.004),
     ];
     let sections: Vec<Section> = sections
         .iter()
-        .map(|&(y, hx, hz, e)| Section::new(Vec3::new(0.0, y, 0.0), Vec3::X, Vec3::Z, hx, hz, e))
+        .map(|&(y, hx, hz, e, oz)| Section::new(Vec3::new(0.0, y, oz), Vec3::X, Vec3::Z, hx, hz, e))
         .collect();
     assembly.add(
         Piece::new(geom::loft(&sections, 18, true))
@@ -333,9 +367,7 @@ fn push_torso(rig: &Rig, assembly: &mut Assembly) {
 /// 双腿：大腿 / 小腿 / 侧袋 / 膝甲 / 战靴。
 fn push_legs(rig: &Rig, assembly: &mut Assembly) {
     let pants = Surface::ClothPants.tile();
-    let armor = Surface::Armor.tile();
     let pouch = Surface::Pouch.tile();
-    let webbing = Surface::Webbing.tile();
     let trim = Surface::Trim.tile();
     for (thigh, shin, foot, side) in [
         (sk::L_THIGH, sk::L_SHIN, sk::L_FOOT, -1.0f32),
@@ -344,42 +376,61 @@ fn push_legs(rig: &Rig, assembly: &mut Assembly) {
         let (hip, knee, ankle) = (rig.p(thigh), rig.p(shin), rig.p(foot));
         let chain = leg_chain(rig, thigh, shin, foot);
         // 大腿：髋臀饱满、股四头肌前凸、膝上收窄
-        let thigh_profile: Vec<(f32, f32, f32, f32)> = vec![
-            (0.00, 0.099, 0.106, 3.0),
-            (0.16, 0.103, 0.112, 3.0),
-            (0.44, 0.095, 0.103, 3.0),
-            (0.72, 0.083, 0.089, 3.0),
-            (0.92, 0.074, 0.079, 3.0),
-            (1.00, 0.071, 0.076, 3.0),
+        // 剖面六元组：(t, 半宽 X, 半深 Z, 指数, 左偏, 后偏)。腘绳肌后鼓（oz > 0）、
+        // 股四头肌前凸（oz < 0）——侧影因此有股直肌的隆起与膝上的收细
+        let thigh_profile: [(f32, f32, f32, f32, f32, f32); 9] = [
+            (0.00, 0.098, 0.107, 3.0, 0.0, 0.005),
+            (0.09, 0.104, 0.115, 3.0, 0.0, -0.001),
+            (0.22, 0.103, 0.113, 3.0, -0.002, -0.004),
+            (0.38, 0.097, 0.106, 3.0, -0.002, -0.006),
+            (0.54, 0.090, 0.098, 3.0, -0.002, -0.006),
+            (0.70, 0.083, 0.089, 3.0, -0.002, -0.005),
+            (0.83, 0.077, 0.082, 3.0, -0.001, -0.003),
+            (0.93, 0.072, 0.077, 3.0, 0.0, -0.001),
+            (1.00, 0.070, 0.075, 3.0, 0.0, 0.0),
         ];
         assembly.add(
-            Piece::new(limb(hip, knee, &thigh_profile, 14))
+            Piece::new(limb_shaped(hip, knee, &thigh_profile, 16))
                 .uv_cylinder(pants, Axis::Y, 1.0, 2.2, Vec2::ZERO)
                 .blend_chain(&chain, 0.10),
         );
         // 小腿：腓肠肌鼓起、踝上收成靴口
-        let shin_profile: Vec<(f32, f32, f32, f32)> = vec![
-            (0.00, 0.072, 0.078, 3.0),
-            (0.20, 0.075, 0.089, 3.0),
-            (0.50, 0.063, 0.071, 3.0),
-            (0.78, 0.053, 0.058, 2.8),
-            (1.00, 0.050, 0.055, 2.8),
+        // 小腿：胫骨前缘相对笔直、腓肠肌在后下方鼓起、踝上收成跟腱（oz 逐行回落）
+        let shin_profile: [(f32, f32, f32, f32, f32, f32); 8] = [
+            (0.00, 0.071, 0.077, 3.0, 0.0, -0.002),
+            (0.10, 0.074, 0.086, 3.0, 0.0, 0.004),
+            (0.26, 0.073, 0.090, 3.2, 0.0, 0.008),
+            (0.42, 0.066, 0.079, 3.2, 0.0, 0.006),
+            (0.58, 0.059, 0.067, 3.0, 0.0, 0.003),
+            (0.74, 0.052, 0.057, 2.8, 0.0, 0.001),
+            (0.88, 0.049, 0.054, 2.8, 0.0, 0.0),
+            (1.00, 0.048, 0.053, 2.8, 0.0, 0.0),
         ];
         assembly.add(
-            Piece::new(limb(knee, ankle, &shin_profile, 14))
+            Piece::new(limb_shaped(knee, ankle, &shin_profile, 16))
                 .uv_cylinder(pants, Axis::Y, 1.0, 2.4, Vec2::ZERO)
                 .blend_chain(&chain, 0.10),
         );
         // 裤脚收口（膝下打褶）：环带，绑小腿
-        let cuff: Vec<(f32, f32, f32, f32)> = vec![
-            (0.00, 0.079, 0.094, 3.0),
-            (0.55, 0.074, 0.086, 3.0),
-            (1.00, 0.068, 0.077, 3.0),
+        // 裤脚：半径与偏移都跟着腓肠肌走（否则小腿会从裤脚里穿出来）
+        // 裤脚（堆在靴口上）：只盖小腿下段。第一版是从膝盖往下 0.19 m 的整圈
+        // 放样（半深 0.094），比护膝（半深 0.079）还大 ⇒ 护膝整片埋进裤腿里，
+        // 等于不存在。现在上口收、下口外张，落在靴口滚边（y = 0.238）之上。
+        let blouse: [(f32, f32, f32, f32, f32, f32); 4] = [
+            (0.00, 0.0760, 0.0940, 3.0, 0.0, 0.008),
+            (0.35, 0.0765, 0.0930, 3.0, 0.0, 0.007),
+            (0.75, 0.0745, 0.0880, 3.0, 0.0, 0.006),
+            (1.00, 0.0720, 0.0840, 3.0, 0.0, 0.006),
         ];
         assembly.add(
-            Piece::new(limb(knee, knee.lerp(ankle, 0.42), &cuff, 14))
-                .uv_cylinder(pants, Axis::Y, 1.0, 5.0, Vec2::new(0.3, 0.0))
-                .rigid(shin as u32),
+            Piece::new(limb_shaped(
+                knee.lerp(ankle, 0.28),
+                knee.lerp(ankle, 0.44),
+                &blouse,
+                16,
+            ))
+            .uv_cylinder(pants, Axis::Y, 1.0, 5.0, Vec2::new(0.3, 0.0))
+            .rigid(shin as u32),
         );
         // 大腿侧袋：硬质口袋 + 翻盖 + 织带扣（绑大腿）
         let pocket_at = hip.lerp(knee, 0.40) + Vec3::new(side * 0.086, 0.0, -0.004);
@@ -424,43 +475,7 @@ fn push_legs(rig: &Rig, assembly: &mut Assembly) {
             )
             .rigid(thigh as u32),
         );
-        // 膝甲：包住膝前 200°（绑小腿，随小腿摆动）
-        let knee_axis_a = knee + (hip - knee).normalize() * 0.055;
-        let knee_axis_b = knee + (ankle - knee).normalize() * 0.080;
-        let knee_profile: Vec<(f32, f32, f32, f32)> = vec![
-            (0.00, 0.079, 0.079, 3.2),
-            (0.42, 0.083, 0.085, 3.2),
-            (1.00, 0.074, 0.072, 3.2),
-        ];
-        assembly.add(
-            Piece::new(limb_shell(
-                knee_axis_a,
-                knee_axis_b,
-                &knee_profile,
-                14,
-                -Vec3::Z,
-                1.75,
-                0.011,
-            ))
-            .uv_box(armor, 3.2, Vec2::new(0.2, 0.5))
-            .rigid(shin as u32),
-        );
-        // 膝甲上下绑带（织带，绕过膝后）
-        for (t, offset) in [(0.06f32, 0.010f32), (0.94, -0.008)] {
-            let at = knee_axis_a.lerp(knee_axis_b, t);
-            assembly.add(
-                Piece::new(ring_shell(
-                    &[
-                        (at.y - 0.010 + offset, 0.076, 0.078, 3.0),
-                        (at.y + 0.010 + offset, 0.076, 0.078, 3.0),
-                    ],
-                    14,
-                    0.006,
-                ))
-                .uv_cylinder(webbing, Axis::Y, 1.0, 12.0, Vec2::ZERO)
-                .rigid(shin as u32),
-            );
-        }
+
         push_boot(rig, assembly, shin, foot, ankle);
     }
 }
@@ -808,26 +823,34 @@ fn push_arms(rig: &Rig, assembly: &mut Assembly) {
             );
         }
         // 上臂
-        let upper_profile: Vec<(f32, f32, f32, f32)> = vec![
-            (0.00, 0.078, 0.081, 2.6),
-            (0.22, 0.076, 0.079, 2.6),
-            (0.70, 0.062, 0.066, 2.6),
-            (1.00, 0.057, 0.061, 2.6),
+        // 上臂：肱二头肌前鼓（oz < 0）、肱三头肌后鼓（oz > 0），肘上收细
+        let upper_profile: [(f32, f32, f32, f32, f32, f32); 7] = [
+            (0.00, 0.079, 0.082, 2.6, 0.0, 0.0),
+            (0.16, 0.082, 0.086, 2.6, 0.0, -0.002),
+            (0.34, 0.079, 0.083, 2.6, 0.0, -0.003),
+            (0.52, 0.072, 0.076, 2.6, 0.0, -0.002),
+            (0.70, 0.065, 0.069, 2.6, 0.0, 0.0),
+            (0.86, 0.060, 0.064, 2.6, 0.0, 0.002),
+            (1.00, 0.057, 0.061, 2.6, 0.0, 0.0),
         ];
         assembly.add(
-            Piece::new(limb(shoulder, elbow, &upper_profile, 12))
+            Piece::new(limb_shaped(shoulder, elbow, &upper_profile, 16))
                 .uv_cylinder(cloth, Axis::Y, 1.0, 2.6, Vec2::ZERO)
                 .blend_chain(&chain, 0.09),
         );
         // 前臂
-        let fore_profile: Vec<(f32, f32, f32, f32)> = vec![
-            (0.00, 0.059, 0.063, 2.6),
-            (0.22, 0.063, 0.067, 2.6),
-            (0.75, 0.049, 0.053, 2.6),
-            (1.00, 0.045, 0.049, 2.6),
+        // 前臂：肱桡肌在肘下前外侧鼓起，向腕收细；截面比上臂更扁（指数抬到 2.8）
+        let fore_profile: [(f32, f32, f32, f32, f32, f32); 7] = [
+            (0.00, 0.059, 0.063, 2.6, 0.0, 0.0),
+            (0.16, 0.064, 0.069, 2.8, 0.0, -0.002),
+            (0.34, 0.060, 0.065, 2.8, 0.0, -0.002),
+            (0.54, 0.054, 0.058, 2.8, 0.0, -0.001),
+            (0.74, 0.049, 0.052, 2.6, 0.0, 0.0),
+            (0.88, 0.046, 0.050, 2.6, 0.0, 0.0),
+            (1.00, 0.045, 0.049, 2.6, 0.0, 0.0),
         ];
         assembly.add(
-            Piece::new(limb(elbow, wrist, &fore_profile, 12))
+            Piece::new(limb_shaped(elbow, wrist, &fore_profile, 16))
                 .uv_cylinder(cloth, Axis::Y, 1.0, 2.6, Vec2::ZERO)
                 .blend_chain(&chain, 0.09),
         );
@@ -849,20 +872,7 @@ fn push_arms(rig: &Rig, assembly: &mut Assembly) {
             .uv_box(armor, 3.6, Vec2::new(0.35, 0.15))
             .rigid(fore as u32),
         );
-        // 肘甲：包住肘后 200°
-        assembly.add(
-            Piece::new(limb_shell(
-                elbow + (shoulder - elbow).normalize() * 0.052,
-                elbow + (wrist - elbow).normalize() * 0.062,
-                &[(0.0, 0.062, 0.062, 3.2), (1.0, 0.058, 0.058, 3.2)],
-                12,
-                Vec3::new(side * 0.35, 0.0, 1.0),
-                1.75,
-                0.009,
-            ))
-            .uv_box(armor, 4.0, Vec2::new(0.2, 0.4))
-            .rigid(fore as u32),
-        );
+
         // 腕环（护腕下沿与手套的接缝）
         assembly.add(
             Piece::new(limb_shell(
@@ -1082,105 +1092,429 @@ fn push_hand(assembly: &mut Assembly, wrist: Vec3, side: f32, hand: usize) {
 // 头颈
 // ---------------------------------------------------------------------------
 
-/// 织物细节：肢体上的**堆褶与束带**——上臂 / 前臂 / 大腿 / 小腿各一两道。
+/// 织物细节：肢体上的堆褶与束带。
 ///
 /// 第一版的四肢是「光滑锥管 + 一块硬壳」，近景读作塑料管：真实的战斗服在关节
-/// 附近必然堆褶（布料被压缩），战术裤在大腿中段有织带束带、膝下裤脚収口。
-/// 这一层的每一件都是「比肢体半径大 3~6 mm 的短环」——limb 放样、两端収口
-/// （剖面半径两端 ×0.92），14 段 ≈ 56 顶点；八个部件合计约 450 顶点，
-/// 用最小代价换掉「锥管感」。
+/// 附近必然堆褶（布料被压缩），战术裤在大腿中段有织带束带。每一条都是
+/// 「比该处肢体大 4~5 mm 的短环」——两端收口（剖面半径 ×0.93），16 段 ≈ 64
+/// 顶点，六条合计约 380 顶点，用最小代价换掉「锥管感」。
 ///
-/// 半径来自相邻肢体的剖面值（腿 0.86 处 hx 0.0765 / 小腿 0.14 处 hx 0.0732 …），
-/// 环一律比该处大 3~6 mm ⇒ 既不埋进肢体，也不鼓成救生圈。
+/// 半径与中心偏移都取自相邻肢体的剖面值（大腿 0.37 处 hx 0.0979 / oz −0.006 …），
+/// 环一律比该处大 4~5 mm ⇒ 既不埋进肢体，也不鼓成救生圈。护腕（0.20 起）
+/// 与靴筒之后的位置不再放褶——看不见的褶是白花的顶点。关节内侧的压缩褶在
+/// push_joints 里。
 fn push_fabric(rig: &Rig, assembly: &mut Assembly) {
     let cloth = Surface::ClothTorso.tile();
     let pants = Surface::ClothPants.tile();
     let webbing = Surface::Webbing.tile();
-    // (起点, 终点, 半宽 X, 半深 Z, 骨, 材质, UV 平铺率)
-    let mut bands: Vec<(Vec3, Vec3, f32, f32, u32, Tile, f32)> = Vec::new();
     for (upper, fore, hand) in [
         (sk::L_UPPERARM, sk::L_FOREARM, sk::L_HAND),
         (sk::R_UPPERARM, sk::R_FOREARM, sk::R_HAND),
     ] {
         let (shoulder, elbow, wrist) = (rig.p(upper), rig.p(fore), rig.p(hand));
-        // 上臂中段袖褶
-        bands.push((
-            shoulder.lerp(elbow, 0.44),
-            shoulder.lerp(elbow, 0.53),
-            0.0700,
-            0.0740,
+        // 上臂中段袖褶（肩甲之下、肘甲之上）
+        fabric_band(
+            assembly,
+            shoulder.lerp(elbow, 0.42),
+            shoulder.lerp(elbow, 0.52),
+            (0.0790, 0.0830, 0.0, -0.002),
             upper as u32,
             cloth,
             8.0,
-        ));
-        // 肘下堆褶
-        bands.push((
-            elbow.lerp(wrist, 0.06),
+        );
+        // 上臂下段袖褶
+        fabric_band(
+            assembly,
+            shoulder.lerp(elbow, 0.62),
+            shoulder.lerp(elbow, 0.70),
+            (0.0710, 0.0750, 0.0, -0.001),
+            upper as u32,
+            cloth,
+            9.0,
+        );
+        // 肘下袖褶（护腕自 0.20 起包住前臂，故只到 0.17）
+        fabric_band(
+            assembly,
+            elbow.lerp(wrist, 0.05),
             elbow.lerp(wrist, 0.17),
-            0.0650,
-            0.0690,
+            (0.0670, 0.0715, 0.0, -0.001),
             fore as u32,
             cloth,
-            8.0,
-        ));
+            9.0,
+        );
+    }
+    for (thigh, shin, _) in [
+        (sk::L_THIGH, sk::L_SHIN, sk::L_FOOT),
+        (sk::R_THIGH, sk::R_SHIN, sk::R_FOOT),
+    ] {
+        let (hip, knee) = (rig.p(thigh), rig.p(shin));
+        // 大腿中段织带束带（唯一用织带材质的一条：读作装具而不是布褶）
+        fabric_band(
+            assembly,
+            hip.lerp(knee, 0.33),
+            hip.lerp(knee, 0.41),
+            (0.1015, 0.1105, 0.0, -0.006),
+            thigh as u32,
+            webbing,
+            9.0,
+        );
+        // 大腿下段布褶 + 膝上布褶
+        fabric_band(
+            assembly,
+            hip.lerp(knee, 0.56),
+            hip.lerp(knee, 0.63),
+            (0.0905, 0.0985, 0.0, -0.006),
+            thigh as u32,
+            pants,
+            6.0,
+        );
+        fabric_band(
+            assembly,
+            hip.lerp(knee, 0.79),
+            hip.lerp(knee, 0.88),
+            (0.0805, 0.0855, 0.0, -0.003),
+            thigh as u32,
+            pants,
+            6.0,
+        );
+    }
+}
+
+/// 织物堆褶环：比该处肢体大 4~5 mm 的短放样环，两端收口（剖面半径 ×0.93）。
+///
+/// shape = (半宽 X, 半深 Z, 左偏 X, 后偏 Z)——**偏移跟着肢体剖面走**，
+/// 否则环会在肌肉鼓起处被顶穿（股四头肌 oz −0.006、腓肠肌 oz +0.008 …）。
+fn fabric_band(
+    assembly: &mut Assembly,
+    start: Vec3,
+    end: Vec3,
+    shape: (f32, f32, f32, f32),
+    bone: u32,
+    tile: Tile,
+    scale: f32,
+) {
+    let (hx, hz, ox, oz) = shape;
+    let profile: [(f32, f32, f32, f32, f32, f32); 4] = [
+        (0.00, hx * 0.93, hz * 0.95, 3.0, ox, oz),
+        (0.22, hx, hz, 3.0, ox, oz),
+        (0.78, hx, hz, 3.0, ox, oz),
+        (1.00, hx * 0.93, hz * 0.95, 3.0, ox, oz),
+    ];
+    assembly.add(
+        Piece::new(limb_shaped(start, end, &profile, 16))
+            .uv_cylinder(tile, Axis::Y, 1.0, scale, Vec2::ZERO)
+            .rigid(bone),
+    );
+}
+
+/// 铆钉 / 螺栓头：小旋转体，轴向由 facing 对齐 outward（先把局部 +Y 掰到 +Z）。
+fn rivet(at: Vec3, outward: Vec3, tile: Tile, scale: f32) -> Piece {
+    Piece::new(geom::lathe(
+        &[
+            (0.0, 0.0),
+            (0.0078, 0.0),
+            (0.0078, 0.0038),
+            (0.0052, 0.0058),
+            (0.0, 0.0062),
+        ],
+        10,
+    ))
+    .uv_box(tile, scale, Vec2::ZERO)
+    .transform(
+        facing(at, outward, Vec3::Y)
+            * Mat4::from_quat(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+    )
+}
+
+/// 关节：肘 / 膝的多片铰接护具 + 关节内侧压缩褶。
+///
+/// 关节不是「一根锥管 + 一块壳」。真实护具在关节处必然分片：伸直时互相叠压、
+/// 弯曲时错开，片子之间的接缝正是「这是护具」的读法。肘三件（上片 / 下片 /
+/// 肘尖凸台）+ 铆钉 ×2；膝五件（护膝弧壳 / 髌骨凸台 / 侧翼 ×2 / 绑带 ×2）
+/// + 铆钉 ×2。关节内侧（肘前）加两道压缩褶——外侧是拉伸面，只在内侧起皱。
+///
+/// 凸台用超椭球（局部 +Z 由 facing 对齐体表法向），铆钉见 rivet。所有关节件
+/// 走 blend_chain（第一版护膝 / 肘甲是 rigid ⇒ 弯曲时与肢体脱节）。
+fn push_joints(rig: &Rig, assembly: &mut Assembly) {
+    let armor = Surface::Armor.tile();
+    let cloth = Surface::ClothTorso.tile();
+    let gunmetal = Surface::Gunmetal.tile();
+    let webbing = Surface::Webbing.tile();
+    for (upper, fore, hand) in [
+        (sk::L_UPPERARM, sk::L_FOREARM, sk::L_HAND),
+        (sk::R_UPPERARM, sk::R_FOREARM, sk::R_HAND),
+    ] {
+        let (shoulder, elbow, wrist) = (rig.p(upper), rig.p(fore), rig.p(hand));
+        let side = if shoulder.x < 0.0 { -1.0f32 } else { 1.0 };
+        let upper_axis = (shoulder - elbow).normalize();
+        let fore_axis = (wrist - elbow).normalize();
+        let outward = Vec3::new(side * 0.30, 0.0, 1.0).normalize();
+        let chain = arm_chain(rig, upper, fore, hand);
+        assembly.add(
+            Piece::new(limb_shell(
+                elbow + upper_axis * 0.074,
+                elbow + upper_axis * 0.012,
+                &[
+                    (0.00, 0.0615, 0.0655, 3.2),
+                    (0.55, 0.0645, 0.0685, 3.2),
+                    (1.00, 0.0640, 0.0680, 3.2),
+                ],
+                16,
+                outward,
+                1.50,
+                0.010,
+            ))
+            .uv_box(armor, 3.6, Vec2::new(0.35, 0.15))
+            .blend_chain(&chain, 0.09),
+        );
+        assembly.add(
+            Piece::new(limb_shell(
+                elbow + fore_axis * 0.010,
+                elbow + fore_axis * 0.084,
+                &[
+                    (0.00, 0.0670, 0.0715, 3.2),
+                    (0.55, 0.0640, 0.0680, 3.2),
+                    (1.00, 0.0575, 0.0615, 3.2),
+                ],
+                16,
+                outward,
+                1.62,
+                0.010,
+            ))
+            .uv_box(armor, 3.6, Vec2::new(0.55, 0.15))
+            .blend_chain(&chain, 0.09),
+        );
+        assembly.add(
+            Piece::new(geom::superellipsoid(
+                Vec3::new(0.027, 0.032, 0.013),
+                3.0,
+                14,
+                9,
+            ))
+            .uv_box(armor, 5.0, Vec2::new(0.2, 0.6))
+            .transform(facing(elbow + outward * 0.056, outward, Vec3::Y))
+            .blend_chain(&chain, 0.09),
+        );
+        for t in [-0.042f32, 0.034] {
+            assembly.add(
+                rivet(
+                    elbow + outward * 0.062 + upper_axis * t,
+                    outward,
+                    gunmetal,
+                    9.0,
+                )
+                .blend_chain(&chain, 0.09),
+            );
+        }
+        for (a, b, shape) in [
+            (
+                elbow + upper_axis * 0.048,
+                elbow + upper_axis * 0.006,
+                (0.0630, 0.0675),
+            ),
+            (
+                elbow + fore_axis * 0.008,
+                elbow + fore_axis * 0.052,
+                (0.0680, 0.0725),
+            ),
+        ] {
+            let (hx, hz) = shape;
+            assembly.add(
+                Piece::new(limb_shell(
+                    a,
+                    b,
+                    &[(0.0, hx * 0.94, hz * 0.94, 3.0), (1.0, hx, hz, 3.0)],
+                    14,
+                    -Vec3::Z,
+                    1.45,
+                    0.005,
+                ))
+                .uv_box(cloth, 9.0, Vec2::new(0.2, 0.4))
+                .blend_chain(&chain, 0.09),
+            );
+        }
     }
     for (thigh, shin, foot) in [
         (sk::L_THIGH, sk::L_SHIN, sk::L_FOOT),
         (sk::R_THIGH, sk::R_SHIN, sk::R_FOOT),
     ] {
         let (hip, knee, ankle) = (rig.p(thigh), rig.p(shin), rig.p(foot));
-        // 大腿中段织带束带（唯一用织带材质的一条：读作装具而不是布褶）
-        bands.push((
-            hip.lerp(knee, 0.34),
-            hip.lerp(knee, 0.41),
-            0.1000,
-            0.1070,
-            thigh as u32,
-            webbing,
-            9.0,
-        ));
-        // 膝上堆褶
-        bands.push((
-            hip.lerp(knee, 0.82),
-            hip.lerp(knee, 0.90),
-            0.0780,
-            0.0840,
-            thigh as u32,
-            pants,
-            6.0,
-        ));
-        // 膝下堆褶（裤脚压在靴口上）
-        bands.push((
-            knee.lerp(ankle, 0.10),
-            knee.lerp(ankle, 0.19),
-            0.0760,
-            0.0870,
-            shin as u32,
-            pants,
-            6.0,
-        ));
-        // 小腿中段
-        bands.push((
-            knee.lerp(ankle, 0.52),
-            knee.lerp(ankle, 0.60),
-            0.0660,
-            0.0740,
-            shin as u32,
-            pants,
-            6.0,
-        ));
-    }
-    for (start, end, hx, hz, bone, tile, scale) in bands {
-        let profile: [(f32, f32, f32, f32); 4] = [
-            (0.00, hx * 0.92, hz * 0.94, 3.0),
-            (0.25, hx, hz, 3.0),
-            (0.75, hx, hz, 3.0),
-            (1.00, hx * 0.92, hz * 0.94, 3.0),
-        ];
+        let chain = leg_chain(rig, thigh, shin, foot);
+        let knee_axis_a = knee + (hip - knee).normalize() * 0.055;
+        let knee_axis_b = knee + (ankle - knee).normalize() * 0.080;
         assembly.add(
-            Piece::new(limb(start, end, &profile, 14))
-                .uv_cylinder(tile, Axis::Y, 1.0, scale, Vec2::ZERO)
-                .rigid(bone),
+            Piece::new(limb_shell(
+                knee_axis_a,
+                knee_axis_b,
+                &[
+                    (0.00, 0.0790, 0.0790, 3.2),
+                    (0.30, 0.0835, 0.0860, 3.2),
+                    (0.68, 0.0805, 0.0800, 3.2),
+                    (1.00, 0.0740, 0.0720, 3.2),
+                ],
+                16,
+                -Vec3::Z,
+                1.75,
+                0.011,
+            ))
+            .uv_box(armor, 3.2, Vec2::new(0.2, 0.5))
+            .blend_chain(&chain, 0.09),
+        );
+        assembly.add(
+            Piece::new(geom::superellipsoid(
+                Vec3::new(0.031, 0.036, 0.016),
+                2.6,
+                14,
+                10,
+            ))
+            .uv_box(armor, 5.0, Vec2::new(0.4, 0.3))
+            .transform(facing(
+                Vec3::new(knee.x, knee.y + 0.008, knee.z - 0.082),
+                -Vec3::Z,
+                Vec3::Y,
+            ))
+            .blend_chain(&chain, 0.09),
+        );
+        for s in [-1.0f32, 1.0] {
+            assembly.add(
+                hard_plate(
+                    Vec3::new(0.010, 0.030, 0.006),
+                    0.003,
+                    facing(
+                        Vec3::new(knee.x + s * 0.082, knee.y - 0.014, knee.z - 0.048),
+                        Vec3::new(s * 0.86, 0.0, -0.51),
+                        Vec3::Y,
+                    ),
+                    armor,
+                    6.0,
+                    Vec2::new(0.3 * (s + 1.0), 0.5),
+                )
+                .blend_chain(&chain, 0.09),
+            );
+        }
+        for (y, hx, hz) in [
+            (knee.y + 0.043, 0.0855, 0.0880),
+            (knee.y - 0.070, 0.0800, 0.0790),
+        ] {
+            assembly.add(
+                Piece::new(limb_shell(
+                    Vec3::new(knee.x, y + 0.011, knee.z),
+                    Vec3::new(knee.x, y - 0.011, knee.z),
+                    &[(0.0, hx, hz, 3.0), (1.0, hx, hz, 3.0)],
+                    16,
+                    -Vec3::Z,
+                    1.90,
+                    0.005,
+                ))
+                .uv_cylinder(webbing, Axis::Y, 1.0, 12.0, Vec2::ZERO)
+                .blend_chain(&chain, 0.09),
+            );
+        }
+        for (dy, at_z) in [(0.052f32, -0.080f32), (-0.052, -0.074)] {
+            assembly.add(
+                rivet(
+                    Vec3::new(knee.x, knee.y + dy, knee.z + at_z),
+                    -Vec3::Z,
+                    gunmetal,
+                    9.0,
+                )
+                .blend_chain(&chain, 0.09),
+            );
+        }
+    }
+}
+
+/// 战斗服结构线与小件：背部育克缝、臀部后袋、下摆抽绳、肩部徽记。
+///
+/// 第一版的躯干是「一根放样管 + 一件背心」，布料上没有任何**接缝**——真实的
+/// 战斗服由多片布缝合（育克 / 袖子 / 后袋 / 下摆），缝线是近景里最便宜也最
+/// 有效的「这是衣服」的证据。全部用倒角板与开弧壳，不引入新原语。
+///
+/// 育克缝的**指数必须与躯干一致（2.6）**：超椭圆躯干的「角」比椭圆鼓，
+/// 用椭圆弧贴上去会在两端陷进躯干里（第一版试过 2.2，两端埋没）。
+fn push_uniform(rig: &Rig, assembly: &mut Assembly) {
+    let cloth = Surface::ClothTorso.tile();
+    let trim = Surface::Trim.tile();
+    let webbing = Surface::Webbing.tile();
+    assembly.add(
+        Piece::new(arc_plate(
+            &[(1.592, 0.2000, 0.1235, 2.6), (1.614, 0.1980, 0.1205, 2.6)],
+            std::f32::consts::FRAC_PI_2,
+            1.35,
+            20,
+            0.004,
+        ))
+        .uv_box(cloth, 8.0, Vec2::new(0.2, 0.8))
+        .rigid(sk::CHEST as u32),
+    );
+    for side in [-1.0f32, 1.0] {
+        assembly.add(
+            hard_plate(
+                Vec3::new(0.044, 0.040, 0.006),
+                0.004,
+                facing(
+                    Vec3::new(side * 0.078, 0.928, 0.112),
+                    Vec3::new(side * 0.42, 0.0, 0.91),
+                    Vec3::Y,
+                ),
+                cloth,
+                6.0,
+                Vec2::new(0.35 * (side + 1.0), 0.2),
+            )
+            .rigid(sk::PELVIS as u32),
+        );
+    }
+    for side in [-1.0f32, 1.0] {
+        assembly.add(
+            Piece::new(geom::sweep(
+                &[
+                    Vec3::new(side * 0.126, 0.968, -0.100),
+                    Vec3::new(side * 0.132, 0.936, -0.108),
+                    Vec3::new(side * 0.136, 0.908, -0.104),
+                ],
+                &[(0.0, 0.0026, 0.0026, 2.0), (1.0, 0.0026, 0.0026, 2.0)],
+                6,
+                Vec3::X,
+            ))
+            .uv_box(webbing, 14.0, Vec2::new(0.5, 0.5))
+            .rigid(sk::PELVIS as u32),
+        );
+        assembly.add(
+            hard_plate(
+                Vec3::new(0.007, 0.012, 0.005),
+                0.002,
+                facing(
+                    Vec3::new(side * 0.137, 0.898, -0.103),
+                    Vec3::new(side * 0.20, 0.0, -1.0),
+                    Vec3::Y,
+                ),
+                trim,
+                11.0,
+                Vec2::ZERO,
+            )
+            .rigid(sk::PELVIS as u32),
+        );
+    }
+    for (upper, fore, hand) in [
+        (sk::L_UPPERARM, sk::L_FOREARM, sk::L_HAND),
+        (sk::R_UPPERARM, sk::R_FOREARM, sk::R_HAND),
+    ] {
+        let (shoulder, elbow) = (rig.p(upper), rig.p(fore));
+        let side = if shoulder.x < 0.0 { -1.0f32 } else { 1.0 };
+        assembly.add(
+            hard_plate(
+                Vec3::new(0.014, 0.020, 0.003),
+                0.002,
+                facing(
+                    shoulder.lerp(elbow, 0.55) + Vec3::new(side * 0.0715, 0.0, -0.004),
+                    Vec3::new(side * 0.98, 0.0, -0.20),
+                    Vec3::Y,
+                ),
+                Surface::Pouch.tile(),
+                9.0,
+                Vec2::new(0.2, 0.1),
+            )
+            .blend_chain(&arm_chain(rig, upper, fore, hand), 0.09),
         );
     }
 }
@@ -1198,6 +1532,7 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
     let gunmetal = Surface::Gunmetal.tile();
     let webbing = Surface::Webbing.tile();
     let rubber = Surface::Rubber.tile();
+    let trim = Surface::Trim.tile();
     let head = rig.p(sk::HEAD);
     // 颈（内衬紧身衣）：胸 → 头平滑混合
     let neck_chain = vec![
@@ -1251,18 +1586,20 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
         .collect();
     assembly.add(
         Piece::new(geom::arc_shell(&rows, 26, 0.009))
-            .uv_box(helmet, 3.6, Vec2::ZERO)
+            .uv_cylinder(helmet, Axis::Y, 3.0, 4.0, Vec2::new(0.0, 0.5))
             .rigid(sk::HEAD as u32),
     );
-    // 头盔颅顶：闭合环壳（上缘收成小环，顶面由封边盖住）
-    let crown: Vec<(f32, f32, f32, f32, f32)> = vec![
-        (1.897, 0.001, 0.124, 0.130, 2.2),
-        (1.930, 0.000, 0.124, 0.129, 2.2),
-        (1.966, 0.000, 0.119, 0.123, 2.2),
-        (2.002, 0.000, 0.106, 0.110, 2.2),
-        (2.034, 0.000, 0.086, 0.089, 2.1),
-        (2.058, 0.000, 0.058, 0.060, 2.0),
-        (2.070, 0.000, 0.026, 0.027, 2.0),
+    // 头盔颅顶：闭合环壳。FAST 型头盔的顶更平、**前后更长**（hz > hx）、两侧更直
+    // ——第一版各层 hz ≈ hx 且顶收得慢，是颗蛋（远看像光头扣个碗）
+    let crown: [(f32, f32, f32, f32, f32); 8] = [
+        (1.897, 0.003, 0.1240, 0.1330, 2.3),
+        (1.928, 0.003, 0.1265, 0.1360, 2.3),
+        (1.962, 0.004, 0.1250, 0.1340, 2.3),
+        (1.994, 0.004, 0.1160, 0.1250, 2.3),
+        (2.022, 0.004, 0.1010, 0.1100, 2.2),
+        (2.044, 0.004, 0.0800, 0.0880, 2.2),
+        (2.062, 0.004, 0.0530, 0.0590, 2.1),
+        (2.072, 0.004, 0.0220, 0.0250, 2.0),
     ];
     let rows: Vec<ArcRow> = crown
         .iter()
@@ -1275,10 +1612,62 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
         })
         .collect();
     assembly.add(
-        Piece::new(geom::arc_shell(&rows, 26, 0.009))
-            .uv_box(helmet, 3.6, Vec2::new(0.3, 0.3))
+        Piece::new(geom::arc_shell(&rows, 28, 0.009))
+            .uv_cylinder(helmet, Axis::Y, 3.0, 4.0, Vec2::ZERO)
             .rigid(sk::HEAD as u32),
     );
+    // 颅顶中脊三段（沿盔面折线：顶面是曲的，一段平板贴不住）
+    for (at, normal) in [
+        (Vec3::new(0.0, 2.056, -0.062), Vec3::new(0.0, 0.949, -0.316)),
+        (Vec3::new(0.0, 2.070, 0.004), Vec3::new(0.0, 1.0, 0.0)),
+        (Vec3::new(0.0, 2.058, 0.066), Vec3::new(0.0, 0.940, 0.342)),
+    ] {
+        assembly.add(
+            hard_plate(
+                Vec3::new(0.011, 0.031, 0.0045),
+                0.002,
+                facing(at, normal, -Vec3::Z),
+                helmet,
+                7.0,
+                Vec2::new(0.5, 0.2),
+            )
+            .rigid(sk::HEAD as u32),
+        );
+    }
+    // 通风窗 ×4（两侧前后各一）：先在盔面截面上取点、再按法向外移 3 mm
+    let crown_section = Section::new(
+        Vec3::new(0.0, 1.998, 0.004),
+        Vec3::X,
+        Vec3::Z,
+        0.1160,
+        0.1250,
+        2.3,
+    );
+    for (theta, half) in [
+        (0.50f32, Vec2::new(0.021, 0.0075)),
+        (-0.40, Vec2::new(0.017, 0.0065)),
+    ] {
+        for sign in [-1.0f32, 1.0] {
+            let angle = if sign < 0.0 {
+                std::f32::consts::PI - theta
+            } else {
+                theta
+            };
+            let p = crown_section.point_at(angle, 0.0);
+            let n = (p - crown_section.center).normalize();
+            assembly.add(
+                hard_plate(
+                    Vec3::new(half.x, half.y, 0.0035),
+                    0.0018,
+                    facing(p - n * 0.003, n, Vec3::Y),
+                    gunmetal,
+                    8.0,
+                    Vec2::new(0.2, 0.2),
+                )
+                .rigid(sk::HEAD as u32),
+            );
+        }
+    }
     // 帽檐（眉眼上方外伸的一圈硬唇）
     let brim: Vec<(f32, f32, f32, f32, f32)> = vec![
         (1.894, 0.004, 0.126, 0.135, 2.2),
@@ -1299,36 +1688,38 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
             .uv_box(helmet, 4.0, Vec2::new(0.6, 0.6))
             .rigid(sk::HEAD as u32),
     );
-    // 侧导轨（两侧各一条，夜视仪 / 手电的挂轨）
+    // 侧导轨（两侧各一条：扫掠轨条 + 端头螺栓 ×2）——第一版是两片平贴的板，
+    // 近景读作「贴纸」；扫掠让轨条真正离开盔面成为一条凸起的轨
     for side in [-1.0f32, 1.0] {
         assembly.add(
-            hard_plate(
-                Vec3::new(0.055, 0.012, 0.005),
-                0.003,
-                facing(
-                    Vec3::new(side * 0.128, 1.938, -0.006),
-                    Vec3::new(side, 0.0, 0.0),
-                    Vec3::Y,
-                ),
-                gunmetal,
-                6.0,
-                Vec2::ZERO,
-            )
-            .rigid(sk::HEAD as u32),
-        );
-        // 侧面固定螺栓
-        assembly.add(
-            Piece::new(geom::lathe(
-                &[(0.0, -0.005), (0.008, -0.005), (0.008, 0.004), (0.0, 0.004)],
+            Piece::new(geom::sweep(
+                &[
+                    Vec3::new(side * 0.126, 1.906, -0.086),
+                    Vec3::new(side * 0.132, 1.918, -0.014),
+                    Vec3::new(side * 0.126, 1.912, 0.058),
+                ],
+                &[
+                    (0.00, 0.0065, 0.0095, 3.0),
+                    (0.50, 0.0085, 0.0125, 3.0),
+                    (1.00, 0.0060, 0.0090, 3.0),
+                ],
                 10,
+                Vec3::Y,
             ))
-            .uv_box(gunmetal, 8.0, Vec2::new(0.2, 0.2))
-            .transform(place(
-                Vec3::new(side * 0.130, 1.940, 0.048),
-                Quat::from_rotation_z(side * std::f32::consts::FRAC_PI_2),
-            ))
+            .uv_box(gunmetal, 6.0, Vec2::ZERO)
             .rigid(sk::HEAD as u32),
         );
+        for (z, y) in [(-0.086f32, 1.906f32), (0.058, 1.912)] {
+            assembly.add(
+                rivet(
+                    Vec3::new(side * 0.138, y, z),
+                    Vec3::new(side, 0.0, 0.0),
+                    gunmetal,
+                    9.0,
+                )
+                .rigid(sk::HEAD as u32),
+            );
+        }
     }
     // 夜视仪座 + 前挂臂（扫掠）
     assembly.add(
@@ -1376,26 +1767,107 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
         )
         .rigid(sk::HEAD as u32),
     );
-    // 护目镜带：环绕面部 140° 的弧壳（暗色镜面）
-    let goggles: Vec<(f32, f32, f32, f32, f32)> = vec![
-        (1.846, 0.006, 0.107, 0.103, 2.4),
-        (1.892, 0.004, 0.112, 0.108, 2.3),
-        (1.930, 0.004, 0.112, 0.107, 2.3),
+    // 护目镜：镜框弧壳（全幅）+ 左右**镜片**各一片（中间留出鼻梁）+ 鼻梁桥 + 侧扣。
+    // 第一版是一整条暗色弧带（无框、无镜片），近景读作「眼罩」而不是护目镜
+    let frame: Vec<(f32, f32, f32, f32, f32)> = vec![
+        (1.842, 0.006, 0.1080, 0.1040, 2.4),
+        (1.886, 0.004, 0.1140, 0.1100, 2.3),
+        (1.932, 0.004, 0.1130, 0.1080, 2.3),
     ];
-    let rows: Vec<ArcRow> = goggles
+    let rows: Vec<ArcRow> = frame
         .iter()
         .map(|&(y, z, hx, hz, e)| {
             ArcRow::new(
                 Section::new(Vec3::new(0.0, y, z), Vec3::X, Vec3::Z, hx, hz, e),
-                FRONT - 1.20,
-                FRONT + 1.20,
+                FRONT - 1.24,
+                FRONT + 1.24,
             )
         })
         .collect();
     assembly.add(
-        Piece::new(geom::arc_shell(&rows, 22, 0.012))
-            .uv_box(visor, 3.4, Vec2::ZERO)
+        Piece::new(geom::arc_shell(&rows, 24, 0.010))
+            .uv_box(rubber, 6.0, Vec2::new(0.2, 0.6))
             .rigid(sk::HEAD as u32),
+    );
+    for side in [-1.0f32, 1.0] {
+        let (start, end) = if side < 0.0 {
+            (FRONT - 1.14, FRONT - 0.13)
+        } else {
+            (FRONT + 0.13, FRONT + 1.14)
+        };
+        let lens: Vec<(f32, f32, f32, f32, f32)> = vec![
+            (1.852, 0.006, 0.1110, 0.1070, 2.4),
+            (1.888, 0.004, 0.1170, 0.1130, 2.3),
+            (1.924, 0.004, 0.1160, 0.1110, 2.3),
+        ];
+        let rows: Vec<ArcRow> = lens
+            .iter()
+            .map(|&(y, z, hx, hz, e)| {
+                ArcRow::new(
+                    Section::new(Vec3::new(0.0, y, z), Vec3::X, Vec3::Z, hx, hz, e),
+                    start,
+                    end,
+                )
+            })
+            .collect();
+        assembly.add(
+            Piece::new(geom::arc_shell(&rows, 12, 0.005))
+                .uv_box(visor, 3.0, Vec2::new(0.5 * (side + 1.0), 0.2))
+                .rigid(sk::HEAD as u32),
+        );
+        // 侧扣（镜框两端的带扣）
+        let anchor = Section::new(
+            Vec3::new(0.0, 1.888, 0.004),
+            Vec3::X,
+            Vec3::Z,
+            0.1150,
+            0.1110,
+            2.3,
+        );
+        let at = anchor.point_at(FRONT + side * 1.21, 0.0);
+        let n = (at - anchor.center).normalize();
+        assembly.add(
+            hard_plate(
+                Vec3::new(0.010, 0.015, 0.005),
+                0.002,
+                facing(at + n * 0.002, n, Vec3::Y),
+                gunmetal,
+                10.0,
+                Vec2::ZERO,
+            )
+            .rigid(sk::HEAD as u32),
+        );
+        // 侧扣 → 盔带的连接带（镜带绕到头盔两侧的读法）
+        assembly.add(
+            Piece::new(geom::sweep(
+                &[
+                    at + n * 0.004,
+                    Vec3::new(side * 0.1260, 1.874, 0.014),
+                    Vec3::new(side * 0.1265, 1.868, 0.062),
+                ],
+                &[(0.0, 0.0035, 0.0125, 3.0), (1.0, 0.0030, 0.0110, 3.0)],
+                8,
+                Vec3::Y,
+            ))
+            .uv_box(webbing, 10.0, Vec2::new(0.4, 0.5))
+            .rigid(sk::HEAD as u32),
+        );
+    }
+    // 鼻梁桥（两镜片之间的中线块）
+    assembly.add(
+        hard_plate(
+            Vec3::new(0.016, 0.013, 0.006),
+            0.003,
+            facing(
+                Vec3::new(0.0, 1.884, -0.110),
+                Vec3::new(0.0, 0.12, -1.0),
+                Vec3::Y,
+            ),
+            helmet,
+            9.0,
+            Vec2::new(0.4, 0.4),
+        )
+        .rigid(sk::HEAD as u32),
     );
     // 下颌护罩（呼吸面罩）：下半张脸的包覆
     let mask: Vec<(f32, f32, f32, f32, f32)> = vec![
@@ -1419,27 +1891,87 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
             .uv_box(rubber, 3.2, Vec2::new(0.4, 0.1))
             .rigid(sk::HEAD as u32),
     );
-    // 呼吸阀 + 滤芯（面罩正面两片圆盘）
-    for (x, radius) in [(-0.040f32, 0.021f32), (0.040, 0.021)] {
+    // 鼻梁脊（护目镜下沿延续到鼻尖的中线凸起）
+    assembly.add(
+        Piece::new(geom::sweep(
+            &[
+                Vec3::new(0.0, 1.842, -0.096),
+                Vec3::new(0.0, 1.814, -0.118),
+                Vec3::new(0.0, 1.790, -0.124),
+            ],
+            &[
+                (0.00, 0.0075, 0.0140, 3.0),
+                (0.45, 0.0090, 0.0165, 3.0),
+                (1.00, 0.0065, 0.0115, 3.0),
+            ],
+            10,
+            Vec3::X,
+        ))
+        .uv_box(rubber, 9.0, Vec2::new(0.5, 0.2))
+        .rigid(sk::HEAD as u32),
+    );
+    // 口栅（三条横缝：面罩下半的排气口）
+    for (y, half) in [(1.776f32, 0.021f32), (1.788, 0.023), (1.800, 0.021)] {
+        assembly.add(
+            hard_plate(
+                Vec3::new(half, 0.0032, 0.0035),
+                0.0014,
+                facing(
+                    Vec3::new(0.0, y, -0.100),
+                    Vec3::new(0.0, 0.10, -1.0),
+                    Vec3::Y,
+                ),
+                gunmetal,
+                12.0,
+                Vec2::new(0.3, 0.3),
+            )
+            .rigid(sk::HEAD as u32),
+        );
+    }
+    // 滤芯 ×2（颊部两侧的圆罐，斜向前外）+ 呼气阀（下巴正中）
+    for side in [-1.0f32, 1.0] {
+        let at = Vec3::new(side * 0.068, 1.802, -0.080);
+        let outward = Vec3::new(side * 0.74, 0.08, -0.67);
         assembly.add(
             Piece::new(geom::lathe(
                 &[
                     (0.0, 0.0),
-                    (radius, 0.0),
-                    (radius, 0.010),
-                    (radius * 0.72, 0.014),
-                    (0.0, 0.014),
+                    (0.0230, 0.0),
+                    (0.0255, 0.006),
+                    (0.0255, 0.017),
+                    (0.0195, 0.021),
+                    (0.0, 0.021),
                 ],
                 14,
             ))
-            .uv_box(rubber, 7.0, Vec2::new(0.3, 0.3))
-            .transform(place(
-                Vec3::new(x, 1.792, -0.104),
-                Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
-            ))
+            // 滤罐用漆面金属（军绿）而不是橡胶：整张脸若全是黑色材质，
+            // 近景就是一团黑（头部特写实测）
+            .uv_box(helmet, 7.0, Vec2::new(0.3, 0.3))
+            .transform(
+                facing(at, outward, Vec3::Y)
+                    * Mat4::from_quat(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            )
             .rigid(sk::HEAD as u32),
         );
     }
+    assembly.add(
+        Piece::new(geom::lathe(
+            &[
+                (0.0, 0.0),
+                (0.0165, 0.0),
+                (0.0165, 0.007),
+                (0.0115, 0.011),
+                (0.0, 0.011),
+            ],
+            12,
+        ))
+        .uv_box(gunmetal, 10.0, Vec2::new(0.3, 0.3))
+        .transform(place(
+            Vec3::new(0.0, 1.762, -0.094),
+            Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+        ))
+        .rigid(sk::HEAD as u32),
+    );
     // 耳罩（头盔下沿两侧的护耳垫）+ 下巴带
     for side in [-1.0f32, 1.0] {
         assembly.add(
@@ -1492,6 +2024,41 @@ fn push_head(rig: &Rig, assembly: &mut Assembly) {
             .rigid(sk::HEAD as u32),
         );
     }
+    // 盔带（绕过盔后的一圈织带：护目镜带与盔壳之间的过渡）+ 后部猫眼片
+    let band: Vec<(f32, f32, f32, f32, f32)> = vec![
+        (1.858, 0.006, 0.1265, 0.1400, 2.3),
+        (1.886, 0.004, 0.1285, 0.1420, 2.3),
+    ];
+    let rows: Vec<ArcRow> = band
+        .iter()
+        .map(|&(y, z, hx, hz, e)| {
+            ArcRow::new(
+                Section::new(Vec3::new(0.0, y, z), Vec3::X, Vec3::Z, hx, hz, e),
+                std::f32::consts::FRAC_PI_2 - 1.62,
+                std::f32::consts::FRAC_PI_2 + 1.62,
+            )
+        })
+        .collect();
+    assembly.add(
+        Piece::new(geom::arc_shell(&rows, 20, 0.005))
+            .uv_box(webbing, 8.0, Vec2::new(0.2, 0.6))
+            .rigid(sk::HEAD as u32),
+    );
+    assembly.add(
+        hard_plate(
+            Vec3::new(0.026, 0.009, 0.004),
+            0.0018,
+            facing(
+                Vec3::new(0.0, 1.872, 0.150),
+                Vec3::new(0.0, 0.10, 1.0),
+                Vec3::Y,
+            ),
+            trim,
+            11.0,
+            Vec2::new(0.4, 0.5),
+        )
+        .rigid(sk::HEAD as u32),
+    );
 }
 
 // ---------------------------------------------------------------------------

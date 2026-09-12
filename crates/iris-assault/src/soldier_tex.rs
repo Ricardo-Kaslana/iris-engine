@@ -164,7 +164,9 @@ impl Surface {
             Surface::Gunmetal => gunmetal(u, v, s),
             Surface::Grip => grip_tape(u, v, s),
             Surface::Glove => glove(u, v, s),
-            Surface::Visor => MaterialSample::new([0.020, 0.033, 0.052], 0.5, 0.4, 0.055, 1.0, 1.0),
+            Surface::Visor => {
+                MaterialSample::new([0.108, 0.140, 0.188], 0.5, 0.16, 0.130, 1.0, 1.0)
+            }
             Surface::Trim => trim(u, v, s),
             Surface::Webbing => webbing(u, v, s),
             Surface::Rubber => rubber(u, v, s),
@@ -483,7 +485,7 @@ fn glove(u: f32, v: f32, seed: u64) -> MaterialSample {
     let cell = 3.0;
     let (cx, cy) = ((u * cell).fract() - 0.5, (v * cell).fract() - 0.5);
     let pad = smooth(1.0 - (cx * cx + cy * cy).sqrt() / 0.42);
-    let base = [0.072, 0.070, 0.066];
+    let base = [0.098, 0.094, 0.088];
     let shade = 0.88 + 0.20 * pad + 0.10 * (grain - 0.5);
     MaterialSample::new(
         [base[0] * shade, base[1] * shade, base[2] * shade],
@@ -542,7 +544,7 @@ fn rubber(u: f32, v: f32, seed: u64) -> MaterialSample {
     MaterialSample::new(
         base,
         bumps,
-        0.80,
+        0.55,
         0.90 - 0.06 * bumps,
         0.0,
         0.88 + 0.12 * bumps,
