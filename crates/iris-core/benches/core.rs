@@ -8,6 +8,9 @@
 //!   （每帧调度前的固定成本，与系统体无关）；
 //! - `parallel_run_8_systems`：8 个无冲突并行系统 × 1 万实体（含每批
 //!   线程创建——批次粒度线程模型的每帧真实代价）；
+//! - `whole_transform_100k` / `sharded_transform_100k`：同一分量变换的
+//!   整体单任务 vs 数据并行分片对照（R73）——单重系统吃满多核的净收益
+//!   （含实体列表收集与分片线程创建的开销）；
 //! - `physics_step_100`：100 体（60 动 + 40 静、持续接触）一帧物理；
 //! - `move_and_slide`：角色控制器一帧（平地 + 一墙，含滑行与贴地）；
 //! - `broadphase_200_aabb`：200 AABB 建网格 + 全量候选查询一次；
@@ -288,6 +291,60 @@ fn bench_core(c: &mut Criterion) {
     par_schedule.run(Stage::Update, &mut par_world);
     c.bench_function("parallel_run_8_systems", |b| {
         b.iter(|| par_schedule.run(Stage::Update, black_box(&mut par_world)))
+    });
+
+    // ---- 调度：数据并行分片 vs 整体遍历对照（R73，10 万实体同列）----
+    // 工作体 = 64 次 sqrt 迭代（有界收敛：不动点 ≈1.604，反复应用不发散、
+    // 不溢出）——分片的适用场景是**计算重**的逐实体变换；实测 55.5ms →
+    // 39.4ms（1.41×，余量被串行写回 + 列级读锁逐实体争用吃掉）。对照：
+    // 纯拷贝级轻变换分片净亏（同机实测 35.3ms vs 24.0ms，缓冲分配 +
+    // 串行写回 + 线程创建占大头）——诚实边界见 API 文档。
+    let heavy = |x: f32| -> f32 {
+        let mut v = x;
+        for _ in 0..64 {
+            v = (v + 1.0).sqrt() - 0.01;
+        }
+        v
+    };
+    let mut shard_world = World::new();
+    for i in 0..100_000u32 {
+        let entity = shard_world.spawn_empty();
+        shard_world.insert(entity, C0(i as f32));
+    }
+    let mut whole_schedule = Schedule::new();
+    whole_schedule.add_parallel_system(
+        Stage::Update,
+        Access::new().write::<C0>(),
+        move |world: &World| {
+            for e in world.entities() {
+                if let Some(mut c) = world.get_mut::<C0>(e) {
+                    c.0 = heavy(c.0);
+                }
+            }
+        },
+    );
+    let mut sharded_schedule = Schedule::new();
+    sharded_schedule.add_sharded_system(
+        Stage::Update,
+        Access::new().read::<C0>(),
+        move |world: &World, slice: &[Entity]| {
+            slice
+                .iter()
+                .filter_map(|&e| {
+                    let v = world.get::<C0>(e)?.0;
+                    Some((e, C0(heavy(v))))
+                })
+                .collect()
+        },
+    );
+    // 预热（分片路径首跑含线程栈 / 页缓存冷启动）
+    whole_schedule.run(Stage::Update, &mut shard_world);
+    sharded_schedule.run(Stage::Update, &mut shard_world);
+    c.bench_function("whole_transform_100k", |b| {
+        b.iter(|| whole_schedule.run(Stage::Update, black_box(&mut shard_world)))
+    });
+    c.bench_function("sharded_transform_100k", |b| {
+        b.iter(|| sharded_schedule.run(Stage::Update, black_box(&mut shard_world)))
     });
 
     // ---- 物理：100 体持续接触一帧（构建在 iter 外，只测 step_physics）----

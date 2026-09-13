@@ -75,7 +75,10 @@ pub mod prelude {
         spawn_ragdoll_kinematic,
     };
     pub use crate::resource::Resource;
-    pub use crate::schedule::{Access, Schedule, Stage, System};
+    pub use crate::schedule::{
+        Access, MIN_SHARD_ITEMS, ParallelSystem, Schedule, Stage, System, shard_count_for,
+        shard_range,
+    };
     pub use crate::time::Time;
     pub use crate::transform::Transform;
     pub use crate::world::{Bundle, World};

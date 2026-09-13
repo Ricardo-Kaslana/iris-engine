@@ -4,15 +4,22 @@
 //! - 独占系统（`fn(&mut World)`）与一切冲突，独占一个批次（屏障语义）；
 //! - 并行系统（`fn(&World)`）声明组件读写集（[`Access`]），与当前批次
 //!   内全部系统无冲突时并入，否则开启新批次——批次间严格保持注册顺序，
-//!   批次内系统在多个线程上并行执行（`std::thread::scope`）。
+//!   批次内系统在多个线程上并行执行（`std::thread::scope`）；
+//! - 分片并行系统（`Fn(&World, &[Entity]) -> Vec<(Entity, T)>`，R73）：
+//!   调度器把实体列表按固定连续区间切片，每片一次调用（只读世界、返回
+//!   写缓冲）——**数据并行**，单个重系统也能吃满多核；join 后按稳定全序
+//!   串行写回 ⇒ 结果与分片数 / 线程数 / 机器核数无关。
 //!
 //! 冲突判定是保守的类型级分析：只要一个系统声明写 `T`，任何读写 `T` 的
 //! 其他系统都不能与它同批。因此运行期锁竞争必然是访问声明不诚实——
 //! 存储层的尝试型借用检查会立即 panic（见 [`crate::sync`]），绝不死锁。
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::component::Component;
+use crate::entity::Entity;
 use crate::world::World;
 
 /// 执行阶段。
@@ -116,18 +123,62 @@ impl Access {
     }
 }
 
+/// 分片并行的单分片最小规模（实体数下限，R73）。分片数到达上限时每片
+/// 仍至少处理这么多实体，保证线程创建的微秒级开销被真实工作量摊薄
+/// （1024 实体的分量遍历远贵于一次线程 spawn）。
+pub const MIN_SHARD_ITEMS: usize = 1024;
+
+/// 分片数纯函数：`items <= MIN_SHARD_ITEMS` 时不分片（单任务内联），
+/// 否则取 `min(cores, items / MIN_SHARD_ITEMS)`（下限 1）。
+///
+/// 确定性要点：输出只依赖 (实体数, 核数) 两个入参——同一次执行内两者
+/// 恒定，全部分片对片数的取值一致。核数跨机器不同只改变分片数，不改变
+/// 结果（分片写集不相交，见 [`Schedule::add_sharded_system`]）。
+pub fn shard_count_for(items: usize, cores: usize) -> usize {
+    if items <= MIN_SHARD_ITEMS {
+        1
+    } else {
+        cores.min(items / MIN_SHARD_ITEMS).max(1)
+    }
+}
+
+/// 第 `shard` 片（共 `shards` 片）负责的实体区间 `[start, end)`：
+/// 连续等分、尾片吸收余数，相邻片首尾相接（`start_{i+1} == end_i`）。
+/// 纯函数——调度器与测试共用同一实现。
+pub fn shard_range(shard: usize, shards: usize, items: usize) -> (usize, usize) {
+    let start = shard * items / shards;
+    let end = (shard + 1) * items / shards;
+    (start, end)
+}
+
+/// 分片体的执行段：以实体区间切片调用用户闭包，返回类型擦除的写缓冲。
+type ShardRunFn = dyn Fn(&World, &[Entity]) -> Box<dyn Any + Send> + Send + Sync;
+/// 分片体的写回段：下行转换写缓冲到具体组件类型并按序插入。
+type ShardApplyFn = dyn Fn(&mut World, Box<dyn Any + Send>) + Send + Sync;
+
+/// 并行系统的执行体：整体执行（一次调用跑完，v1 形态）或分片执行
+/// （每个实体区间各调一次，R73）。
+///
+/// 分片体的两段式由存储模型决定：组件列的写锁是**列级** RwLock
+/// （`sync.rs`），分片线程并发写同一列必冲突——因此分片闭包只读世界、
+/// 返回类型擦除的写缓冲（`Box<dyn Any + Send>`，实际是
+/// `Vec<(Entity, T)>`），调度器在 join 后按稳定全序串行写回。`apply`
+/// 是注册期合成的下行转换 + 写回闭包（泛型 `T` 在此处具象化）。
+enum SystemBody {
+    Whole(Box<dyn Fn(&World) + Send + Sync>),
+    Sharded {
+        run: Box<ShardRunFn>,
+        apply: Box<ShardApplyFn>,
+    },
+}
+
 /// 并行系统：只读世界（`&World`），通过世界内部的尝试型锁获得组件写访问；
-/// 与其他并行系统的并发安全性由声明的 [`Access`] 决定。
+/// 与其他并行系统的并发安全性由声明的 [`Access`] 决定。执行统一走
+/// [`Schedule::run`] 的批执行器（整体体 = 单任务；分片体 = 按区间展开）。
 pub struct ParallelSystem {
     pub name: &'static str,
     access: Access,
-    f: Box<dyn Fn(&World) + Send + Sync>,
-}
-
-impl ParallelSystem {
-    pub fn run(&self, world: &World) {
-        (self.f)(world);
-    }
+    body: SystemBody,
 }
 
 impl std::fmt::Debug for ParallelSystem {
@@ -194,7 +245,76 @@ impl Schedule {
         self.entry_mut(stage).push(Entry::Parallel(ParallelSystem {
             name,
             access,
-            f: Box::new(f),
+            body: SystemBody::Whole(Box::new(f)),
+        }));
+        self
+    }
+
+    /// 注册分片并行系统（R73）：调度器把当前世界的实体列表（稀疏集
+    /// 插入序，同一世界状态下恒定）按固定连续区间切成
+    /// [`shard_count_for`] 片，每片以不相交的实体子切片调用一次闭包，
+    /// 单个重系统也能吃满多核（数据并行）。
+    ///
+    /// **执行模型（两段式）**：组件列的写锁是列级 RwLock（`sync.rs`），
+    /// 分片线程并发写同一列必冲突——因此闭包**只读**世界，逐实体返回
+    /// `(Entity, T)` 写缓冲；并行段结束后调度器按
+    /// **成员序 × 分片序 × 缓冲序**（= 实体列表序的稳定全序）串行写回。
+    /// 稳定全序 ⇒ 结果与分片数、线程数、机器核数无关——native 多线程
+    /// 与 wasm 单线程（分片数退化为 1，内联路径）逐位一致。
+    ///
+    /// ```ignore
+    /// // 典型形态：读 Vel，写 Pos（dt 为捕获的步长）
+    /// schedule.add_sharded_system(
+    ///     Stage::FixedUpdate,
+    ///     Access::new().read::<Vel>().read::<Pos>(),
+    ///     |world: &World, slice: &[Entity]| {
+    ///         slice.iter().filter_map(|&e| {
+    ///             let pos = world.get::<Pos>(e)?;
+    ///             let vel = world.get::<Vel>(e)?;
+    ///             Some((e, Pos(pos.0 + vel.0 * dt)))
+    ///         }).collect()
+    ///     },
+    /// );
+    /// ```
+    ///
+    /// **契约与诚实边界**：
+    /// - 写组件 `T` 由签名给定并**自动并入** [`Access`] 写集（与其他系统
+    ///   的冲突分批按「一方写 ∩ 另一方读写 ≠ ∅」照常判定）；`access`
+    ///   参数声明其余只读访问；
+    /// - 闭包对世界只读：并发 `get_mut` / 资源写会在运行期被尝试型锁
+    ///   当场击穿（panic 消息含 "already borrowed"），绝不静默串数据；
+    /// - 跨实体全局聚合（求和 / 求最值）请走两阶段：分片把部分结果作为
+    ///   写缓冲落到本区间实体上，再由后续独立系统归并；
+    /// - 写回段是串行的：**写密集、计算轻**的变换（纯拷贝级）分片收益
+    ///   有限，此类场景更适合整体并行系统按列拆分；
+    /// - 同一实体在缓冲中出现多次时按缓冲序重复插入（最后一次生效）——
+    ///   请勿依赖此行为。
+    pub fn add_sharded_system<T, F>(&mut self, stage: Stage, access: Access, f: F) -> &mut Self
+    where
+        T: Component,
+        F: Fn(&World, &[Entity]) -> Vec<(Entity, T)> + Send + Sync + 'static,
+    {
+        let name = std::any::type_name::<F>();
+        log::trace!("注册分片并行系统 {name} 到阶段 {stage:?}");
+        // 写组件 T 自动并入访问集（分批口径必须覆盖闭包的实际写）
+        let mut access = access;
+        access.writes.push(TypeId::of::<T>());
+        self.entry_mut(stage).push(Entry::Parallel(ParallelSystem {
+            name,
+            access,
+            body: SystemBody::Sharded {
+                run: Box::new(move |world: &World, slice: &[Entity]| {
+                    Box::new(f(world, slice)) as Box<dyn Any + Send>
+                }),
+                apply: Box::new(|world: &mut World, buffer: Box<dyn Any + Send>| {
+                    let buffer = buffer
+                        .downcast::<Vec<(Entity, T)>>()
+                        .expect("分片写缓冲类型错位（内部不变量破坏）");
+                    for (entity, component) in *buffer {
+                        world.insert(entity, component);
+                    }
+                }),
+            },
         }));
         self
     }
@@ -253,13 +373,7 @@ impl Schedule {
                     }
                 }
                 Batch::Parallel(indices) => {
-                    if indices.len() == 1 {
-                        if let Entry::Parallel(parallel) = &systems[indices[0]] {
-                            parallel.run(world);
-                        }
-                        continue;
-                    }
-                    run_parallel(systems, &indices, world);
+                    run_batch_parallel(systems, &indices, world);
                 }
             }
         }
@@ -324,46 +438,125 @@ impl Schedule {
     }
 }
 
-/// 并行批次执行：线程数取 min(系统数, 可用核数)，
-/// 工作线程以原子计数器自取任务，全部完成后 scope 返回。
+/// 并行批执行（R73 重构）：把批内成员展开成**任务列表**——普通并行系统
+/// 1 个任务；分片系统按 [`shard_count_for`] 展开 W 个任务，各绑一个实体
+/// 区间切片与一个结果槽。线程数取 `min(任务数, 可用核数)`，工作线程以
+/// 原子计数器自取任务；单任务或可用线程数 ≤ 1 直接内联。
+///
+/// **两段式写回**：分片闭包只读世界、把写缓冲写入自己的结果槽（Mutex
+/// 槽互不争用）；join 后按 **成员序 × 分片序 × 缓冲序**（= 实体列表序的
+/// 稳定全序）串行写回——写回顺序确定 ⇒ 结果与分片数、线程数、机器核数
+/// 无关，native 多线程与 wasm 单线程逐位一致。
+///
+/// 任务序 = 注册序 × 分片序——只约束内联路径的执行顺序；并行段内任务
+/// 间无共享写（列级读锁并存、写全部延迟到写回段），任何顺序下结果一致。
 ///
 /// 平台原因（wasm32）：std 线程在 wasm 上不可用——`thread::spawn` 运行时
 /// panic（实测探针：`thread::scope` + spawn 1 线程即触发 unreachable 陷阱），
 /// 且 `available_parallelism` 返回 `Err`（兜底为 1）。因此可用线程数 ≤ 1 时
 /// 不进 scope、不 spawn，直接内联顺序执行（native 单核同样受益：避免
-/// 无谓的线程创建，语义与顺序执行完全等价）。
-fn run_parallel(systems: &[Entry], indices: &[usize], world: &World) {
-    let fns: Vec<&(dyn Fn(&World) + Send + Sync)> = indices
-        .iter()
-        .filter_map(|&i| match &systems[i] {
-            Entry::Parallel(parallel) => Some(&*parallel.f),
-            Entry::Exclusive(_) => None,
-        })
-        .collect();
-    let threads = fns.len().min(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    );
-    if threads <= 1 {
-        // 单线程可用：内联顺序执行（wasm 无 std 线程 / native 单核）
-        run_inline(&fns, world);
-        return;
-    }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= fns.len() {
-                        break;
-                    }
-                    fns[index](world);
-                }
-            });
+/// 无谓的线程创建，语义与顺序执行完全等价；分片数同步退化为 1）。
+fn run_batch_parallel(systems: &[Entry], indices: &[usize], world: &mut World) {
+    // 任务类型带生命周期参数：分片闭包借用本函数栈上的实体列表，
+    // 不得默认 'static（Box<dyn ...> 省略生命周期时默认 'static）。
+    type TaskFn<'a> = dyn Fn(&World) + Send + Sync + 'a;
+    type ResultSlot = Mutex<Option<Box<dyn Any + Send>>>;
+
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    // 三路平行集合（按注册序，每个分片成员一组）：实体列表（数据）、
+    // 闭包体 run 引用、结果槽（W 个，与分片一一对应）。
+    let mut shard_ents: Vec<Vec<Entity>> = Vec::new();
+    let mut shard_runs: Vec<&ShardRunFn> = Vec::new();
+    let mut shard_results: Vec<Vec<ResultSlot>> = Vec::new();
+    for &i in indices {
+        if let Entry::Parallel(parallel) = &systems[i] {
+            if let SystemBody::Sharded { run, .. } = &parallel.body {
+                let ents: Vec<Entity> = world.entities().collect();
+                let shards = shard_count_for(ents.len(), cores);
+                shard_ents.push(ents);
+                shard_runs.push(&**run);
+                shard_results.push((0..shards).map(|_| Mutex::new(None)).collect());
+            }
         }
-    });
+    }
+
+    // 分片闭包从最终存储位置不可变借用（实体列表 / run / 结果槽），
+    // 闭包组单独持有，避免穿过 &mut 的长寿命重借用。
+    let mut shard_groups: Vec<Vec<Box<TaskFn<'_>>>> = Vec::with_capacity(shard_results.len());
+    for ((slots, ents), run) in shard_results
+        .iter()
+        .zip(shard_ents.iter())
+        .zip(shard_runs.iter().copied())
+    {
+        let shards = slots.len();
+        let mut group: Vec<Box<TaskFn<'_>>> = Vec::with_capacity(shards);
+        for (s, slot) in slots.iter().enumerate() {
+            let (start, end) = shard_range(s, shards, ents.len());
+            let slice = &ents[start..end];
+            group.push(Box::new(move |world: &World| {
+                let buffer = run(world, slice);
+                *slot.lock().unwrap() = Some(buffer);
+            }) as Box<TaskFn<'_>>);
+        }
+        shard_groups.push(group);
+    }
+
+    let mut groups = shard_groups.iter();
+    let mut tasks: Vec<&TaskFn<'_>> = Vec::new();
+    for &i in indices {
+        match &systems[i] {
+            Entry::Parallel(parallel) => match &parallel.body {
+                SystemBody::Whole(f) => tasks.push(&**f),
+                SystemBody::Sharded { .. } => {
+                    let group = groups.next().expect("分片闭包组与分片成员一一对应");
+                    tasks.extend(group.iter().map(|b| &**b));
+                }
+            },
+            // 批内不会有独占系统（build_batches 保证），防御性兜底。
+            Entry::Exclusive(_) => {}
+        }
+    }
+
+    if tasks.len() <= 1 {
+        // 单任务：内联执行（wasm / 单核 / 单系统小批，避免无谓线程创建）
+        run_inline(&tasks, world);
+    } else {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..tasks.len().min(cores) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= tasks.len() {
+                            break;
+                        }
+                        tasks[index](world);
+                    }
+                });
+            }
+        });
+    }
+
+    // 写回段（串行，稳定全序）：成员序 × 分片序 × 缓冲序
+    let mut member = 0usize;
+    for &i in indices {
+        if let Entry::Parallel(parallel) = &systems[i] {
+            if let SystemBody::Sharded { apply, .. } = &parallel.body {
+                for slot in &shard_results[member] {
+                    let buffer = slot
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("分片未写入结果缓冲（内部不变量破坏）");
+                    apply(world, buffer);
+                }
+                member += 1;
+            }
+        }
+    }
 }
 
 /// 顺序执行一批并行系统（单线程 fallback 路径，注册顺序保序）。
@@ -640,5 +833,176 @@ mod tests {
         assert_eq!(world.get::<Counter>(b).unwrap().0, 2, "系统二必须执行");
         assert_eq!(world.get::<Observed>(a).unwrap().0, 0, "系统一先执行");
         assert_eq!(world.get::<Observed>(b).unwrap().0, 1, "系统二后执行");
+    }
+
+    /// 分片测试用的载荷组件：f32 值 + 收敛变换（×1.0001 + 0.001，
+    /// 与 benches 的 step_column 同款——反复应用收敛到定点，不溢出）。
+    #[derive(Component)]
+    struct Payload(f32);
+
+    fn transform_payload(x: f32) -> f32 {
+        x * 1.0001 + 0.001
+    }
+
+    /// 分片数与区间划分的精确边界：纯函数输出只依赖入参。
+    #[test]
+    fn shard_count_and_range_are_exact() {
+        assert_eq!(shard_count_for(0, 16), 1);
+        assert_eq!(shard_count_for(1024, 16), 1, "恰好下限不分片");
+        assert_eq!(shard_count_for(1025, 16), 1, "1025/1024 = 1");
+        assert_eq!(shard_count_for(2049, 16), 2);
+        assert_eq!(shard_count_for(10_000, 2), 2);
+        assert_eq!(
+            shard_count_for(10_000, 64),
+            9,
+            "10000/1024 = 9，核数截断前先到分片上限"
+        );
+        assert_eq!(shard_count_for(100_000, 16), 16, "核数封顶");
+        assert_eq!(shard_count_for(100_000, 1), 1, "单核退化为不分片");
+
+        // 区间划分性质：连续、不相交、并集恰为 [0, items)，且每片非空
+        let (shards, items) = (7, 10_000);
+        let mut covered = 0;
+        for s in 0..shards {
+            let (start, end) = shard_range(s, shards, items);
+            assert_eq!(start, covered, "片 {s} 首与前片尾相接");
+            assert!(end > start, "片 {s} 非空");
+            covered = end;
+        }
+        assert_eq!(covered, items, "并集恰为全域");
+    }
+
+    /// 分片执行与分片数无关（写回是稳定全序 ⇒ 顺序不可观测）：三个不同
+    /// 规模的世界走真实调度路径（分片数随实体数变化，线程数随机器核数
+    /// 变化），结果逐实体与「直接按实体序应用同一变换」的参考实现对账
+    /// to_bits。
+    #[test]
+    fn sharded_system_matches_reference_regardless_of_shard_count() {
+        for n in [3000usize, 9000, 30000] {
+            let mut world = World::new();
+            for i in 0..n {
+                world.spawn((Payload(i as f32 + 0.25),));
+            }
+            let mut schedule = Schedule::new();
+            schedule.add_sharded_system(
+                Stage::Update,
+                Access::new().read::<Payload>(),
+                |world: &World, slice: &[Entity]| {
+                    slice
+                        .iter()
+                        .filter_map(|&e| {
+                            let p = world.get::<Payload>(e)?.0;
+                            Some((e, Payload(transform_payload(p))))
+                        })
+                        .collect()
+                },
+            );
+            schedule.run(Stage::Update, &mut world);
+
+            // 参考实现：初值 i + 0.25（实体列表插入序恒定）应用同一变换
+            for (i, e) in world.entities().enumerate() {
+                let expected = transform_payload(i as f32 + 0.25);
+                let actual = world.get::<Payload>(e).unwrap().0;
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "实体 {i} 值不符（n={n}，分片路径与参考实现偏离）"
+                );
+            }
+        }
+    }
+
+    /// 分片系统与无冲突普通并行系统同批执行，两者效果都在；
+    /// Access 冲突判定对分片成员与整体成员同口径。
+    #[test]
+    fn sharded_and_whole_systems_share_a_batch() {
+        let mut world = World::new();
+        let first = world.spawn((Payload(1.0), Observed(-1)));
+        for i in 1..3000 {
+            world.spawn((Payload(i as f32),));
+        }
+
+        let mut schedule = Schedule::new();
+        schedule
+            .add_sharded_system(
+                Stage::Update,
+                Access::new().read::<Payload>(),
+                |world: &World, slice: &[Entity]| {
+                    slice
+                        .iter()
+                        .filter_map(|&e| {
+                            let p = world.get::<Payload>(e)?.0;
+                            Some((e, Payload(transform_payload(p))))
+                        })
+                        .collect()
+                },
+            )
+            .add_parallel_system(
+                Stage::Update,
+                Access::new().write::<Observed>(),
+                |world: &World| {
+                    let e = world.entities().next().unwrap();
+                    world.get_mut::<Observed>(e).unwrap().0 = 42;
+                },
+            );
+
+        let layout = schedule.batch_layout(Stage::Update);
+        assert_eq!(layout.len(), 1, "无冲突应同批，实际 {layout:?}");
+        schedule.run(Stage::Update, &mut world);
+        assert_eq!(
+            world.get::<Payload>(first).unwrap().0.to_bits(),
+            transform_payload(1.0).to_bits(),
+            "分片系统效果必须在"
+        );
+        assert_eq!(
+            world.get::<Observed>(first).unwrap().0,
+            42,
+            "同批并行系统效果必须在"
+        );
+    }
+
+    /// 分片系统与冲突并行系统异批保序：写者（分片）先、读者后，
+    /// 读者看到写者的完整结果——分片成员的 Access 按整体参与分批。
+    #[test]
+    fn sharded_system_conflicts_serialize_in_order() {
+        let mut world = World::new();
+        let first = world.spawn((Payload(2.0), Observed(-1)));
+        for i in 1..3000 {
+            world.spawn((Payload(i as f32),));
+        }
+
+        let mut schedule = Schedule::new();
+        schedule
+            .add_sharded_system(
+                Stage::Update,
+                Access::new().read::<Payload>(),
+                |world: &World, slice: &[Entity]| {
+                    slice
+                        .iter()
+                        .filter_map(|&e| {
+                            let p = world.get::<Payload>(e)?.0;
+                            Some((e, Payload(transform_payload(p))))
+                        })
+                        .collect()
+                },
+            )
+            .add_parallel_system(
+                Stage::Update,
+                Access::new().read::<Payload>().write::<Observed>(),
+                |world: &World| {
+                    let e = world.entities().next().unwrap();
+                    let value = world.get::<Payload>(e).unwrap().0;
+                    world.get_mut::<Observed>(e).unwrap().0 = value.to_bits() as i32;
+                },
+            );
+
+        let layout = schedule.batch_layout(Stage::Update);
+        assert_eq!(layout.len(), 2, "读写冲突应异批，实际 {layout:?}");
+        schedule.run(Stage::Update, &mut world);
+        assert_eq!(
+            world.get::<Observed>(first).unwrap().0,
+            transform_payload(2.0).to_bits() as i32,
+            "读者必须看到分片写者的完整结果"
+        );
     }
 }
