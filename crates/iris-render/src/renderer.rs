@@ -366,6 +366,12 @@ pub struct Renderer {
     last_instances: Vec<InstanceRaw>,
     mesh_gpu: HashMap<u32, GpuMesh>,
     texture_gpu: HashMap<u32, GpuTexture>,
+    /// MipSettings 的上传期快照（R66）：`draw` 开头从 World 读取，此后
+    /// 本帧内的全部懒上传（材质 / 探针捕获 / UI 图片）同口径。`None` =
+    /// 资源缺席（单 mip + 采样器逐字段与 R66 之前一致）；`Some(a)` =
+    /// RGBA8 路径上传 CPU mip 链 + 三线性 + 各向异性 `min(a, 适配器上限)`。
+    /// 生效时机 = 纹理首次上传（句柄值缓存不追溯，见 `ensure_texture`）。
+    mip_anisotropy: Option<u8>,
     /// 材质绑定组缓存（R52c 起键为 [`material_key`] 的复合值 =
     /// `(材质句柄 << 32) | 图集槽位`——同一材质配不同图集时掩码与图集
     /// 纹理都不同，必须分组；无光照贴图槽位恒 0，与旧键一一对应）。
@@ -2539,6 +2545,7 @@ impl Renderer {
             last_instances: Vec::new(),
             mesh_gpu: HashMap::new(),
             texture_gpu,
+            mip_anisotropy: None,
             material_gpu: HashMap::new(),
             neutral_normal_tex,
             neutral_normal_view,
@@ -3802,6 +3809,11 @@ impl Renderer {
         height: u32,
     ) {
         // 环境源失效检查在最前：重烘焙与绑定组重建必须发生在本帧编码之前
+        // MipSettings（R66）：先于环境/探针路径读取——探针捕获内的材质
+        // 懒上传与本帧主 pass 同口径。上传时生效：已上传纹理不追溯。
+        self.mip_anisotropy = world
+            .try_resource::<crate::texture::MipSettings>()
+            .map(|m| m.anisotropy);
         self.ensure_environment(world);
         self.ensure_hdr_targets(width, height);
         // 遮挡查询（R53）：帧号自增后先消费上一帧读回（非阻塞 poll +
@@ -6784,6 +6796,16 @@ impl Renderer {
                 CompressedPath::Rgba8,
             )
         };
+        // MipSettings 在场（R66）：仅 RGBA8 回退路径生成完整 CPU mip 链
+        // （BC1 / BC3 压缩块流不多级化——诚实限制，见 texture.rs 模块文档
+        // 与 ARCHITECTURE §8）；空 Vec = 单 mip（既有路径）。1×1 纹理链长
+        // 恒 1，天然落入单 mip 形态，白色兜底（句柄 0）根本不进本函数。
+        let mip_levels: Vec<Vec<u8>> =
+            if self.mip_anisotropy.is_some() && !use_bc1 && !use_bc3 && !cpu.rgba.is_empty() {
+                crate::texture::mip_chain_rgba8(width, height, &cpu.rgba)
+            } else {
+                Vec::new()
+            };
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: match path {
                 CompressedPath::Bc3 => Some("iris.texture.bc3"),
@@ -6795,40 +6817,80 @@ impl Renderer {
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mip_levels.len().max(1) as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: None,
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        if mip_levels.is_empty() {
+            self.gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else {
+            // 逐级上传：第 0 级 = 源数据，每级维数 max(1, dim >> level)、
+            // 行步长 = 级宽 × 4（queue.write_texture 无 256 字节对齐要求）
+            for (level, bytes) in mip_levels.iter().enumerate() {
+                let level_w = (width >> level).max(1);
+                let level_h = (height >> level).max(1);
+                debug_assert_eq!(bytes.len(), (level_w * level_h * 4) as usize);
+                self.gpu.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(level_w * 4),
+                        rows_per_image: None,
+                    },
+                    wgpu::Extent3d {
+                        width: level_w,
+                        height: level_h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // 采样器（R66）：MipSettings 缺席 = 逐字段与既有采样器一致
+        // （Nearest mip 过滤 + anisotropy_clamp 1——Default 值）；在场 =
+        // 三线性 + 各向异性（u8 值夹到 wgpu hal 接口的 [1, 16]；适配器
+        // 不支持各向异性时 wgpu-core 内部再收敛为 1）。随纹理缓存按
+        // 句柄持有，上传时生效、运行中修改资源不追溯。
+        let mips_on = self.mip_anisotropy.is_some();
         let sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("iris.sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: if mips_on {
+                wgpu::MipmapFilterMode::Linear
+            } else {
+                wgpu::MipmapFilterMode::Nearest
+            },
+            anisotropy_clamp: self.mip_anisotropy.map_or(1, |a| (a as u16).clamp(1, 16)),
             ..Default::default()
         });
         self.texture_gpu.insert(

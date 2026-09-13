@@ -5,6 +5,67 @@
 
 ## [Unreleased]
 
+### Added（R66：纹理 mip 链 + 各向异性过滤——`MipSettings` 资源，默认像素零变化）
+
+全库材质纹理此前的上传路径为**单 mip**（`mip_level_count` 恒 1）且无一处
+配置各向异性过滤——`games/iris-exp` 导入外部 GLB 角色实测暴露该缺口
+（frictions ①）：发片材质（黑底透明 + 彩色发丝，alpha BLEND）远距重度
+缩小采样时高频 alpha 逐像素翻转成噪点。混合公式核实无误（wgpu
+ALPHA_BLENDING 直通 alpha 与 glTF 非预乘语义一致，不动），病灶就是
+「无 mip + 无各向异性」的全局缺口。本轮修复形态与既有「资源缺席 = 关」
+范式（TaaSettings / SsrSettings / OcclusionCulling）完全同款：
+
+- **`MipSettings { anisotropy: u8 }` 资源**（`texture.rs`，Default = 8，
+  入 prelude）：**资源缺席 = 与 R66 之前逐位一致**（单 mip 上传、采样器
+  逐字段不变）——默认渲染像素零变化，全部既有 FNV 帧哈希锁原值通过。
+  在场时 RGBA8 回退路径上传完整 CPU mip 链，采样器换三线性
+  （`mipmap_filter: Linear`）+ 各向异性（u8 夹到 wgpu hal 边界 [1, 16]，
+  适配器不支持时 wgpu-core 内部收敛为 1）；BC1 / BC3 压缩路径维持单 mip
+  （诚实限制，§8.43）。生效时机 = 纹理首次上传（句柄值缓存不追溯）。
+- **CPU 纯函数 mip 生成**（`texture.rs`：`mip_level_count` /
+  `downsample_rgba8` / `mip_chain_rgba8`）：2×2 box 降采样、逐通道整数
+  floor 均值（跨平台位级确定）、维数 `max(1, dim/2)` 终止于 1×1；奇数维
+  末行/列不参与下一级（floor 链语义，与 GPU mip 维数公式一致），一维
+  为 1 时边缘 clamp。sRGB 编码空间过滤为诚实限制（不追求线性空间）。
+  链的每一级可脱离 World 精确值单测。
+- **mip 感知显存估算** `TextureStore::gpu_bytes_estimate_mipped`：RGBA8
+  路径补链增量（≈ 基级 +1/3），压缩路径与旧口径相同；旧
+  `gpu_bytes_estimate` 签名与数值不动（既有测试零改动）。
+- **GPU 验收**（新套件 `mip_render.rs`，自带文件内 `GPU_SERIAL` 互斥）：
+  ①兼容——无纹理 / 1×1 纹理场景「缺席 = 在场」全帧 FNV 逐位一致
+  （链与采样器改动对这两类纹理数学上不可见）；②有效性双向可判别
+  （R53/R60 指标学）——512² / 4 纹素格棋盘俯视重度缩小（≈12 纹素/像素）
+  ROI 亮度标准差：关 mip 实测 99.77（摩尔纹噪点）> 60 阈值、开 0.00
+  （box 链均灰）< 20 阈值，两阈值独立断言；③确定性——同输入双会话
+  （独立世界 + 独立渲染器）两态逐位一致；④mip 关闭帧锁 R66 文件基线
+  哈希（新建，非改既有锁）。纯函数单测 4 项（含奇数尺寸边缘处理、
+  1×1 终止、链长、估算口径）。验收图 `docs/mip.png`（关/开对照离屏图）。
+- **iris-exp 接入**：`ExpPlugin` 插入 `MipSettings { anisotropy: 8 }`
+  （headless 路径无渲染器，无害）+ 光照调参（frictions ②，intensity
+  2.6→1.4、ambient 0.22/0.24/0.28→0.11/0.12/0.14，白服区域实测亮度
+  ≈223→≈184，大面积过曝缓解）；`docs/exp.png` 重生成，快照跨运行
+  逐字节一致（sha256 对账），mip 生效性经「资源在场/缺席」哈希差对照
+  证实。`assets/exp_weiqing.glb` 缺席时全部路径照常跳过。
+
+### Added（iris-exp：实验性项目——外部 GLB 角色 + Mixamo 重定向动作导入验证）
+
+新建 `games/iris-exp`（最小实验环境，非完整游戏）：验证外部建模管线
+（Blender 4.x 导出 GLB）产出的蒙皮角色在引擎内的渲染 / 动画 / 动作切换。
+资产（`assets/exp_weiqing.glb`，32MB 版权模型）不入库，`.gitignore` 按名字
+精确忽略，缺席时插件降级无角色模式（诚实告警，测试跳过）。
+
+- **装配**：4 蒙皮网格 + 4 骨骼挂接刚性挂件 + 87 骨骨架；动画按名加载
+  （`Mixamo_Walk` 循环 / `Mixamo_Jump` 单次播完自动回落步行——用非循环
+  播放结束的 `playing` 落 `false` 做接线，零状态机）。
+- **验证**（headless 确定性 + 离屏快照双轨）：剪辑名按名可查、87 具名
+  节点在位；步行推进采样关节逐帧变化；跳跃骨盆 z 起伏 >1 m（蓄力 1.08 /
+  腾空 3.36）；播完自动回落步行；同输入两次推进关节位姿 `to_bits()`
+  逐位一致；离屏快照跨运行逐字节一致，验收图 `docs/exp.png`；渲染实测
+  蒙皮 / 阴影 / 贴图正常，角色面向 +Z（相机已对位）。
+- **暴露的引擎侧缺口**独立成档（`docs/private/iris-exp-frictions.md`，
+  「现象 → 归因 → 绕行 → 建议修法」）：① alpha BLEND 发片材质噪点、
+  ② 场景观感偏亮——两条均已于 R66 闭合（见上）。
+
 ## [0.1.1] - 2026-09-12
 
 ### Changed（仓库结构：六个 dogfooding 游戏 crate 迁入根级 `games/`）

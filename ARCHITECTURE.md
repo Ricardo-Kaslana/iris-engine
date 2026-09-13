@@ -2150,8 +2150,32 @@ glTF / HDR 错误经 `From` 映射保上下文）。
   「不透明副本 → BC1 路径、alpha=100 副本 → RGBA 回退」的同画面 A/B
   （不透明材质不消费纹理 alpha，两副本画面等价，像素对比即纯格式对比）
   断言全帧平均误差 < 2/255（块内纯色棋盘格解码精确，实测 0）。
-- **mipmap v1 不做**：引擎无 mipmap 机制（`mip_level_count` 恒 1），
-  BC1 上传为单 mip；引入 mipmap 时编码器补 mip 链生成（接口另议）。
+- **mip 链 + 各向异性过滤（R66，`MipSettings` 资源，默认关）**：
+  `texture.rs` 的 `MipSettings { anisotropy: u8 }`（Default = 8）是全库
+  材质纹理采样策略总开关——**资源缺席 = 与 R66 之前逐位一致**（单 mip
+  上传、`mip_level_count` 恒 1、采样器 Nearest mip 过滤 + clamp 1），
+  与 TaaSettings / SsrSettings 的「缺席 = 关」范式同款。在场时：
+  - **CPU 纯函数链**（`mip_chain_rgba8` / `downsample_rgba8` /
+    `mip_level_count`，全整数运算跨平台位级确定）：2×2 box 降采样、
+    逐通道 floor 均值、维数 `max(1, dim/2)` 终止于 1×1；**奇数维末行/
+    列源像素不参与下一级**（floor 链语义），一维为 1 时边缘 clamp
+    （边缘纹素权重加倍）。仅 RGBA8 回退路径生效——**BC1 / BC3 压缩
+    路径维持单 mip**（压缩块流降采样需先解码，v1 不做，§8.43）；
+  - **采样器**：`mipmap_filter: Linear`（三线性）+ `anisotropy_clamp`
+    夹到 wgpu hal 边界 [1, 16]（适配器不支持各向异性时 wgpu-core 内部
+    收敛为 1）；1×1 纹理链长恒 1，trilinear / 各向异性对常色纹理
+    数学上不可见（`mip_render.rs` 帧级逐位断言）；
+  - **生效时机 = 上传时**：GPU 纹理与采样器按句柄值缓存，运行中修改
+    资源不追溯已上传纹理（`draw` 开头读取快照，本帧全部懒上传同口径）；
+  - **动机**（games/iris-exp frictions ①）：外部 GLB 发片（黑底透明 +
+    彩色发丝）远距重度缩小采样时高频 alpha 逐像素翻转成噪点；混合
+    公式（ALPHA_BLENDING 直通 alpha）与 glTF 非预乘语义一致，不动。
+  GPU 验收（`mip_render.rs`，文件内互斥）：512² / 4 纹素格棋盘俯视
+  重度缩小（≈12 纹素/像素）ROI 亮度标准差**双向可判别**——关 mip
+  实测 99.77（摩尔纹噪点）vs 开 0.00（box 链均灰），阈值 60 / 20
+  独立断言；1×1 / 无纹理场景「缺席 = 在场」全帧 FNV 逐位一致（改动面
+  未外溢旁证）；关帧另锁 R66 文件基线哈希；同输入双会话（独立世界 +
+  独立渲染器）两态逐位一致。验收图 `docs/mip.png`（关/开对照）。
 
 **内存占用统计**（「低占用」卖点的观测口径）：
 
@@ -2163,6 +2187,10 @@ glTF / HDR 错误经 `From` 映射保上下文）。
   决策树计（BC1 0.5 B/px 或 RGBA 4 B/px）；`false`/`true` 两次调用之差
   即压缩节省。`Renderer::texture_is_bc1(handle)` 观测逐纹理实际上传
   格式（测试与内存对账用）。
+- `TextureStore::gpu_bytes_estimate_mipped(feature_bc)`（R66）：mip 感知
+  口径——RGBA8 路径纹理补算完整链增量（第 1 级起 Σ w_k·h_k·4，几何
+  级数 ≈ 基级 +1/3），BC1 / BC3 路径与旧口径相同（单 mip）；假设
+  `MipSettings` 在场。**旧方法签名与数值口径不动**（既有测试零改动）。
 
 **实测数据**（开发机：RTX 4060 Laptop GPU / Vulkan / Windows，release
 构建，`memory_bench` 示例，量级参考非承诺值）：
@@ -4772,6 +4800,15 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     一并完成组件注册。**建议**：若后续出现更多「早期隐藏」场景，可在
     `iris-core` 补 `World::register_component::<T>()`（`&mut World` 侧的一次性
     注册 API）——本轮未做（游戏轮不改引擎）。
+43. **BC1 / BC3 压缩纹理维持单 mip（R66 mip 链的诚实边界）**：
+    `MipSettings` 的 CPU box 链只对 RGBA8 回退路径生成——压缩块流没有
+    逐像素语义，降采样需先解码再重编码（CPU 侧成本与质量取舍另议），
+    因此 4 对齐全不透明纹理走 BC1 / 声明半透明走 BC3 时即使资源在场
+    也没有 mip 链与三线性收益（采样器仍会换三线性 + 各向异性，但单 mip
+    下层间过滤不生效，仅各向异性在层内起作用）。重度缩小的压缩纹理仍会
+    摩尔纹；补法 = GPU 侧 `copy_texture_to_texture` 逐级 blit 或压缩
+    链生成（`gpu_bytes_estimate_mipped` 口径已与上传路径一致：压缩路径
+    不计链增量）。
 ## 9. 关键设计取舍记录
 
 - **回调式查询 vs 迭代器**：见 §3.4。牺牲一点语法糖换取零 unsafe 与确定性 panic。

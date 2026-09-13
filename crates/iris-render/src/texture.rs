@@ -15,10 +15,121 @@
 //! 只对声明过的纹理启用 BC3 上传路径（[`crate::texture_bcn::bc3_eligible`]），
 //! 未声明纹理维持既有 RGBA8 / BC1 决策树逐位不变。声明表用
 //! `BTreeSet`（确定性文化：迭代序 = 句柄序，与 broadphase 同规约）。
+//!
+//! **Mip 链与各向异性过滤（R66）**：[`MipSettings`] 资源是全库材质纹理
+//! mip 链 + 各向异性过滤的**总开关**——资源缺席 = 单 mip 上传 + 采样器
+//! 逐字段与 R66 之前一致（默认像素零变化的兼容形态，与 TaaSettings /
+//! SsrSettings / OcclusionCulling 的「缺席 = 关」范式同款）。在场时：
+//! RGBA8 路径上传完整 CPU 生成 mip 链（[`mip_chain_rgba8`]，2×2 box
+//! 降采样整数运算、跨平台位级确定），采样器三线性 + 各向异性过滤
+//! （值域 [1, 16]，适配器能力由 wgpu-core 二次收敛，见 [`MipSettings`]）。**诚实限制清单**：
+//! - mip 在 **sRGB 编码空间**过滤（对 u8 编码值直接求均值），非线性光
+//!   空间的物理正确降采样——高对比边缘的半级行为与线性空间过滤略有
+//!   差异；线性空间过滤需要浮点中间格式 + 逐级编解码，v1 不做；
+//! - **BC1 / BC3 压缩路径维持单 mip**（压缩块流的降采样需先解码，
+//!   本轮不做压缩纹理多级化；`gpu_bytes_estimate_mipped` 口径一致）；
+//! - 生效时机 = **上传时**：渲染器按句柄值缓存 GPU 纹理与采样器，
+//!   资源在纹理首次上传后修改/移除**不追溯**已上传纹理；
+//! - 奇数维降采样语义见 [`downsample_rgba8`] 文档（floor 链维数公式，
+//!   末行/列源像素不参与下一级）。
 
 use std::collections::BTreeSet;
 
 use iris_core::Resource;
+
+/// 各向异性过滤 / mip 链设置（R66，全库材质纹理采样策略的总开关）。
+///
+/// **缺席语义 = 与 R66 之前逐位一致**：单 mip 上传、采样器逐字段不变
+/// （`mipmap_filter: Nearest`、`anisotropy_clamp: 1`）——默认渲染像素
+/// 零变化。在场时材质纹理走「CPU mip 链 + 三线性 + 各向异性」上传
+/// （RGBA8 路径；BC1 / BC3 压缩路径维持单 mip，见模块文档诚实限制）。
+///
+/// 生效时机为**纹理首次上传时**：渲染器按句柄值缓存 GPU 资源，运行中
+/// 修改本资源只影响之后新上传的纹理，不追溯已上传者。
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct MipSettings {
+    /// 各向异性过滤上限（1 = 关；典型 4 / 8）。实际生效值先夹到
+    /// wgpu hal 接口边界 `[1, 16]`，再由 wgpu-core 按适配器能力二次
+    /// 收敛（`DownlevelFlags::ANISOTROPIC_FILTERING` 不支持时恒 1，
+    /// 不会创建失败）。
+    pub anisotropy: u8,
+}
+
+impl Default for MipSettings {
+    fn default() -> Self {
+        Self { anisotropy: 8 }
+    }
+}
+
+/// 完整 mip 链的级数（含第 0 级原图）：`1 + floor(log2(max(w, h)))`，
+/// 每级维数 `max(1, dim / 2)` 直到 1×1。1×1 纹理链长恒 1（渲染器白色
+/// 兜底纹理无需特判的依据）。
+pub fn mip_level_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
+/// 单级 2×2 box 降采样（RGBA8，纯函数，整数运算跨平台位级确定）。
+///
+/// 输出维数 `w' = max(1, w / 2)`、`h' = max(1, h / 2)`（整数除法 =
+/// floor，与 GPU mip 链维数公式一致）。输出纹素 (x, y) = 源纹素
+/// (2x, 2y)、(2x+1, 2y)、(2x, 2y+1)、(2x+1, 2y+1) 四采样**逐通道整数
+/// 均值（floor 舍入）**；越界下标 clamp 到边缘（一维为 1 时该维两采样
+/// 同纹素——边缘像素权重加倍，即「边缘 clamp」语义）。
+///
+/// **奇数维的诚实语义**：floor 维数公式下，奇数维的末行/列源像素不
+/// 落进任何输出纹素的采样窗（如 5 宽 → 2 宽，采样窗为列 (0,1) 与
+/// (2,3)，列 4 丢弃）——与 GPU 硬件 mip 链的维数推进一致，信息损失
+/// 每级至多一行/列，三线性插值下不可感知。
+///
+/// 注意：均值在**编码空间**直接求（调用方负责 sRGB 语义标注，限制见
+/// 模块文档），非线性光空间过滤。
+pub fn downsample_rgba8(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    assert_eq!(
+        (width as u64) * (height as u64) * 4,
+        rgba.len() as u64,
+        "降采样输入尺寸与数据长度不匹配"
+    );
+    let w2 = (width / 2).max(1);
+    let h2 = (height / 2).max(1);
+    let mut out = vec![0u8; (w2 * h2 * 4) as usize];
+    let w = width as usize;
+    // 采样下标 clamp：一维为 1 时 2x+1 越界 → 复制边缘（权重加倍）；
+    // floor 维数公式下其余情形采样窗天然不越界。
+    let clamp_x = |i: u32| (i as usize).min(w - 1);
+    let clamp_y = |i: u32| (i as usize).min(height as usize - 1);
+    for y in 0..h2 {
+        let sy0 = clamp_y(2 * y);
+        let sy1 = clamp_y(2 * y + 1);
+        for x in 0..w2 {
+            let sx0 = clamp_x(2 * x);
+            let sx1 = clamp_x(2 * x + 1);
+            for c in 0..4 {
+                let sum = rgba[(sy0 * w + sx0) * 4 + c] as u32
+                    + rgba[(sy0 * w + sx1) * 4 + c] as u32
+                    + rgba[(sy1 * w + sx0) * 4 + c] as u32
+                    + rgba[(sy1 * w + sx1) * 4 + c] as u32;
+                out[((y * w2 + x) * 4) as usize + c] = (sum / 4) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// 生成完整 mip 链（RGBA8，纯函数）：返回逐级像素数据，第 0 级 =
+/// 源数据副本，逐级 [`downsample_rgba8`] 直到 1×1（[`mip_level_count`]
+/// 级）。链的每一级可脱离 World 精确值单测；同输入两次调用逐位一致。
+pub fn mip_chain_rgba8(width: u32, height: u32, rgba: &[u8]) -> Vec<Vec<u8>> {
+    let mut levels = vec![rgba.to_vec()];
+    let mut w = width.max(1);
+    let mut h = height.max(1);
+    while w > 1 || h > 1 {
+        let next = downsample_rgba8(w, h, levels.last().expect("链至少含第 0 级"));
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        levels.push(next);
+    }
+    levels
+}
 
 /// 纹理句柄，指向 `TextureStore` 中的条目。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -256,6 +367,22 @@ impl TextureStore {
             .sum()
     }
 
+    /// 单张纹理的上传口径字节数（`gpu_bytes_estimate` 与 mip 感知估算
+    /// 共用的决策树——两口径之差恒等于 mip 链的增量，不含其他因素）。
+    fn texture_gpu_bytes(&self, index: usize, t: &CpuTexture, feature_bc: bool) -> u64 {
+        let handle = TextureHandle(index as u32);
+        if feature_bc
+            && self.bc3_declared.contains(&handle.0)
+            && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)
+        {
+            (t.width as u64 / 4) * (t.height as u64 / 4) * 16
+        } else if crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc) {
+            (t.width as u64 / 4) * (t.height as u64 / 4) * 8
+        } else {
+            t.width as u64 * t.height as u64 * 4
+        }
+    }
+
     /// GPU 侧显存占位**估算**（非精确值：驱动可能对齐 / 复制分配，
     /// 采样器等附属对象不计）。按渲染器上传决策树逐纹理计算（R30 / R59）：
     /// - BC3 路径（声明过且 `feature_bc` 为真、尺寸 4 对齐、带 alpha，
@@ -273,17 +400,39 @@ impl TextureStore {
         self.textures
             .iter()
             .enumerate()
+            .map(|(index, t)| self.texture_gpu_bytes(index, t, feature_bc))
+            .sum()
+    }
+
+    /// mip 感知显存估算（R66）：[`Self::gpu_bytes_estimate`] 口径之上，
+    /// RGBA8 路径纹理补算完整 mip 链的增量（第 1 级起 Σ w_k·h_k·4，
+    /// 几何级数 ≈ 基级的 +1/3）；BC1 / BC3 路径维持单 mip（与上传路径
+    /// 一致——压缩纹理本轮不多级化），估算值与旧口径相同。**假设
+    /// `MipSettings` 在场**；1×1 纹理链长 1，无增量。旧
+    /// [`Self::gpu_bytes_estimate`] 签名与数值口径不动（既有测试零改动）。
+    pub fn gpu_bytes_estimate_mipped(&self, feature_bc: bool) -> u64 {
+        self.textures
+            .iter()
+            .enumerate()
             .map(|(index, t)| {
+                let base = self.texture_gpu_bytes(index, t, feature_bc);
+                // BC 命中（按与上传决策树同一谓词判定）⇒ 单 mip，无增量
                 let handle = TextureHandle(index as u32);
-                if feature_bc
+                let compressed = (feature_bc
                     && self.bc3_declared.contains(&handle.0)
-                    && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)
-                {
-                    (t.width as u64 / 4) * (t.height as u64 / 4) * 16
-                } else if crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc) {
-                    (t.width as u64 / 4) * (t.height as u64 / 4) * 8
+                    && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc))
+                    || crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc);
+                if compressed {
+                    base
                 } else {
-                    t.width as u64 * t.height as u64 * 4
+                    let mut extra = 0u64;
+                    let (mut w, mut h) = (t.width.max(1), t.height.max(1));
+                    while w > 1 || h > 1 {
+                        w = (w / 2).max(1);
+                        h = (h / 2).max(1);
+                        extra += w as u64 * h as u64 * 4;
+                    }
+                    base + extra
                 }
             })
             .sum()
@@ -457,5 +606,139 @@ mod tests {
         let fu = shifted - col;
         let fv = v * rows as f32 - row as f32;
         fu.min(1.0 - fu).min(fv.min(1.0 - fv))
+    }
+
+    /// 链长公式（R66）：1 + floor(log2(max(w, h)))；1×1 终止于单级，
+    /// 长方形按长边计。
+    #[test]
+    fn mip_level_count_formula() {
+        assert_eq!(mip_level_count(1, 1), 1, "1×1 链长恒 1（白色兜底无需特判）");
+        assert_eq!(mip_level_count(2, 2), 2);
+        assert_eq!(mip_level_count(4, 4), 3);
+        assert_eq!(mip_level_count(8, 8), 4);
+        assert_eq!(mip_level_count(1024, 64), 11, "长方形按长边计");
+        assert_eq!(mip_level_count(5, 5), 3, "奇数：5→2→1");
+        assert_eq!(mip_level_count(3, 3), 2, "奇数：3→1");
+    }
+
+    /// 2×2 box 降采样精确值（R66）：均匀场不变；黑白格均值 floor 舍入；
+    /// 奇数维末行/列丢弃（floor 链语义）；一维为 1 时边缘 clamp 权重
+    /// 加倍。
+    #[test]
+    fn downsample_rgba8_exact_values() {
+        // 均匀场恒等（R 通道 100、其余 0）
+        let mut flat = vec![0u8; 2 * 2 * 4];
+        for px in flat.chunks_exact_mut(4) {
+            px[0] = 100;
+        }
+        let out = downsample_rgba8(2, 2, &flat);
+        assert_eq!(out, vec![100, 0, 0, 0]);
+        // 2×2 棋盘：四像素 R = 0/255/255/0 → floor(510/4) = 127
+        let mut tex = vec![0u8; 2 * 2 * 4];
+        for (i, px) in tex.chunks_exact_mut(4).enumerate() {
+            px[0] = if i % 2 == 0 { 0 } else { 255 };
+        }
+        let out = downsample_rgba8(2, 2, &tex);
+        assert_eq!(out[0], 127, "floor(510/4) = 127（精确舍入依据）");
+        // 4×1 → 2×1：奇数高度 = 1，两行采样 clamp 到同一行（边缘权重
+        // 加倍不改变均值口径）；列对 (0,1)、(2,3) 均值
+        let mut row = vec![0u8; 4 * 4];
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            px[0] = [10, 20, 30, 40][x];
+        }
+        let out = downsample_rgba8(4, 1, &row);
+        assert_eq!(
+            out,
+            vec![15, 0, 0, 0, 35, 0, 0, 0],
+            "行对均值 (10+20)/2、(30+40)/2"
+        );
+        // 3×1 → 1×1：奇数宽，列 2 丢弃——均值 = (10+20)/2 = 15 而非
+        // (10+20+30)/3；这是「奇数维末列不参与」的可判别证据
+        let mut row3 = vec![0u8; 3 * 4];
+        for (x, px) in row3.chunks_exact_mut(4).enumerate() {
+            px[0] = [10, 20, 30][x];
+        }
+        let out = downsample_rgba8(3, 1, &row3);
+        assert_eq!(out, vec![15, 0, 0, 0], "末列 30 应被丢弃（floor 链语义）");
+        // 1×4 → 1×2：宽为 1，列采样 clamp（两列同列，权重加倍）；
+        // 行对 (0,1)、(2,3) 均值不受影响
+        let mut col = vec![0u8; 4 * 4];
+        for (y, px) in col.chunks_exact_mut(4).enumerate() {
+            px[0] = [8, 16, 32, 64][y];
+        }
+        let out = downsample_rgba8(1, 4, &col);
+        assert_eq!(
+            out,
+            vec![12, 0, 0, 0, 48, 0, 0, 0],
+            "1×N：列 clamp + 行对均值"
+        );
+        // 1×1：链终止，输出 = 输入
+        let one = vec![7u8, 8, 9, 255];
+        assert_eq!(downsample_rgba8(1, 1, &one), one);
+    }
+
+    /// mip 链生成（R66）：级数 = 公式值、逐级维数 max(1, dim/2)、末级
+    /// 1×1、第 0 级 = 源数据；同输入双跑逐位一致（确定性）。
+    #[test]
+    fn mip_chain_shape_and_determinism() {
+        let src = CpuTexture::checkerboard(4, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let levels = mip_chain_rgba8(src.width, src.height, &src.rgba);
+        assert_eq!(levels.len(), mip_level_count(16, 16) as usize);
+        assert_eq!(levels[0], src.rgba, "第 0 级 = 源数据");
+        let (mut w, mut h) = (16u32, 16u32);
+        for level in &levels {
+            assert_eq!(level.len(), (w * h * 4) as usize, "{w}×{h} 级尺寸");
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        assert_eq!((w, h), (1, 1), "链终止于 1×1");
+        let again = mip_chain_rgba8(src.width, src.height, &src.rgba);
+        assert_eq!(levels, again, "同输入双跑逐位一致（确定性）");
+        // 奇数尺寸：5×5 → 2×2 → 1×1
+        let odd = mip_chain_rgba8(5, 5, &[128u8; 5 * 5 * 4]);
+        assert_eq!(odd.len(), 3);
+        assert_eq!(odd[1].len(), 2 * 2 * 4);
+        assert_eq!(odd[2], vec![128; 4], "均匀场 1×1 末级（全通道 128）");
+        // alpha 通道逐级独立均值（2×2 全部同色 → 1×1 保值，不串色）
+        let chain = mip_chain_rgba8(2, 2, &[0u8, 0, 0, 200].repeat(4));
+        assert_eq!(chain[1], vec![0, 0, 0, 200], "alpha 通道独立均值");
+    }
+
+    /// mip 感知显存估算（R66）：RGBA8 路径补链增量（4×4 → +16+4 = +20）；
+    /// BC1 / BC3 路径与旧口径相同（压缩纹理不多级化）；旧估算方法数值
+    /// 与既有测试口径逐字节一致。
+    #[test]
+    fn mipped_gpu_estimate_adds_chain_only_for_rgba_path() {
+        let mut store = TextureStore::new();
+        // 0 号兜底 1×1：链长 1，两口径一致
+        assert_eq!(store.gpu_bytes_estimate(false), 4);
+        assert_eq!(store.gpu_bytes_estimate_mipped(false), 4);
+        // 4×4 半透明纹理（非全不透明 → RGBA 路径）：基级 64，
+        // 链增量 = 2×2×4 + 1×1×4 = 20 → 84
+        let translucent = CpuTexture::checkerboard(1, 4, [0, 0, 0, 40], [255, 255, 255, 40]);
+        store.add(translucent);
+        assert_eq!(store.gpu_bytes_estimate(false), 4 + 64);
+        assert_eq!(store.gpu_bytes_estimate_mipped(false), 4 + 64 + 16 + 4);
+        // 同一纹理开 BC 特性：不透明棋盘走 BC1（单块 8 B），mip 增量为 0
+        let mut store2 = TextureStore::new();
+        let opaque = CpuTexture::checkerboard(1, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
+        store2.add(opaque);
+        assert_eq!(store2.gpu_bytes_estimate(true), 4 + 8);
+        assert_eq!(
+            store2.gpu_bytes_estimate_mipped(true),
+            4 + 8,
+            "BC1 路径单 mip，两口径一致"
+        );
+        // BC3 声明 + alpha：同样单 mip
+        let mut store3 = TextureStore::new();
+        let h = store3.add_bc3_declared(CpuTexture::checkerboard(
+            1,
+            4,
+            [0, 0, 0, 40],
+            [255, 255, 255, 255],
+        ));
+        assert!(store3.is_bc3_declared(h));
+        assert_eq!(store3.gpu_bytes_estimate(true), 4 + 16);
+        assert_eq!(store3.gpu_bytes_estimate_mipped(true), 4 + 16);
     }
 }

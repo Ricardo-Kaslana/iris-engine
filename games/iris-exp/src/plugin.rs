@@ -11,8 +11,8 @@ use iris_core::prelude::{Entity, Stage};
 use iris_engine::prelude::{
     Access, ActiveCamera, AnimationClip, AnimationPlayer, AnimationPlugin, App, Camera,
     DirectionalLight, HierarchyPlugin, Input, KeyCode, MaterialDef, MaterialStore, MeshData,
-    MeshStore, Name, OffscreenRenderer, Plugin, Quat, Resource, Schedule, TextureStore, Transform,
-    Vec3, Visibility, World, asset_path, spawn_gltf_instance,
+    MeshStore, MipSettings, Name, OffscreenRenderer, Plugin, Quat, Resource, Schedule,
+    TextureStore, Transform, Vec3, Visibility, World, asset_path, spawn_gltf_instance,
 };
 
 /// 角色 GLB 路径（`asset_path` 解析：CWD 相对优先，workspace 根相对回退）。
@@ -98,6 +98,12 @@ fn setup_resources(world: &mut World) {
     if !world.contains_resource::<TextureStore>() {
         world.insert_resource(TextureStore::new());
     }
+    // mip 链 + 各向异性过滤（R66）：外部 GLB 的发片（黑底透明 + 彩色
+    // 发丝）远距缩小采样必须走 mip，否则高频 alpha 逐像素翻噪点
+    //（frictions ①）。headless 路径无渲染器，资源在场无害。
+    if !world.contains_resource::<MipSettings>() {
+        world.insert_resource(MipSettings { anisotropy: 8 });
+    }
     if !world.contains_resource::<Camera>() {
         world.insert_resource(Camera::default());
     }
@@ -129,10 +135,13 @@ fn build_scene(world: &mut World) {
     ));
 
     // ---- 方向光：右上前方斜射，开阴影 ----
+    // R66 调参（frictions ②）：intensity 2.6 + ambient 0.22 观感整体偏白
+    //（白色服装大面积过曝、贴图细节被冲掉），按离屏快照逐轮目检调低至
+    // 白色布料恢复层次。离屏与窗口共用 ACES 链，观感可直接对照。
     if let Some(mut light) = world.try_resource_mut::<DirectionalLight>() {
         light.direction = Vec3::new(-0.45, -1.0, -0.35).normalize_or_zero();
-        light.intensity = 2.6;
-        light.ambient = Vec3::new(0.22, 0.24, 0.28);
+        light.intensity = 1.4;
+        light.ambient = Vec3::new(0.11, 0.12, 0.14);
         light.shadows = true;
     }
 

@@ -190,7 +190,10 @@ pub mod prelude {
         TERRAIN_LOD_STRIDES, Terrain, TerrainBuild, TerrainOptions, build_terrain, chunk_mesh,
         generate_hills, grass_textures, terrain_statics,
     };
-    pub use crate::texture::{CpuTexture, TextureHandle, TextureStore};
+    pub use crate::texture::{
+        CpuTexture, MipSettings, TextureHandle, TextureStore, downsample_rgba8, mip_chain_rgba8,
+        mip_level_count,
+    };
     pub use crate::texture_bcn::{
         BC1_BLOCK_BYTES, BC3_BLOCK_BYTES, bc1_eligible, bc3_eligible, encode_bc1, encode_bc3,
         encoded_len, encoded_len_bc3, padded_extent,

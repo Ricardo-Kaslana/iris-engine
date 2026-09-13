@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1180 / release 1178**（每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1186 / release 1184**（每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -120,7 +120,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1064 / release 1062）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1186 / release 1184）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -136,17 +136,19 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 - 与规格偏离必须汇报并给理由（历史偏离多有充分依据，如 `&mut World` spawn、rest 姿势显式捕获、上帧深度复用单份 scene_depth）。
 - 文档滞后是 bug：改行为必须同步 ARCHITECTURE 对应章节，_FEATURES 数字（测试数等）过期也要顺手修。
 
-## 当前状态与路线图（2026-09-11 更新）
+## 当前状态与路线图（2026-09-13 更新）
 
-- 测试基线 debug 1180 / release 1178；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1186 / release 1184；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v4**（上限跃迁：工具链 × 视觉 × AI × 完整 Assault）：
   - W5 内容产能 ✅：R57 关卡格式 v2、R58a/b 编辑器、R59 资产管线（BC3/manifest/动画注册表）
-  - W6 视觉上限：R60 TAA ✅、R61 阴影 v2 ✅、R62a/b 反射探针+SSR ✅；剩 **R63 材质上限**（预积分皮肤 SSS）、R64 光照探针 GI（可选）
+  - W6 视觉上限 ✅：R60 TAA、R61 阴影 v2、R62a/b 反射探针+SSR、R63 预积分皮肤 SSS、R64 光照探针 GI、R66 纹理 mip 链+各向异性（iris-exp 摩擦①②闭合，docs/private/iris-exp-frictions.md）
   - W7 AI 与战斗手感：R65 行为树 ✅（行为树 / 黑板 / 感知事件落 iris-core，
-    iris-infiltration 守卫迁移验收——迁移前后轨迹 FNV 逐位相同）；剩 R66 帧数据
-    战斗、R67 战斗相机（未开工）
-  - W8 完整 Assault（游戏七，dogfooding 纪律）：R68–R71（未获用户「OK」不开工）
+    iris-infiltration 守卫迁移验收——迁移前后轨迹 FNV 逐位相同）；剩 R67 帧数据
+    战斗、R68 战斗相机（未开工）
+  - W8 完整 Assault（游戏七，dogfooding 纪律）：R69–R72（未获用户「OK」不开工）
   - W9 收官：R55 生产化、R56 发布 0.1（语义版本/docs.rs/CHANGELOG 发布段）
+- 实验项目：`games/iris-exp`（外部 GLB 角色 + Mixamo 重定向动作导入验证；
+  引擎侧摩擦独立成档 `docs/private/iris-exp-frictions.md`）。
 - 休眠项（可插队）：手柄输入（**用户明确暂缓**）、Android、wasm 深化、GPU 粒子拖尾、水面、载具、本地化。
 - **红线（用户裁定）**：中文交流；用户是项目唯一决策人（裁剪/加轮都听他的）；不做网络多人、照片级（Nanite/Lumen 类）、大开放世界流式、通用 DCC 级编辑器（自有 MVP 编辑器除外）。
 - 用户会实际运行游戏与编辑器并报 bug（Infiltration 四问题、编辑器试玩落盘）——演示与验收图质量必须真实。
