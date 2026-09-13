@@ -43,6 +43,16 @@
   踩坑四则录 frictions ⑥（ResourceRef 守卫作用域、atan2 负零 ±π、
   相机跟随判定须含 WASD 电平、陈旧注释定错模型前向——验收图目检抓出）。
 
+### Fixed（测试基建：`post_render` 套件补文件内串行互斥 `GPU_SERIAL`）
+
+R62b 轮给 shadow_v2 / transparent / decal 三个 GPU 套件补串行互斥时**漏了
+`post_render.rs`**（13 项 GPU 测试全裸奔）。本轮 iris-exp 控制轮的 debug
+全量门禁实锤复现：vignette 两项并行共用单适配器自旋挂死，日志 10 分钟零
+推进（杀任务 → 加互斥 → 复跑 13 项 10.6 秒全过）。修法与既定处方同款：
+文件内 `static GPU_SERIAL: Mutex<()>`，逐测试加锁，断言逻辑零改动；
+AGENTS.md 互斥清单同步（ssr / sss / irradiance / shadow_v2 / transparent /
+decal / post）。
+
 ### Added（R66：纹理 mip 链 + 各向异性过滤——`MipSettings` 资源，默认像素零变化）
 
 全库材质纹理此前的上传路径为**单 mip**（`mip_level_count` 恒 1）且无一处
