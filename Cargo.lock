@@ -1102,6 +1102,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-exp"
+version = "0.1.1"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
+ "log",
+]
+
+[[package]]
 name = "iris-game"
 version = "0.1.1"
 dependencies = [

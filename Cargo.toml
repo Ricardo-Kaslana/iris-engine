@@ -15,6 +15,8 @@ members = [
     "games/iris-ascent",
     "games/iris-infiltration",
     "games/iris-assault",
+    # 实验性项目：外部 GLB 角色 + Mixamo 重定向动作导入验证
+    "games/iris-exp",
 ]
 
 [workspace.package]
@@ -38,6 +40,7 @@ iris-bastion = { path = "games/iris-bastion", version = "0.1.1" }
 iris-ascent = { path = "games/iris-ascent", version = "0.1.1" }
 iris-infiltration = { path = "games/iris-infiltration", version = "0.1.1" }
 iris-assault = { path = "games/iris-assault", version = "0.1.1" }
+iris-exp = { path = "games/iris-exp", version = "0.1.1" }
 iris-editor = { path = "crates/iris-editor", version = "0.1.1" }
 
 # 数学：SIMD 优化的线性代数库
