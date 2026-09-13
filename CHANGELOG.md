@@ -53,6 +53,37 @@ R62b 轮给 shadow_v2 / transparent / decal 三个 GPU 套件补串行互斥时*
 AGENTS.md 互斥清单同步（ssr / sss / irradiance / shadow_v2 / transparent /
 decal / post）。
 
+### Fixed（iris-exp 资产：R66b GLB 重导出——布料纯白 / 面部不可见 / 皮肤噪点 / 挂件不跟头）
+
+用户对照 Blender 原始渲染报告四问题。诊断链（回导 Blender 无头 EEVEE 对照 +
+引擎头部特写 + 贴图解包）定位**全部为 glTF 导出语义损失，非引擎缺陷**；
+修复全部在 Blender 侧（材质重接 + 贴图烘焙 + 重导出，GLB 含 TANGENT，
+46.39 MB 版权资产不入库；血泪细节 docs/private/04.md §6，frictions ③④⑤
+已闭合）：
+
+- **布料纯白**：元凶 = 导出器误追踪节点群组内 Math 节点的未连线默认值
+  （0.5×10），写出 `emissiveFactor=[1,1,1]` + KHR strength 9.1——引擎
+  不支持 emissiveTexture 却整片应用 factor ⇒ 自发光纯白。烘焙
+  `exp_cloth_d`（d×mravB 乘算 + d.alpha）+ 正确通道 `exp_cloth_orm`，
+  材质重接为导出器规范图（Emission 全断）。引擎复验黑色泳衣 + 金饰 +
+  蓝灰纱罩衫全部恢复。
+- **皮肤密布噪点**：复合机理——导出 ORM 的 G 通道语义错位（原始
+  SEPARATE_COLOR 分离的哑光粗糙度被直传原图 G≈0.23，引擎按 glTF 语义
+  读成高光泽镜面）+ 全 primitive 无 TANGENT（引擎按 R42 设计用屏幕空间
+  导数推 TBN，蒙皮弯曲曲面逐像素法线抖动），低粗糙度镜面 × 抖动 TBN ⇒
+  密集闪点。重导出勾 `export_tangents=True` + 皮肤/面部 ORM 按原始通道
+  烘焙（G = 原 R 通道）。引擎复验皮肤噪点完全消失。
+- **面部五官不可见**：非贴图丢失（特写可见唇红渲染正确、回导 Blender
+  五官俱全）——正常游玩距离像素太少 + 皮肤噪点淹没 + 挂件眼球位移的
+  复合观感。
+- **挂件不跟头**：骨骼挂接（BONE 父级）经 glTF 退化为普通节点变换且
+  基准位置偏移（回导位于 −1.4）。四挂件（mesh_30/32/56/57）转头骨蒙皮
+  （OBJECT 父级 + ARMATURE 修改器 + gMan Head 权重 1），含骨架缩放
+  2.207 的世界空间共轭修正（S·D·S⁻¹）。蒙皮后引擎内真正跟头。
+
+引擎侧验证（零引擎改动）：iris-exp headless 测试过、快照跨运行逐字节
+一致、`docs/exp.png` 重生成。
+
 ### Added（R66：纹理 mip 链 + 各向异性过滤——`MipSettings` 资源，默认像素零变化）
 
 全库材质纹理此前的上传路径为**单 mip**（`mip_level_count` 恒 1）且无一处
