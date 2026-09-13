@@ -3,8 +3,11 @@
 //! `AnimationPlugin`，`Time::advance` 确定性推进，不建窗口。定格**两帧**
 //! （640×360，横向拼接）：
 //!
-//! - **帧 A「步行」**：步行循环中段（第 30 帧，迈步姿态）；
-//! - **帧 B「跳跃」**：注入空格后推进到腾空段（骨盆最高点附近）。
+//! - **帧 A「步行」**：按住 `S` 朝相机方向行走 30 帧（迈步姿态 + 正脸，
+//!   相机注视点跟随角色）——步行动画的播放状态随移动（frictions ⑥），
+//!   必须注入移动键才会播放；
+//! - **帧 B「跳跃」**：松开 `S` 后注入空格，推进到腾空段（骨盆最高点
+//!   附近，原地正脸跳）。
 //!
 //! 输出 `exp_walk.bmp` / `exp_jump.bmp`。转 PNG（两帧横向拼接）：
 //! ```sh
@@ -12,6 +15,8 @@
 //! ```
 //!
 //! 同帧打印 FrameStats 并断言有实例被渲染（角色确实入画）。
+//! `EXP_CAM_HEAD=1` 走头部特写诊断机位——该路径无移动注入，动画定格
+//! 在 t=0（静止姿态，仍可验收面部渲染）。
 //!
 //! ```sh
 //! cargo run -p iris-exp --example exp_snapshot --release
@@ -70,6 +75,17 @@ impl Harness {
         let mut input = self.app.world.resource_mut::<Input>();
         input.press(KeyCode::Space);
     }
+
+    fn hold_s(&mut self) {
+        self.app.world.resource_mut::<Input>().press(KeyCode::KeyS);
+    }
+
+    fn release_s(&mut self) {
+        self.app
+            .world
+            .resource_mut::<Input>()
+            .release(KeyCode::KeyS);
+    }
 }
 
 fn main() {
@@ -106,7 +122,11 @@ fn main() {
         }
     }
 
-    // ---- 帧 A：步行循环中段（迈步姿态）----
+    // ---- 帧 A：按住 S 朝相机行走 30 帧（迈步姿态 + 正脸）----
+    // 诊断特写模式（EXP_CAM_HEAD）不注入移动：动画随移动，无输入即定格
+    if std::env::var("EXP_CAM_HEAD").is_err() {
+        game.hold_s();
+    }
     for _ in 0..30 {
         game.frame();
     }
@@ -120,7 +140,8 @@ fn main() {
     );
     assert!(stats.instances > 0, "步行帧应有实例入画");
 
-    // ---- 帧 B：空格起跳，推进到腾空段（骨盆 z 最高点附近）----
+    // ---- 帧 B：松开 S（原地）+ 空格起跳，推进到腾空段（骨盆 z 最高点附近）----
+    game.release_s();
     game.press_space();
     let mut best_z = f32::MIN;
     let mut since_best = 0u32;

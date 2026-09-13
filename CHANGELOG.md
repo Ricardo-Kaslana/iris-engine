@@ -5,6 +5,44 @@
 
 ## [Unreleased]
 
+### Added（iris-exp：自由视角 / 缩放 / 角色控制——frictions ⑥ 闭合，纯游戏层）
+
+`games/iris-exp` 此前只有动作播放（机位固定、角色钉在原地）。本轮在
+`ExpPlugin` 内补齐第三人称控制装配，**引擎零改动**（`Input` 的鼠标查询
+能力早已齐备——`mouse_button` / `mouse_delta` / `wheel_delta`，轨道相机
++ 缩放 + WASD 移动是纯游戏层工作，与 frictions 档案的归因一致）：
+
+- **轨道相机**（`OrbitCamera` 资源 = yaw/pitch/dist 跨帧状态）：右键
+  拖拽环绕（0.0035 rad/px，俯角钳 [−5°, 85°]）+ 滚轮指数缩放
+  （`dist×=exp(−wheel·0.003)`，钳 [2.5, 18] m）+ 注视点跟随角色（胸口
+  +1.5 m，注册序保证同帧读到角色新位置）。位姿几何提纯为自由函数
+  `orbit_pose`（偏航后俯仰的旋转使相机前向与「eye 指向 target」解析
+  一致，距离不变量 + 特殊角单测守护）；初始机位由轨道参数构造（正面
+  俯 9°、dist 7.5，与旧手调机位同构观感，拖拽无跳变）。
+- **角色移动**：WASD 相对相机方位（基向量由 `OrbitCamera.yaw` 解析
+  求出，不读相机 Transform）、3 m/s、钳在地面 ±11 m；朝向 = `facing_yaw`
+  （模型前向本地 +Z——旧注释「面向 -Z」系笔误，快照目检抓出，
+  `atan2(x,z)` 解析解）+ `exp_approach` 帧率无关指数趋近（每步
+  `wrap_angle` 规范状态角，残差 = 角差×`exp(−rate·Σdt)`，切分无关性
+  单测守护）。
+  动画播放状态随移动：移动播步行、停下定格当前帧、跳跃单次不受影响
+  （播完回落按移动状态定播放）——「移动即走、停即站」，验证 `playing`
+  开关的运行期切换。
+- **两条硬语义**：①无输入帧（鼠标/滚轮/WASD 全静默）不写相机与角色
+  `Transform`——headless / 离屏路径逐位行为与 R66b 之前一致，
+  `EXP_CAM_HEAD` 诊断机位不被运行期改写，既有快照基线语义保持；
+  ②由此旧测试台「无输入推进动画」失效——headless 测试与快照 example
+  同轮改为注入移动键（W/S 电平按住），断言语义不变（快照帧 A 按住 S
+  朝相机行走保正脸 + 迈步姿态，帧 B 松开 S 原地跳；`docs/exp.png`
+  重生成）。
+- **验证**：纯函数 5 项单测（orbit_pose 解析解/距离不变量、facing_yaw
+  基向、shortest_angle 环绕、wrap_angle 规范、exp_approach 切分无关 +
+  解析残差）；headless 新增 2 项集成（轨道相机拖拽/缩放/clamp/无输入
+  恒等——不依赖资产；WASD 移动/转身/定格/跟随/clamp——依赖资产）；既有
+  `determinism_bitwise` 原样通过（同输入双跑 `to_bits()` 逐位一致）。
+  踩坑四则录 frictions ⑥（ResourceRef 守卫作用域、atan2 负零 ±π、
+  相机跟随判定须含 WASD 电平、陈旧注释定错模型前向——验收图目检抓出）。
+
 ### Added（R66：纹理 mip 链 + 各向异性过滤——`MipSettings` 资源，默认像素零变化）
 
 全库材质纹理此前的上传路径为**单 mip**（`mip_level_count` 恒 1）且无一处

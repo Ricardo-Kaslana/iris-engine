@@ -20,6 +20,12 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Transform, World};
 use iris_render::prelude::*;
 
+/// 同文件 13 个 GPU 测试并行共用单适配器时「每帧 poll 的同步循环互相
+/// 争用」会挂死（R62b 病灶谱：自旋挂死 / 空转死等，本轮 debug 全量
+/// 门禁 vignette 两项实锤复现）——文件内互斥锁把并发度压到 1，标准
+/// 门禁命令（默认并行度）恢复可靠（与 ssr_render.rs::GPU_SERIAL 同款）。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 曝光测试场景：中央高自发光球（HDR ≈ 2，0.5×/1×/2× 后仍落在 ACES
 /// 非饱和段，单调可辨）+ 暗地面。泛光显式关闭以隔离曝光效果。
 fn exposure_scene(exposure: Option<f32>) -> World {
@@ -89,6 +95,7 @@ fn region_mean(px: &[u8], w: u32, x0: u32, x1: u32, y0: u32, y1: u32) -> f64 {
 /// 更大的曝光必给出不更暗、且在非饱和段严格更亮的色调映射结果。
 #[test]
 fn exposure_scales_center_brightness_monotonically() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -117,6 +124,7 @@ fn exposure_scales_center_brightness_monotonically() {
 /// 中性），整帧必须逐位一致——这是「默认设置零变化」的引擎级证明。
 #[test]
 fn exposure_absent_equals_explicit_one_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -135,6 +143,7 @@ fn exposure_absent_equals_explicit_one_bitwise() {
 /// 叠加在内的全部链上内容都被清零（曝光是链的终点前的乘法）。
 #[test]
 fn exposure_zero_renders_black() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -222,6 +231,7 @@ fn region_linear_mean(px: &[u8], w: u32, x0: u32, x1: u32, y0: u32, y1: u32) -> 
 /// 一致（中心 falloff 恒 0，压暗不触碰画面核心）。
 #[test]
 fn vignette_darkens_corners_more_than_center() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -271,6 +281,7 @@ fn vignette_darkens_corners_more_than_center() {
 /// 等价性证明。
 #[test]
 fn vignette_zero_and_absent_equal_nopass_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -362,6 +373,7 @@ fn baseline_scene() -> World {
 /// 逐位一致。哈希改变的任何一位都意味着默认路径被破坏。
 #[test]
 fn dof_mb_absent_match_r42_baseline_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 180) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -381,6 +393,7 @@ fn dof_mb_absent_match_r42_baseline_bitwise() {
 /// 一致（两者都整段跳过新 pass、blit 直读主解析缓冲）。
 #[test]
 fn dof_mb_disabled_equals_absent_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 180) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -521,6 +534,7 @@ fn region_highfreq_variance(
 /// 0.5 倍为留有余量的上界。
 #[test]
 fn dof_blurs_far_background_reducing_variance() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -577,6 +591,7 @@ fn dof_blurs_far_background_reducing_variance() {
 /// 无 DOF 帧逐位一致（纹理采样在纹素中心返回精确原值）。
 #[test]
 fn dof_focus_range_covering_scene_is_bitwise_transparent() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -690,6 +705,7 @@ fn region_gradient_energy(
 /// 画面」的强断言：静止场景下的运动模糊必须是纯空转。
 #[test]
 fn motion_blur_static_camera_is_bitwise_transparent() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -730,6 +746,7 @@ fn motion_blur_static_camera_is_bitwise_transparent() {
 /// 理论上逐位不变，1.2 倍余量只覆盖 8-bit 量化扰动。
 #[test]
 fn motion_blur_panning_reduces_gradient_energy() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -793,6 +810,7 @@ fn motion_blur_panning_reduces_gradient_energy() {
 /// 逐位回退标量对焦帧。
 #[test]
 fn dof_focus_target_overrides_scalar_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -849,6 +867,7 @@ fn dof_focus_target_overrides_scalar_bitwise() {
 /// 常量表，无状态哈希流不涉及）。
 #[test]
 fn dof_render_is_deterministic() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(320, 240) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
