@@ -84,6 +84,28 @@ fn main() {
 
     let mut game = Harness::new();
 
+    // 诊断机位（EXP_CAM_HEAD=1）：头部特写——角色面向 +Z，头部约在
+    // y≈3.0；相机放 +Z 侧近距直视面部。正常验收不设该变量。
+    if std::env::var("EXP_CAM_HEAD").is_ok() {
+        use iris_engine::prelude::{ActiveCamera, Transform};
+        let mut hit = None;
+        game.app
+            .world
+            .query::<(iris_engine::prelude::Entity, &ActiveCamera)>(|(e, _)| {
+                hit = Some(e);
+            });
+        if let Some(cam) = hit {
+            game.app.world.insert(
+                cam,
+                Transform {
+                    position: glam::Vec3::new(0.0, 2.72, 1.5),
+                    rotation: glam::Quat::IDENTITY,
+                    scale: glam::Vec3::ONE,
+                },
+            );
+        }
+    }
+
     // ---- 帧 A：步行循环中段（迈步姿态）----
     for _ in 0..30 {
         game.frame();
