@@ -105,7 +105,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ### 给外部 Agent 的提示词骨架（发新一轮时照此拼装）
 
 ```
-# RXX：<轮名>（路线图 v4 · W?）
+# RXX：<轮名>（路线图 v5 · W?/梯队?）
 
 你是 iris-engine 仓库（D:\Development\Complex\iris-engine）的外部工程 Agent。
 开工前必读：AGENTS.md（工程规约权威——门禁顺序/耗时陷阱/统计陷阱/硬约束）、
@@ -136,19 +136,35 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 - 与规格偏离必须汇报并给理由（历史偏离多有充分依据，如 `&mut World` spawn、rest 姿势显式捕获、上帧深度复用单份 scene_depth）。
 - 文档滞后是 bug：改行为必须同步 ARCHITECTURE 对应章节，_FEATURES 数字（测试数等）过期也要顺手修。
 
-## 当前状态与路线图（2026-09-13 更新）
+## 当前状态与路线图（2026-09-14 更新）
 
 - 测试基线 debug 1193 / release 1191；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
-- **路线图 v4**（上限跃迁：工具链 × 视觉 × AI × 完整 Assault）：
-  - W5 内容产能 ✅：R57 关卡格式 v2、R58a/b 编辑器、R59 资产管线（BC3/manifest/动画注册表）
-  - W6 视觉上限 ✅：R60 TAA、R61 阴影 v2、R62a/b 反射探针+SSR、R63 预积分皮肤 SSS、R64 光照探针 GI、R66 纹理 mip 链+各向异性（iris-exp 摩擦①②闭合，docs/private/iris-exp-frictions.md）
-  - W7 AI 与战斗手感：R65 行为树 ✅（行为树 / 黑板 / 感知事件落 iris-core，
-    iris-infiltration 守卫迁移验收——迁移前后轨迹 FNV 逐位相同）；剩 R67 帧数据
-    战斗、R68 战斗相机（未开工）
+- **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
+  编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
+  - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
+    行为树 ✅（infiltration 守卫迁移 FNV 逐位等价）
+  - 第一梯队（战斗底座，先于 W8）：**R73 任务调度器 v2（用户裁定提前）**、R74 动画
+    事件+曲线轨道、R67 帧数据战斗（依赖 R74）、R68 战斗相机、R75 IK v2、R76 接触
+    求解 v2、R77 SSAO、R78 SpotLight+光源扩容
+  - 第二梯队（环境底座）：R79 天空 v2+大气+体积雾、R80 昼夜+风场、R81 平面水体
+    v1、R82 粒子 v2（GPU 化+拖尾）、R83 GI 逐片元化（探针 SH）
+  - 第三梯队（硬科技）：R84–R87 虚拟几何体 V1–V4（opaque-only MVP，裁定接受）、
+    R88/R89 DDGI 动态 GI、R90/R91 毛发、R92 降水、R93 海洋 v2+水下（CPU 位移图
+    折衷，裁定接受）
+  - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /
+    OIT / 贴花 v2 / LOD v2 / 音频 v3 空间化 / 动画压缩 / BC7+KTX2 / 热重载局部 /
+    CCD / RVO 群体
   - W8 完整 Assault（游戏七，dogfooding 纪律）：R69–R72（未获用户「OK」不开工）
   - W9 收官：R55 生产化、R56 发布 0.1（语义版本/docs.rs/CHANGELOG 发布段）
 - 实验项目：`games/iris-exp`（外部 GLB 角色 + Mixamo 重定向动作导入验证；
   引擎侧摩擦独立成档 `docs/private/iris-exp-frictions.md`）。
-- 休眠项（可插队）：手柄输入（**用户明确暂缓**）、Android、wasm 深化、GPU 粒子拖尾、水面、载具、本地化。
-- **红线（用户裁定）**：中文交流；用户是项目唯一决策人（裁剪/加轮都听他的）；不做网络多人、照片级（Nanite/Lumen 类）、大开放世界流式、通用 DCC 级编辑器（自有 MVP 编辑器除外）。
+- 休眠项（可插队）：手柄输入（**用户明确暂缓**）、Android、wasm 深化、载具
+  （2026-09-14 裁定维持休眠）、本地化。（GPU 粒子拖尾 / 水面已随路线图 v5 立项为
+  R82 / R81，脱离休眠。）
+- **红线（用户裁定，2026-09-14 修订）**：中文交流；用户是项目唯一决策人（裁剪/加轮
+  都听他的）；不做网络多人、通用 DCC 级编辑器（自有 MVP 编辑器除外）。原「照片级
+  （Nanite/Lumen 类）」红线解禁收窄：虚拟几何体（本仓体量 Nanite 式子集、opaque-only
+  MVP，R84–R87）与 DDGI 动态 GI（R88–R89）立项；visbuffer 全量管线与 Lumen 类全动态
+  GI 仍不做。原「大开放世界流式」收窄：开放世界地块流式不做，资产级 meshlet 分页
+  流送随 R87 允许。
 - 用户会实际运行游戏与编辑器并报 bug（Infiltration 四问题、编辑器试玩落盘）——演示与验收图质量必须真实。
