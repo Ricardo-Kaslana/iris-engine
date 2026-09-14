@@ -1094,6 +1094,29 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   不消费会跨帧累积）。crossfade 期间只有目标剪辑（active）产事件——
   源已冻结不再推进。典型联动（音频脚步声，玩法侧每帧）：
   `for name in player.take_events() { if name == "footstep" { audio.play(...) } }`。
+  **诚实限制：负 `speed`（倒放）不触发事件**——`collect_crossings` 的
+  数学以「时间正向推进」为前提（非循环分支区间恒空、循环分支 floor 差
+  同样无命中），战斗玩法无倒放需求，v1 不支持。
+- **帧数据窗口 + 参数曲线轨（R74）**：事件是离散点，战斗判定还需要
+  **区间**与**连续值**两类时间语义，本轮补齐：
+  - **窗口** `AnimationClip.windows: Vec<ClipWindow { name, start, end }>`
+    ——「攻击判定开 / 可取消 / 无敌」等区间载体，判定纯函数
+    `window_active(windows, time, name)`：半开区间 `[start, end)`（start
+    含、end 不含——**事件帧 = 窗口首帧**，与「事件在 start 触发」同帧
+    衔接）、`start >= end` 畸形窗口恒 false、无同名窗口 = false（未声明
+    即不 active，组件缺席语义）。播放器便捷入口
+    `AnimationPlayer::window_active(name)`（active 剪辑 × 当前时间）。
+  - **参数曲线** `AnimationClip.curves: Vec<ParameterTrack { name, keys }>`
+    ——命名标量关键帧轨（伤害随命中帧衰减、镜头 FOV 等游戏侧数值的
+    时间演化），采样纯函数 `sample_track`（线性插值、端点钳制、并列
+    时间取输入先者——构造 `ParameterTrack::new` 稳定排序、扫描首遇即
+    返回 ⇒ 并列行为确定；非有限 t 返回 0.0）。`update_animations` 每帧
+    推进后对 active 剪辑全部曲线重采样，**整表覆写**
+    `player.parameter_values`（区间状态语义，非消息流、无 drain），查询
+    `player.parameter(name)`（同名多轨取先声明者）。
+  - 资产侧与事件同款：GLB 解析不产窗口 / 曲线（不在 glTF 标准内），
+    由 API 侧构造或经 `clips_mut()`（`Arc::make_mut`，共享时复制——
+    setup 期一次性注入）写入。R67 帧数据战斗的直接前置。
 - **BlendSpace2D 混合空间（v3）**：`BlendSpace { samples: Vec<(Vec2, usize)> }`
   ——任意分布的参数点集 → 剪辑索引（idle / walk / run / strafe 按
   「速度 × 转向」连续混合的标准载体）。**采样 = 逐轴线性分解**：先按
@@ -4836,6 +4859,17 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     摩尔纹；补法 = GPU 侧 `copy_texture_to_texture` 逐级 blit 或压缩
     链生成（`gpu_bytes_estimate_mipped` 口径已与上传路径一致：压缩路径
     不计链增量）。
+44. **动画窗口 / 参数曲线轨 v1 边界（R74）**：①GLB 解析不产窗口与曲线
+    （不在 glTF 标准内；glTF 侧自动化的 KHR_animation_pointer 类扩展
+    不做），由 API 侧构造或 `clips_mut()` 注入（`Arc::make_mut` 共享时
+    复制整表，只宜 setup 期调用）；②负 `speed`（倒放）不触发事件轨道
+    （`collect_crossings` 以正向推进为前提）；③`parameter_values` 每帧
+    整表覆写是**区间状态语义**（查询型），与事件的消息流（drain 型）
+    刻意分离——把曲线当事件流消费是误用；④窗口 / 曲线采样只对 active
+    剪辑生效（crossfade 源剪辑冻结、附加层剪辑不产——与事件轨道同
+    口径）；⑤同刻并列 key 的区间左端取后者、并列点取前者（确定性
+    规则，语义上是「重复 key 后者只作用于开区间」，见
+    `sample_track` 文档）。
 ## 9. 关键设计取舍记录
 
 - **回调式查询 vs 迭代器**：见 §3.4。牺牲一点语法糖换取零 unsafe 与确定性 panic。

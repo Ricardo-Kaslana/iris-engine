@@ -1192,6 +1192,10 @@ impl GltfLoader {
             duration,
             // 事件不在 glTF 标准内：GLB 解析不产事件，由 API 侧构造
             events: Vec::new(),
+            // 窗口 / 参数曲线同样不在 glTF 标准内（R74）：解析恒为空，
+            // 由 API 侧构造或经 clips_mut() 注入
+            windows: Vec::new(),
+            curves: Vec::new(),
         })
     }
 }

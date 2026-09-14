@@ -199,12 +199,18 @@ fn crossfade_quad_midframe_between_extremes() {
         channels: vec![constant_yaw([0.0, 0.0, 0.0, 1.0])],
         duration: 1.0,
         events: Vec::new(),
+
+        windows: Vec::new(),
+        curves: Vec::new(),
     };
     let clip_side = AnimationClip {
         name: "side".into(),
         channels: vec![constant_yaw([0.0, s, 0.0, c])],
         duration: 1.0,
         events: Vec::new(),
+
+        windows: Vec::new(),
+        curves: Vec::new(),
     };
     world.insert(
         root,
@@ -303,12 +309,18 @@ fn crossfade_source_only_channel_settles_to_rest_on_screen() {
         }],
         duration: 1.0,
         events: Vec::new(),
+
+        windows: Vec::new(),
+        curves: Vec::new(),
     };
     let clip_none = AnimationClip {
         name: "none".into(),
         channels: vec![],
         duration: 1.0,
         events: Vec::new(),
+
+        windows: Vec::new(),
+        curves: Vec::new(),
     };
     let mut player =
         AnimationPlayer::new(vec![clip_offset, clip_none], instance.node_entities.clone());

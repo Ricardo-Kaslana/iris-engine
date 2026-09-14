@@ -5,6 +5,48 @@
 
 ## [Unreleased]
 
+### Added（R74：帧数据窗口 + 参数曲线轨——R67 帧数据战斗的动画侧前置）
+
+**设计定稿修正**：路线图原文「动画事件 + 曲线轨道；全库无事件轨道
+（grep 实证）」前半句有误——事件轨道 v1 早已完备（`AnimationEvent` /
+`collect_events` 纯函数：非循环 `(prev, new]`、循环 multi-fire、触发
+时刻升序；`take_events` drain），当轮 grep 用了小写模式漏检，本条即
+偏离声明。事件是离散点，战斗判定还需要**区间**与**连续值**两类时间
+语义，本轮把这两块补齐：
+
+- **帧数据窗口**：`AnimationClip.windows: Vec<ClipWindow { name, start,
+  end }>`——「攻击判定开 / 可取消 / 无敌」的区间载体。判定纯函数
+  `window_active`（可脱离 ECS 单测）：半开区间 `[start, end)`、畸形
+  窗口（`start >= end`）恒 false、无同名窗口 = false（未声明即不
+  active，组件缺席语义）、非有限 time 恒 false。播放器便捷入口
+  `AnimationPlayer::window_active(name)`（active 剪辑 × 当前时间）。
+  **与事件同帧衔接**：事件在 `start` 触发、窗口从 `start` 生效——
+  同一帧既收到事件又处于窗口首帧（集成测试逐帧锁定）。
+- **参数曲线轨**：`AnimationClip.curves: Vec<ParameterTrack { name,
+  keys }>`——命名标量关键帧轨（伤害随命中帧衰减、镜头 FOV 等数值的
+  时间演化）。采样纯函数 `sample_track`：线性插值、端点钳制、并列
+  时间取输入先者（`ParameterTrack::new` 稳定排序 + 扫描首遇即返回
+  ⇒ 并列行为确定）、非有限 t 返回 0.0（与 BlendSpace「无效参数 →
+  中性值」先例一致）。`update_animations` 每帧推进后对 active 剪辑
+  全部曲线重采样**整表覆写** `player.parameter_values`（区间状态
+  语义，非消息流、无 drain），查询 `player.parameter(name)`（同名
+  多轨取先声明者，向量序确定）。
+- **实现形态**：`AnimationJob` 扩展第 7 元（曲线采样表），两阶段
+  数据流不变——阶段一只读采样（推进后的播放时间）、阶段二落账。
+  GLB 解析不产窗口 / 曲线（不在 glTF 标准内，同事件先例），经
+  API 侧构造或 `clips_mut()`（`Arc::make_mut`，共享时复制）注入。
+- **测试（4 项新增，关键帧全取 2 的幂分数 ⇒ 期望值精确无舍入）**：
+  采样排序 / 钳制 / 区间线性 / 单 key / 空 keys / 非有限 t 的精确值
+  断言；并列 key 的「并列点取前者、区间左端取后者」确定性行为；
+  窗口半开边界（start 含 / end 不含 / 畸形 / 未声明 / NaN）；三件套
+  经 `update_animations` 的四帧推进逐帧断言（事件触发帧 = 窗口首帧、
+  曲线值逐位、末端钳制）。既有 50 项动画测试零改动全过（17 处
+  `AnimationClip` 字面量中 8 处机械补 `windows` / `curves` 空字段、
+  9 处本就走 `..Default::default()`，断言逻辑零改动）。
+- **诚实限制（§8.44）**：倒放（负 speed）不触发事件；`parameter_values`
+  是区间状态语义非事件流（误用即每帧整表被覆写）；窗口 / 曲线只对
+  active 剪辑生效（crossfade 源冻结、附加层不产——与事件同口径）。
+
 ### Added（R73：数据并行分片——单重系统吃满多核，§8.1 半闭合）
 
 调度器 v2 首轮（路线图 v5 第一梯队，用户裁定提前）。此前并行只到

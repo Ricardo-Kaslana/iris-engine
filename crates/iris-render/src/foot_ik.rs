@@ -1068,6 +1068,9 @@ mod tests {
             }],
             duration: 2.0,
             events: Vec::new(),
+
+            windows: Vec::new(),
+            curves: Vec::new(),
         };
         world.insert(
             root,

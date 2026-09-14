@@ -19,7 +19,18 @@
 //! - **事件轨道**：[`AnimationClip::events`] 命中后进入
 //!   [`AnimationPlayer::pending_events`]，消费方每帧
 //!   [`AnimationPlayer::take_events`] drain；跨界检测在纯函数
-//!   [`collect_events`] 中（可脱离 ECS 单测）。
+//!   [`collect_events`] 中（可脱离 ECS 单测）；
+//! - **帧数据窗口 + 参数曲线轨（R74）**：[`AnimationClip::windows`]
+//!   命名区间标记（半开 `[start, end)`，战斗判定的「攻击判定开 /
+//!   可取消 / 无敌」区间语义载体，判定纯函数 [`window_active`]、
+//!   播放器便捷入口 [`AnimationPlayer::window_active`]）；
+//!   [`AnimationClip::curves`] 命名标量关键帧轨（线性插值、端点钳制，
+//!   采样纯函数 [`sample_track`]），`update_animations` 每帧推进后
+//!   重采样整表写入 [`AnimationPlayer::parameter_values`]（查询
+//!   [`AnimationPlayer::parameter`]）。两者与事件同帧衔接：事件在
+//!   `start` 触发、窗口从 `start` 生效（事件帧 = 窗口首帧）。
+//!   GLB 解析均不产（不在 glTF 标准内），由 API 侧构造或经
+//!   `clips_mut()` 注入。诚实限制：负 `speed`（倒放）不触发事件。
 //!
 //! 事件联动示范（音频脚步声；iris-render 不依赖 audio，运行时联动由
 //! 玩法侧完成）：
@@ -202,6 +213,97 @@ pub struct AnimationEvent {
     pub name: String,
 }
 
+/// 帧数据窗口（R74）：剪辑时间轴上的命名**区间**标记——战斗判定的
+/// 「攻击判定开 / 可取消 / 无敌」等区间语义的载体（事件是离散点、
+/// 窗口是区间；两者边界衔接：事件在 `start` 时刻触发、窗口从 `start`
+/// 生效——同一帧既收到事件又处于窗口首帧）。GLB 解析不产窗口（同
+/// 事件先例），由 API 侧构造或经 [`AnimationPlayer::clips_mut`] 注入。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipWindow {
+    /// 窗口名（消费方按名查询，如 "active_frames" / "cancel_window"）。
+    pub name: String,
+    /// 起点（秒，**含**）。
+    pub start: f32,
+    /// 终点（秒，**不含**——半开区间 `[start, end)`）。
+    pub end: f32,
+}
+
+/// 参数曲线轨（R74）：剪辑时间轴上的命名**标量**轨道（关键帧线性
+/// 插值、端点钳制）——伤害随命中帧衰减、镜头 FOV / 受击权重等游戏侧
+/// 数值的时间演化载体。GLB 解析不产曲线（同事件先例）；采样见
+/// [`sample_track`]，播放器每帧采样见
+/// [`AnimationPlayer::parameter_values`]。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParameterTrack {
+    /// 轨道名（消费方按名查询）。
+    pub name: String,
+    /// 关键帧表 `(时间, 值)`；[`ParameterTrack::new`] 构造时按时间升序
+    /// 排序（稳定排序 ⇒ 并列时间保持输入先者，确定性）。
+    pub keys: Vec<(f32, f32)>,
+}
+
+impl ParameterTrack {
+    /// 构造：按时间升序排序（稳定排序 ⇒ 并列时间保持输入先者）。
+    pub fn new(name: impl Into<String>, mut keys: Vec<(f32, f32)>) -> Self {
+        keys.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        Self {
+            name: name.into(),
+            keys,
+        }
+    }
+}
+
+/// 参数曲线采样（纯函数）：线性插值、端点钳制。
+///
+/// 确定性纪律：区间括号取「t ≤ key 时间的最大者」（扫描首遇即返回），
+/// 相邻两 key 时间相等时返回**前者**的值（构造排序保证并列相邻，防
+/// 除零且并列行为确定）；非有限 `t` 返回 0.0（与 [`BlendSpace::sample`]
+/// 的「无效参数 → 中性值」先例一致）。
+pub fn sample_track(keys: &[(f32, f32)], t: f32) -> f32 {
+    if !t.is_finite() {
+        return 0.0;
+    }
+    match keys.len() {
+        0 => 0.0,
+        1 => keys[0].1,
+        _ => {
+            if t <= keys[0].0 {
+                return keys[0].1;
+            }
+            if t >= keys[keys.len() - 1].0 {
+                return keys[keys.len() - 1].1;
+            }
+            for w in keys.windows(2) {
+                let (t0, v0) = w[0];
+                let (t1, v1) = w[1];
+                if t <= t1 {
+                    if t1 > t0 {
+                        let a = (t - t0) / (t1 - t0);
+                        return v0 + (v1 - v0) * a;
+                    }
+                    return v0;
+                }
+            }
+            unreachable!("t < 末 key 时间 ⇒ 扫描必命中括住区间")
+        }
+    }
+}
+
+/// 帧数据窗口判定（纯函数）：播放时间 `time` 是否落在任一同名窗口内。
+///
+/// 半开区间 `[start, end)`；`start >= end` 的畸形窗口恒不命中（区间为
+/// 空）；无同名窗口 = `false`（**未声明即不 active**，与组件缺席语义
+/// 一致）；非有限 `time` 恒 `false`。循环播放的 `time` 为取模后的
+/// 播放时间（天然落在 `[0, duration)`）。
+pub fn window_active(windows: &[ClipWindow], time: f32, name: &str) -> bool {
+    if !time.is_finite() {
+        return false;
+    }
+    windows
+        .iter()
+        .any(|w| w.name == name && w.start <= time && time < w.end)
+}
+
 /// 一段动画剪辑：若干通道的集合，时长取各通道最后关键帧时间的最大值。
 #[derive(Clone, Debug, Default)]
 pub struct AnimationClip {
@@ -211,6 +313,10 @@ pub struct AnimationClip {
     pub duration: f32,
     /// 事件轨道（时间任意序均可，输出恒按触发时刻排序）；GLB 解析恒为空。
     pub events: Vec<AnimationEvent>,
+    /// 帧数据窗口（R74，区间语义见 [`ClipWindow`]）；GLB 解析恒为空。
+    pub windows: Vec<ClipWindow>,
+    /// 参数曲线轨（R74，见 [`ParameterTrack`]）；GLB 解析恒为空。
+    pub curves: Vec<ParameterTrack>,
 }
 
 /// 2D 混合空间（v3）：任意分布的参数点集 → 剪辑索引的映射，第三人称
@@ -530,6 +636,11 @@ pub struct AnimationPlayer {
     /// 节点遮罩（v4）：覆写过滤器，集合外节点本帧不覆写（语义与
     /// 正交性见 [`AnimationMask`]）。默认 None = 全覆写照旧。
     pub mask: Option<AnimationMask>,
+    /// 当前帧的参数曲线值（R74）：active 剪辑的全部
+    /// [`ParameterTrack`] 由 `update_animations` 每帧推进后**重采样
+    /// 整表覆写**（非消息流，无 drain 语义——查询用
+    /// [`Self::parameter`]）。未推进 / 无曲线 = 空。
+    pub parameter_values: Vec<(String, f32)>,
 }
 
 impl Default for AnimationPlayer {
@@ -560,6 +671,7 @@ impl Default for AnimationPlayer {
             pending_root_motion: None,
             additive: None,
             mask: None,
+            parameter_values: Vec::new(),
         }
     }
 }
@@ -761,6 +873,27 @@ impl AnimationPlayer {
     /// 事件是帧内消息，不调用会跨帧累积。
     pub fn take_events(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    /// 帧数据窗口判定（R74）：active 剪辑在**当前播放时间**下，名为
+    /// `name` 的窗口是否 active（纯函数语义见 [`window_active`]——
+    /// 半开区间、未声明即 false）。查询发生在
+    /// `update_animations` 推进之后（消费系统读到的 time 为本帧新值，
+    /// 与事件「跨过即发」同帧衔接：事件帧即窗口首帧）。无剪辑恒 false。
+    pub fn window_active(&self, name: &str) -> bool {
+        self.clips
+            .get(self.active)
+            .map(|clip| window_active(&clip.windows, self.time, name))
+            .unwrap_or(false)
+    }
+
+    /// 当前帧参数曲线值查询（R74）：同名多轨取先声明者（`clips` 内
+    /// 向量序确定）。无该名轨 = `None`。
+    pub fn parameter(&self, name: &str) -> Option<f32> {
+        self.parameter_values
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| *v)
     }
 
     /// 激活混合空间模式（v3）：此后 `update_animations` 每帧按
@@ -1295,7 +1428,8 @@ pub fn root_motion_delta(
 /// 单个动画根实体的采样任务包（`update_animations` 阶段一产出、阶段二
 /// 消费）：根实体 + 推进后的时间 + 循环标记 + 「目标实体 → 覆写字段」
 /// 列表（crossfade / 混合空间时已混合完毕）+ 本帧命中的事件名 +
-/// 本帧根运动增量（未启用 / 无效时为 None）。
+/// 本帧根运动增量（未启用 / 无效时为 None）+ active 剪辑参数曲线
+/// 采样值（R74，推进后时间采样，阶段二整表覆写）。
 type AnimationJob = (
     Entity,
     f32,
@@ -1303,6 +1437,7 @@ type AnimationJob = (
     Vec<(Entity, AnimatedField)>,
     Vec<String>,
     Option<Vec3>,
+    Vec<(String, f32)>,
 );
 
 /// 每帧动画系统：推进所有 [`AnimationPlayer`]，把采样结果覆写到目标实体的
@@ -1358,8 +1493,28 @@ pub fn update_animations(world: &iris_core::world::World) {
                     .collect()
             })
             .unwrap_or_default();
+        // 参数曲线采样（R74）：用推进后的播放时间（窗口/曲线的「当前
+        // 值」语义 = 本帧新值；循环时 time 已取模）
+        let parameter_values = player
+            .clips
+            .get(player.active)
+            .map(|clip| {
+                clip.curves
+                    .iter()
+                    .map(|track| (track.name.clone(), sample_track(&track.keys, time)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let Some(clip) = player.clips.get(player.active) else {
-            jobs.push((entity, time, playing, Vec::new(), fired, None));
+            jobs.push((
+                entity,
+                time,
+                playing,
+                Vec::new(),
+                fired,
+                None,
+                parameter_values,
+            ));
             return;
         };
         // 姿势来源：混合空间激活时按参数点 N 路采样，否则纯 active 剪辑
@@ -1481,17 +1636,26 @@ pub fn update_animations(world: &iris_core::world::World) {
                 }
             }
         }
-        jobs.push((entity, time, playing, fields, fired, root_delta));
+        jobs.push((
+            entity,
+            time,
+            playing,
+            fields,
+            fired,
+            root_delta,
+            parameter_values,
+        ));
     });
 
     // 阶段二（写入）：更新播放状态，覆写目标实体的局部变换
-    for (player_entity, time, playing, fields, events, root_delta) in jobs {
+    for (player_entity, time, playing, fields, events, root_delta, parameter_values) in jobs {
         if let Some(mut player) = world.get_mut::<AnimationPlayer>(player_entity) {
             // 读到的是推进前的 playing：暂停时混合计时同步冻结
             let was_playing = player.playing;
             player.time = time;
             player.playing = playing;
             player.pending_events.extend(events);
+            player.parameter_values = parameter_values;
             // 根运动增量累积（消费方 take_root_motion 取走；一帧一增量，
             // 已有累积时叠加——多系统同帧写同一播放器的防御性合并）
             if let Some(delta) = root_delta {
@@ -1577,6 +1741,9 @@ mod tests {
             channels,
             duration,
             events: Vec::new(),
+
+            windows: Vec::new(),
+            curves: Vec::new(),
         }
     }
 
@@ -1677,6 +1844,9 @@ mod tests {
             channels: vec![],
             duration: 1.0,
             events: Vec::new(),
+
+            windows: Vec::new(),
+            curves: Vec::new(),
         };
         let mut player = AnimationPlayer::new(vec![clip], vec![]);
         assert_eq!(player.advanced(0.3), (0.3, true));
@@ -3077,5 +3247,135 @@ mod tests {
             None,
             "无名字表的手写播放器按名查找恒 None"
         );
+    }
+
+    /// 参数曲线采样（R74）：排序构造、端点钳制、区间线性——全部精确值
+    /// 断言（关键帧取 2 的幂分数，插值无舍入）。
+    #[test]
+    fn sample_track_is_exact_linear_with_clamping() {
+        // 乱序输入 → 构造时升序排序
+        let track = ParameterTrack::new("dmg", vec![(1.0, 10.0), (0.0, 0.0), (2.0, 30.0)]);
+        assert_eq!(track.keys, vec![(0.0, 0.0), (1.0, 10.0), (2.0, 30.0)]);
+        assert_eq!(track.name, "dmg");
+        // 端点钳制
+        assert_eq!(sample_track(&track.keys, -1.0), 0.0);
+        assert_eq!(sample_track(&track.keys, 9.0), 30.0);
+        // 区间线性（0.5 / 1.5 均为精确可表示值）
+        assert_eq!(sample_track(&track.keys, 0.5), 5.0);
+        assert_eq!(sample_track(&track.keys, 1.5), 20.0);
+        // 单 key 恒值；空 keys → 0；非有限 t → 0（中性值先例同 BlendSpace）
+        let single = ParameterTrack::new("s", vec![(0.3, 7.0)]);
+        assert_eq!(sample_track(&single.keys, 0.0), 7.0);
+        assert_eq!(sample_track(&single.keys, 5.0), 7.0);
+        assert_eq!(sample_track(&[], 1.0), 0.0);
+        assert_eq!(sample_track(&track.keys, f32::NAN), 0.0);
+    }
+
+    /// 并列时间 key：构造排序保持输入先者；采样在并列处取前者、
+    /// 并列之后的区间以**后者**为左端（扫描首遇即返回的确定性行为）。
+    #[test]
+    fn duplicate_time_keys_are_deterministic() {
+        let track = ParameterTrack::new("k", vec![(1.0, 5.0), (1.0, 9.0), (2.0, 3.0)]);
+        // 排序稳定：同刻两 key 保持 (5.0, 9.0) 输入序
+        assert_eq!(track.keys[0], (1.0, 5.0));
+        assert_eq!(track.keys[1], (1.0, 9.0));
+        // t 恰在并列处：区间 (0..1] 的右端 → 前者 5.0
+        let track = ParameterTrack::new("k", vec![(0.0, 1.0), (1.0, 5.0), (1.0, 9.0), (2.0, 3.0)]);
+        assert_eq!(sample_track(&track.keys, 1.0), 5.0);
+        // t=1.5 落在 (1.0, 2.0] 区间：左端取并列后者 9.0 → 9 + (3−9)·0.5 = 6.0
+        assert_eq!(sample_track(&track.keys, 1.5), 6.0);
+    }
+
+    /// 帧数据窗口判定（R74）：半开区间 [start, end)、start 含 / end 不含、
+    /// 畸形窗口恒 false、未声明即 false、非有限 time 恒 false。
+    #[test]
+    fn window_semantics_are_half_open() {
+        let windows = vec![
+            ClipWindow {
+                name: "active".into(),
+                start: 0.5,
+                end: 1.0,
+            },
+            ClipWindow {
+                name: "active".into(),
+                start: 1.5,
+                end: 2.0,
+            },
+            ClipWindow {
+                name: "cancel".into(),
+                start: 1.2,
+                end: 3.0,
+            },
+        ];
+        assert!(!window_active(&windows, 0.499, "active"));
+        assert!(window_active(&windows, 0.5, "active"), "start 含");
+        assert!(window_active(&windows, 0.999, "active"));
+        assert!(!window_active(&windows, 1.0, "active"), "end 不含");
+        assert!(window_active(&windows, 1.5, "active"), "第二个同名窗口");
+        assert!(window_active(&windows, 1.8, "cancel"));
+        assert!(!window_active(&windows, 0.7, "cancel"), "未进区间");
+        assert!(!window_active(&windows, 0.7, "nope"), "未声明 = false");
+        assert!(!window_active(&windows, f32::NAN, "active"));
+        let malformed = vec![ClipWindow {
+            name: "m".into(),
+            start: 2.0,
+            end: 1.0,
+        }];
+        assert!(!window_active(&malformed, 1.5, "m"), "畸形窗口恒 false");
+    }
+
+    /// 窗口 / 曲线 / 事件三件套经 update_animations：事件「跨过即发」与
+    /// 窗口半开区间**同帧衔接**（事件帧 = 窗口首帧）；曲线值 = 推进后
+    /// 时间的采样。关键帧与步长全取 2 的幂分数 ⇒ 期望值精确无舍入。
+    #[test]
+    fn windows_curves_and_events_flow_through_update() {
+        let mut combat = clip("combat", vec![], 2.0);
+        combat.events.push(AnimationEvent {
+            time: 0.5,
+            name: "hit".into(),
+        });
+        combat.windows.push(ClipWindow {
+            name: "active".into(),
+            start: 0.5,
+            end: 1.0,
+        });
+        combat
+            .curves
+            .push(ParameterTrack::new("dmg", vec![(0.0, 0.0), (1.0, 10.0)]));
+        let (mut world, root) = blend_world(combat, clip("idle", vec![], 1.0));
+        world.insert_resource(Time::default());
+        world.get_mut::<AnimationPlayer>(root).unwrap().looping = false;
+
+        step(&world, 0.25); // 0.0 → 0.25
+        {
+            let mut player = world.get_mut::<AnimationPlayer>(root).unwrap();
+            assert!(player.take_events().is_empty(), "未跨过 0.5 不触发");
+            assert!(!player.window_active("active"));
+            assert_eq!(player.parameter("dmg"), Some(2.5));
+        }
+        step(&world, 0.25); // 0.25 → 0.5：跨过事件时刻
+        {
+            let mut player = world.get_mut::<AnimationPlayer>(root).unwrap();
+            assert_eq!(player.take_events(), vec!["hit".to_string()]);
+            assert!(
+                player.window_active("active"),
+                "事件帧 = 窗口首帧（0.5 ∈ [0.5, 1.0)）"
+            );
+            assert_eq!(player.parameter("dmg"), Some(5.0));
+        }
+        step(&world, 0.25); // 0.5 → 0.75
+        {
+            let mut player = world.get_mut::<AnimationPlayer>(root).unwrap();
+            assert!(player.take_events().is_empty());
+            assert!(player.window_active("active"));
+            assert_eq!(player.parameter("dmg"), Some(7.5));
+        }
+        step(&world, 0.25); // 0.75 → 1.0
+        {
+            let mut player = world.get_mut::<AnimationPlayer>(root).unwrap();
+            assert!(player.take_events().is_empty());
+            assert!(!player.window_active("active"), "end=1.0 不含");
+            assert_eq!(player.parameter("dmg"), Some(10.0), "越末端钳制");
+        }
     }
 }
