@@ -143,6 +143,34 @@ R62b 轮给 shadow_v2 / transparent / decal 三个 GPU 套件补串行互斥时*
 AGENTS.md 互斥清单同步（ssr / sss / irradiance / shadow_v2 / transparent /
 decal / post）。
 
+### Fixed（iris-exp 资产：R66c GLB 重导出——头发彩虹/透明、三张 B=0 法线、耳坠群组误追踪）
+
+用户对照 Blender 报告：GLB 往返回导后头发呈「彩虹丝 + 看似透明」。诊断链
+（GLB JSON + 内嵌贴图解包 + Blender 节点图逐参数对照）钉死三处导出语义
+损失，**全在资产侧、零引擎改动**（血泪细节 docs/private/04.md §6.7）：
+
+- **头发彩虹 + 透明观感**：原始头发材质 Base Color = Mix(factor=1,
+  A=发丝图集, B=纯黑)——发色本为纯黑、图集只供 alpha；导出器不追踪 Mix，
+  把图集 RGB（高饱和彩丝）直写 baseColorTexture ⇒ 任何 glTF 消费者看到
+  原色彩丝，叠 alpha BLEND 后发片只剩稀疏彩虹丝、「透明」是观感。烘焙
+  `exp_hair_d`（纯黑 RGB + 图集 alpha）重接闭合。
+- **三张法线 B=0**：原始工程法线为两通道（RG）约定，材质内以
+  「invert R + Combine(B=1)」重建（头发/耳坠）或直连（身体/布料——原始
+  渲染同病）；导出器不追踪重建链、直写原图 ⇒ glTF 按三通道规范解码
+  z=−1、着色法线指向面内（回导深色壳状发团 + 异常高光的元凶）。烘焙
+  `exp_hair_n` / `exp_ear_n` / `exp_body_n`（按原链应用 R 反转 + B=1）重接。
+- **耳坠 mat_36 群组误追踪**（R66b 白布同源）：Mix MULTIPLY（色彩×信息.B）
+  与 Math 自发光（遮罩×发光、原值 0）误追踪 + 金属度通道错位（原始取
+  信息.R、glTF 读 B）。烘焙 `exp_ear_d` / `exp_ear_orm`（R=AO、G=粗糙、
+  B=金属）+ 材质重建规范图、Emission 全断。
+- **mat_16 间接引用回退**：R66b 曾烘焙「纹理作 UV」间接引用成合成图，会话
+  其后回退为间接引用图（烘焙图 users=0），照导必复现；恢复烘焙图直连。
+
+自检（GLB JSON + 内嵌贴图解包）：法线 B 通道均值全 1.0、材质 emissive 全
+None、全 primitive 带 TANGENT、alphaMode 分类与动画/蒙皮完好；Blender 回导
+目检与原渲染一致（黑发 + 发丝 alpha）；引擎 iris-exp 快照重生成
+`docs/exp.png`，头发为黑发团、彩虹噪点消失。
+
 ### Fixed（iris-exp 资产：R66b GLB 重导出——布料纯白 / 面部不可见 / 皮肤噪点 / 挂件不跟头）
 
 用户对照 Blender 原始渲染报告四问题。诊断链（回导 Blender 无头 EEVEE 对照 +
