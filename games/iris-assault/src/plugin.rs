@@ -84,6 +84,7 @@ use iris_engine::prelude::*;
 // ——iris-render 的 prelude 已含 GLB 内存加载入口（打磨 VI 摩擦② 闭合），
 // 本 crate 不再直依 iris-render。
 
+use crate::frame_data;
 use crate::logic::{
     self, AssaultEvent, AssaultInput, AssaultState, EnemyState, HALF_HEIGHT, MOVE_SPEED, Phase,
 };
@@ -769,9 +770,70 @@ fn assemble_animated_character(
         actuator.active = guard;
         actuator.looping = true;
     }
+    if is_player {
+        // R67：把帧数据表生成 R74 窗口 / 事件 / 曲线注入 sword1..3 剪辑
+        //（玩家专用——敌人动作剪辑 0.54 s 短于其 1.22 s 逻辑动作总长，
+        // 注入窗口只会在末端之外，无表现意义，见 frame_data 模块文档）
+        inject_sword_frame_data(&mut actuator);
+    }
     actuator.capture_rest(world);
     world.insert(action, actuator);
     (model, action)
+}
+
+/// 把玩家刀剑帧数据注入上身动作播放器的 sword1..3 剪辑（R67 / R74）：
+/// 窗口（`windup` / `strike` / `recover` / `cancel`）+ 事件
+/// （`swing_start` @判定窗开、`cancel_ready` @取消窗开）+ 甜区曲线
+/// （`dmg_scale`，判定窗映射 [0,1] 后 1.0→1.5→1.0）。值全部来自
+/// [`crate::frame_data::PLAYER_SWORD`]——模拟相位与表现窗口构造性
+/// 同源（表 = 单一事实源，见 frame_data 模块文档）。剪辑名缺失
+/// （资产降级路径）静默跳过。
+fn inject_sword_frame_data(actuator: &mut AnimationPlayer) {
+    let clips = actuator.clips_mut();
+    for (i, stage) in frame_data::PLAYER_SWORD.iter().enumerate() {
+        let name = format!("sword{}", i + 1);
+        let Some(clip) = clips.iter_mut().find(|clip| clip.name == name) else {
+            continue;
+        };
+        let (w, s, total) = (stage.windup, stage.sweep, stage.total());
+        clip.windows.extend([
+            ClipWindow {
+                name: "windup".into(),
+                start: 0.0,
+                end: w,
+            },
+            ClipWindow {
+                name: "strike".into(),
+                start: w,
+                end: w + s,
+            },
+            ClipWindow {
+                name: "recover".into(),
+                start: w + s,
+                end: total,
+            },
+        ]);
+        clip.events.push(AnimationEvent {
+            time: w,
+            name: "swing_start".into(),
+        });
+        if let Some((cs, _ce)) = stage.cancel {
+            clip.windows.push(ClipWindow {
+                name: "cancel".into(),
+                start: cs,
+                end: total,
+            });
+            clip.events.push(AnimationEvent {
+                time: cs,
+                name: "cancel_ready".into(),
+            });
+        }
+        let keys = frame_data::DMG_SCALE_CURVE
+            .iter()
+            .map(|(k, v)| (w + k * s, *v))
+            .collect();
+        clip.curves.push(ParameterTrack::new("dmg_scale", keys));
+    }
 }
 
 /// 把某骨节点下全部 primitive 子实体的材质换成新 base_color（其余字段
@@ -1304,6 +1366,41 @@ fn run_assault(world: &World) {
         }
     }
 
+    // ---- R67：动画事件 / 窗口 / 曲线消费（R74 帧数据的运行期实弹）----
+    // update_animations 在本系统之后运行：此处读到的是上一帧填入的
+    // pending_events 与推进后的窗口 / 曲线状态（滞后一帧对表现无感）。
+    {
+        let frame = (state.elapsed * 60.0) as usize;
+        if let Some(mut action) = world.get_mut::<AnimationPlayer>(ents.player_action) {
+            let events = action.take_events();
+            // `cancel_ready`（取消窗口开启帧）→ 刀尖提示火花
+            if events.iter().any(|name| name == "cancel_ready") {
+                if let Some(slot) = fx_slot(&ents, FX_SPARK, frame, 0) {
+                    trigger_fx(
+                        world,
+                        slot,
+                        state.player.pos + Vec3::new(0.0, 1.2, 0.0),
+                        |emitter| {
+                            emitter.trigger_burst(5);
+                        },
+                    );
+                }
+            }
+            // 判定窗内逐帧刀光小 burst：窗口做门控、`dmg_scale` 甜区
+            // 曲线（1.0→1.5→1.0）缩放粒子数（每帧 3..5 粒，窗中点最密）
+            if action.window_active("strike") {
+                let scale = action.parameter("dmg_scale").unwrap_or(1.0);
+                let facing = state.player.facing;
+                let fwd = Vec3::new(-facing.sin(), 0.1, -facing.cos());
+                if let Some(slot) = fx_slot(&ents, FX_TRAIL, frame, 0) {
+                    trigger_fx(world, slot, state.player.pos + fwd * 1.2, |emitter| {
+                        emitter.trigger_burst((3.0 * scale).round() as u32)
+                    });
+                }
+            }
+        }
+    }
+
     // ---- HUD 刷新 ----
     update_hud(world, &state);
 }
@@ -1337,11 +1434,12 @@ fn write_character_visuals(
     if let Some(mut player) = world.get_mut::<AnimationPlayer>(ents.player_model) {
         player.blend_param = Vec2::new((state.player.anim_speed / MOVE_SPEED).min(1.0), 0.0);
     }
-    // ---- 玩家上身动作状态机（R46）：目标剪辑由逻辑状态派生；变化沿
-    // 触发 transition（同剪辑是引擎侧 no-op）+ 起手帧时间归零（重触发）。
+    // ---- 玩家上身动作状态机（R46 → R67）：sword{1..3} 的切换与重触发
+    // 已事件驱动（`SwordStageStart`，见 consume_game_events）——本处只
+    // 轮询无事件的状态跟随（reload / aim / guard）。stage > 0 分支保留
+    // 为防御性对账（事件已切换时 active == target，轮询是 no-op）。
     let reloading = state.player.rifle.reload_t > 0.0;
     let stage = state.player.sword.stage;
-    let just_started = stage > 0 && state.player.sword.t <= 1.5 / 60.0;
     if let Some(mut action) = world.get_mut::<AnimationPlayer>(ents.player_action) {
         let target = if reloading {
             clip_index(&action.clips, "reload")
@@ -1355,10 +1453,6 @@ fn write_character_visuals(
         if let Some(target) = target {
             if action.active != target {
                 action.transition(target, 0.06);
-                action.time = 0.0;
-            } else if just_started {
-                // 同剪辑重入（如三连段后再起 sword1）：时间归零重触发
-                action.time = 0.0;
             }
         }
         // 受击附加层（R46）：hurt_flash ∈ (0, 0.25] → flinch 增量压幅
@@ -1417,20 +1511,15 @@ fn write_character_visuals(
             player.blend_param = Vec2::new((enemy.anim_speed / logic::ENEMY_SPEED).min(1.0), 0.0);
         }
         if let Some(mut action) = world.get_mut::<AnimationPlayer>(enemy_view.action) {
+            // 出刀切换已事件驱动（`EnemyWindupStart`，见 consume_game_events）
+            // ——本处只保留收刀回待机的状态跟随
             if let Some(sword1) = clip_index(&action.clips, "sword1") {
-                if enemy.state == EnemyState::Windup && enemy.t <= 1.5 / 60.0 {
-                    // 出刀：重触发（时间归零，与逻辑前摇对齐）
-                    if action.active != sword1 {
-                        action.transition(sword1, 0.04);
-                    }
-                    action.time = 0.0;
-                } else if action.active == sword1
+                if action.active == sword1
                     && matches!(
                         enemy.state,
                         EnemyState::Chase | EnemyState::Idle | EnemyState::Recover
                     )
                 {
-                    // 收刀回待机
                     if let Some(guard) = clip_index(&action.clips, "guard") {
                         action.transition(guard, 0.15);
                     }
@@ -1639,6 +1728,28 @@ fn consume_game_events(world: &World) {
                     trigger_fx(world, slot, pos + fwd * 1.2, |emitter| {
                         emitter.trigger_burst(10);
                     });
+                }
+            }
+            AssaultEvent::SwordStageStart { stage } => {
+                // R67 事件驱动出刀：切上身剪辑 + 时间归零（与逻辑相位
+                // 起点对齐；取代旧「首帧启发式」轮询重触发）
+                if let Some(mut action) = world.get_mut::<AnimationPlayer>(ents.player_action) {
+                    if let Some(idx) = clip_index(&action.clips, &format!("sword{stage}")) {
+                        action.transition(idx, 0.06);
+                        action.time = 0.0;
+                    }
+                }
+            }
+            AssaultEvent::EnemyWindupStart { enemy } => {
+                // R67：敌人前摇起手即切 sword1（时间归零，与 0.5 s 前摇
+                // 对齐——旧启发式只认「Windup 首帧」，事件版一帧不差）
+                if let Some(view) = ents.enemies.get(enemy) {
+                    if let Some(mut action) = world.get_mut::<AnimationPlayer>(view.action) {
+                        if let Some(idx) = clip_index(&action.clips, "sword1") {
+                            action.transition(idx, 0.04);
+                            action.time = 0.0;
+                        }
+                    }
                 }
             }
             // 终局演出（胜利 / 败北）：命令队列延迟启动（start_timeline

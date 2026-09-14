@@ -157,7 +157,14 @@ fn main() {
         // 相机定格条件额外要求玩家在内场（|x| < 5、z < 2）——玩家贴南墙
         // 时相机（玩家 + 固定偏移）会在墙外被墙体遮挡
         let interior = state.player.pos.x.abs() < 6.5 && state.player.pos.z < 3.0;
+        // 剔除断言的几何前提：相机朝北俯视（CAMERA_OFFSET 南偏 +6.2），
+        // 玩家在北半场（z < 0）时南外墙必在视锥背后 → culled > 0 有保证。
+        // R67 取消窗口让首次 stage ≥ 2 横扫提前，曾捕捉到南半场画面
+        // （南墙进入视锥 → culled = 0 断言炸）——收窄捕捉条件而非放宽
+        // 断言（R67 实测教训）
+        let north = state.player.pos.z < 0.0;
         let swept = interior
+            && north
             && state.player.sword.phase == SwordPhase::Sweep
             && state.player.sword.stage >= 2;
         let shot = interior

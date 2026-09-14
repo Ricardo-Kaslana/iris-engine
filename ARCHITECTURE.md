@@ -4562,6 +4562,15 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
       （cargo 警告 "may become a hard error"）→ 绕行：改名
       `gen_assault_assets` → **闭合（打磨 VI，工程约定）**：命名约定
       写入 §7.2（example 名跨 crate 唯一，游戏 crate 带游戏前缀）。
+    - **⑧（R67 补记）R74 帧数据类型不在 iris-render prelude**：
+      `ClipWindow` / `ParameterTrack` / `window_active` / `sample_track`
+      落库时只导出在 `iris_render::animation` 路径下，而 assault 自
+      R48 打磨后刻意**不直依 iris-render**（渲染类型一律经
+      `iris_engine::prelude` 直达）——帧数据注入在编译期即撞墙。
+      → **闭合（R67 同轮，引擎侧最小修复）**：四项补入
+      `iris_render::prelude`（纯再导出，零行为）；教训：新公开 API
+      落库时同步评估 prelude 归位（R74 漏评估 = 埋给下一个实弹游戏
+      的摩擦）。
 
 27. **角速度物理 / 旋转感知胶囊 / SwingJoint 的诚实限制（R50）**——完整
     清单在 §3.8「v1 限制（诚实清单）」第 6–8 条，此处索引：①**接触不产生

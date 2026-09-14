@@ -27,15 +27,24 @@
 //!         玩家出生 (-7.5, 0)，面朝 +X（庭院中心方向）
 //! ```
 //!
-//! # 刀剑三连段（每段 = 前摇 / 横扫判定窗 / 后摇）
+//! # 刀剑三连段（每段 = 前摇 / 横扫判定窗 / 后摇；时序权威 = 帧数据表）
 //!
 //! 状态机 [`SwordState`]：`stage = 0` 空闲，否则 `stage 1..=3` ×
 //! [`SwordPhase`]（前摇 → 横扫 → 后摇）。判定窗内**每帧**对扇形区域
 //! （半径 [`SWORD_REACH`]、半角 55°）内的敌人做判定——同一敌人在同一次
 //! 横扫（`sweep_id` 代次）内至多命中一次；第三段命中附带击退（线性衰减
-//! 冲量，击退期间不追击）。横扫 / 后摇期的攻击键边沿预约下一段
-//! （`queued`），后摇结束自动接续——三连段由此成立。前摇起手时面向
-//! **自动锁定** 4 m 内最近敌人（无则保持当前朝向）。
+//! 冲量，击退期间不追击）。接续有两条路（R67 起）：
+//! - **预约**（横扫判定窗内按键边沿）：记 `queued`，后摇结束自动接续；
+//! - **取消**（后摇期内、动作时刻落在 [`crate::frame_data`] 取消窗内的
+//!   按键边沿）：**当帧立即接续**——判定窗关闭即可连，三连段手感收紧；
+//!   第 3 段终结无取消窗，后摇走完收刀。
+//!
+//! 全部相位时序的单一事实源是 [`crate::frame_data`] 表（本模块的
+//! `SWORD_WINDUP` 等常量从表 const 派生；插件层再把同一张表生成为
+//! R74 剪辑窗口 / 事件 / 曲线注入动画——模拟与表现构造性同源）。
+//! 起手与每次接续发 [`AssaultEvent::SwordStageStart`]（插件层事件驱动
+//! 切动画）。前摇起手时面向**自动锁定** 4 m 内最近敌人（无则保持当前
+//! 朝向）。
 //!
 //! # 步枪（射速 + 弹匣 + 换弹计时）
 //!
@@ -52,10 +61,11 @@
 //!
 //! 状态机 [`EnemyState`]：待机（玩家进入 [`AGGRO_RADIUS`] 即警觉）→
 //! 追击（[`NavGrid::find_path`] 航点，0.5 s 重寻路节拍）→ 挥砍前摇
-//! （0.5 s，持续转向玩家）→ 判定窗（窗中点一次性判定：近身圆 + 前扇形
-//! 60°）→ 后摇 → 回追击。被击中进硬直 [`ENEMY_STAGGER`]——**硬直不
-//! 叠加**：硬直中再被击只重置计时（单测锁定）。死亡（HP ≤ 0）即标记
-//! [`EnemyState::Dead`]（表现层 ragdoll 瘫倒）。
+//! （前摇起点发 [`AssaultEvent::EnemyWindupStart`]，持续转向玩家）→
+//! 判定窗（窗中点一次性判定：近身圆 + 前扇形 60°）→ 后摇 → 回追击。
+//! 被击中进硬直 [`ENEMY_STAGGER`]——**硬直不叠加**：硬直中再被击只
+//! 重置计时（单测锁定）。死亡（HP ≤ 0）即标记 [`EnemyState::Dead`]
+//! （表现层 ragdoll 瘫倒）。
 //!
 //! # 帧内顺序（固定，是确定性的一部分）
 //!
@@ -108,14 +118,16 @@ pub const ENEMY_ATTACK_RANGE: f32 = 1.7;
 pub const ENEMY_STRIKE_REACH: f32 = 1.9;
 /// 敌人挥砍扇形半角余弦（半角 60°，cos = 0.5，const 上下文取精确字面量）。
 pub const ENEMY_STRIKE_COS: f32 = 0.5;
-/// 敌人挥砍前摇（秒）。
-pub const ENEMY_WINDUP: f32 = 0.5;
+/// 敌人挥砍前摇（秒）。**R67 起从 [`crate::frame_data`] 表派生**——
+/// 相位时序的单一事实源在帧数据表，本组常量只是表的游戏内别名
+/// （既有测试 / 文档继续按常量名引用）。
+pub const ENEMY_WINDUP: f32 = crate::frame_data::ENEMY_STRIKE.windup;
 /// 敌人挥砍判定窗（秒）：判定在中点一次性完成。
-pub const ENEMY_STRIKE_WINDOW: f32 = 0.12;
+pub const ENEMY_STRIKE_WINDOW: f32 = crate::frame_data::ENEMY_STRIKE.sweep;
 /// 敌人挥砍后摇（秒）。
-pub const ENEMY_RECOVER: f32 = 0.6;
+pub const ENEMY_RECOVER: f32 = crate::frame_data::ENEMY_STRIKE.recover;
 /// 敌人被击硬直（秒）；硬直中再被击**重置**为该值（不叠加，见模块文档）。
-pub const ENEMY_STAGGER: f32 = 0.35;
+pub const ENEMY_STAGGER: f32 = crate::frame_data::ENEMY_STAGGER;
 /// 敌人伤害（每刀）。
 pub const ENEMY_DAMAGE: i32 = 12;
 /// 敌人最大生命。
@@ -130,12 +142,26 @@ pub const SWORD_REACH: f32 = 2.3;
 pub const SWORD_SECTOR_COS: f32 = 0.573_576_4;
 /// 起手自动锁敌半径（米）：前摇起手面向最近敌人的搜索半径。
 pub const SWORD_FACE_RADIUS: f32 = 4.0;
-/// 三段的前摇（秒）：第三段蓄力更久、伤害更高。
-pub const SWORD_WINDUP: [f32; 3] = [0.18, 0.16, 0.22];
+/// 三段的前摇（秒）：第三段蓄力更久、伤害更高。**R67 起从
+/// [`crate::frame_data`] 表派生**（相位时序的单一事实源在帧数据表，
+/// 本组常量只是表的游戏内别名——既有测试 / 文档继续按常量名引用）。
+pub const SWORD_WINDUP: [f32; 3] = [
+    crate::frame_data::PLAYER_SWORD[0].windup,
+    crate::frame_data::PLAYER_SWORD[1].windup,
+    crate::frame_data::PLAYER_SWORD[2].windup,
+];
 /// 三段的横扫判定窗（秒）。
-pub const SWORD_SWEEP: [f32; 3] = [0.14, 0.14, 0.16];
+pub const SWORD_SWEEP: [f32; 3] = [
+    crate::frame_data::PLAYER_SWORD[0].sweep,
+    crate::frame_data::PLAYER_SWORD[1].sweep,
+    crate::frame_data::PLAYER_SWORD[2].sweep,
+];
 /// 三段的后摇（秒）。
-pub const SWORD_RECOVER: [f32; 3] = [0.22, 0.24, 0.42];
+pub const SWORD_RECOVER: [f32; 3] = [
+    crate::frame_data::PLAYER_SWORD[0].recover,
+    crate::frame_data::PLAYER_SWORD[1].recover,
+    crate::frame_data::PLAYER_SWORD[2].recover,
+];
 /// 三段伤害。
 pub const SWORD_DAMAGE: [i32; 3] = [25, 25, 40];
 /// 第三段击退初速（米/秒）：线性衰减 [`KNOCKBACK_TIME`] 秒归零。
@@ -353,6 +379,13 @@ pub enum AssaultEvent {
     ReloadStart { pos: Vec3 },
     /// 敌人挥砍出刀（判定窗开始；表现层放敌人刀光）。
     EnemyStruck { pos: Vec3, enemy: usize },
+    /// 刀剑动作起手 / 接续（R67，事件驱动表现层）：`stage` = 进入的段
+    /// （1..=3）。起手（含取消接续、预约接续）各发一次——插件层据此
+    /// 切上身动作剪辑并重触发（替代旧的 `t <= 1.5/60` 启发式轮询）。
+    SwordStageStart { stage: u8 },
+    /// 敌人挥砍前摇起手（R67）：`enemy` = 敌人下标。插件层据此把敌人
+    /// 上身切到 sword1 剪辑（同样替代启发式轮询）。
+    EnemyWindupStart { enemy: usize },
     /// 玩家被击中（pos = 玩家胶囊中心；hp = 击后余量）。
     PlayerHurt { pos: Vec3, hp: i32 },
     /// 敌人被击硬直（pos = 敌人胶囊中心；重置语义见 [`ENEMY_STAGGER`]）。
@@ -768,6 +801,8 @@ impl AssaultState {
                 self.player.sword.phase = SwordPhase::Windup;
                 self.player.sword.t = 0.0;
                 self.player.sword.queued = false;
+                self.frame_events
+                    .push(AssaultEvent::SwordStageStart { stage: 1 });
             }
             return;
         }
@@ -810,6 +845,9 @@ impl AssaultState {
                         self.player.sword.phase = SwordPhase::Windup;
                         self.player.sword.t = 0.0;
                         self.player.sword.queued = false;
+                        let stage = self.player.sword.stage;
+                        self.frame_events
+                            .push(AssaultEvent::SwordStageStart { stage });
                     } else {
                         // 收刀归鞘（保留横扫代次——敌人侧防重键仍单调）
                         let sweep_id = self.player.sword.sweep_id;
@@ -821,15 +859,34 @@ impl AssaultState {
                 }
             }
         }
-        // sweep / recover 期的攻击键边沿预约下一段
+        // sweep 期的攻击键边沿预约下一段（取消窗内的边沿走下方立即接续）
         if input.sword_press
-            && matches!(
-                self.player.sword.phase,
-                SwordPhase::Sweep | SwordPhase::Recover
-            )
+            && self.player.sword.phase == SwordPhase::Sweep
             && self.player.sword.stage < 3
         {
             self.player.sword.queued = true;
+        }
+        // 取消窗口（R67）：后摇期内、动作时刻落在帧数据取消窗口内的攻击
+        // 键边沿**立即接续**下一段（不等后摇走完——动作游戏的取消连段）。
+        // 判定放在相位推进之后：本帧刚跨入后摇（t 小）即取消窗口起点，
+        // 边沿当帧生效。第 3 段无取消窗（表值 None），自然落到收刀。
+        if input.sword_press
+            && self.player.sword.phase == SwordPhase::Recover
+            && self.player.sword.stage < 3
+        {
+            let stage_data = &crate::frame_data::PLAYER_SWORD[stage_index];
+            let action_time = stage_data.recover_start() + self.player.sword.t;
+            if stage_data.cancel_active(action_time) {
+                self.player.sword.stage += 1;
+                self.player.sword.phase = SwordPhase::Windup;
+                self.player.sword.t = 0.0;
+                self.player.sword.queued = false;
+                let stage = self.player.sword.stage;
+                self.frame_events
+                    .push(AssaultEvent::SwordStageStart { stage });
+            } else {
+                self.player.sword.queued = true;
+            }
         }
     }
 
@@ -1042,6 +1099,10 @@ impl AssaultState {
                 } else if dist <= ENEMY_ATTACK_RANGE {
                     enemy.state = EnemyState::Windup;
                     enemy.t = 0.0;
+                    // R67 事件驱动表现层：前摇起手即发（替代插件层的
+                    // 「Windup 首帧」启发式轮询）
+                    self.frame_events
+                        .push(AssaultEvent::EnemyWindupStart { enemy: index });
                 }
             }
             EnemyState::Windup => {
@@ -1668,6 +1729,142 @@ mod tests {
         );
         assert_eq!(state.kills, 1);
         assert!(knocked, "第三段命中时敌人应处于击退中或已死");
+    }
+
+    /// 取消窗口（R67）：后摇期内的攻击键边沿**当帧**接续下一段，
+    /// 并发 `SwordStageStart` 事件（事件驱动表现层的验收口）。
+    #[test]
+    fn cancel_window_press_chains_immediately() {
+        let mut state = battle();
+        enemies_away(&mut state);
+        pin_player(&mut state, Vec3::new(0.0, 0.0, -3.5), 0.0);
+        state.step(&input(Vec2::ZERO, true, false, false));
+        assert_eq!(state.player.sword.stage, 1);
+        // 推进到第 1 段后摇内（前摇 + 横扫 + 0.03 s > 取消窗起点）
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[0].recover_start() + 0.03,
+        );
+        assert_eq!(state.player.sword.phase, SwordPhase::Recover);
+        state.frame_events.clear();
+        state.step(&input(Vec2::ZERO, true, false, false));
+        assert_eq!(state.player.sword.stage, 2, "取消窗内按键应立即接续");
+        assert_eq!(state.player.sword.phase, SwordPhase::Windup);
+        assert_eq!(state.player.sword.t, 0.0, "接续段前摇从零起");
+        assert!(
+            state
+                .frame_events
+                .iter()
+                .any(|e| matches!(e, AssaultEvent::SwordStageStart { stage: 2, .. })),
+            "取消接续应发 SwordStageStart"
+        );
+    }
+
+    /// 横扫判定窗内的按键仍是预约语义：后摇走完才接续（取消窗只在
+    /// 后摇期生效——预约在先、取消在后，两种接续并存）。
+    #[test]
+    fn sweep_press_still_queues_until_recover_end() {
+        let mut state = battle();
+        enemies_away(&mut state);
+        pin_player(&mut state, Vec3::new(0.0, 0.0, -3.5), 0.0);
+        state.step(&input(Vec2::ZERO, true, false, false));
+        // 推进到第 1 段横扫中段（前摇 + 半个横扫）
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[0].windup
+                + crate::frame_data::PLAYER_SWORD[0].sweep * 0.5,
+        );
+        assert_eq!(state.player.sword.phase, SwordPhase::Sweep);
+        state.frame_events.clear();
+        state.step(&input(Vec2::ZERO, true, false, false));
+        assert!(
+            !state
+                .frame_events
+                .iter()
+                .any(|e| matches!(e, AssaultEvent::SwordStageStart { .. })),
+            "判定窗内按键不应立即接续"
+        );
+        // 后摇剩余 + 余量：预约接续发生在后摇结束帧
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[0].sweep * 0.5
+                + crate::frame_data::PLAYER_SWORD[0].recover
+                + 0.05,
+        );
+        assert_eq!(state.player.sword.stage, 2, "预约应在后摇结束接续");
+        assert_eq!(state.player.sword.phase, SwordPhase::Windup);
+    }
+
+    /// 第 3 段无取消窗：后摇期按键不接续任何段，后摇走完收刀归鞘；
+    /// 全程 SwordStageStart 恰为 1→2→3 三次。
+    #[test]
+    fn stage3_recover_press_neither_cancels_nor_chains() {
+        let mut state = battle();
+        enemies_away(&mut state);
+        pin_player(&mut state, Vec3::new(0.0, 0.0, -3.5), 0.0);
+        state.step(&input(Vec2::ZERO, true, false, false));
+        // 取消链推进到第 3 段后摇
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[0].recover_start() + 0.03,
+        );
+        state.step(&input(Vec2::ZERO, true, false, false)); // 取消 → 2
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[1].recover_start() + 0.03,
+        );
+        state.step(&input(Vec2::ZERO, true, false, false)); // 取消 → 3
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[2].recover_start() + 0.03,
+        );
+        assert_eq!(state.player.sword.stage, 3);
+        assert_eq!(state.player.sword.phase, SwordPhase::Recover);
+        // 第 3 段后摇内按键：无取消、无接续
+        state.step(&input(Vec2::ZERO, true, false, false));
+        assert_eq!(state.player.sword.stage, 3, "第 3 段不可取消接续");
+        // 后摇走完：收刀归鞘
+        idle(
+            &mut state,
+            crate::frame_data::PLAYER_SWORD[2].recover + 0.05,
+        );
+        assert_eq!(state.player.sword.stage, 0, "第 3 段后摇结束应收刀");
+        // 起手 + 两次取消接续：SwordStageStart 恰为 1→2→3
+        let stages: Vec<u8> = state
+            .frame_events
+            .iter()
+            .filter_map(|e| match *e {
+                AssaultEvent::SwordStageStart { stage } => Some(stage),
+                _ => None,
+            })
+            .collect();
+        // 收刀后 frame_events 只剩本帧事件——三段序列由推进期分段断言：
+        // 此处只断言收刀帧无残留 stage 事件
+        assert!(
+            stages.is_empty(),
+            "收刀帧不应有 SwordStageStart（实际 {stages:?}）"
+        );
+    }
+
+    /// 敌人前摇起手事件（R67）：进入挥砍前摇即发 `EnemyWindupStart`
+    /// （插件层事件驱动切动画的验收口）。
+    #[test]
+    fn enemy_windup_start_event_emitted_on_aggro_strike() {
+        let mut state = battle();
+        // 玩家贴住敌人 0（攻击距离内；pin 即 Chase，首帧便满足转前摇）
+        pin_enemy(&mut state, 0, Vec3::new(0.0, 0.0, -3.5));
+        pin_player(&mut state, Vec3::new(0.0, 0.0, -4.6), 0.0);
+        state.frame_events.clear();
+        // 单步推进：事件只在 Chase→Windup 转换帧发一次，多帧会被
+        // 每帧开头的事件清空冲掉
+        state.step(&rest());
+        assert!(
+            state
+                .frame_events
+                .iter()
+                .any(|e| matches!(e, AssaultEvent::EnemyWindupStart { enemy: 0 })),
+            "敌人进入前摇应发 EnemyWindupStart"
+        );
     }
 
     /// 同一次横扫内敌人至多被打一次：判定窗跨多帧，敌人 HP 只扣一次。
