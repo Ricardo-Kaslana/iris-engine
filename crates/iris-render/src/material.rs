@@ -89,6 +89,15 @@ pub struct MaterialDef {
     pub orm_texture: Option<TextureHandle>,
     /// 透明模式：`Opaque` 走不透明主 pass，`Blend` 走透明 pass（见 `AlphaMode`）。
     pub alpha_mode: AlphaMode,
+    /// 双面材质（glTF `doubleSided`，R66d）：`true` = 关闭背面剔除
+    /// （管线 `cull_mode: None` 变体），发片 / 叶片 / 薄片类资产的两个
+    /// 朝向都可见；`false`（缺省）= 维持背面剔除（`Cull Back`）。
+    ///
+    /// **兼容形态**：缺省 false 的材质走与引入本字段前**同一条管线**
+    /// （剔除状态是管线级而非着色器级，无逐像素差异）——既有场景与
+    /// FNV 基线逐位不变；glTF 加载器按规范直读该字段
+    /// （见 `asset/gltf.rs`），引擎原生资产不声明即单面。
+    pub double_sided: bool,
     /// 预积分皮肤次表面散射强度（R63，0..1）。**缺省 0 = 关闭**：直射
     /// 漫反射与引入本字段前**逐位一致**（着色器整段分支不进入，无任何
     /// 算术）；1 = 漫反射的 NdotL 完全取预积分 LUT 值（光包裹进终结线
@@ -114,6 +123,7 @@ impl Default for MaterialDef {
             normal_texture: None,
             orm_texture: None,
             alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
             subsurface_strength: 0.0,
             subsurface_scale: crate::sss::SSS_DEFAULT_SCALE,
         }
@@ -161,6 +171,13 @@ impl MaterialDef {
     /// （`CpuTexture.srgb == false`），R = AO / G = 粗糙度 / B = 金属度。
     pub fn with_orm(mut self, tex: TextureHandle) -> Self {
         self.orm_texture = Some(tex);
+        self
+    }
+
+    /// 开启双面（builder 风格，R66d）：关闭背面剔除，发片 / 薄片类资产
+    /// 两朝向可见（glTF `doubleSided: true` 的引擎侧等价物）。
+    pub fn with_double_sided(mut self) -> Self {
+        self.double_sided = true;
         self
     }
 
@@ -276,6 +293,24 @@ mod tests {
         assert_eq!(def.orm_texture, Some(TextureHandle(9)));
         assert_eq!(def.metallic, 1.0, "builder 不得改写其他字段");
         assert_eq!(def.roughness, 0.35);
+    }
+
+    /// 双面标志（R66d）：缺省与全部便捷构造器恒 false（单面 = 既有背面
+    /// 剔除行为，逐位兼容）；builder 开启且不改写其他字段。
+    #[test]
+    fn double_sided_defaults_false_and_builder_sets() {
+        assert!(!MaterialDef::default().double_sided);
+        for d in [
+            MaterialDef::solid(1.0, 1.0, 1.0, 0.5),
+            MaterialDef::metal(1.0, 1.0, 1.0, 0.2),
+            MaterialDef::glass(0.6, 0.8, 1.0, 0.35),
+        ] {
+            assert!(!d.double_sided, "便捷构造器不携带双面");
+        }
+        let def = MaterialDef::glass(0.6, 0.8, 1.0, 0.35).with_double_sided();
+        assert!(def.double_sided);
+        assert_eq!(def.alpha_mode, AlphaMode::Blend, "builder 不得改写其他字段");
+        assert_eq!(def.roughness, 0.08);
     }
 
     /// 预积分 SSS 参数（R63）：缺省 = 关闭（强度 0）+ 头 / 前臂量级曲率

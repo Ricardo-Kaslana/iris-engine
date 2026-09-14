@@ -182,6 +182,12 @@ struct GltfMaterial {
     /// alpha cutoff 逐像素裁剪，v1 按不透明处理（与数值直通约定一致）。
     #[serde(default)]
     alpha_mode: String,
+    /// glTF `doubleSided`（缺省 false = 单面）：`true` 映射
+    /// [`MaterialDef::double_sided`]（R66d，管线关闭背面剔除）——发片 /
+    /// 叶片类资产两朝向可见的规范声明，历史版本丢弃该字段导致顶视角
+    /// 发片被背面剔除整片消失（iris-exp frictions ⑦）。
+    #[serde(default)]
+    double_sided: bool,
 }
 
 impl GltfMaterial {
@@ -979,6 +985,8 @@ impl GltfLoader {
                     } else {
                         AlphaMode::Opaque
                     },
+                    // glTF doubleSided 直通（R66d）：缺省 false = 单面剔除
+                    double_sided: mat.double_sided,
                     normal_texture: None,
                     orm_texture: None,
                     // 预积分 SSS（R63）：glTF 核心规范与既有扩展（KHR_*）
@@ -1629,6 +1637,59 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("内存 PNG 编码不应失败");
         png
+    }
+
+    /// glTF `doubleSided` 直通（R66d）：声明 true 的材质映射
+    /// [`MaterialDef::double_sided`]（管线关背面剔除，iris-exp 顶视角发片
+    /// 消失的引擎侧修复入口）；字段缺席 = false（单面，历史资产行为不变）。
+    #[test]
+    fn material_double_sided_flag_passthrough() -> Result<(), GltfError> {
+        let mut buffer: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            buffer.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        buffer.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "uri": "data:application/octet-stream;base64,{}", "byteLength": {} }}],
+                "bufferViews": [
+                    {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }},
+                    {{ "buffer": 0, "byteOffset": 36, "byteLength": 6 }}
+                ],
+                "accessors": [
+                    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+                    {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+                ],
+                "materials": [
+                    {{ "doubleSided": true, "alphaMode": "BLEND" }},
+                    {{ }}
+                ],
+                "meshes": [{{ "primitives": [
+                    {{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 0 }},
+                    {{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 1 }}
+                ] }}],
+                "nodes": [{{ "mesh": 0 }}],
+                "scenes": [{{ "nodes": [0] }}],
+                "scene": 0
+            }}"#,
+            base64::encode(&buffer),
+            buffer.len()
+        );
+        let mut world = world_with_stores();
+        spawn_gltf_instance_from_bytes(&mut world, write_glb(&json, &[]))?;
+        // 守卫须绑定命名变量活到读取完成（资源借用的已知坑）
+        let store = world.resource::<MaterialStore>();
+        let declared = store.get(MaterialHandle(1)).expect("材质 1 已注册");
+        let absent = store.get(MaterialHandle(2)).expect("材质 2 已注册");
+        assert!(declared.double_sided, "doubleSided: true 必须直通");
+        assert_eq!(
+            declared.alpha_mode,
+            AlphaMode::Blend,
+            "与 alphaMode 独立解析"
+        );
+        assert!(!absent.double_sided, "字段缺席 = false（单面）");
+        Ok(())
     }
 
     /// 回归（外部资产触发）：GLB 内嵌图片的 **bufferView 形态**（规范

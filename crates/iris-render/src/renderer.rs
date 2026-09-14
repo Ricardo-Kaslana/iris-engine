@@ -209,6 +209,9 @@ struct SkinnedItem {
     material: u32,
     /// 光照贴图图集句柄值（[`NO_LIGHTMAP`] = 缺席；R52c）。
     lightmap: u32,
+    /// 双面标志（R66d，收集期从材质目录烙印）：绘制期选 cull None 管线
+    /// 变体。**不进任何排序键**——缺席双面场景的批划分与次序逐位不变。
+    double_sided: bool,
     instance: InstanceRaw,
     /// 关节矩阵（列主序平铺后直接上传）。
     joint_matrices: Vec<glam::Mat4>,
@@ -224,6 +227,8 @@ struct TransparentItem {
     depth: f32,
     /// 实体位标识（深度并列时的确定性次序）。
     entity: u64,
+    /// 双面标志（R66d）：同 key run 内恒同值（标志是材质的函数）。
+    double_sided: bool,
     instance: InstanceRaw,
 }
 
@@ -344,6 +349,10 @@ struct DrawItem {
     /// 实体位标识（R53 遮挡查询身份键：查询槽 ↔ 实体映射与「上一帧
     /// 遮挡」判定按此记账）。**同样不进排序键**，缺席场景逐位不变。
     entity: u64,
+    /// 双面标志（R66d，收集期从材质目录烙印）：绘制期选 cull None 管线
+    /// 变体。**不进排序键**（标志是材质句柄的函数，同批恒同值）——无
+    /// 双面场景的排序 / 批划分与引入前逐位一致。
+    double_sided: bool,
 }
 
 /// 渲染器：可同时服务窗口表面与离屏目标。
@@ -1274,6 +1283,14 @@ fn alpha_of(materials: &MaterialStore, handle: MaterialHandle) -> AlphaMode {
         .unwrap_or(AlphaMode::Opaque)
 }
 
+/// 材质的双面标志（R66d，目录缺席按 `false` = 单面背面剔除）。
+fn double_sided_of(materials: &MaterialStore, handle: MaterialHandle) -> bool {
+    materials
+        .get(handle)
+        .map(|def| def.double_sided)
+        .unwrap_or(false)
+}
+
 /// LOD 网格解析（R30 / R51）：挂 [`LodMesh3`](crate::terrain::LodMesh3) 的实体按距离在 3 级间
 /// 选（地形 chunk，见 `terrain.rs`）；否则挂 [`LodMesh`] 的实体按距离
 /// 选 high / low（距离 = 实体原点到相机 eye 的欧氏距离，v1 不用包围球
@@ -1491,6 +1508,7 @@ fn collect_instances(
             mesh: m.0,
             material: mat.0,
             lightmap,
+            double_sided: double_sided_of(material_store, *mat),
             instance: InstanceRaw::from_matrix(model)
                 .with_probe(probe_payload(gt.position(), lightmap)),
             joint_matrices,
@@ -1561,6 +1579,7 @@ fn collect_instances(
                 key,
                 depth: view_depth(view, mesh_store, m, model),
                 entity: e.to_bits(),
+                double_sided: double_sided_of(material_store, *mat),
                 instance: InstanceRaw::from_matrix(model)
                     .with_probe(probe_payload(gt.position(), NO_LIGHTMAP)),
             });
@@ -1572,6 +1591,7 @@ fn collect_instances(
                     .with_probe(probe_payload(gt.position(), lightmap)),
                 lightmap,
                 entity: e.to_bits(),
+                double_sided: double_sided_of(material_store, *mat),
             });
         }
     });
@@ -3365,6 +3385,11 @@ impl Renderer {
                     let count = run_length(&items, index);
                     let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                     let material = &self.material_gpu[&material_key(key as u32, lightmap)];
+                    pass.set_pipeline(if items[index].double_sided {
+                        &self.bundle.probe_capture_double_sided_pipeline
+                    } else {
+                        &self.bundle.probe_capture_pipeline
+                    });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
@@ -3383,6 +3408,11 @@ impl Renderer {
                         let material =
                             &self.material_gpu[&material_key(item.material, item.lightmap)];
                         let skin = &self.skin_gpu[&item.skin_entity];
+                        pass.set_pipeline(if item.double_sided {
+                            &self.bundle.probe_capture_double_sided_skinned_pipeline
+                        } else {
+                            &self.bundle.probe_capture_skinned_pipeline
+                        });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -4979,6 +5009,13 @@ impl Renderer {
                 let count = run_length(&items, index);
                 let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                 let material = &self.material_gpu[&material_key(key as u32, lightmap)];
+                // 双面材质（R66d）选 cull None 变体；同批恒同值（标志是
+                // 材质句柄的函数），状态切换只发生在批边界
+                pass.set_pipeline(if items[index].double_sided {
+                    &self.bundle.double_sided_pipeline
+                } else {
+                    &self.bundle.pipeline
+                });
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
@@ -5026,6 +5063,11 @@ impl Renderer {
                     let mesh = &self.mesh_gpu[&item.mesh];
                     let material = &self.material_gpu[&material_key(item.material, item.lightmap)];
                     let skin = &self.skin_gpu[&item.skin_entity];
+                    pass.set_pipeline(if item.double_sided {
+                        &self.bundle.double_sided_skinned_pipeline
+                    } else {
+                        &self.bundle.skinned_pipeline
+                    });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -5235,6 +5277,12 @@ impl Renderer {
                 // 透明普通项不采样光照贴图（v1 限制，见 lightmap.rs）⇒
                 // 图集槽位恒 NO_LIGHTMAP，与 4b 的懒上传键一致
                 let material = &self.material_gpu[&material_key(key as u32, NO_LIGHTMAP)];
+                // 双面透明（R66d）：发片类资产两朝向都参与 alpha 混合
+                pass.set_pipeline(if transparent[t].double_sided {
+                    &self.bundle.transparent_double_sided_pipeline
+                } else {
+                    &self.bundle.transparent_pipeline
+                });
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                 // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
@@ -5269,6 +5317,11 @@ impl Renderer {
                     // draw，不存在分批冲突（与 4a 的懒上传键一致）
                     let material = &self.material_gpu[&material_key(item.material, item.lightmap)];
                     let skin = &self.skin_gpu[&item.skin_entity];
+                    pass.set_pipeline(if item.double_sided {
+                        &self.bundle.transparent_double_sided_skinned_pipeline
+                    } else {
+                        &self.bundle.transparent_skinned_pipeline
+                    });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -6487,6 +6540,11 @@ impl Renderer {
                     let count = run_length(&items, idx);
                     let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                     let material = &self.material_gpu[&material_key(key as u32, lightmap)];
+                    pass.set_pipeline(if items[idx].double_sided {
+                        &self.bundle.rt_double_sided_pipeline
+                    } else {
+                        &self.bundle.rt_pipeline
+                    });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
@@ -6506,6 +6564,11 @@ impl Renderer {
                         let material =
                             &self.material_gpu[&material_key(item.material, item.lightmap)];
                         let skin = &self.skin_gpu[&item.skin_entity];
+                        pass.set_pipeline(if item.double_sided {
+                            &self.bundle.rt_double_sided_skinned_pipeline
+                        } else {
+                            &self.bundle.rt_skinned_pipeline
+                        });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -6540,6 +6603,11 @@ impl Renderer {
                         let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                         // 透明普通项不采样光照贴图（与主 pass 同口径）
                         let material = &self.material_gpu[&material_key(key as u32, NO_LIGHTMAP)];
+                        pass.set_pipeline(if transparent[t].double_sided {
+                            &self.bundle.rt_transparent_double_sided_pipeline
+                        } else {
+                            &self.bundle.rt_transparent_pipeline
+                        });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                         // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
@@ -6564,6 +6632,11 @@ impl Renderer {
                             let material =
                                 &self.material_gpu[&material_key(item.material, item.lightmap)];
                             let skin = &self.skin_gpu[&item.skin_entity];
+                            pass.set_pipeline(if item.double_sided {
+                                &self.bundle.rt_transparent_double_sided_skinned_pipeline
+                            } else {
+                                &self.bundle.rt_transparent_skinned_pipeline
+                            });
                             pass.set_bind_group(1, &material.bind_group, &[]);
                             pass.set_bind_group(2, &skin.bind_group, &[]);
                             pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
@@ -6796,16 +6869,24 @@ impl Renderer {
                 CompressedPath::Rgba8,
             )
         };
-        // MipSettings 在场（R66）：仅 RGBA8 回退路径生成完整 CPU mip 链
-        // （BC1 / BC3 压缩块流不多级化——诚实限制，见 texture.rs 模块文档
-        // 与 ARCHITECTURE §8）；空 Vec = 单 mip（既有路径）。1×1 纹理链长
-        // 恒 1，天然落入单 mip 形态，白色兜底（句柄 0）根本不进本函数。
-        let mip_levels: Vec<Vec<u8>> =
-            if self.mip_anisotropy.is_some() && !use_bc1 && !use_bc3 && !cpu.rgba.is_empty() {
-                crate::texture::mip_chain_rgba8(width, height, &cpu.rgba)
-            } else {
-                Vec::new()
-            };
+        // MipSettings 在场（R66 / R66d）：三条上传路径都生成完整 CPU mip
+        // 链——RGBA8 回退路径直接 box 链；BC1 / BC3 压缩路径逐级 RGBA8
+        // 降采样后编码成块流链（R66d：法线 / ORM 等全不透明数据贴图命中
+        // BC1，R66 只做 RGBA8 链时恒单 mip，远距无法线平滑出点状噪点，
+        // iris-exp frictions ⑧）。**MipSettings 缺席 = 空 Vec = 单 mip，
+        // 与 R66 之前逐位一致**。1×1 纹理链长恒 1，天然落入单 mip 形态，
+        // 白色兜底（句柄 0）根本不进本函数。
+        let mip_levels: Vec<Vec<u8>> = if self.mip_anisotropy.is_some() && !cpu.rgba.is_empty() {
+            match path {
+                CompressedPath::Bc3 => crate::texture::mip_chain_bc(width, height, &cpu.rgba, true),
+                CompressedPath::Bc1 => {
+                    crate::texture::mip_chain_bc(width, height, &cpu.rgba, false)
+                }
+                CompressedPath::Rgba8 => crate::texture::mip_chain_rgba8(width, height, &cpu.rgba),
+            }
+        } else {
+            Vec::new()
+        };
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: match path {
                 CompressedPath::Bc3 => Some("iris.texture.bc3"),
@@ -6845,12 +6926,25 @@ impl Renderer {
                 },
             );
         } else {
-            // 逐级上传：第 0 级 = 源数据，每级维数 max(1, dim >> level)、
-            // 行步长 = 级宽 × 4（queue.write_texture 无 256 字节对齐要求）
+            // 逐级上传：第 0 级 = 源数据，每级维数 max(1, dim >> level)；
+            // 行步长按路径——RGBA8 = 级宽 × 4；BC 块流 = 补边块数 × 块
+            // 字节（BC1 8 / BC3 16；queue.write_texture 无 256 字节对齐
+            // 要求）
             for (level, bytes) in mip_levels.iter().enumerate() {
                 let level_w = (width >> level).max(1);
                 let level_h = (height >> level).max(1);
-                debug_assert_eq!(bytes.len(), (level_w * level_h * 4) as usize);
+                let (level_row, level_bytes) = match path {
+                    CompressedPath::Bc1 => (
+                        level_w.div_ceil(4) * 8,
+                        level_w.div_ceil(4) * level_h.div_ceil(4) * 8,
+                    ),
+                    CompressedPath::Bc3 => (
+                        level_w.div_ceil(4) * 16,
+                        level_w.div_ceil(4) * level_h.div_ceil(4) * 16,
+                    ),
+                    CompressedPath::Rgba8 => (level_w * 4, level_w * level_h * 4),
+                };
+                debug_assert_eq!(bytes.len(), level_bytes as usize);
                 self.gpu.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
@@ -6861,7 +6955,7 @@ impl Renderer {
                     bytes,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(level_w * 4),
+                        bytes_per_row: Some(level_row),
                         rows_per_image: None,
                     },
                     wgpu::Extent3d {

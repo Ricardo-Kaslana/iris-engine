@@ -12,13 +12,21 @@
 //! 3. **层级可见性级联（打磨 III）**：根 rig（HIDDEN）→ 子夹层（无网格
 //!    无 Visibility）→ 孙子网格——任一祖先隐藏 ⇒ 子树全隐藏（iris-bastion
 //!    draw calls 139 事故的引擎级回归锁）。
+//! 4. **双面材质背面可见（R66d，glTF `doubleSided`）**：单面平面背对相机
+//!    被背面剔除整片消失（红像素恒 0）；同几何同材质开双面标志后背面必须
+//!    可见（红像素为正）——管线 cull 状态族选择的像素级判别。
 //!
 //! 环境无 GPU 适配器时优雅跳过（打印提示，测试仍算通过）。
+//! 同文件多项 GPU 测试并行争用单适配器有挂死先例（R62b / AGENTS 门禁
+//! 陷阱）——文件内 `GPU_SERIAL` 互斥串行化，标准门禁命令默认可靠。
 
 use glam::Vec3;
 use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Transform, World};
 use iris_render::prelude::*;
+
+/// 文件内 GPU 互斥：逐项加锁串行（见模块头注释）。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 每个立方体网格的三角形数（6 面 × 2）。
 const CUBE_TRIANGLES: u32 = 12;
@@ -67,6 +75,7 @@ fn base_scene() -> (World, MeshHandle, MaterialHandle) {
 /// 两组均要求红像素为正（朝向的可见），且对调后红像素更多（6 个 > 4 个）。
 #[test]
 fn culling_stats_consistent_and_swap_with_camera_flip() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -151,6 +160,7 @@ fn culling_stats_consistent_and_swap_with_camera_flip() {
 /// 蒙皮后几何 = 绑定网格整体刚移到 (10, 0, 0)。
 #[test]
 fn skinned_culling_tracks_joint_transformed_geometry() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -225,6 +235,7 @@ fn skinned_culling_tracks_joint_transformed_geometry() {
 /// 渲染」，待命池槽位的身体全部堆在世界原点入画（draw calls 139）。
 #[test]
 fn hidden_ancestor_cascades_to_descendant_subtree() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -286,5 +297,52 @@ fn hidden_ancestor_cascades_to_descendant_subtree() {
         count_red(&renderer.read_pixels(), w, h),
         0,
         "夹层隐藏时画面应零红像素"
+    );
+}
+
+/// 双面材质背面可见（R66d，glTF `doubleSided` 的引擎侧判别）：`plane` 是
+/// XZ 地面（法线 +Y），绕 X 转 −90° 后法线朝 −Z、背对相机（相机在原点
+/// 看向 −Z，见到的是平面背面）。单面（缺省）= 背面剔除 ⇒ 整片消失（红
+/// 像素恒 0，与 iris-exp 顶视角发片消失同机理）；同几何同发光参数开
+/// `double_sided` 后背面必须可见（红像素为正）。判别纯在管线 cull 状态
+/// 族，与光照 / 纹理无关。
+#[test]
+fn double_sided_material_renders_backface() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer) = OffscreenRenderer::new(128, 128) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let mut render_back = |double_sided: bool| -> u32 {
+        let (mut world, _cube, _red) = base_scene();
+        let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(6.0));
+        let mat = world.resource_mut::<MaterialStore>().add(MaterialDef {
+            base_color: [0.9, 0.15, 0.1, 1.0],
+            emissive: [2.5, 0.28, 0.28, 1.0],
+            double_sided,
+            ..MaterialDef::default()
+        });
+        world.spawn((
+            Transform {
+                position: Vec3::new(0.0, 0.0, -6.0),
+                rotation: glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                ..Transform::IDENTITY
+            },
+            plane,
+            mat,
+        ));
+        propagate_transforms(&mut world);
+        renderer.render(&world);
+        count_red(&renderer.read_pixels(), 128, 128)
+    };
+    assert_eq!(
+        render_back(false),
+        0,
+        "单面材质背对相机应被背面剔除整片消失"
+    );
+    let ds = render_back(true);
+    assert!(
+        ds > 5000,
+        "双面材质背面必须可见（size 6 平面约覆盖半幅画面），红像素 {ds}"
     );
 }

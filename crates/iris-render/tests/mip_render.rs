@@ -122,6 +122,52 @@ fn checker_world(mip: bool) -> World {
     world
 }
 
+/// BC1 压缩路径对照场景（R66d）：与 [`checker_world`] 同几何同相机，仅
+/// 棋盘 alpha 恒 255（全不透明 ⇒ 命中 BC1 压缩上传）——BC 路径 mip 链的
+/// 测试对象。R66 时压缩路径恒单 mip，本场景两态同噪；R66d 起在场态走
+/// 块流链平滑（frictions ⑧ 皮肤点状噪点的病灶形态）。
+fn checker_world_bc(mip: bool) -> World {
+    let mut world = World::new();
+    world.insert_resource(MeshStore::new());
+    world.insert_resource(MaterialStore::new());
+    world.insert_resource(TextureStore::new());
+    let camera = Camera {
+        eye: Vec3::new(0.0, 39.8, 3.0),
+        target: Vec3::ZERO,
+        fov_y_radians: std::f32::consts::FRAC_PI_4,
+        z_near: 0.1,
+        z_far: 200.0,
+        ..Camera::default()
+    };
+    world.insert_resource(camera);
+    world.insert_resource(DirectionalLight {
+        intensity: 0.0,
+        ambient: Vec3::splat(1.0),
+        shadows: false,
+        ..DirectionalLight::default()
+    });
+    world.insert_resource(BloomSettings::disabled());
+    if mip {
+        world.insert_resource(MipSettings::default());
+    }
+    let tex = world
+        .resource_mut::<TextureStore>()
+        .add(CpuTexture::checkerboard(
+            128,
+            4,
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+        ));
+    let mat = world.resource_mut::<MaterialStore>().add(MaterialDef {
+        texture: tex,
+        ..MaterialDef::default()
+    });
+    let ground = world.resource_mut::<MeshStore>().add(MeshData::plane(4.0));
+    world.spawn((Transform::IDENTITY, ground, mat));
+    propagate_transforms(&mut world);
+    world
+}
+
 /// 纯色 1×1 纹理立方体场景（兼容对照用：链长恒 1，mip 路径数学上
 /// 不可见）。`textured = false` 时材质用纯色（无任何纹理上传）。
 fn simple_world(mip: bool, textured: bool) -> World {
@@ -296,5 +342,53 @@ fn mip_off_aliases_and_mip_on_resolves_with_determinism() {
         fnv1a(&on),
         fnv1a(&renderer_on2.read_pixels()),
         "mip 开：同输入双会话必须逐位一致（各向异性采样确定性）"
+    );
+}
+
+/// BC 压缩路径 mip 链（R66d）：全不透明棋盘命中 BC1 上传，重度缩小下
+/// 关 mip（`MipSettings` 缺席 = 单 mip，与 R66 之前逐位一致）必须高方差
+/// （块别名噪点存在）、开 mip 必须低方差（块流链平滑）——R66 时压缩路径
+/// 恒单 mip、两态同噪（iris-exp frictions ⑧ 皮肤点状噪点的病灶形态），
+/// 本测试双向阈值锁 R66d 修复后的行为。
+#[test]
+fn bc_path_mip_chain_suppresses_minify_aliasing() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer_off) = OffscreenRenderer::new(SIZE, SIZE) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let Some(mut renderer_on) = OffscreenRenderer::new(SIZE, SIZE) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let camera = Camera {
+        eye: Vec3::new(0.0, 39.8, 3.0),
+        target: Vec3::ZERO,
+        fov_y_radians: std::f32::consts::FRAC_PI_4,
+        z_near: 0.1,
+        z_far: 200.0,
+        ..Camera::default()
+    };
+    let (cx, cy) = project_to_pixel(&camera, Vec3::ZERO, SIZE, SIZE);
+    let world_off = checker_world_bc(false);
+    let world_on = checker_world_bc(true);
+    renderer_off.render(&world_off);
+    renderer_on.render(&world_on);
+    let off = renderer_off.read_pixels();
+    let on = renderer_on.read_pixels();
+    let off_std = roi_lum_std(&off, SIZE, cx, cy);
+    let on_std = roi_lum_std(&on, SIZE, cx, cy);
+    println!("BC 路径 mip 关 ROI 标准差 = {off_std:.2}，开 = {on_std:.2}");
+    assert!(
+        off_std > OFF_STD_MIN,
+        "BC 路径关 mip 的重度缩小 ROI 必须高方差（单 mip 块别名）：{off_std:.2} ≤ {OFF_STD_MIN}"
+    );
+    assert!(
+        on_std < ON_STD_MAX,
+        "BC 路径开 mip 的重度缩小 ROI 必须低方差（块流链平滑）：{on_std:.2} ≥ {ON_STD_MAX}"
+    );
+    assert!(
+        off_std > on_std * 3.0,
+        "BC 路径两态指标必须拉开数量级差距：{off_std:.2} vs {on_std:.2}"
     );
 }

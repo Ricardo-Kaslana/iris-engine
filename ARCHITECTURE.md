@@ -2202,8 +2202,11 @@ glTF / HDR 错误经 `From` 映射保上下文）。
     `mip_level_count`，全整数运算跨平台位级确定）：2×2 box 降采样、
     逐通道 floor 均值、维数 `max(1, dim/2)` 终止于 1×1；**奇数维末行/
     列源像素不参与下一级**（floor 链语义），一维为 1 时边缘 clamp
-    （边缘纹素权重加倍）。仅 RGBA8 回退路径生效——**BC1 / BC3 压缩
-    路径维持单 mip**（压缩块流降采样需先解码，v1 不做，§8.43）；
+    （边缘纹素权重加倍）。RGBA8 回退路径直接生效；**BC1 / BC3 压缩路径
+    自 R66d 起在场时也生成链**（`mip_chain_bc`：逐级 RGBA8 降采样后编码
+    成块流——R66 只做 RGBA8 链时全不透明数据贴图命中 BC1 恒单 mip，远距
+    无法线平滑出点状噪点，iris-exp frictions ⑧），**缺席仍单 mip 逐位
+    不变**（§8.43 已闭合为历史形态）；
   - **采样器**：`mipmap_filter: Linear`（三线性）+ `anisotropy_clamp`
     夹到 wgpu hal 边界 [1, 16]（适配器不支持各向异性时 wgpu-core 内部
     收敛为 1）；1×1 纹理链长恒 1，trilinear / 各向异性对常色纹理
@@ -4850,15 +4853,16 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     一并完成组件注册。**建议**：若后续出现更多「早期隐藏」场景，可在
     `iris-core` 补 `World::register_component::<T>()`（`&mut World` 侧的一次性
     注册 API）——本轮未做（游戏轮不改引擎）。
-43. **BC1 / BC3 压缩纹理维持单 mip（R66 mip 链的诚实边界）**：
-    `MipSettings` 的 CPU box 链只对 RGBA8 回退路径生成——压缩块流没有
-    逐像素语义，降采样需先解码再重编码（CPU 侧成本与质量取舍另议），
-    因此 4 对齐全不透明纹理走 BC1 / 声明半透明走 BC3 时即使资源在场
-    也没有 mip 链与三线性收益（采样器仍会换三线性 + 各向异性，但单 mip
-    下层间过滤不生效，仅各向异性在层内起作用）。重度缩小的压缩纹理仍会
-    摩尔纹；补法 = GPU 侧 `copy_texture_to_texture` 逐级 blit 或压缩
-    链生成（`gpu_bytes_estimate_mipped` 口径已与上传路径一致：压缩路径
-    不计链增量）。
+43. **BC1 / BC3 压缩纹理单 mip（R66 诚实边界，✅ R66d 闭合）**：R66 的
+    CPU box 链只对 RGBA8 回退路径生成——压缩块流没有逐像素语义，降采样
+    需先解码再重编码。后果实测显形（iris-exp frictions ⑧）：4 对齐全不
+    透明纹理（法线 / ORM 数据贴图）命中 BC1 恒单 mip，远距缩小采样无法线
+    平滑 ⇒ 皮肤点状噪点（归因实验：关法线噪点消失、关 mip 不变、关阴影
+    不变）。**R66d 修法**：`mip_chain_bc` 逐级 RGBA8 降采样后编码成块流
+    链（止于 4×4——wgpu 压缩纹理 copy extent 须块宽整数倍），`MipSettings` 在
+    场时三条上传路径同口径多级化；**缺席 = 单 mip 逐位不变**（兼容形态与
+    R66 同款）。`gpu_bytes_estimate_mipped` 口径同步（BC 路径补块流链增量）；
+    `mip_render.rs::bc_path_mip_chain_suppresses_minify_aliasing` 双向阈值锁。
 44. **动画窗口 / 参数曲线轨 v1 边界（R74）**：①GLB 解析不产窗口与曲线
     （不在 glTF 标准内；glTF 侧自动化的 KHR_animation_pointer 类扩展
     不做），由 API 侧构造或 `clips_mut()` 注入（`Arc::make_mut` 共享时

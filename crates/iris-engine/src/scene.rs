@@ -650,6 +650,12 @@ pub struct MaterialSection {
     /// 序列化省略不透明（旧场景文件往返字节级不变，见下方断言函数）。
     #[serde(skip_serializing_if = "alpha_mode_is_opaque")]
     pub alpha_mode: AlphaMode,
+    /// 双面材质（R66d，glTF `doubleSided` 的关卡格式等价物）：缺省
+    /// false = 单面（背面剔除）。**false 时序列化省略** ⇒ v2 旧档（无该
+    /// 字段）反序列化得缺省、重存后仍不含该字段（往返逐字节不变，
+    /// `SCENE_FORMAT_VERSION` 保持 2，与 SSS 两字段同款可选增量形态）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub double_sided: bool,
     /// 预积分皮肤 SSS 强度（R63，0..1）。**缺省 0 = 关闭 ⇒ 序列化省略**
     /// ——v2 旧档（无该字段）反序列化得缺省、重存后仍不含该字段（往返
     /// 逐字节不变，[\`SCENE_FORMAT_VERSION\`] 保持 2）。
@@ -674,6 +680,7 @@ impl Default for MaterialSection {
             normal_texture: None,
             orm_texture: None,
             alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
             subsurface_strength: MaterialDef::default().subsurface_strength,
             subsurface_scale: MaterialDef::default().subsurface_scale,
         }
@@ -714,6 +721,7 @@ impl MaterialSection {
             normal_texture,
             orm_texture,
             alpha_mode: self.alpha_mode,
+            double_sided: self.double_sided,
             subsurface_strength: self.subsurface_strength,
             subsurface_scale: self.subsurface_scale,
         }
@@ -748,6 +756,7 @@ impl MaterialSection {
             normal_texture,
             orm_texture,
             alpha_mode: def.alpha_mode,
+            double_sided: def.double_sided,
             subsurface_strength: def.subsurface_strength,
             subsurface_scale: def.subsurface_scale,
         }
@@ -2736,6 +2745,71 @@ mod tests {
             .clone();
         assert_eq!(def_b.alpha_mode, AlphaMode::Blend, "往返后仍为 Blend");
         assert_eq!(def_b.base_color, [0.6, 0.8, 1.0, 0.4]);
+    }
+
+    /// 双面标志序列化（R66d）：旧场景文件（无 `double_sided` 字段）加载
+    /// 回退 false（单面背面剔除）；false 在 save 时省略（旧档重存字节级
+    /// 稳定）、true 必须写出且 save ↔ load 往返保持。与 `alpha_mode` 的
+    /// 省略策略同款兼容形态（可选增量，格式版本不动）。
+    #[test]
+    fn double_sided_legacy_default_and_roundtrip() {
+        // 旧格式：无字段 → false（单面）
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "legacy_single_sided.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [0.5, 0.5, 0.5, 1.0] }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert!(!def.double_sided, "旧档缺字段 = false（单面）");
+        let out = test_dir().join("legacy_single_sided_out.json");
+        save_scene(&mut world, &out).expect("保存旧格式场景");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            !text.contains("double_sided"),
+            "单面材质 save 省略 double_sided，旧文件重存保持字节级稳定"
+        );
+
+        // 新格式：显式 true → 加载为双面，写出且往返保持
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "double_sided_mat.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [0.5, 0.5, 0.5, 1.0], "double_sided": true }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert!(def.double_sided);
+        let out_a = test_dir().join("double_sided_out_a.json");
+        save_scene(&mut world, &out_a).expect("保存双面场景");
+        let text = std::fs::read_to_string(&out_a).unwrap();
+        assert!(text.contains(r#""double_sided": true"#), "双面必须写出");
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out_a).expect("二次加载");
+        let handle_b = *world_b.get::<MaterialHandle>(entities_b[0]).unwrap();
+        assert!(
+            world_b
+                .resource::<MaterialStore>()
+                .get(handle_b)
+                .unwrap()
+                .double_sided,
+            "往返后仍为双面"
+        );
     }
 
     /// 预积分 SSS 序列化（R63）：旧档（无两字段）加载回退引擎缺省 =

@@ -159,6 +159,38 @@ R62b 轮给 shadow_v2 / transparent / decal 三个 GPU 套件补串行互斥时*
 AGENTS.md 互斥清单同步（ssr / sss / irradiance / shadow_v2 / transparent /
 decal / post）。
 
+### Fixed（R66d：glTF doubleSided 落地 + BC 压缩路径 mip 链——顶视角发片消失与皮肤点状噪点闭合）
+
+用户顶视角 orbit 截图暴露两枚引擎侧既有缺口（iris-exp frictions ⑦⑧，
+归因链与实验见 docs/private/iris-exp-frictions.md；均**非 R66c 资产轮
+引入**——R66c 前后验收图对照同款）：
+
+- **顶视角发片/贴片整片消失**：全仓 `doubleSided` 零命中——GLB 加载丢弃
+  该字段、场景材质管线硬编码 `Cull Back`；角色 9 材质全 `doubleSided:
+  true`，绕向朝内的发片在顶视角恰见背面被全剔（Blender 回导同视角完整
+  ⇒ 资产无病）。修复：`MaterialDef.double_sided`（缺省 false）+ glTF 直通
+  + 关卡格式 v2 可选字段（false 省略、旧档字节级稳定）；管线族扩 10 条
+  `cull_mode: None` 变体（主 pass / RT / 探针捕获 × 不透明 / 透明 × 普通 /
+  蒙皮）；收集期烙印进绘制项且**不进排序键**（无双面场景批划分与次序
+  逐位不变）。像素级判别测试 `culling_render.rs::
+  double_sided_material_renders_backface`（单面背对相机红像素恒 0 /
+  双面为正）。
+- **皮肤点状噪点**：三组离屏对照钉死病灶——关阴影仍在、关 `MipSettings`
+  不变、**摘法线贴图完全消失**；机制 = 法线/ORM 全不透明命中 R30 BC1 决策
+  树，而 R66 mip 链只覆盖 RGBA8 回退路径 ⇒ 压缩贴图恒单 mip、远距无法线
+  平滑。修复：`mip_chain_bc` 逐级 RGBA8 降采样后编码 BC1/BC3 块流链
+  （**止于 4×4**——wgpu 压缩 copy extent 须块宽整数倍）；`MipSettings`
+  在场三路径同口径多级化、**缺席单 mip 逐位不变**（R66 同款兼容形态）；
+  `gpu_bytes_estimate_mipped` 口径同步。双向阈值测试 `mip_render.rs::
+  bc_path_mip_chain_suppresses_minify_aliasing`。
+- **兼容与基线**：两修均为「资源/字段缺席 = 逐位不变」形态——引擎原生
+  资产不声明 doubleSided、基线锁场景不带 `MipSettings` ⇒ 既有 FNV 像素
+  基线零漂移（门禁全量复跑确认，无重锁程序）；culling_render 文件按
+  AGENTS 铁律补 `GPU_SERIAL` 互斥（新增第四项 GPU 测试）。
+- 文档同步：ARCHITECTURE §4 mip 条目与 §8.43 改写为闭合形态；frictions
+  ⑦⑧ 闭合；`docs/exp.png` 重生成（黑发 + 皮肤干净，顶视角覆盖恢复由
+  用户游戏内复验）。
+
 ### Fixed（iris-exp 资产：R66c GLB 重导出——头发彩虹/透明、三张 B=0 法线、耳坠群组误追踪）
 
 用户对照 Blender 报告：GLB 往返回导后头发呈「彩虹丝 + 看似透明」。诊断链

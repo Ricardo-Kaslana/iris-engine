@@ -26,8 +26,11 @@
 //! - mip 在 **sRGB 编码空间**过滤（对 u8 编码值直接求均值），非线性光
 //!   空间的物理正确降采样——高对比边缘的半级行为与线性空间过滤略有
 //!   差异；线性空间过滤需要浮点中间格式 + 逐级编解码，v1 不做；
-//! - **BC1 / BC3 压缩路径维持单 mip**（压缩块流的降采样需先解码，
-//!   本轮不做压缩纹理多级化；`gpu_bytes_estimate_mipped` 口径一致）；
+//! - **BC1 / BC3 压缩路径的 mip 链以 `MipSettings` 在场为前提（R66d）**：
+//!   缺席 = 单 mip（与 R66 之前逐位一致）；在场 = 逐级 RGBA8 降采样后编码
+//!   成块流链（[`mip_chain_bc`]）——R66 只做 RGBA8 路径时，全不透明数据
+//!   贴图（法线 / ORM）命中 BC1 恒单 mip，远距无法线平滑出点状噪点
+//!   （iris-exp frictions ⑧）；`gpu_bytes_estimate_mipped` 口径一致）；
 //! - 生效时机 = **上传时**：渲染器按句柄值缓存 GPU 纹理与采样器，
 //!   资源在纹理首次上传后修改/移除**不追溯**已上传纹理；
 //! - 奇数维降采样语义见 [`downsample_rgba8`] 文档（floor 链维数公式，
@@ -129,6 +132,39 @@ pub fn mip_chain_rgba8(width: u32, height: u32, rgba: &[u8]) -> Vec<Vec<u8>> {
         levels.push(next);
     }
     levels
+}
+
+/// 生成完整 mip 链（BC 压缩路径，纯函数，R66d）：先按 [`mip_chain_rgba8`]
+/// 逐级降采样 RGBA8，再把每一级编码为 BC1 / BC3 块流（编码器内部做 4
+/// 对齐补边）。**链止于 4×4**：wgpu 压缩纹理的 copy extent 必须为块宽
+/// （4）整数倍，2×2 / 1×1 级上传非法（Validation Error）——4×4 已足够
+/// 远距平滑，更深层级由采样器钳到末级。
+///
+/// 动机：法线 / ORM 等**全不透明数据贴图**命中 BC1 压缩路径（R30 决策
+/// 树），R66 的 mip 链只覆盖 RGBA8 回退路径 ⇒ 压缩贴图恒单 mip，远距缩小
+/// 采样无法线平滑 ⇒ 皮肤点状噪点（iris-exp frictions ⑧ 归因实验：关法线
+/// 噪点消失、关 mip 不变）。**兼容形态与 R66 同款**：`MipSettings` 缺席 =
+/// 单 mip 上传逐位不变；在场才走本链（上传分支见 `renderer.rs`）。
+/// 第 0 级 = 源图直接编码的块流（与单 mip 路径同函数同输入，逐位一致）。
+pub fn mip_chain_bc(width: u32, height: u32, rgba: &[u8], bc3: bool) -> Vec<Vec<u8>> {
+    mip_chain_rgba8(width, height, rgba)
+        .into_iter()
+        .enumerate()
+        .take_while(|(level, _)| {
+            let w = (width >> level).max(1);
+            let h = (height >> level).max(1);
+            w >= 4 && h >= 4
+        })
+        .map(|(level, px)| {
+            let w = (width >> level).max(1);
+            let h = (height >> level).max(1);
+            if bc3 {
+                crate::texture_bcn::encode_bc3(&px, w, h)
+            } else {
+                crate::texture_bcn::encode_bc1(&px, w, h)
+            }
+        })
+        .collect()
 }
 
 /// 纹理句柄，指向 `TextureStore` 中的条目。
@@ -404,11 +440,11 @@ impl TextureStore {
             .sum()
     }
 
-    /// mip 感知显存估算（R66）：[`Self::gpu_bytes_estimate`] 口径之上，
-    /// RGBA8 路径纹理补算完整 mip 链的增量（第 1 级起 Σ w_k·h_k·4，
-    /// 几何级数 ≈ 基级的 +1/3）；BC1 / BC3 路径维持单 mip（与上传路径
-    /// 一致——压缩纹理本轮不多级化），估算值与旧口径相同。**假设
-    /// `MipSettings` 在场**；1×1 纹理链长 1，无增量。旧
+    /// mip 感知显存估算（R66 / R66d）：[`Self::gpu_bytes_estimate`] 口径
+    /// 之上补算完整 mip 链增量——RGBA8 路径 Σ w_k·h_k·4（几何级数 ≈ 基级
+    /// +1/3）；BC1 / BC3 路径 Σ 各级块流字节（R66d：压缩路径 mip 化，
+    /// 增量 ≈ 基级的 +1/3 × 压缩率）。**假设 `MipSettings` 在场**（缺席
+    /// 时上传为单 mip，估算偏保守）；1×1 纹理链长 1，无增量。旧
     /// [`Self::gpu_bytes_estimate`] 签名与数值口径不动（既有测试零改动）。
     pub fn gpu_bytes_estimate_mipped(&self, feature_bc: bool) -> u64 {
         self.textures
@@ -416,24 +452,31 @@ impl TextureStore {
             .enumerate()
             .map(|(index, t)| {
                 let base = self.texture_gpu_bytes(index, t, feature_bc);
-                // BC 命中（按与上传决策树同一谓词判定）⇒ 单 mip，无增量
                 let handle = TextureHandle(index as u32);
-                let compressed = (feature_bc
+                let bc3 = feature_bc
                     && self.bc3_declared.contains(&handle.0)
-                    && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc))
-                    || crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc);
-                if compressed {
-                    base
-                } else {
-                    let mut extra = 0u64;
-                    let (mut w, mut h) = (t.width.max(1), t.height.max(1));
-                    while w > 1 || h > 1 {
-                        w = (w / 2).max(1);
-                        h = (h / 2).max(1);
-                        extra += w as u64 * h as u64 * 4;
+                    && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc);
+                let bc1 = !bc3
+                    && crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc);
+                let mut extra = 0u64;
+                let (mut w, mut h) = (t.width.max(1), t.height.max(1));
+                while w > 1 || h > 1 {
+                    w = (w / 2).max(1);
+                    h = (h / 2).max(1);
+                    // BC 链止于 4×4（压缩 copy extent 块宽整数倍约束，
+                    // 与 mip_chain_bc 同口径）；RGBA8 链到 1×1
+                    if (bc3 || bc1) && (w < 4 || h < 4) {
+                        break;
                     }
-                    base + extra
+                    extra += if bc3 {
+                        crate::texture_bcn::encoded_len_bc3(w, h)
+                    } else if bc1 {
+                        crate::texture_bcn::encoded_len(w, h)
+                    } else {
+                        w as u64 * h as u64 * 4
+                    };
                 }
+                base + extra
             })
             .sum()
     }
@@ -704,11 +747,11 @@ mod tests {
         assert_eq!(chain[1], vec![0, 0, 0, 200], "alpha 通道独立均值");
     }
 
-    /// mip 感知显存估算（R66）：RGBA8 路径补链增量（4×4 → +16+4 = +20）；
-    /// BC1 / BC3 路径与旧口径相同（压缩纹理不多级化）；旧估算方法数值
-    /// 与既有测试口径逐字节一致。
+    /// mip 感知显存估算（R66 / R66d）：各上传路径均补链增量——RGBA8
+    /// 4×4 → +16+4 = +20；BC1 4×4 → 2×2 单块 +8、1×1 单块 +8 = +16；
+    /// BC3 同款块大小 ×2 = +32。旧估算方法数值与既有测试口径逐字节一致。
     #[test]
-    fn mipped_gpu_estimate_adds_chain_only_for_rgba_path() {
+    fn mipped_gpu_estimate_adds_chain_per_path() {
         let mut store = TextureStore::new();
         // 0 号兜底 1×1：链长 1，两口径一致
         assert_eq!(store.gpu_bytes_estimate(false), 4);
@@ -719,26 +762,60 @@ mod tests {
         store.add(translucent);
         assert_eq!(store.gpu_bytes_estimate(false), 4 + 64);
         assert_eq!(store.gpu_bytes_estimate_mipped(false), 4 + 64 + 16 + 4);
-        // 同一纹理开 BC 特性：不透明棋盘走 BC1（单块 8 B），mip 增量为 0
+        // 同一纹理开 BC 特性：不透明棋盘走 BC1；8×8 基级 4 块 32 B，
+        // 链增量 = 4×4 单块 8 B（链止于 4×4）
         let mut store2 = TextureStore::new();
-        let opaque = CpuTexture::checkerboard(1, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let opaque = CpuTexture::checkerboard(1, 8, [0, 0, 0, 255], [255, 255, 255, 255]);
         store2.add(opaque);
-        assert_eq!(store2.gpu_bytes_estimate(true), 4 + 8);
+        assert_eq!(store2.gpu_bytes_estimate(true), 4 + 32);
         assert_eq!(
             store2.gpu_bytes_estimate_mipped(true),
-            4 + 8,
-            "BC1 路径单 mip，两口径一致"
+            4 + 32 + 8,
+            "BC1 路径链增量 = 4×4 单块（R66d 压缩路径 mip 化，止于 4×4）"
         );
-        // BC3 声明 + alpha：同样单 mip
+        // BC3 声明 + alpha：8×8 基级 64 B，链增量 = 4×4 块 16 B
         let mut store3 = TextureStore::new();
         let h = store3.add_bc3_declared(CpuTexture::checkerboard(
             1,
-            4,
+            8,
             [0, 0, 0, 40],
             [255, 255, 255, 255],
         ));
         assert!(store3.is_bc3_declared(h));
-        assert_eq!(store3.gpu_bytes_estimate(true), 4 + 16);
-        assert_eq!(store3.gpu_bytes_estimate_mipped(true), 4 + 16);
+        assert_eq!(store3.gpu_bytes_estimate(true), 4 + 64);
+        assert_eq!(store3.gpu_bytes_estimate_mipped(true), 4 + 64 + 16);
+    }
+
+    /// BC 路径 mip 链（R66d）：级数 = 维数 halve 至 4×4 止（wgpu 压缩
+    /// copy extent 块宽整数倍约束）；各级块流长度 = 补边后块数 × 块字节；
+    /// 第 0 级与「源图直接单编码」逐位一致（同函数同输入）；同输入双跑
+    /// 逐位一致（确定性）。
+    #[test]
+    fn mip_chain_bc_levels_match_encoder_and_are_deterministic() {
+        let src = CpuTexture::checkerboard(1, 8, [10, 20, 30, 255], [200, 180, 160, 255]);
+        let chain = mip_chain_bc(src.width, src.height, &src.rgba, false);
+        assert_eq!(chain.len(), 2, "8×8 链 = 8×8 + 4×4（止于 4×4）");
+        assert_eq!(
+            chain[0],
+            crate::texture_bcn::encode_bc1(&src.rgba, src.width, src.height),
+            "第 0 级 = 源图单编码块流（与单 mip 路径逐位一致）"
+        );
+        assert_eq!(chain[1].len() as u64, crate::texture_bcn::encoded_len(4, 4));
+        let again = mip_chain_bc(src.width, src.height, &src.rgba, false);
+        assert_eq!(chain, again, "同输入双跑逐位一致（确定性）");
+        // BC3 变体：块 16 B，级数同
+        let chain3 = mip_chain_bc(src.width, src.height, &src.rgba, true);
+        assert_eq!(chain3.len(), chain.len());
+        assert_eq!(
+            chain3[0],
+            crate::texture_bcn::encode_bc3(&src.rgba, src.width, src.height)
+        );
+        assert_eq!(
+            chain3[1].len() as u64,
+            crate::texture_bcn::encoded_len_bc3(4, 4)
+        );
+        // 4×4 源：链长 1（无增量级），单 mip 形态
+        let tiny = CpuTexture::checkerboard(1, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
+        assert_eq!(mip_chain_bc(4, 4, &tiny.rgba, false).len(), 1);
     }
 }

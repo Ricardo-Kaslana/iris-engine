@@ -33,6 +33,16 @@ pub(crate) struct PipelineBundle {
     pub transparent_pipeline: wgpu::RenderPipeline,
     /// 透明蒙皮变体：组 2 绑定关节矩阵，混合语义同上。
     pub transparent_skinned_pipeline: wgpu::RenderPipeline,
+    /// 双面变体（R66d，glTF `doubleSided`）：与 [`Self::pipeline`] 唯一
+    /// 差异 = `cull_mode: None`（背面不剔除）；绘制期按材质
+    /// [`crate::material::MaterialDef::double_sided`] 选族。
+    pub double_sided_pipeline: wgpu::RenderPipeline,
+    /// 双面蒙皮变体（组 2 绑定关节矩阵）。
+    pub double_sided_skinned_pipeline: wgpu::RenderPipeline,
+    /// 透明双面变体（alpha 混合 + 深度只测不写 + 不剔除）。
+    pub transparent_double_sided_pipeline: wgpu::RenderPipeline,
+    /// 透明双面蒙皮变体。
+    pub transparent_double_sided_skinned_pipeline: wgpu::RenderPipeline,
     pub sky_pipeline: wgpu::RenderPipeline,
     /// 反射探针捕获的天空盒变体（R62a）：与 [`Self::sky_pipeline`] 同
     /// 着色器 / 同布局，仅采样数为 1（单采样立方体面目标）。
@@ -74,12 +84,24 @@ pub(crate) struct PipelineBundle {
     pub rt_transparent_pipeline: wgpu::RenderPipeline,
     /// RT 透明蒙皮变体。
     pub rt_transparent_skinned_pipeline: wgpu::RenderPipeline,
+    /// RT 双面变体（R66d）：RT 内双面材质与主 pass 同语义。
+    pub rt_double_sided_pipeline: wgpu::RenderPipeline,
+    /// RT 双面蒙皮变体。
+    pub rt_double_sided_skinned_pipeline: wgpu::RenderPipeline,
+    /// RT 透明双面变体。
+    pub rt_transparent_double_sided_pipeline: wgpu::RenderPipeline,
+    /// RT 透明双面蒙皮变体。
+    pub rt_transparent_double_sided_skinned_pipeline: wgpu::RenderPipeline,
     /// 反射探针捕获的不透明几何管线（R62a）：单采样 + `front_face: Cw`
     /// （捕获面矩阵的 NDC y 翻转会反转环绕方向，正面约定须同步翻转，
     /// 否则剔除的是房间内壁而非外壳——见 `create_pipeline` 内的实测结论）。
     pub probe_capture_pipeline: wgpu::RenderPipeline,
     /// 反射探针捕获的蒙皮变体（组 2 绑定关节矩阵）。
     pub probe_capture_skinned_pipeline: wgpu::RenderPipeline,
+    /// 反射探针捕获的双面变体（R66d）。
+    pub probe_capture_double_sided_pipeline: wgpu::RenderPipeline,
+    /// 反射探针捕获的双面蒙皮变体。
+    pub probe_capture_double_sided_skinned_pipeline: wgpu::RenderPipeline,
     /// RT 色调映射管线（Rgba8UnormSrgb 输出）：复用 blit 着色器做 ACES +
     /// 曝光、泛光强度恒 0（RT 无 bloom），把 RT 线性 HDR 中间缓冲 map 到
     /// RT 颜色纹理。
@@ -445,21 +467,25 @@ pub(crate) fn create_pipeline(
         immediate_size: 0,
     });
 
-    // 主 pass 几何管线族构造：不透明 / 透明 × 普通 / 蒙皮共四条，顶点布局、
-    // 拓扑（背面剔除 Ccw/Cull Back）、深度格式与绑定组全部一致，只有
-    // 混合状态与深度写入按变体区分——
+    // 主 pass 几何管线族构造：不透明 / 透明 × 普通 / 蒙皮 × 单面 / 双面
+    // 共八条，顶点布局、拓扑、深度格式与绑定组全部一致，只有混合状态、
+    // 深度写入与背面剔除按变体区分——
     // - 不透明：REPLACE + 深度写入（Less）；
     // - 透明：`ALPHA_BLENDING`（src α, 1 − src α，与 UI 管线一致）+
     //   深度只测不写（Less 测试保留、写入关闭）——写入会让后画的远透明面
     //   被先画的近透明面错误裁掉（共面透明对必然丢失其一），只测不写则
-    //   透明仍被不透明几何正确遮挡。
+    //   透明仍被不透明几何正确遮挡；
+    // - 双面（R66d，glTF `doubleSided`）：`cull_mode: None`——发片 / 薄片
+    //   类资产绕向朝内的面在单面管线下会被整片剔掉（iris-exp frictions
+    //   ⑦）；单面变体维持 `Cull Back`，既有材质逐位不变。
     let make_mesh_pipeline = |label: &'static str,
                               entry_point: &'static str,
                               layout: &wgpu::PipelineLayout,
                               skinned: bool,
                               blend: wgpu::BlendState,
                               depth_write: bool,
-                              msaa: u32|
+                              msaa: u32,
+                              double_sided: bool|
      -> wgpu::RenderPipeline {
         // 顶点缓冲（R42 起含切线路、R52c 起含光照贴图 UV2 路）：
         // 普通 = [顶点, 实例, 切线, UV2]，蒙皮 = [顶点, 蒙皮属性, 实例,
@@ -503,7 +529,12 @@ pub(crate) fn create_pipeline(
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                // 双面材质（R66d）关背面剔除；单面维持既有 Cull Back
+                cull_mode: if double_sided {
+                    None
+                } else {
+                    Some(wgpu::Face::Back)
+                },
                 front_face: wgpu::FrontFace::Ccw,
                 ..Default::default()
             },
@@ -531,6 +562,7 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::REPLACE,
         true,
         sample_count,
+        false,
     );
     // 蒙皮主管线：顶点输入 = [常规顶点, 蒙皮属性, 实例]，
     // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
@@ -542,6 +574,7 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::REPLACE,
         true,
         sample_count,
+        false,
     );
     // 透明变体（普通 + 蒙皮）：alpha 混合 + 深度只测不写，
     // 绘制在不透明主 pass 之后、按视深降序（见 renderer.rs 透明 pass）。
@@ -553,6 +586,7 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
         false,
         sample_count,
+        false,
     );
     let transparent_skinned_pipeline = make_mesh_pipeline(
         "iris.pipeline.transparent_skinned",
@@ -562,6 +596,49 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
         false,
         sample_count,
+        false,
+    );
+    // 双面变体（R66d，glTF doubleSided）：与单面族唯一差异 = cull None。
+    // 不透明双面 / 透明双面 × 普通 / 蒙皮共四条，绘制期按材质标志选族。
+    let double_sided_pipeline = make_mesh_pipeline(
+        "iris.pipeline.double_sided",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::REPLACE,
+        true,
+        sample_count,
+        true,
+    );
+    let double_sided_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.double_sided_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::REPLACE,
+        true,
+        sample_count,
+        true,
+    );
+    let transparent_double_sided_pipeline = make_mesh_pipeline(
+        "iris.pipeline.transparent_double_sided",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+        sample_count,
+        true,
+    );
+    let transparent_double_sided_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.transparent_double_sided_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+        sample_count,
+        true,
     );
     // RT（R40）几何管线族：单采样变体（RT 无 MSAA——像素化小地图天然契合，
     // 见 rendertarget.rs），复用同源着色器 / 布局，仅 multisample.count = 1。
@@ -573,6 +650,7 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::REPLACE,
         true,
         1,
+        false,
     );
     let rt_skinned_pipeline = make_mesh_pipeline(
         "iris.pipeline.rt_skinned",
@@ -582,6 +660,7 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::REPLACE,
         true,
         1,
+        false,
     );
     let rt_transparent_pipeline = make_mesh_pipeline(
         "iris.pipeline.rt_transparent",
@@ -591,6 +670,7 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
         false,
         1,
+        false,
     );
     let rt_transparent_skinned_pipeline = make_mesh_pipeline(
         "iris.pipeline.rt_transparent_skinned",
@@ -600,6 +680,48 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
         false,
         1,
+        false,
+    );
+    // RT 双面变体（R66d）：小地图 / 监视器 RT 内的双面材质与主 pass 同语义。
+    let rt_double_sided_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_double_sided",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::REPLACE,
+        true,
+        1,
+        true,
+    );
+    let rt_double_sided_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_double_sided_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::REPLACE,
+        true,
+        1,
+        true,
+    );
+    let rt_transparent_double_sided_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_transparent_double_sided",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+        1,
+        true,
+    );
+    let rt_transparent_double_sided_skinned_pipeline = make_mesh_pipeline(
+        "iris.pipeline.rt_transparent_double_sided_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
+        wgpu::BlendState::ALPHA_BLENDING,
+        false,
+        1,
+        true,
     );
 
     // 反射探针捕获管线族（R62a）：单采样 + **front_face: Cw**。捕获的面矩阵
@@ -613,7 +735,8 @@ pub(crate) fn create_pipeline(
     let make_capture_pipeline = |label: &'static str,
                                  entry_point: &'static str,
                                  layout: &wgpu::PipelineLayout,
-                                 skinned: bool|
+                                 skinned: bool,
+                                 double_sided: bool|
      -> wgpu::RenderPipeline {
         let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
             &[
@@ -652,7 +775,12 @@ pub(crate) fn create_pipeline(
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                // 双面材质（R66d）关剔除；单面维持 Cw + Cull Back 的捕获语义
+                cull_mode: if double_sided {
+                    None
+                } else {
+                    Some(wgpu::Face::Back)
+                },
                 front_face: wgpu::FrontFace::Cw,
                 ..Default::default()
             },
@@ -673,11 +801,28 @@ pub(crate) fn create_pipeline(
         "vs_main",
         &pipeline_layout,
         false,
+        false,
     );
     let probe_capture_skinned_pipeline = make_capture_pipeline(
         "iris.pipeline.probe_capture_skinned",
         "vs_skinned",
         &skinned_pipeline_layout,
+        true,
+        false,
+    );
+    // 双面捕获变体（R66d）：探针 cubemap 内的双面材质与主 pass 同语义。
+    let probe_capture_double_sided_pipeline = make_capture_pipeline(
+        "iris.pipeline.probe_capture_double_sided",
+        "vs_main",
+        &pipeline_layout,
+        false,
+        true,
+    );
+    let probe_capture_double_sided_skinned_pipeline = make_capture_pipeline(
+        "iris.pipeline.probe_capture_double_sided_skinned",
+        "vs_skinned",
+        &skinned_pipeline_layout,
+        true,
         true,
     );
 
@@ -1845,6 +1990,10 @@ pub(crate) fn create_pipeline(
         skinned_pipeline,
         transparent_pipeline,
         transparent_skinned_pipeline,
+        double_sided_pipeline,
+        double_sided_skinned_pipeline,
+        transparent_double_sided_pipeline,
+        transparent_double_sided_skinned_pipeline,
         sky_pipeline,
         probe_sky_pipeline,
         shadow_pipeline,
@@ -1864,8 +2013,14 @@ pub(crate) fn create_pipeline(
         rt_skinned_pipeline,
         rt_transparent_pipeline,
         rt_transparent_skinned_pipeline,
+        rt_double_sided_pipeline,
+        rt_double_sided_skinned_pipeline,
+        rt_transparent_double_sided_pipeline,
+        rt_transparent_double_sided_skinned_pipeline,
         probe_capture_pipeline,
         probe_capture_skinned_pipeline,
+        probe_capture_double_sided_pipeline,
+        probe_capture_double_sided_skinned_pipeline,
         rt_blit_pipeline,
         particle_additive_pipeline,
         particle_alpha_pipeline,
