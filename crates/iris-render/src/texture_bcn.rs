@@ -6,12 +6,15 @@
 //!   第 4 字节的最低 2 位）。
 //!
 //! 编码采用**全不透明 4 色模式**（不使用三色 punch-through）：调色板为
-//! 端点 c0/c1 与两个 1/3 插值 `(2c0+c1)/3`、`(c0+2c1)/3`。理由：BC1 的
+//! 端点 c0/c1 与两个 1/3 插值 `(2c0+c1)/3`、`(c0+2c1)/3`。四色模式的
+//! 前提是**打包值 `c0 > c1`**（解码器按 565 整数值比较选模式，反序即
+//! 落三色模式、index 3 解出纯黑——R66f 教训：旧版按亮度排序，高饱和
+//! 暖色块出反序 ⇒ 脸部黑斑）。理由：BC1 的
 //! alpha 通道只有「1 位 punch-through」形态，无法表达连续半透明；引擎
 //! 纹理含半透明像素时整体回退 RGBA8 上传（见 [`bc1_eligible`]），编码器
 //! 内部索性不感知 alpha（输入仍为 RGBA8，alpha 被忽略）。
 //!
-//! **确定性**：端点选择、亮度排序、量化、索引匹配全部为整数运算 +
+//! **确定性**：端点选择、打包值排序、量化、索引匹配全部为整数运算 +
 //! 固定的并列取先规则（严格 `>` / `<` 比较保留首个最优），同输入两次
 //! 编码逐位一致（单测守护）——这对场景序列化 / 回放 / 差分测试是硬要求。
 //!
@@ -269,11 +272,6 @@ fn dist_sq(a: [u8; 3], b: [u8; 3]) -> i64 {
     dr * dr + dg * dg + db * db
 }
 
-/// 亮度权值（BT.601 × 256 取整权值，仅用于端点排序的确定性约定）。
-fn luma(c: [u8; 3]) -> u32 {
-    c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114
-}
-
 /// 8-bit → RGB565（各通道四舍五入）。
 fn pack565(c: [u8; 3]) -> u16 {
     let r = (c[0] as u16 * 31 + 127) / 255;
@@ -295,15 +293,17 @@ fn unpack565(v: u16) -> [u8; 3] {
 }
 
 /// 端点插值：`t = 1` 为 `(2a + b) / 3`，`t = 2` 为 `(a + 2b) / 3`
-/// （+1 后整除实现对称舍入，与常见硬件解码器的整数实现一致量级；
-/// 插值点只用于索引匹配，不进入输出字节流）。
+/// （**向下取整**，与 BC1 规格的整数除法口径一致——R66f 教训：旧版
+/// +1 四舍五入使编码器调色板与解码器差 ±1，最近邻索引可错档到相邻
+/// 色阶，整块偏一个色阶）。插值点用于索引匹配并进入索引位流，须与
+/// 解码器严格一致。
 fn mix_third(a: [u8; 3], b: [u8; 3], t: u32) -> [u8; 3] {
     let mut out = [0u8; 3];
     for i in 0..3 {
         let v = if t == 1 {
-            (2 * a[i] as i32 + b[i] as i32 + 1) / 3
+            (2 * a[i] as i32 + b[i] as i32) / 3
         } else {
-            (a[i] as i32 + 2 * b[i] as i32 + 1) / 3
+            (a[i] as i32 + 2 * b[i] as i32) / 3
         };
         out[i] = v.clamp(0, 255) as u8;
     }
@@ -336,13 +336,16 @@ fn encode_block(rgba: &[u8], width: u32, height: u32, bx: usize, by: usize) -> [
             }
         }
     }
-    let (mut c0, mut c1) = (pixels[best.0], pixels[best.1]);
-    // 约定亮度序 c0 > c1（BC1 四色模式不要求，但固定方向是确定性的一部分）
-    if luma(c1) > luma(c0) {
-        std::mem::swap(&mut c0, &mut c1);
+    let (c0, c1) = (pixels[best.0], pixels[best.1]);
+    let (mut c0_565, mut c1_565) = (pack565(c0), pack565(c1));
+    // 端点按 **565 打包整数值** 排序（R66f）：BC1 解码器的四色/三色模式
+    // 选择依据是 `c0 > c1` 的打包值比较，而非亮度。按亮度排序在高饱和暖色
+    // （粉红皮肤等：R 分量主导打包值、亮度却由 G 主导）上会出反序块，
+    // 被解码器误判为三色模式，index 3 解出纯黑 ⇒ 脸部黑斑。打包值序
+    // 恒保证四色模式（相等时调色板四项同色、索引恒 0，亦安全）。
+    if c1_565 > c0_565 {
+        std::mem::swap(&mut c0_565, &mut c1_565);
     }
-    let c0_565 = pack565(c0);
-    let c1_565 = pack565(c1);
     let p0 = unpack565(c0_565);
     let p1 = unpack565(c1_565);
     // 四色调色板：两 565 端点（8-bit 展开）+ 两个 1/3 插值。
@@ -392,7 +395,18 @@ mod tests {
                 let c1 = u16::from_le_bytes([b[2], b[3]]);
                 let p0 = unpack565(c0);
                 let p1 = unpack565(c1);
-                let palette = [p0, p1, mix_third(p0, p1, 1), mix_third(p0, p1, 2)];
+                // 硬件规则（R66f 补齐）：打包值 c0 > c1 才是四色模式；
+                // 否则三色模式，index 2 = 半程混合、index 3 = 纯黑。
+                let palette = if c0 > c1 {
+                    [p0, p1, mix_third(p0, p1, 1), mix_third(p0, p1, 2)]
+                } else {
+                    let half = [
+                        (p0[0] as u32 + p1[0] as u32).div_ceil(2) as u8,
+                        (p0[1] as u32 + p1[1] as u32).div_ceil(2) as u8,
+                        (p0[2] as u32 + p1[2] as u32).div_ceil(2) as u8,
+                    ];
+                    [p0, p1, half, [0, 0, 0]]
+                };
                 for k in 0..16 {
                     let idx = (b[4 + k / 4] >> ((k % 4) * 2)) & 0b11;
                     let i = (((by * 4 + k / 4) * pw as usize) + bx * 4 + k % 4) * 4;
@@ -438,6 +452,35 @@ mod tests {
             &[0xe4, 0xe4, 0xe4, 0xe4],
             "索引应为 0,1,2,3 循环"
         );
+    }
+
+    /// 高饱和暖色块（R66f 回归锁）：橄榄 (200,200,120) 亮度高于
+    /// 红 (240,60,60)，但 565 打包值更低（R 主导打包序）——旧编码器按
+    /// 亮度排序出反序块，硬件误判三色模式，index 3 解出纯黑（脸部黑斑
+    /// 病灶）。修复后端点按打包值排序，恒四色模式。
+    #[test]
+    fn bc1_saturated_warm_block_never_decodes_black() {
+        let olive = [200u8, 200, 120];
+        let red = [240u8, 60, 60];
+        // 前提：亮度序与打包值序确实相反（否则本测试失去判别力）
+        let luma = |c: [u8; 3]| c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114;
+        assert!(luma(olive) > luma(red), "亮度序前提");
+        assert!(pack565(olive) < pack565(red), "打包值序前提");
+        let mut rgba = Vec::with_capacity(4 * 4 * 4);
+        for k in 0..16 {
+            let c = if k % 2 == 0 { olive } else { red };
+            rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+        let blocks = encode_bc1(&rgba, 4, 4);
+        let (_, _, decoded) = decode_bc1(&blocks, 4, 4);
+        for (i, px) in decoded.chunks_exact(4).enumerate() {
+            assert!(
+                px[..3] != [0, 0, 0],
+                "像素 {i} 解出纯黑：块被误判为三色模式"
+            );
+        }
+        let mae = mean_abs_error(&decoded, &rgba, 4, 4);
+        assert!(mae < 30.0, "暖色块解码误差应受控，实际 MAE = {mae:.1}");
     }
 
     /// 纯色块往返零误差：565 可精确表示的颜色（黑/白/三原色/三补色）
