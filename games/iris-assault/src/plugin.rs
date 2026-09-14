@@ -84,6 +84,7 @@ use iris_engine::prelude::*;
 // ——iris-render 的 prelude 已含 GLB 内存加载入口（打磨 VI 摩擦② 闭合），
 // 本 crate 不再直依 iris-render。
 
+use crate::camera_fx::{self, CameraFx};
 use crate::frame_data;
 use crate::logic::{
     self, AssaultEvent, AssaultInput, AssaultState, EnemyState, HALF_HEIGHT, MOVE_SPEED, Phase,
@@ -108,6 +109,8 @@ pub const GLB_FALLBACK: &str = "assets/assault_bot.glb";
 /// 主相机跟随偏移（固定俯角第三人称——相机是根级实体，非玩家子实体，
 /// 时间线接管才能按世界系写位姿，见 [`start_camera`] 注释）。
 pub const CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 7.2, 6.2);
+/// 相机基准视场角（弧度）：FOV kick 的回落终点（R68 战斗相机反馈）。
+pub const BASE_FOV: f32 = 55.0_f32.to_radians();
 /// 相机俯仰角（弧度）：望向玩家脚下的固定俯角。
 const CAMERA_PITCH: f32 = -36.0_f32.to_radians();
 /// 空间音频距离参考（米）：俯视相机距角色 ~11 m，按此尺度放大。
@@ -359,6 +362,8 @@ fn setup_resources(world: &mut World, pack_path: &Path) {
     world.insert_resource(AssaultState::new());
     world.insert_resource(BannerTimer::default());
     world.insert_resource(OutroLatch(false));
+    // R68：战斗相机反馈状态（trauma / fov kick / 噪声游标）
+    world.insert_resource(CameraFx::default());
 
     // ---- R45：pack 挂载（AssetSource::Pack；缺失时回退文件路径——
     // 诚实降级：pack 优先，文件只作开发兜底）----
@@ -1010,7 +1015,7 @@ fn start_camera(world: &mut World) -> Entity {
             scale: Vec3::ONE,
         },
         ActiveCamera {
-            fov_y_radians: 55.0_f32.to_radians(),
+            fov_y_radians: BASE_FOV,
             ..ActiveCamera::default()
         },
     ))
@@ -1415,14 +1420,47 @@ fn write_character_visuals(
     cinematic: bool,
 ) {
     // ---- 相机跟随（演出期间让位时间线——后写会赢，必须自查）----
+    // R68：机位 = 玩家 + CAMERA_OFFSET × 取景缩放（敌近拉远）+ 震动
+    // 偏移；roll 绕视线轴微旋；FOV = 基准 + kick。演出期时间线接管，
+    // 反馈状态只衰减不上屏（trauma 不打断运镜）。
+    let dt = world
+        .try_resource::<Time>()
+        .map(|time| time.delta_secs())
+        .unwrap_or(0.0);
+    let (shake, roll, fov, scale) = {
+        let nearest = state
+            .nearest_enemy()
+            .map(|(_, dist)| dist)
+            .unwrap_or(f32::INFINITY);
+        let scale = camera_fx::frame_scale(nearest);
+        match world.try_resource_mut::<CameraFx>() {
+            Some(mut fx) => {
+                let (shake, roll, fov) = fx.advance(dt);
+                (shake, roll, fov, scale)
+            }
+            None => (Vec3::ZERO, 0.0, 0.0, scale),
+        }
+    };
     if !cinematic {
         if let Some(mut transform) = world.get_mut::<Transform>(ents.camera) {
-            let eye = state.player.pos + CAMERA_OFFSET;
+            let eye = state.player.pos + CAMERA_OFFSET * scale + shake;
             transform.position = eye;
             let target = state.player.pos + Vec3::new(0.0, 0.6, 0.0);
             let dir = (target - eye).normalize_or_zero();
-            transform.rotation = Quat::from_rotation_arc(Vec3::NEG_Z, dir);
+            let mut rotation = Quat::from_rotation_arc(Vec3::NEG_Z, dir);
+            if roll != 0.0 {
+                // roll 绕相机本地 Z（视线轴）——后乘 = 局部系旋转
+                rotation *= Quat::from_rotation_z(roll);
+            }
+            transform.rotation = rotation;
+            // FOV 无条件写回：kick 衰减到 0 的那帧若跳过写，残留 kick
+            // 会永久粘在视场上（advance 归零后 BASE_FOV + 0 = 基准值）
+            if let Some(mut cam) = world.get_mut::<ActiveCamera>(ents.camera) {
+                cam.fov_y_radians = BASE_FOV + fov;
+            }
         }
+    } else if let Some(mut fx) = world.try_resource_mut::<CameraFx>() {
+        let _ = fx.advance(dt); // 演出期：记忆态照常衰减，输出不上屏
     }
     // ---- 玩家：根位置 / 朝向 / 步态参数 ----
     if let Some(mut transform) = world.get_mut::<Transform>(ents.player_root) {
@@ -1611,6 +1649,31 @@ fn consume_game_events(world: &World) {
     };
     // 确定性 FX 游标：帧计数由 elapsed 派生（每帧递增 → 组内轮转）
     let frame = (state.elapsed * 60.0) as usize;
+
+    // ---- R68：相机反馈触发（事件 → trauma / fov kick）——独立扫描
+    // 循环，与各事件的表现处理解耦（命中强度分级：三段重劈 > 普通刀 >
+    // 枪；受击最重）。clamp 由 add_* 负责，连击不爆表。
+    if let Some(mut fx) = world.try_resource_mut::<CameraFx>() {
+        for event in &state.frame_events {
+            match *event {
+                AssaultEvent::SwordHit { stage, .. } => {
+                    if stage == 3 {
+                        fx.add_trauma(0.35);
+                        fx.add_fov_kick(6.0f32.to_radians());
+                    } else {
+                        fx.add_trauma(0.18);
+                    }
+                }
+                AssaultEvent::PlayerHurt { .. } => {
+                    fx.add_trauma(0.45);
+                    fx.add_fov_kick(4.0f32.to_radians());
+                }
+                AssaultEvent::EnemyKilled { .. } => fx.add_trauma(0.25),
+                AssaultEvent::Shot { .. } => fx.add_trauma(0.06),
+                _ => {}
+            }
+        }
+    }
 
     for event in &state.frame_events {
         match *event {

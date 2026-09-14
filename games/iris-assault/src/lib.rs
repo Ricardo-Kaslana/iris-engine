@@ -68,6 +68,7 @@
 //! `focus_target`、`node_entity_by_name`、example 命名约定），本 crate
 //! 不再保留 R48 的四处绕行代码。
 
+pub mod camera_fx;
 pub mod frame_data;
 pub mod geom;
 pub mod logic;
