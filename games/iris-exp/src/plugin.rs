@@ -10,8 +10,8 @@
 //! # 控制（frictions ⑥：自由视角 / 缩放 / 角色移动）
 //!
 //! 纯游戏层装配（引擎无改动）：[`OrbitCamera`] 资源记录轨道状态
-//! （yaw / pitch / dist），右键拖拽环绕 + 滚轮缩放；WASD 相对相机移动 +
-//! 朝向平滑转身。两条硬语义：
+//! （yaw / pitch / dist / focus_h），右键拖拽环绕 + 滚轮缩放 + Q/E 调
+//! 注视点高度；WASD 相对相机移动 + 朝向平滑转身。两条硬语义：
 //!
 //! - **无输入帧恒等**：鼠标与 WASD 全静默的帧不写相机与角色
 //!   `Transform`——headless / 离屏路径（无输入注入）与窗口静态帧的
@@ -39,8 +39,16 @@ pub const WALK_CLIP: &str = "Mixamo_Walk";
 /// 跳跃单次剪辑名（播完自动回落步行）。
 pub const JUMP_CLIP: &str = "Mixamo_Jump";
 
-/// 轨道相机注视点高度（世界坐标 y 偏移；角色约 4 m 高，取胸腹位）。
+/// 轨道相机注视点**初始**高度（世界坐标 y 偏移；角色约 4 m 高，取胸腹
+/// 位）。运行期由 Q/E 连续调节（[`OrbitCamera::focus_h`]，区间
+/// [FOCUS_H_MIN, FOCUS_H_MAX]）。
 pub const TARGET_HEIGHT: f32 = 1.5;
+/// 注视点高度下限（m）：贴地（脚部特写）。
+pub const FOCUS_H_MIN: f32 = 0.0;
+/// 注视点高度上限（m）：角色约 4 m 高，头顶之上留余量。
+pub const FOCUS_H_MAX: f32 = 4.5;
+/// 注视点高度调节速率（m/s，Q/E 按住线性升降）。
+pub const FOCUS_H_RATE: f32 = 2.5;
 /// 拖拽环绕灵敏度（rad / 像素；≈0.2°/px，800 px 拖满 ≈160°）。
 pub const ORBIT_SENS: f32 = 0.0035;
 /// 滚轮缩放系数（`dist ×= exp(−wheel·k)`；窗口路径行模式一格 = ±40，
@@ -50,10 +58,11 @@ pub const WHEEL_SENS: f32 = 0.003;
 pub const PITCH_MIN: f32 = -5.0_f32.to_radians();
 /// 俯角上限（rad）：接近顶视但不过顶。
 pub const PITCH_MAX: f32 = 85.0_f32.to_radians();
-/// 轨道距离下限（m）：贴近特写。
-pub const DIST_MIN: f32 = 2.5;
-/// 轨道距离上限（m）：拉远看全景。
-pub const DIST_MAX: f32 = 18.0;
+/// 轨道距离下限（m）：贴近面部特写。下限取相机近裁剪面（`z_near=0.1`）
+/// 之上留裕量——再近角色表面会被近裁剪面切穿。
+pub const DIST_MIN: f32 = 0.3;
+/// 轨道距离上限（m）：拉远看全景（地面 24 m 尺度之上再留余量）。
+pub const DIST_MAX: f32 = 60.0;
 /// 角色移动速度（m/s）。
 pub const MOVE_SPEED: f32 = 3.0;
 /// 朝向转身速率（1/s；帧率无关指数趋近，见 [`exp_approach`]）。
@@ -62,9 +71,10 @@ pub const TURN_RATE: f32 = 12.0;
 pub const GROUND_HALF: f32 = 11.0;
 
 /// 轨道相机状态（游戏层资源）：yaw = 环绕方位角（0 = 相机在 +Z 侧）、
-/// pitch = 俯角（0 = 水平，正值 = 相机升高俯视）、dist = 轨道距离。
-/// 位姿几何见 [`orbit_pose`]。资源由插件 Startup 兜底插入；缺席时
-/// 轨道系统空转（相机静止——与引擎「资源缺席 = 关」语义同款）。
+/// pitch = 俯角（0 = 水平，正值 = 相机升高俯视）、dist = 轨道距离、
+/// focus_h = 注视点在角色上方的高度（Q/E 调节）。位姿几何见
+/// [`orbit_pose`]。资源由插件 Startup 兜底插入；缺席时轨道系统空转
+/// （相机静止——与引擎「资源缺席 = 关」语义同款）。
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct OrbitCamera {
     /// 环绕方位角（rad）。
@@ -73,6 +83,9 @@ pub struct OrbitCamera {
     pub pitch: f32,
     /// 轨道距离（m）。
     pub dist: f32,
+    /// 注视点高度（m，角色本地 y 偏移；Q/E 调节，区间
+    /// [FOCUS_H_MIN, FOCUS_H_MAX]）。
+    pub focus_h: f32,
 }
 
 impl Default for OrbitCamera {
@@ -83,6 +96,7 @@ impl Default for OrbitCamera {
             yaw: 0.0,
             pitch: 9.0_f32.to_radians(),
             dist: 7.5,
+            focus_h: TARGET_HEIGHT,
         }
     }
 }
@@ -255,7 +269,7 @@ fn build_scene(world: &mut World) {
         light.shadows = true;
     }
 
-    // ---- 相机：轨道位姿构造（注视原点上方 TARGET_HEIGHT）----
+    // ---- 相机：轨道位姿构造（注视原点上方 orbit.focus_h）----
     let orbit = *world
         .try_resource::<OrbitCamera>()
         .expect("OrbitCamera 已由 setup_resources 插入");
@@ -263,7 +277,7 @@ fn build_scene(world: &mut World) {
         orbit.yaw,
         orbit.pitch,
         orbit.dist,
-        Vec3::new(0.0, TARGET_HEIGHT, 0.0),
+        Vec3::new(0.0, orbit.focus_h, 0.0),
     );
     let camera = world.spawn((
         Name("exp/camera".to_string()),
@@ -296,7 +310,8 @@ fn build_scene(world: &mut World) {
             world.insert(model, player);
             log::info!(
                 "ExpPlugin：角色已装配（{} 节点 / {} 剪辑），\
-                 控制：WASD 移动 / 右键拖拽视角 / 滚轮缩放 / 空格 跳跃 / 1 步行",
+                 控制：WASD 移动 / 右键拖拽视角 / 滚轮缩放 / Q·E 注视点高度 / \
+                 空格 跳跃 / 1 步行",
                 instance.node_entities.len(),
                 clips.len()
             );
@@ -429,11 +444,12 @@ fn wasd_held(input: &Input) -> bool {
         || input.key(KeyCode::KeyD)
 }
 
-/// Update：右键拖拽轨道环绕 + 滚轮缩放 + 注视点跟随角色。鼠标、滚轮与
-/// WASD 全静默的帧直接返回（不写相机 `Transform`、不写资源——恒等帧
-/// 保护外部机位覆盖与 headless 逐位稳定）；WASD 按住帧照写（注视点
-/// 跟随移动中的角色，钳制边界上写的是逐位恒等值，无副作用）。相机
-/// 实体缺席（理论上不发生，实体表自有即建）时仅状态更新不写位姿。
+/// Update：右键拖拽轨道环绕 + 滚轮缩放 + Q/E 调注视点高度 + 注视点跟随
+/// 角色。鼠标、滚轮、Q/E 与 WASD 全静默的帧直接返回（不写相机
+/// `Transform`、不写资源——恒等帧保护外部机位覆盖与 headless 逐位稳定）；
+/// WASD 按住帧照写（注视点跟随移动中的角色，钳制边界上写的是逐位恒等
+/// 值，无副作用）。相机实体缺席（理论上不发生，实体表自有即建）时仅
+/// 状态更新不写位姿。
 fn update_orbit_camera(world: &World) {
     let Some(ents) = world.try_resource::<ExpEntities>() else {
         return;
@@ -444,16 +460,18 @@ fn update_orbit_camera(world: &World) {
     let dragging = input.mouse_button(MouseButton::Right);
     let (dx, dy) = input.mouse_delta();
     let wheel = input.wheel_delta();
-    if !dragging && dx == 0.0 && dy == 0.0 && wheel == 0.0 && !wasd_held(&input) {
+    let focus_key_held = input.key(KeyCode::KeyQ) || input.key(KeyCode::KeyE);
+    if !dragging && dx == 0.0 && dy == 0.0 && wheel == 0.0 && !focus_key_held && !wasd_held(&input)
+    {
         return;
     }
     // 轨道状态读取圈进作用域（try_resource 守卫活到块尾——在守卫持有
     // 期间 try_resource_mut 同一资源会触发 already borrowed panic）
-    let (mut yaw, mut pitch, mut dist) = {
+    let (mut yaw, mut pitch, mut dist, mut focus_h) = {
         let Some(orbit) = world.try_resource::<OrbitCamera>() else {
             return;
         };
-        (orbit.yaw, orbit.pitch, orbit.dist)
+        (orbit.yaw, orbit.pitch, orbit.dist, orbit.focus_h)
     };
     if dragging {
         // 右移 = 相机向右环绕（yaw 增）；上移 = 相机升高俯视（pitch 增）
@@ -465,15 +483,26 @@ fn update_orbit_camera(world: &World) {
         dist *= (-wheel * WHEEL_SENS).exp();
     }
     dist = dist.clamp(DIST_MIN, DIST_MAX);
+    if let Some(dt) = world.try_resource::<Time>().map(|t| t.delta_secs()) {
+        // Q 降 / E 升（注视点朝脚部 / 头顶移动；相机同向跟随）
+        if input.key(KeyCode::KeyQ) {
+            focus_h -= FOCUS_H_RATE * dt;
+        }
+        if input.key(KeyCode::KeyE) {
+            focus_h += FOCUS_H_RATE * dt;
+        }
+    }
+    focus_h = focus_h.clamp(FOCUS_H_MIN, FOCUS_H_MAX);
 
-    // ---- 注视点：角色当前位置（同帧新值——注册序在移动系统之后）----
+    // ---- 注视点：角色当前位置 + focus_h 高度（同帧新值——注册序在
+    // 移动系统之后）----
     let focus = match ents.model {
         Some(m) => world
             .get::<Transform>(m)
             .map(|t| t.position)
             .unwrap_or(Vec3::ZERO),
         None => Vec3::ZERO,
-    } + Vec3::new(0.0, TARGET_HEIGHT, 0.0);
+    } + Vec3::new(0.0, focus_h, 0.0);
     let (eye, rot) = orbit_pose(yaw, pitch, dist, focus);
 
     if let Some(mut t) = world.get_mut::<Transform>(ents.camera) {
@@ -484,6 +513,7 @@ fn update_orbit_camera(world: &World) {
         o.yaw = yaw;
         o.pitch = pitch;
         o.dist = dist;
+        o.focus_h = focus_h;
     }
 }
 

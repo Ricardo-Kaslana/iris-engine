@@ -30,8 +30,8 @@ use iris_engine::prelude::{
 };
 use iris_exp::ExpPlugin;
 use iris_exp::plugin::{
-    DIST_MAX, GROUND_HALF, MOVE_SPEED, ORBIT_SENS, PITCH_MAX, TARGET_HEIGHT, WHEEL_SENS,
-    facing_yaw, orbit_pose,
+    DIST_MAX, FOCUS_H_MAX, FOCUS_H_MIN, FOCUS_H_RATE, GROUND_HALF, MOVE_SPEED, ORBIT_SENS,
+    PITCH_MAX, TARGET_HEIGHT, WHEEL_SENS, facing_yaw, orbit_pose,
 };
 
 /// 测试台：世界 + ExpPlugin 系统链 + 层级 / 动画插件 + 虚拟时钟
@@ -429,6 +429,111 @@ fn orbit_camera_control() {
             .expect("轨道资源在位");
         assert!((o.yaw - yaw_a).abs() < 1e-6, "松开右键后拖拽不应改变 yaw");
         assert_eq!(o.pitch, PITCH_MAX, "松开右键后拖拽不应改变 pitch");
+    }
+}
+
+/// Q/E 注视点高度调节：升降速率、双端 clamp、相机位姿跟随（纯函数
+/// oracle）与无输入恒等（focus_h 改动后恢复逐位）。
+#[test]
+fn orbit_camera_focus_height() {
+    use iris_engine::prelude::{Transform, Vec3};
+
+    let mut game = Harness::new();
+    let ents = *game
+        .app
+        .world
+        .try_resource::<iris_exp::ExpEntities>()
+        .expect("实体表在位");
+
+    let focus = |game: &Harness, h: f32| -> Vec3 {
+        (match ents.model {
+            Some(m) => game
+                .app
+                .world
+                .get::<Transform>(m)
+                .map(|t| t.position)
+                .unwrap_or(Vec3::ZERO),
+            None => Vec3::ZERO,
+        }) + Vec3::new(0.0, h, 0.0)
+    };
+    let orbit = |game: &Harness| -> iris_exp::OrbitCamera {
+        *game
+            .app
+            .world
+            .try_resource::<iris_exp::OrbitCamera>()
+            .expect("轨道资源在位")
+    };
+
+    // ---- E 按住 30 帧：focus_h = 1.5 + 2.5 × 0.5 = 2.75 m（升向头顶）----
+    game.hold(KeyCode::KeyE);
+    for _ in 0..30 {
+        game.frame();
+    }
+    game.release(KeyCode::KeyE);
+    {
+        let o = orbit(&game);
+        let expect = TARGET_HEIGHT + FOCUS_H_RATE * 0.5;
+        assert!(
+            (o.focus_h - expect).abs() < 1e-5,
+            "E 30 帧注视点应升至 {expect} m，实际 {}",
+            o.focus_h
+        );
+        // 相机位姿 = 轨道参数 × 新注视点（纯函数 oracle，逐位口径同系统）
+        let (eye, rot) = orbit_pose(o.yaw, o.pitch, o.dist, focus(&game, o.focus_h));
+        let t = game
+            .app
+            .world
+            .get::<Transform>(ents.camera)
+            .expect("相机在位");
+        assert!(
+            t.position.abs_diff_eq(eye, 1e-5) && t.rotation.abs_diff_eq(rot, 1e-5),
+            "升注视点后相机位姿应跟随（注视点 = 位置 + focus_h）"
+        );
+    }
+
+    // ---- Q 按住长推：精确钳到下限（贴地）----
+    game.hold(KeyCode::KeyQ);
+    for _ in 0..600 {
+        game.frame();
+    }
+    game.release(KeyCode::KeyQ);
+    {
+        let o = orbit(&game);
+        assert_eq!(o.focus_h, FOCUS_H_MIN, "长按 Q 应精确钳到下限（贴地）");
+    }
+
+    // ---- E 长推：精确钳到上限（头顶之上）----
+    game.hold(KeyCode::KeyE);
+    for _ in 0..600 {
+        game.frame();
+    }
+    game.release(KeyCode::KeyE);
+    {
+        let o = orbit(&game);
+        assert_eq!(o.focus_h, FOCUS_H_MAX, "长按 E 应精确钳到上限");
+    }
+
+    // ---- 无输入帧恒等：focus_h 与相机位姿逐位不变 ----
+    let o_before = orbit(&game);
+    let t_before = *game
+        .app
+        .world
+        .get::<Transform>(ents.camera)
+        .expect("相机在位");
+    game.frame();
+    {
+        let o = orbit(&game);
+        let t = game
+            .app
+            .world
+            .get::<Transform>(ents.camera)
+            .expect("相机在位");
+        assert!(
+            o.focus_h.to_bits() == o_before.focus_h.to_bits()
+                && t.position == t_before.position
+                && t.rotation == t_before.rotation,
+            "无输入帧 focus_h 与相机位姿应逐位不变"
+        );
     }
 }
 

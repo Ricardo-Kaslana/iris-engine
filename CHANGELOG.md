@@ -133,6 +133,22 @@
   踩坑四则录 frictions ⑥（ResourceRef 守卫作用域、atan2 负零 ±π、
   相机跟随判定须含 WASD 电平、陈旧注释定错模型前向——验收图目检抓出）。
 
+### Changed（iris-exp：轨道相机 Q/E 注视点高度 + 缩放范围放宽——frictions ⑥ 同轮增量）
+
+自由视角轮（见上条 Added 基础形态）的会话前未提交增量，补记：
+
+- **Q/E 注视点高度**：`OrbitCamera` 增 `focus_h`（Q 降 / E 按住 2.5 m/s
+  线性升降，钳 [0, 4.5] m = 脚 ↔ 头顶之上留余量）；注视点 = 角色位置 +
+  focus_h（`TARGET_HEIGHT` 退化为初始值）；无输入帧恒等语义同步扩为
+  「鼠标 + 滚轮 + Q/E + WASD 全静默」才恒等；
+- **缩放范围** [2.5, 18] → **[0.3, 60] m**：下限取相机近裁剪面
+  （`z_near = 0.1`）之上留裕量——再近角色表面被近裁剪面切穿；上限取
+  地面 24 m 尺度之上再留余量（全景机位）；
+- **测试**：headless 增 `orbit_camera_focus_height`——E 按住 30 帧 =
+  1.5 + 2.5×0.5 = 2.75 m 精确值、双端长推精确钳到 [FOCUS_H_MIN,
+  FOCUS_H_MAX]、相机位姿跟 `orbit_pose` 纯函数 oracle 逐位对齐、无输入
+  帧 focus_h 与相机位姿 `to_bits()` 逐位恒等。
+
 ### Fixed（测试基建：`post_render` 套件补文件内串行互斥 `GPU_SERIAL`）
 
 R62b 轮给 shadow_v2 / transparent / decal 三个 GPU 套件补串行互斥时**漏了
