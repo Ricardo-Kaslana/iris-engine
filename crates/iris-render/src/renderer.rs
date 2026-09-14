@@ -6812,12 +6812,18 @@ impl Renderer {
         // alpha 纹理走 BC3（1 B/px），全不透明仍归 BC1（分层互斥，
         // 见 `bc3_eligible` / `bc1_eligible` 文档）。
         let declared_bc3 = store.is_some_and(|s| s.is_bc3_declared(handle));
-        let use_bc3 = declared_bc3
+        // 无压缩声明（R66e）：数据贴图（法线 / ORM）质量优先，跳过 BC 块
+        // 压缩（BC1 对法线的近距块状伪梯度，frictions ⑨）；未声明 = 既有
+        // 决策树逐位不变
+        let declared_raw = store.is_some_and(|s| s.is_uncompressed_declared(handle));
+        let use_bc3 = !declared_raw
+            && declared_bc3
             && crate::texture_bcn::bc3_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
         if use_bc3 {
             log::info!("纹理 {handle:?}（{width}×{height}）经声明走 BC3 压缩上传（显存 1/4）");
         }
-        let use_bc1 = !use_bc3
+        let use_bc1 = !declared_raw
+            && !use_bc3
             && crate::texture_bcn::bc1_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
         if use_bc1 {
             log::info!("纹理 {handle:?}（{width}×{height}）走 BC1 压缩上传（显存 1/8）");

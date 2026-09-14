@@ -243,6 +243,35 @@ R62b 轮给 shadow_v2 / transparent / decal 三个 GPU 套件补串行互斥时*
 AGENTS.md 互斥清单同步（ssr / sss / irradiance / shadow_v2 / transparent /
 decal / post）。
 
+### Fixed（R66e：数据贴图无压缩声明门——皮肤近距块状斑闭合，BC1 法线压缩病灶）
+
+用户近距对照（Blender 原模型 vs iris-exp，Orbit 下限 0.3 m 新可达机位）：
+皮肤密布**块状斑**——与 R66d ⑧ 的远距点状噪点不同形态、不同病灶
+（frictions ⑨）。归因链：腿近距离屏三模式对照——**摘法线完全干净**、
+摘 ORM 更糟（排除）、base 复现块斑 ⇒ 病灶在法线贴图；同图 Blender
+（无压缩）渲染干净 ⇒ 引擎侧退化 = **BC1 块压缩**（R30 决策树全不透明
+数据贴图命中 BC1；BC1 通道耦合端点插值对法线的伪梯度在近距 level 0
+显形——R66d mip 链只救远距缩小采样）。
+
+- **修法**：`TextureStore::declare_uncompressed` / `is_uncompressed_declared`
+  声明门 = BC 决策树**前置否决**（声明句柄直走 RGBA8 + mip 链）；glTF
+  加载器为法线 / ORM **自动声明**（外部资产质量优先）；
+- **兼容形态**：引擎原生资产不声明 = 决策树逐位不变（内存优先）⇒ 既有
+  FNV 像素基线零漂移（门禁全量复跑确认，无重锁程序）；显存估算两口径
+  同步（`texture_gpu_bytes` 前置分支 + `gpu_bytes_estimate_mipped` 谓词，
+  声明者按 RGBA8 链增量计）；
+- **测试**：`texture.rs::uncompressed_declaration_switches_estimate_to_rgba8`
+  （口径切换 + 幂等）、`gltf.rs::normal_texture_declared_uncompressed_on_load`
+  （加载期声明断言）；腿近距离屏复跑块斑消失、与 Blender 观感对齐；
+  `docs/exp.png` 重生成；
+- **既有断言同步（本轮唯一）**：`asset_pipeline.rs` 显存口径断言原锁
+  「法线归 BC1」旧决策树——加载器声明门合法改变该口径（法线 RGBA8、
+  BC3 声明被无压缩声明前置否决），期望值与注释同步更新并归因；其余
+  既有测试零改动全过；
+- **诚实限制**（ARCHITECTURE §8.45 新增）：引擎原生数据贴图仍走 BC1
+  （声明 opt-in，近距块斑机理同款——按需补声明即可，无管线改动）；
+  BC5（法线专用双通道压缩）不做（体量取舍）。
+
 ### Fixed（R66d：glTF doubleSided 落地 + BC 压缩路径 mip 链——顶视角发片消失与皮肤点状噪点闭合）
 
 用户顶视角 orbit 截图暴露两枚引擎侧既有缺口（iris-exp frictions ⑦⑧，

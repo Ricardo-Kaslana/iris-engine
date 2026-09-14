@@ -1001,6 +1001,14 @@ impl GltfLoader {
                     def.normal_texture = Some(self.texture_srgb(world, info.index, false)?);
                 }
                 def.orm_texture = orm_texture;
+                // 无压缩声明（R66e）：法线 / ORM 等数据贴图不走 BC1 块压缩
+                // （BC1 通道耦合在法线上产生近距块状伪梯度，frictions ⑨；
+                // 同图无压缩渲染干净）。声明在首次上传前完成即可（懒上传）。
+                for h in def.normal_texture.iter().chain(def.orm_texture.iter()) {
+                    world
+                        .resource_mut::<TextureStore>()
+                        .declare_uncompressed(*h);
+                }
                 def
             }
         };
@@ -1689,6 +1697,64 @@ mod tests {
             "与 alphaMode 独立解析"
         );
         assert!(!absent.double_sided, "字段缺席 = false（单面）");
+        Ok(())
+    }
+
+    /// 法线 / ORM 无压缩声明（R66e，frictions ⑨）：带 `normalTexture` 的
+    /// 材质 spawn 后，法线句柄必须已声明无压缩（BC1 块压缩对法线的近距
+    /// 块状伪梯度）；声明发生在首次上传前（懒上传语义）。
+    #[test]
+    fn normal_texture_declared_uncompressed_on_load() -> Result<(), GltfError> {
+        let mut buffer: Vec<u8> = Vec::new();
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            buffer.extend_from_slice(&p.map(f32::to_le_bytes).concat());
+        }
+        buffer.extend_from_slice(&[0u16, 1, 2].map(u16::to_le_bytes).concat());
+        let png = solid_png_bytes([128, 128, 255, 255]);
+        let png_len = png.len() as u32;
+        let mut bin = buffer.clone();
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let png_at = bin.len() as u32;
+        bin.extend_from_slice(&png);
+        let json = format!(
+            r#"{{
+                "asset": {{ "version": "2.0" }},
+                "buffers": [{{ "byteLength": {} }}],
+                "bufferViews": [
+                    {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }},
+                    {{ "buffer": 0, "byteOffset": 36, "byteLength": 6 }},
+                    {{ "buffer": 0, "byteOffset": {}, "byteLength": {} }}
+                ],
+                "accessors": [
+                    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3" }},
+                    {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+                ],
+                "images": [{{ "bufferView": 2, "mimeType": "image/png" }}],
+                "textures": [{{ "source": 0 }}],
+                "materials": [{{ "normalTexture": {{ "index": 0 }} }}],
+                "meshes": [{{ "primitives": [
+                    {{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 0 }}
+                ] }}],
+                "nodes": [{{ "mesh": 0 }}],
+                "scenes": [{{ "nodes": [0] }}],
+                "scene": 0
+            }}"#,
+            bin.len(),
+            png_at,
+            png_len
+        );
+        let mut world = world_with_stores();
+        spawn_gltf_instance_from_bytes(&mut world, write_glb(&json, &bin))?;
+        let store = world.resource::<TextureStore>();
+        let mats = world.resource::<MaterialStore>();
+        let def = mats.get(MaterialHandle(1)).expect("材质 1 已注册");
+        let normal = def.normal_texture.expect("法线槽已装配");
+        assert!(
+            store.is_uncompressed_declared(normal),
+            "glTF 法线贴图必须自动声明无压缩（frictions ⑨）"
+        );
         Ok(())
     }
 

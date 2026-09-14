@@ -216,20 +216,22 @@ fn manifest_async_registry_spawn_play_by_name_end_to_end() {
     let textures_after = store.gpu_bytes_estimate(true);
     drop(store);
     // 两实例各登记两张 8×8 纹理（每次 spawn 独立注册——诚实清单在案）：
-    // - baseColor（带 alpha，未声明）→ RGBA8 4 B/px = 256 B；
-    // - 法线（brick_normal_orm 全不透明）→ 声明与否都归 BC1（4 块 ×
-    //   8 B = 32 B，4 对齐不透明本来就走 BC1）。
+    // - baseColor（带 alpha，未声明 BC3）→ RGBA8 4 B/px = 256 B；
+    // - 法线（brick_normal_orm 全不透明）→ **R66e 起加载器自动声明无压缩**
+    //   （BC1 对法线的近距块状伪梯度，frictions ⑨）⇒ RGBA8 256 B，不再
+    //   归 BC1。
     // 声明只作用在第一实例的两张句柄上：baseColor → BC3（4 块 ×
-    // 16 B = 64 B），法线分层规则保持 BC1。0 号槽位 1×1 白底恒 4 B。
+    // 16 B = 64 B）；法线句柄的 BC3 声明被无压缩声明**前置否决**（R66e
+    // 决策树序），维持 RGBA8。0 号槽位 1×1 白底恒 4 B。
     assert_eq!(
         textures_before,
-        4 + 2 * (8 * 8 * 4 + 4 * 8),
-        "声明前：两实例 baseColor 按 RGBA8、法线按 BC1 计"
+        4 + 2 * (8 * 8 * 4 + 8 * 8 * 4),
+        "声明前：两实例 baseColor 与法线均按 RGBA8 计（R66e 法线自动无压缩）"
     );
     assert_eq!(
         textures_after,
-        4 + (4 * 16 + 4 * 8) + (8 * 8 * 4 + 4 * 8),
-        "声明后：第一实例 baseColor 改按 BC3 1 B/px，法线分层归 BC1，第二实例不变"
+        4 + (4 * 16 + 8 * 8 * 4) + (8 * 8 * 4 + 8 * 8 * 4),
+        "声明后：第一实例 baseColor 改按 BC3 1 B/px，法线被无压缩声明否决维持 RGBA8，第二实例不变"
     );
 
     // ---- 按名播放：swing 负向关键帧应恰为 yaw −40°（第二实例，

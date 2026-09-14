@@ -16,6 +16,15 @@
 //! 未声明纹理维持既有 RGBA8 / BC1 决策树逐位不变。声明表用
 //! `BTreeSet`（确定性文化：迭代序 = 句柄序，与 broadphase 同规约）。
 //!
+//! **无压缩声明（R66e）**：[`TextureStore::declare_uncompressed`] /
+//! [`TextureStore::is_uncompressed_declared`] 是 BC 决策树的**前置否决**——
+//! 声明句柄跳过 BC1/BC3 直走 RGBA8 + mip 链。动机：BC1 的通道耦合端点
+//! 插值在**法线图**上产生近距块状伪梯度（iris-exp frictions ⑨：皮肤近距
+//! 块斑；同图 Blender 无压缩渲染干净、摘法线离屏对照干净 ⇒ 压缩为病灶）。
+//! glTF 加载器为法线 / ORM **自动声明**（外部资产质量优先）；引擎原生资产
+//! 不声明 = 决策树逐位不变（内存优先，既有基线零漂移）。显存估算两口径
+//! 同步（`texture_gpu_bytes` 前置分支 + `gpu_bytes_estimate_mipped` 谓词）。
+//!
 //! **Mip 链与各向异性过滤（R66）**：[`MipSettings`] 资源是全库材质纹理
 //! mip 链 + 各向异性过滤的**总开关**——资源缺席 = 单 mip 上传 + 采样器
 //! 逐字段与 R66 之前一致（默认像素零变化的兼容形态，与 TaaSettings /
@@ -339,6 +348,13 @@ pub struct TextureStore {
     /// 经 manifest 声明走 BC3 上传的句柄表（R59，见模块文档）。
     /// 缺席 = 既有 RGBA8 / BC1 决策树逐位不变——默认路径零改动。
     bc3_declared: BTreeSet<u32>,
+    /// 声明**不走 BC 块压缩**的句柄表（R66e）：数据贴图（法线 / ORM，
+    /// `srgb = false`）走 RGBA8 + mip 链。BC1 的通道耦合端点插值在法线
+    /// 图上产生近距块状伪梯度（iris-exp frictions ⑨：皮肤近距块斑，
+    /// 同图 Blender 无压缩渲染干净 ⇒ 压缩为病灶）；缺席 = BC 决策树逐位
+    /// 不变（引擎原生资产内存优先），glTF 加载器为法线 / ORM 自动声明
+    /// （外部资产质量优先）。
+    uncompressed: BTreeSet<u32>,
 }
 
 impl Default for TextureStore {
@@ -346,6 +362,7 @@ impl Default for TextureStore {
         Self {
             textures: vec![CpuTexture::solid([255, 255, 255, 255])],
             bc3_declared: BTreeSet::new(),
+            uncompressed: BTreeSet::new(),
         }
     }
 }
@@ -382,6 +399,18 @@ impl TextureStore {
         self.bc3_declared.contains(&handle.0)
     }
 
+    /// 为已存在的句柄补**无压缩**声明（R66e）：数据贴图（法线 / ORM）
+    /// 不走 BC1/BC3 块压缩（BC1 对法线的近距块状伪梯度，frictions ⑨）。
+    /// 声明只需发生在**首次 GPU 上传前**（渲染器懒上传）；重复声明幂等。
+    pub fn declare_uncompressed(&mut self, handle: TextureHandle) {
+        self.uncompressed.insert(handle.0);
+    }
+
+    /// 该句柄是否声明了无压缩（渲染器决策树与显存估算共用的查询口）。
+    pub fn is_uncompressed_declared(&self, handle: TextureHandle) -> bool {
+        self.uncompressed.contains(&handle.0)
+    }
+
     pub fn get(&self, handle: TextureHandle) -> Option<&CpuTexture> {
         self.textures.get(handle.0 as usize)
     }
@@ -407,6 +436,10 @@ impl TextureStore {
     /// 共用的决策树——两口径之差恒等于 mip 链的增量，不含其他因素）。
     fn texture_gpu_bytes(&self, index: usize, t: &CpuTexture, feature_bc: bool) -> u64 {
         let handle = TextureHandle(index as u32);
+        // 无压缩声明（R66e）优先于一切 BC 路径（数据贴图质量优先）
+        if self.uncompressed.contains(&handle.0) {
+            return t.width as u64 * t.height as u64 * 4;
+        }
         if feature_bc
             && self.bc3_declared.contains(&handle.0)
             && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)
@@ -453,10 +486,14 @@ impl TextureStore {
             .map(|(index, t)| {
                 let base = self.texture_gpu_bytes(index, t, feature_bc);
                 let handle = TextureHandle(index as u32);
-                let bc3 = feature_bc
+                // 无压缩声明（R66e）= RGBA8 链口径
+                let raw = self.uncompressed.contains(&handle.0);
+                let bc3 = !raw
+                    && feature_bc
                     && self.bc3_declared.contains(&handle.0)
                     && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc);
-                let bc1 = !bc3
+                let bc1 = !raw
+                    && !bc3
                     && crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc);
                 let mut extra = 0u64;
                 let (mut w, mut h) = (t.width.max(1), t.height.max(1));
@@ -817,5 +854,35 @@ mod tests {
         // 4×4 源：链长 1（无增量级），单 mip 形态
         let tiny = CpuTexture::checkerboard(1, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
         assert_eq!(mip_chain_bc(4, 4, &tiny.rgba, false).len(), 1);
+    }
+
+    /// 无压缩声明（R66e）：BC1 合格的全不透明纹理声明后，显存估算切
+    /// RGBA8 口径（基级 4 B/px + mip 链增量），未声明者维持 BC1 口径；
+    /// 重复声明幂等。
+    #[test]
+    fn uncompressed_declaration_switches_estimate_to_rgba8() {
+        let mut store = TextureStore::new();
+        let opaque = CpuTexture::checkerboard(1, 8, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let h = store.add(opaque);
+        assert!(!store.is_uncompressed_declared(h));
+        assert_eq!(store.gpu_bytes_estimate(true), 4 + 32, "未声明 = BC1 口径");
+        assert_eq!(
+            store.gpu_bytes_estimate_mipped(true),
+            4 + 32 + 8,
+            "未声明 = BC1 链口径（止于 4×4）"
+        );
+        store.declare_uncompressed(h);
+        assert!(store.is_uncompressed_declared(h));
+        store.declare_uncompressed(h);
+        assert_eq!(
+            store.gpu_bytes_estimate(true),
+            4 + 8 * 8 * 4,
+            "声明后 = RGBA8 基级（8×8×4）"
+        );
+        assert_eq!(
+            store.gpu_bytes_estimate_mipped(true),
+            4 + 8 * 8 * 4 + (64 + 16 + 4),
+            "声明后 = RGBA8 完整链增量（到 1×1）"
+        );
     }
 }
