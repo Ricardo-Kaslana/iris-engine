@@ -65,9 +65,10 @@ pub mod prelude {
         in_view_cone, perception_system, within_hearing,
     };
     pub use crate::physics::{
-        BodyType, Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactTracker,
-        DistanceJoint, PHYSICS_GRAVITY, RigidBody, StaticObstacle, SwingJoint, TargetJoint,
-        effective_static, step_physics,
+        BodyType, Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactSolverV2,
+        ContactTracker, DistanceJoint, ImpulseParams, PHYSICS_GRAVITY, RigidBody,
+        RigidContactState, StaticObstacle, SwingJoint, TargetJoint, contact_point_rotated,
+        effective_static, inv_inertia_world, shape_inertia, solve_contact_impulse, step_physics,
     };
     pub use crate::query::QueryPart;
     pub use crate::ragdoll::{

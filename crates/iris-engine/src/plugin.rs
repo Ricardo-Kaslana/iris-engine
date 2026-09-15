@@ -305,7 +305,8 @@ impl Plugin for PhysicsPlugin {
                 .write::<Transform>()
                 .write::<Collider>()
                 .write::<RigidBody>()
-                .read::<Time>(),
+                .read::<Time>()
+                .read::<iris_core::physics::ContactSolverV2>(),
             step_physics,
         );
     }

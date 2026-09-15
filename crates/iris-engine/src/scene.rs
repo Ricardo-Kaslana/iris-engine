@@ -1487,6 +1487,8 @@ fn spawn_section(
             entity,
             RigidBody {
                 velocity: Vec3::ZERO,
+                // 质量不序列化（R76）：加载即默认 1.0，v2 求解器按需代码侧覆写
+                mass: 1.0,
                 gravity_scale: body.gravity_scale,
                 friction: body.friction,
                 linear_damping: body.linear_damping,

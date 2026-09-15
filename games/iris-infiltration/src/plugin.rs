@@ -807,6 +807,7 @@ fn build_machinery(world: &mut World) -> (Entity, Entity, Entity) {
         Collider::dynamic_box(Vec3::new(1.0, 1.25, 0.15), 0.0),
         RigidBody {
             velocity: Vec3::ZERO,
+            mass: 1.0,
             gravity_scale: 0.0,
             friction: 0.6,
             linear_damping: 3.0,

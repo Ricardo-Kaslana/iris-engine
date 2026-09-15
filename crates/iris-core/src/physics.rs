@@ -52,7 +52,8 @@
 //!    等质量近似）；速度法向分量按 restitution 反弹（`v_n' = -e × v_n`，
 //!    仅当朝向穿透，e 取双方最大）；切向分量乘 `max(0, 1 - friction)`
 //!    （friction 取参与响应的动体的均值）；**接触不产生角冲量**（诚实
-//!    限制，见「v1 限制」）；
+//!    限制，见「v1 限制」——**可选的接触求解 v2 补齐角冲量与库仑摩擦锥**
+//!    ，见「接触求解 v2（R76）」章节）；
 //! 5. **松弛**：位置分离重复求解 [`SOLVER_ITERATIONS`] 次（速度响应只在
 //!    首轮施加），减弱堆叠抖动；每轮接触之后追加**约束求解轮**（距离 →
 //!    **摆动（R50）** → 目标点关节，见「约束与关节」章节）；
@@ -66,6 +67,35 @@
 //! 系统内部严格单线程、固定遍历序（收集序 = 组件存储序），同一输入两次
 //! 模拟逐采样 bit 级一致（单测守护）。引擎侧配 `Time::advance` /
 //! 固定步长驱动即可做确定性回放 / 联机同步。
+//!
+//! # 接触求解 v2（R76，资源启用——缺席 = v1 逐位不变）
+//!
+//! [`ContactSolverV2`] 资源缺席时 [`step_physics`] 走上方 v1 管线
+//! （逐位不变——六个 dogfooding 游戏不注册本资源，轨迹 FNV 锁零改动
+//! 通过）；注册后**接触求解段**换成顺序冲量求解器（检测 / 过滤 /
+//! sensor / 事件采样 / 关节轮 / 写回全部共用 v1 管线）：
+//!
+//! - **角冲量**（§8.27① 的闭合）：接触点臂 `r = point − center` 进冲量
+//!   ——`ω += I⁻¹(r × P)`，惯性张量按形状解析计算
+//!   （[`shape_inertia`]：球 / 盒精确，胶囊 = 圆柱 + 双半球精确组合；
+//!   胶囊随体旋转 `R·diag⁻¹·Rᵀ`，球各向同性，盒按世界轴对齐语义——
+//!   与盒碰撞体恒 AABB 的既有口径一致）；
+//! - **库仑摩擦锥**：切向冲量向量按 `|λ_t| ≤ μ·λ_n` 钳制（μ 取参与
+//!   响应的**动体**摩擦的几何均值——v1 参与规则的 v2 版；静体的摩擦
+//!   不参与，纯 Collider 静态地板没有摩擦数据，想表达粗糙地面给球
+//!   自己设 `RigidBody::friction`）；
+//! - **迭代**：每帧首轮收集全部接触（遍历序 = v1 候选序），跑
+//!   `velocity_iterations` 轮顺序冲量（Gauss-Seidel，累积冲量
+//!   `λ ≥ 0` 与锥钳制保证不吸不爆），随后位置投影按**逆质量加权**
+//!   （替代 v1 的动体数均分——重物少动、轻物多动）+ `slop` 容差 +
+//!   `beta` 比例；外层 [`SOLVER_ITERATIONS`] 轮结构不变（每轮重检测
+//!   + 重投影，速度轮仅首轮）。
+//!
+//! **v2 诚实边界**：无 warm starting（跨帧冲量缓存不做——有状态与
+//! 「资源缺席 = 无状态」的兼容形态冲突，收敛速度低于生产引擎，堆叠
+//! 场景需更多轮次）；摩擦锥用向量模长钳制（各向同性 μ，无方向摩擦）；
+//! 关节轮仍是 v1（无角冲量耦合）；`RigidBody::mass` 不进关卡序列化
+//! （代码侧装配；序列化留后续轮）。
 //!
 //! # 静态推离查询（运动学角色控制器）
 //!
@@ -369,7 +399,7 @@
 //! ));
 //! ```
 
-use glam::{Quat, Vec3};
+use glam::{Mat3, Quat, Vec3};
 
 use crate::Component;
 use crate::Event;
@@ -574,6 +604,12 @@ pub struct RigidBody {
     /// 线速度（米/秒）。`body_type = Kinematic` 时本字段不参与积分也不被
     /// 写回（位移由游戏每帧写 `Transform`，语义见 [`BodyType::Kinematic`]）。
     pub velocity: Vec3,
+    /// **质量**（千克，R76）：只被接触求解 v2（[`ContactSolverV2`]）读取
+    /// ——逆质量 `1/mass` 加权冲量分配与惯性张量缩放。默认 1.0；**须为
+    /// 正**（≤ 0 按无穷质量处理 = 不可推动，debug 断言提示）。v1 求解
+    /// 路径不读本字段（动体数均分的等质量近似不变）。不进关卡序列化
+    /// （代码侧装配，见模块文档 v2 诚实边界）。
+    pub mass: f32,
     /// 重力缩放：1.0 = 标准重力（[`PHYSICS_GRAVITY`]），0 = 失重，负值反向。
     pub gravity_scale: f32,
     /// 摩擦：接触时切向速度的每帧衰减系数（把切向相对速度乘
@@ -604,6 +640,7 @@ impl Default for RigidBody {
     fn default() -> Self {
         Self {
             velocity: Vec3::ZERO,
+            mass: 1.0,
             gravity_scale: 1.0,
             friction: 0.0,
             linear_damping: 0.0,
@@ -1171,6 +1208,405 @@ pub fn solve_contact(contact: Contact, a: BodyParams, b: BodyParams) -> ContactR
         delta_vel_a,
         delta_vel_b,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 接触求解 v2（R76，资源启用——缺席 = v1 逐位不变；见模块文档对应章节）
+// ---------------------------------------------------------------------------
+
+/// 接触求解 v2 的启用资源（缺席 = v1 路径逐位不变，见模块文档）。
+///
+/// 注册方式：`world.insert_resource(ContactSolverV2::default())`。启用后
+/// [`step_physics`] 的**接触求解段**换成顺序冲量求解器——角冲量
+/// （`ω += I⁻¹(r × P)`，惯性张量按形状解析计算）+ 库仑摩擦锥
+/// （`|λ_t| ≤ μ·λ_n` 向量钳制）+ 多轮 Gauss-Seidel 迭代；检测 / 过滤 /
+/// sensor / 事件采样 / 关节轮 / 写回共用 v1 管线。
+#[derive(Clone, Copy, Debug, iris_core::Resource)]
+pub struct ContactSolverV2 {
+    /// 速度求解轮数（每帧首轮对全部收集接触重复顺序冲量这么多次；
+    /// 默认 8——生产引擎量级，单 / 少接触一轮即精确）。
+    pub velocity_iterations: usize,
+    /// 位置投影比例（0..1，默认 0.8）：每轮外层迭代把穿透减去 slop 后的
+    /// 余量按此比例分离（1.0 = 全额，堆叠易抖；与 v1 的「每轮全额分离
+    /// × SOLVER_ITERATIONS 轮」不同——v2 有 slop 兜底）。
+    pub beta: f32,
+    /// 位置容差（米，默认 0.005）：穿透低于此值不分离——静止堆叠允许
+    /// 微小重叠，消除「推离—落下」的抖动极限环。
+    pub slop: f32,
+    /// 弹性速度阈值（米/秒，默认 0.5）：法向接近速度低于此值的接触按
+    /// 非弹性处理（target = 0）——低速微弹是堆叠抖动的经典来源，
+    /// 生产求解器的标准配件（v1 无此阈值，靠「分离中不注入」保静止）。
+    pub restitution_threshold: f32,
+}
+
+impl Default for ContactSolverV2 {
+    fn default() -> Self {
+        Self {
+            velocity_iterations: 8,
+            beta: 0.8,
+            slop: 0.005,
+            restitution_threshold: 0.5,
+        }
+    }
+}
+
+/// 形状的主惯性矩（纯函数，R76）：返回**局部系对角** `(Ix, Iy, Iz)`
+/// （千克·米²）。
+///
+/// - **球**：精确实体球 `⅖·m·r²`（各向同性）；
+/// - **盒**：精确实体盒 `m·((2h_j)² + (2h_k)²)/12`——**世界轴对齐语义**
+///   （盒碰撞体恒 AABB，`rotation` 无语义，惯性也不随旋转，见
+///   [`detect_pair_rotated`] 的旋转语义边界）；
+/// - **胶囊**：精确「圆柱 + 双半球」组合（轴对称于本地 +Y）：圆柱段长
+///   `L = 2(hh − r)`，质量按体积比分配；
+///   `I_y = ½·m_cyl·r² + ⅖·m_cap_total·r²`（两半球各 ⅖·m_h·r²——
+///   对称轴切半不改到轴距离分布）；
+///   `I_x = I_z = m_cyl(3r² + L²)/12 + 2·[⅖·m_h·r² + m_h·(L/2)²]`
+///   （半球关于底面直径的垂直轴惯量同为 ⅖·m_h·r² + 平行轴移到胶囊
+///   中心）。退化校验：`hh == r` 时圆柱段消失，两式同归 ⅖·m·r² = 球
+///   （单测守护）。
+///
+/// `mass` 非正时返回全零（静态 / 异常防御，配合逆质量 0 语义）。
+pub fn shape_inertia(shape: &ColliderShape, mass: f32) -> (f32, f32, f32) {
+    if mass <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    match *shape {
+        ColliderShape::Sphere { radius } => {
+            let i = 0.4 * mass * radius * radius;
+            (i, i, i)
+        }
+        ColliderShape::Box { ref half_extents } => {
+            let h = half_extents;
+            let full = |a: f32, b: f32| mass * (4.0 * (a * a + b * b)) / 12.0;
+            (full(h.y, h.z), full(h.x, h.z), full(h.x, h.y))
+        }
+        ColliderShape::Capsule {
+            radius,
+            half_height,
+        } => {
+            let length = 2.0 * (half_height - radius); // 圆柱段全长
+            let v_cyl = std::f32::consts::PI * radius * radius * length;
+            let v_cap = 4.0 / 3.0 * std::f32::consts::PI * radius * radius * radius;
+            let total = v_cyl + v_cap;
+            if total <= 0.0 {
+                return (0.0, 0.0, 0.0);
+            }
+            let m_cyl = mass * v_cyl / total;
+            let m_cap_each = mass * v_cap / total / 2.0;
+            let i_axis = 0.5 * m_cyl * radius * radius + 0.8 * m_cap_each * radius * radius;
+            let i_perp = m_cyl * (3.0 * radius * radius + length * length) / 12.0
+                + 2.0
+                    * (0.4 * m_cap_each * radius * radius
+                        + m_cap_each * (length * 0.5) * (length * 0.5));
+            (i_perp, i_axis, i_perp)
+        }
+    }
+}
+
+/// 世界系逆惯性张量（纯函数，R76）：[`shape_inertia`] 的局部对角 →
+/// 逆（取倒数）→ 按需旋转到世界系，返回 3×3 矩阵。
+///
+/// - **球**：各向同性 → 标量倒数单位阵（与 `rotation` 无关）；
+/// - **盒**：世界轴对齐语义（同 [`shape_inertia`]）→ 对角阵；
+/// - **胶囊**：轴对称于本地 +Y → `R·diag(1/Ix, 1/Iy, 1/Iz)·Rᵀ`
+///   （`R = rotation` 的旋转矩阵）——胶囊碰撞是旋转感知的（R50），
+///   惯性随体旋转。
+///
+/// `inv_mass == 0`（静态 / 运动学 / 异常质量）返回零矩阵：角冲量对
+/// 不可推动的体恒为零。
+pub fn inv_inertia_world(shape: &ColliderShape, rotation: Quat, inv_mass: f32) -> Mat3 {
+    if inv_mass <= 0.0 {
+        return Mat3::ZERO;
+    }
+    let (ix, iy, iz) = shape_inertia(shape, 1.0 / inv_mass);
+    let diag = |x: f32, y: f32, z: f32| {
+        Mat3::from_diagonal(Vec3::new(
+            if x > 0.0 { 1.0 / x } else { 0.0 },
+            if y > 0.0 { 1.0 / y } else { 0.0 },
+            if z > 0.0 { 1.0 / z } else { 0.0 },
+        ))
+    };
+    match *shape {
+        // 球各向同性、盒世界轴对齐：都不随旋转
+        ColliderShape::Sphere { .. } | ColliderShape::Box { .. } => diag(ix, iy, iz),
+        ColliderShape::Capsule { .. } => {
+            let r = Mat3::from_quat(rotation);
+            r * diag(ix, iy, iz) * r.transpose()
+        }
+    }
+}
+
+/// 接触点（纯函数，R76）：两形状接触面的**界面点近似**——角冲量的
+/// 力臂来源（`r = point − center`）。分支与 [`detect_pair_rotated`]
+/// 一一对应（对称分支交换求解），全部走「两侧表面最近点的中点」：
+/// 球-球取表面点中点（恒在连心线上——法向冲量零力臂、摩擦冲量有，
+/// 与真实物理一致）；球-盒取「盒上最近点 ↔ 球面点」中点；盒-盒取
+/// 重叠区中心；胶囊对取「轴段最近点 ↔ 对侧表面点」中点。退化
+/// （方向零向量）取中心连线中点（确定性兜底）。
+///
+/// 这是**近似**（单点接触模型）：真实面接触有分布压力，单点 + 冲量
+/// 求解是生产引擎的标准折衷——力臂误差只影响力矩大小级，不影响方向。
+pub fn contact_point_rotated(
+    a_pos: Vec3,
+    a_rotation: Quat,
+    a_shape: &ColliderShape,
+    b_pos: Vec3,
+    b_rotation: Quat,
+    b_shape: &ColliderShape,
+) -> Vec3 {
+    /// 两表面点 `p`（a 侧）/ `q`（b 侧）的中点：穿透时落在重叠区内、
+    /// 恰好触碰时即触碰点本身。
+    fn midpoint_surfaces(_center_a: Vec3, _center_b: Vec3, p: Vec3, q: Vec3) -> Vec3 {
+        (p + q) * 0.5
+    }
+    /// 点到 AABB 的最近点（clamp）。
+    fn clamp_box(center: Vec3, half: &Vec3, p: Vec3) -> Vec3 {
+        p.clamp(center - *half, center + *half)
+    }
+    /// 段上离点最近的参数 t（0..1）。
+    fn closest_t(a0: Vec3, a1: Vec3, p: Vec3) -> f32 {
+        let ab = a1 - a0;
+        let denom = ab.dot(ab);
+        if denom <= SEGMENT_EPSILON_SQ {
+            return 0.5;
+        }
+        ((p - a0).dot(ab) / denom).clamp(0.0, 1.0)
+    }
+    match (a_shape, b_shape) {
+        (ColliderShape::Sphere { radius: ra }, ColliderShape::Sphere { radius: rb }) => {
+            let d = b_pos - a_pos;
+            let dist = d.length();
+            let dir = if dist > 1e-9 { d / dist } else { Vec3::Y };
+            midpoint_surfaces(a_pos, b_pos, a_pos + dir * ra, b_pos - dir * rb)
+        }
+        (ColliderShape::Sphere { radius }, ColliderShape::Box { half_extents }) => {
+            let clamped = clamp_box(b_pos, half_extents, a_pos);
+            let offset = clamped - a_pos;
+            let dist = offset.length();
+            let dir = if dist > 1e-9 { offset / dist } else { Vec3::Y };
+            midpoint_surfaces(a_pos, b_pos, a_pos + dir * radius, clamped)
+        }
+        (ColliderShape::Box { half_extents: ha }, ColliderShape::Box { half_extents: hb }) => {
+            // 重叠区中心（检测已保证三轴都重叠）
+            let mut point = Vec3::ZERO;
+            for axis in 0..3 {
+                let (a_lo, a_hi) = (a_pos[axis] - ha[axis], a_pos[axis] + ha[axis]);
+                let (b_lo, b_hi) = (b_pos[axis] - hb[axis], b_pos[axis] + hb[axis]);
+                point[axis] = (a_lo.max(b_lo) + a_hi.min(b_hi)) * 0.5;
+            }
+            point
+        }
+        (
+            ColliderShape::Capsule {
+                radius: rc,
+                half_height: hh,
+            },
+            ColliderShape::Sphere { radius: rs },
+        ) => {
+            let (a0, a1) = capsule_axis(a_pos, a_rotation, *hh, *rc);
+            let t = closest_t(a0, a1, b_pos);
+            let axis_point = a0 + (a1 - a0) * t;
+            let offset = b_pos - axis_point;
+            let dist = offset.length();
+            let dir = if dist > 1e-9 { offset / dist } else { Vec3::Y };
+            midpoint_surfaces(a_pos, b_pos, axis_point + dir * rc, b_pos - dir * rs)
+        }
+        (
+            ColliderShape::Capsule {
+                radius: rc,
+                half_height: hh,
+            },
+            ColliderShape::Box { half_extents: hb },
+        ) => {
+            // 与 capsule_box 同款交替投影（同轮数）：轴段最近点 → 盒
+            let (a0, a1) = capsule_axis(a_pos, a_rotation, *hh, *rc);
+            let mut axis_point = a0 + (a1 - a0) * 0.5;
+            for _ in 0..CAPSULE_PROJECTION_ROUNDS {
+                let clamped = clamp_box(b_pos, hb, axis_point);
+                let t = closest_t(a0, a1, clamped);
+                axis_point = a0 + (a1 - a0) * t;
+            }
+            let clamped = clamp_box(b_pos, hb, axis_point);
+            let offset = clamped - axis_point;
+            let dist = offset.length();
+            let dir = if dist > 1e-9 { offset / dist } else { Vec3::Y };
+            midpoint_surfaces(a_pos, b_pos, axis_point + dir * rc, clamped)
+        }
+        (
+            ColliderShape::Capsule {
+                radius: ra,
+                half_height: ahh,
+            },
+            ColliderShape::Capsule {
+                radius: rb,
+                half_height: bhh,
+            },
+        ) => {
+            let (a0, a1) = capsule_axis(a_pos, a_rotation, *ahh, *ra);
+            let (b0, b1) = capsule_axis(b_pos, b_rotation, *bhh, *rb);
+            let ta = closest_t(a0, a1, b0 + (b1 - b0) * 0.5);
+            let a_point = a0 + (a1 - a0) * ta;
+            let tb = closest_t(b0, b1, a_point);
+            let b_point = b0 + (b1 - b0) * tb;
+            let offset = b_point - a_point;
+            let dist = offset.length();
+            let dir = if dist > 1e-9 { offset / dist } else { Vec3::Y };
+            midpoint_surfaces(a_pos, b_pos, a_point + dir * ra, b_point - dir * rb)
+        }
+        // 对称分支：交换到「胶囊 / 盒在前」求解。接触点是空间中的一点，
+        // 交换 a/b 后算出的仍是同一点（与 detect_pair_rotated 的法线翻转
+        // 不同——法线有方向、点没有）
+        (ColliderShape::Sphere { .. }, ColliderShape::Capsule { .. })
+        | (ColliderShape::Box { .. }, ColliderShape::Sphere { .. })
+        | (ColliderShape::Box { .. }, ColliderShape::Capsule { .. }) => {
+            contact_point_rotated(b_pos, b_rotation, b_shape, a_pos, a_rotation, a_shape)
+        }
+    }
+}
+
+/// 接触求解 v2 的单方求解状态（纯数据）：从管线数组拷入 / 拷出，
+/// 冲量解算期间独占持有——可脱离 ECS 单测。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RigidContactState {
+    /// 世界位置（力臂基准 `r = point − position`；速度轮期间冻结——
+    /// 位置投影在速度轮之后）。
+    pub position: Vec3,
+    /// 线速度（静态 / 运动学体传当前值参与相对速度计算——inv_mass = 0
+    /// 保证不会被冲量改动）。
+    pub velocity: Vec3,
+    /// 角速度（rad/s，轴角式，同 [`RigidBody::angular_velocity`]）。
+    pub angular_velocity: Vec3,
+    /// 逆质量（1/kg；0 = 不可推动——静态 / 运动学 / 异常质量）。
+    pub inv_mass: f32,
+    /// 世界系逆惯性张量（[`inv_inertia_world`]；零矩阵 = 不接受角冲量）。
+    pub inv_inertia: Mat3,
+}
+
+/// [`solve_contact_impulse`] 的接触参数（纯数据）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImpulseParams {
+    /// 摩擦系数 μ（已组合——参与响应的动体的几何均值，见模块文档）。
+    pub friction: f32,
+    /// 法向目标速度：求解后接触点法向相对速度应达到的值
+    /// （`−e·max(0, v_n0 − threshold)`，首轮捕获；静止接触为 0）。
+    /// 「v_n 已低于目标」（分离中）时 λ 钳零自然不施冲量。弹性已并入
+    /// 本值——冲量轮本身不区分弹性 / 塑性。
+    pub target_vn: f32,
+}
+
+/// 单个接触的一次顺序冲量求解（纯函数，R76）：法向冲量（λ ≥ 0 累积
+/// 钳制）+ 摩擦锥（`|λ_t| ≤ μ·λ_n` 向量模长钳制）。**就地更新**双方
+/// 状态与累积冲量——Gauss-Seidel 的一步；调用 K 轮即完整速度求解。
+///
+/// # 数学（约定与 v1 一致：法线从 a 指向 b、`rel = v_a − v_b`、
+/// 接近 = `v_n > 0`）
+///
+/// - 接触点相对速度 `v = (v_a + ω_a×r_a) − (v_b + ω_b×r_b)`，
+///   `r = point − pos`；
+/// - 法向有效质量 `k_n = inv_m_a + inv_m_b + n·((I_a⁻¹(r_a×n))×r_a)
+///   + n·((I_b⁻¹(r_b×n))×r_b)`；冲量增量 `Δλ = (v_n − target)/k_n`，
+///   累积 `λ = max(0, λ + Δλ)`（不吸），施 `P = n·(λ_new − λ_old)`：
+///   **b 沿 +P、a 沿 −P**（a 被推离 b）；`ω += I⁻¹(r × P_a)`；
+/// - 切向：重算 v，`t_rel = v − n(v·n)`，沿 `t = t_rel/|t_rel|` 解
+///   出使切向归零的冲量向量增量，与累积 `λ_t` 相加后按锥半径
+///   `μ·λ` 钳制模长（各向同性库仑近似），差额施加（同 a/b 反向）。
+///
+/// 确定性：全纯浮点、固定运算序；退化防御（k ≤ 1e-9、t 零向量）跳过。
+pub fn solve_contact_impulse(
+    normal: Vec3,
+    point: Vec3,
+    a: &mut RigidContactState,
+    b: &mut RigidContactState,
+    params: ImpulseParams,
+    lambda_n: &mut f32,
+    lambda_t: &mut Vec3,
+) {
+    if a.inv_mass <= 0.0 && b.inv_mass <= 0.0 {
+        return; // 双方不可推动：无冲量语义（管线收集已跳过静-静对，防御）
+    }
+    let r_a = point - a.position;
+    let r_b = point - b.position;
+    // ---- 法向冲量 ----
+    let rel =
+        (a.velocity + a.angular_velocity.cross(r_a)) - (b.velocity + b.angular_velocity.cross(r_b));
+    let v_n = rel.dot(normal);
+    let rn_a = r_a.cross(normal);
+    let rn_b = r_b.cross(normal);
+    let k_n = a.inv_mass
+        + b.inv_mass
+        + normal.dot((a.inv_inertia * rn_a).cross(r_a))
+        + normal.dot((b.inv_inertia * rn_b).cross(r_b));
+    if k_n > 1e-9 {
+        let delta = (v_n - params.target_vn) / k_n;
+        let new_lambda = (*lambda_n + delta).max(0.0);
+        let applied = new_lambda - *lambda_n;
+        *lambda_n = new_lambda;
+        if applied != 0.0 {
+            let p = normal * applied;
+            b.velocity += p * b.inv_mass;
+            b.angular_velocity += b.inv_inertia * r_b.cross(p);
+            a.velocity -= p * a.inv_mass;
+            a.angular_velocity -= a.inv_inertia * r_a.cross(p);
+        }
+    }
+    // ---- 切向（摩擦锥）----
+    let rel =
+        (a.velocity + a.angular_velocity.cross(r_a)) - (b.velocity + b.angular_velocity.cross(r_b));
+    let tangent = rel - normal * rel.dot(normal);
+    let t_speed = tangent.length();
+    if t_speed > 1e-9 && params.friction > 0.0 {
+        let t = tangent / t_speed;
+        let rt_a = r_a.cross(t);
+        let rt_b = r_b.cross(t);
+        let k_t = a.inv_mass
+            + b.inv_mass
+            + t.dot((a.inv_inertia * rt_a).cross(r_a))
+            + t.dot((b.inv_inertia * rt_b).cross(r_b));
+        if k_t > 1e-9 {
+            // 把切向相对速度归零所需的总冲量向量（冲量施给 b 沿 +t 使
+            // rel·t 下降 t_speed：从当前累积推到 λ_t + t·(t_speed/k_t)），
+            // 随后按锥半径 μ·λ 钳制模长（各向同性库仑近似）
+            let needed = *lambda_t + t * (t_speed / k_t);
+            let cone = params.friction * *lambda_n;
+            let clamped = if needed.length() > cone {
+                needed / needed.length() * cone
+            } else {
+                needed
+            };
+            let applied_t = clamped - *lambda_t;
+            *lambda_t = clamped;
+            if applied_t != Vec3::ZERO {
+                b.velocity += applied_t * b.inv_mass;
+                b.angular_velocity += b.inv_inertia * r_b.cross(applied_t);
+                a.velocity -= applied_t * a.inv_mass;
+                a.angular_velocity -= a.inv_inertia * r_a.cross(applied_t);
+            }
+        }
+    }
+}
+
+/// v2 求解轮的单条接触（`step_physics` 内部纯数据，R76）：几何 + 组合
+/// 参数 + **累积冲量**（跨本帧速度轮保持、每帧重置——无 warm starting，
+/// 见模块文档 v2 诚实边界）。
+struct V2Contact {
+    /// 配对双方快照索引（恒 `i < j`——收集保留下三角）。
+    i: usize,
+    j: usize,
+    /// 接触法线（a → b，同 [`Contact`]）。
+    normal: Vec3,
+    /// 接触点（[`contact_point_rotated`] 的界面点近似）。
+    point: Vec3,
+    /// 穿透深度。
+    penetration: f32,
+    /// 组合摩擦系数 μ。
+    mu: f32,
+    /// 法向目标速度（首轮捕获，弹性已并入）。
+    target_vn: f32,
+    /// 累积法向冲量（λ ≥ 0 钳制）。
+    lambda_n: f32,
+    /// 累积切向冲量向量（锥钳制）。
+    lambda_t: Vec3,
 }
 
 /// 关节求解的目标端（`step_physics` 收集阶段的内部纯数据，脱离 ECS）：
@@ -2080,6 +2516,48 @@ pub fn step_physics(world: &World) {
         });
     }
 
+    // ---- 接触求解 v2 的每体求解状态（R76）：资源缺席时为空——v1 路径
+    // 零参与（零额外成本）。inv_mass = 0 涵盖静态 / 运动学 / 非正质量
+    // （debug 断言提示非正质量；velocity / ω 取「积分后动体值 / 刚体
+    // 当前值（静态运动学）」——后者只读参与相对速度，inv_mass = 0 保证
+    // 冲量改不动它们）----
+    let solver_v2 = world.try_resource::<ContactSolverV2>().map(|r| *r);
+    let mut states: Vec<RigidContactState> = if solver_v2.is_some() {
+        (0..n)
+            .map(|x| {
+                let inv_mass = if is_static[x] || is_kinematic[x] {
+                    0.0
+                } else {
+                    let mass = collected[x].2.map(|b| b.mass).unwrap_or(1.0);
+                    debug_assert!(
+                        mass > 0.0,
+                        "RigidBody::mass 须为正（实体 {:?} 为 {mass}——≤0 按无穷质量 = 不可推动）",
+                        collected[x].0
+                    );
+                    if mass > 0.0 { 1.0 / mass } else { 0.0 }
+                };
+                RigidContactState {
+                    position: positions[x],
+                    velocity: velocities[x].unwrap_or_else(|| {
+                        collected[x].2.map(|b| b.velocity).unwrap_or(Vec3::ZERO)
+                    }),
+                    angular_velocity: if is_static[x] || is_kinematic[x] {
+                        collected[x]
+                            .2
+                            .map(|b| b.angular_velocity)
+                            .unwrap_or(Vec3::ZERO)
+                    } else {
+                        angular_velocities[x]
+                    },
+                    inv_mass,
+                    inv_inertia: inv_inertia_world(&collected[x].1.shape, rotations[x], inv_mass),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // ---- 检测 + 响应 + 松弛（均匀网格 broadphase 筛候选对）----
     // 粗筛：按「积分后、求解前」的位置算每个碰撞体的世界 AABB（球 →
     // 中心 ± 半径；盒 → 中心 ± 半边长），建一次性网格。cell 尺寸取全部
@@ -2131,63 +2609,199 @@ pub fn step_physics(world: &World) {
     // 事件只在**首轮**采样：松弛轮的重复检出对是同一配对的求解残影，
     // 无 begin/end 语义。
     for iteration in 0..SOLVER_ITERATIONS {
-        for i in 0..n {
-            for &j in &candidates[i] {
-                if j <= i {
-                    continue; // 只保留下三角（j > i），与原 (i+1)..n 内层一致
-                }
-                if (is_static[i] && is_static[j]) || (is_kinematic[i] && is_kinematic[j]) {
-                    continue;
-                }
-                // 碰撞过滤（groups/mask 位掩码，见模块文档「碰撞过滤掩码」）：
-                // 双向白名单都认可的配对才检测求解；被过滤对与静-静对同
-                // 待遇——不检测、不求解、不进接触集合（下方分支共享）。
-                // 放在 broadphase 之后：过滤只影响配对白名单、不粗筛——
-                // 网格候选构建与遍历序完全不变（确定性保持），逐配对一次
-                // 位与的成本可忽略。
-                if collected[i].1.groups & collected[j].1.mask == 0
-                    || collected[j].1.groups & collected[i].1.mask == 0
-                {
-                    continue;
-                }
-                let Some(contact) = detect_pair_rotated(
-                    positions[i],
-                    rotations[i],
-                    &collected[i].1.shape,
-                    positions[j],
-                    rotations[j],
-                    &collected[j].1.shape,
-                ) else {
-                    continue;
-                };
-                if iteration == 0 {
-                    // 实体序归一化（a.index() ≤ b.index()）：配对以索引序
-                    // 入集合；检测原始方向与索引序相反时法线随归一化翻转
-                    //（保持「从 a 指向 b」的方向约定，见 CollisionStarted）
-                    let (entity_a, entity_b) = (collected[i].0, collected[j].0);
-                    let (pair, normal) = if entity_a.index() <= entity_b.index() {
-                        ((entity_a.to_bits(), entity_b.to_bits()), contact.normal)
-                    } else {
-                        ((entity_b.to_bits(), entity_a.to_bits()), -contact.normal)
-                    };
-                    current_contacts.insert(pair, (normal, contact.penetration));
-                }
-                // sensor 对照常入接触集合（报事件），但跳过位置/速度求解
-                // ——不推离不反弹，实体彼此穿过（见 Collider::is_sensor）
-                if is_sensor[i] || is_sensor[j] {
-                    continue;
-                }
-                let response = solve_contact(contact, params[i], params[j]);
-                positions[i] += response.delta_pos_a;
-                positions[j] += response.delta_pos_b;
-                if iteration == 0 {
-                    if let Some(v) = velocities[i].as_mut() {
-                        *v += response.delta_vel_a;
-                        params[i].velocity = Some(*v);
+        if let Some(v2) = solver_v2 {
+            // ---- 接触求解 v2（R76）：本轮接触收集（遍历序 / 过滤 /
+            // 事件采样与 v1 分支完全一致）→ 速度轮（仅首轮：K 轮
+            // Gauss-Seidel 顺序冲量 + 摩擦锥）→ 逆质量加权位置投影 ----
+            let mut round: Vec<V2Contact> = Vec::new();
+            for i in 0..n {
+                for &j in &candidates[i] {
+                    if j <= i {
+                        continue;
                     }
-                    if let Some(v) = velocities[j].as_mut() {
-                        *v += response.delta_vel_b;
-                        params[j].velocity = Some(*v);
+                    if (is_static[i] && is_static[j]) || (is_kinematic[i] && is_kinematic[j]) {
+                        continue;
+                    }
+                    if collected[i].1.groups & collected[j].1.mask == 0
+                        || collected[j].1.groups & collected[i].1.mask == 0
+                    {
+                        continue;
+                    }
+                    let Some(contact) = detect_pair_rotated(
+                        positions[i],
+                        rotations[i],
+                        &collected[i].1.shape,
+                        positions[j],
+                        rotations[j],
+                        &collected[j].1.shape,
+                    ) else {
+                        continue;
+                    };
+                    if iteration == 0 {
+                        // 实体序归一化（与 v1 分支同款，见 CollisionStarted）
+                        let (entity_a, entity_b) = (collected[i].0, collected[j].0);
+                        let (pair, normal) = if entity_a.index() <= entity_b.index() {
+                            ((entity_a.to_bits(), entity_b.to_bits()), contact.normal)
+                        } else {
+                            ((entity_b.to_bits(), entity_a.to_bits()), -contact.normal)
+                        };
+                        current_contacts.insert(pair, (normal, contact.penetration));
+                    }
+                    if is_sensor[i] || is_sensor[j] {
+                        continue;
+                    }
+                    let point = contact_point_rotated(
+                        positions[i],
+                        rotations[i],
+                        &collected[i].1.shape,
+                        positions[j],
+                        rotations[j],
+                        &collected[j].1.shape,
+                    );
+                    // 组合参数：弹性取双方最大（v1 同规则，并入 target_vn）；
+                    // μ = 参与响应的**动体**摩擦的几何均值（v1 参与规则的
+                    // v2 版——静态 / 运动学侧不参与，负值先钳零：几何均值
+                    // 对负数无定义）
+                    let restitution = collected[i].1.restitution.max(collected[j].1.restitution);
+                    let dynamic_friction = |x: usize| -> Option<f32> {
+                        if is_static[x] || is_kinematic[x] {
+                            None
+                        } else {
+                            Some(collected[x].2.map(|b| b.friction).unwrap_or(0.0).max(0.0))
+                        }
+                    };
+                    let mu = match (dynamic_friction(i), dynamic_friction(j)) {
+                        (Some(a), Some(b)) => (a * b).sqrt(),
+                        (Some(a), None) | (None, Some(a)) => a,
+                        (None, None) => 0.0, // 不可达（静-静对已跳过），兜底
+                    };
+                    // target_vn 首轮捕获（含 ω 贡献的接触点相对速度；低速
+                    // 接触按非弹性处理——restitution_threshold，见资源文档）
+                    let target_vn = if iteration == 0 {
+                        let r_a = point - positions[i];
+                        let r_b = point - positions[j];
+                        let rel = (states[i].velocity + states[i].angular_velocity.cross(r_a))
+                            - (states[j].velocity + states[j].angular_velocity.cross(r_b));
+                        let v_n0 = rel.dot(contact.normal);
+                        if v_n0 > v2.restitution_threshold {
+                            -restitution * v_n0
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    round.push(V2Contact {
+                        i,
+                        j,
+                        normal: contact.normal,
+                        point,
+                        penetration: contact.penetration,
+                        mu,
+                        target_vn,
+                        lambda_n: 0.0,
+                        lambda_t: Vec3::ZERO,
+                    });
+                }
+            }
+            if iteration == 0 {
+                for _ in 0..v2.velocity_iterations {
+                    for c in &mut round {
+                        // 配对恒 i < j（收集保留下三角）⇒ split_at_mut 恒可行
+                        let (lo, hi) = states.split_at_mut(c.j);
+                        solve_contact_impulse(
+                            c.normal,
+                            c.point,
+                            &mut lo[c.i],
+                            &mut hi[0],
+                            ImpulseParams {
+                                friction: c.mu,
+                                target_vn: c.target_vn,
+                            },
+                            &mut c.lambda_n,
+                            &mut c.lambda_t,
+                        );
+                    }
+                }
+                // 状态同步回管线数组（写回阶段读 velocities / angular；
+                // 静态与运动学体不写——inv_mass = 0 其值本就未被改动）
+                for x in 0..n {
+                    if !is_static[x] && !is_kinematic[x] {
+                        velocities[x] = Some(states[x].velocity);
+                        angular_velocities[x] = states[x].angular_velocity;
+                    }
+                }
+            }
+            // 位置投影：逆质量加权 + slop 容差 + beta 比例（Gauss-Seidel
+            // 即时生效——与 v1 分离同款风格，重物少动轻物多动）
+            for c in &round {
+                let inv_sum = states[c.i].inv_mass + states[c.j].inv_mass;
+                if inv_sum <= 0.0 {
+                    continue;
+                }
+                let correction = ((c.penetration - v2.slop).max(0.0)) * v2.beta;
+                positions[c.i] -= c.normal * (correction * states[c.i].inv_mass / inv_sum);
+                positions[c.j] += c.normal * (correction * states[c.j].inv_mass / inv_sum);
+            }
+        } else {
+            for i in 0..n {
+                for &j in &candidates[i] {
+                    if j <= i {
+                        continue; // 只保留下三角（j > i），与原 (i+1)..n 内层一致
+                    }
+                    if (is_static[i] && is_static[j]) || (is_kinematic[i] && is_kinematic[j]) {
+                        continue;
+                    }
+                    // 碰撞过滤（groups/mask 位掩码，见模块文档「碰撞过滤掩码」）：
+                    // 双向白名单都认可的配对才检测求解；被过滤对与静-静对同
+                    // 待遇——不检测、不求解、不进接触集合（下方分支共享）。
+                    // 放在 broadphase 之后：过滤只影响配对白名单、不粗筛——
+                    // 网格候选构建与遍历序完全不变（确定性保持），逐配对一次
+                    // 位与的成本可忽略。
+                    if collected[i].1.groups & collected[j].1.mask == 0
+                        || collected[j].1.groups & collected[i].1.mask == 0
+                    {
+                        continue;
+                    }
+                    let Some(contact) = detect_pair_rotated(
+                        positions[i],
+                        rotations[i],
+                        &collected[i].1.shape,
+                        positions[j],
+                        rotations[j],
+                        &collected[j].1.shape,
+                    ) else {
+                        continue;
+                    };
+                    if iteration == 0 {
+                        // 实体序归一化（a.index() ≤ b.index()）：配对以索引序
+                        // 入集合；检测原始方向与索引序相反时法线随归一化翻转
+                        //（保持「从 a 指向 b」的方向约定，见 CollisionStarted）
+                        let (entity_a, entity_b) = (collected[i].0, collected[j].0);
+                        let (pair, normal) = if entity_a.index() <= entity_b.index() {
+                            ((entity_a.to_bits(), entity_b.to_bits()), contact.normal)
+                        } else {
+                            ((entity_b.to_bits(), entity_a.to_bits()), -contact.normal)
+                        };
+                        current_contacts.insert(pair, (normal, contact.penetration));
+                    }
+                    // sensor 对照常入接触集合（报事件），但跳过位置/速度求解
+                    // ——不推离不反弹，实体彼此穿过（见 Collider::is_sensor）
+                    if is_sensor[i] || is_sensor[j] {
+                        continue;
+                    }
+                    let response = solve_contact(contact, params[i], params[j]);
+                    positions[i] += response.delta_pos_a;
+                    positions[j] += response.delta_pos_b;
+                    if iteration == 0 {
+                        if let Some(v) = velocities[i].as_mut() {
+                            *v += response.delta_vel_a;
+                            params[i].velocity = Some(*v);
+                        }
+                        if let Some(v) = velocities[j].as_mut() {
+                            *v += response.delta_vel_b;
+                            params[j].velocity = Some(*v);
+                        }
                     }
                 }
             }
@@ -3468,6 +4082,7 @@ mod tests {
             Transform::from_xyz(0.0, 100.0, 0.0),
             RigidBody {
                 velocity: Vec3::new(4.0, 0.0, 0.0),
+                mass: 1.0,
                 gravity_scale: 0.0, // 隔离重力，只看阻尼
                 friction: 0.0,
                 linear_damping: damping,
@@ -7099,6 +7714,717 @@ mod tests {
         assert!(
             final_position.distance(Vec3::new(0.0, 0.6, 0.0)) > 0.2,
             "小腿应被初速 / 重力 / 关节真实驱动过，实际 {final_position:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 接触求解 v2（R76）测试：解析对照（惯性 / 冲量 / 弹性碰撞 / 摩擦锥）、
+// 管线集成（质量加权 / 起转 / 事件兼容）、确定性、v1 零变化锁
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod solver_v2_tests {
+    use super::*;
+    use crate::prelude::Time;
+    use std::time::Duration;
+
+    /// v2 测试世界：注册求解器资源 + Time。
+    fn make_v2_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(ContactSolverV2::default());
+        world.insert_resource(Time::default());
+        world
+    }
+
+    fn step(world: &World, dt: f32) {
+        world
+            .resource_mut::<Time>()
+            .advance(Duration::from_secs_f64(dt as f64));
+        step_physics(world);
+    }
+
+    fn spawn_floor(world: &mut World) {
+        world.spawn((
+            Transform::from_xyz(0.0, -1.0, 0.0),
+            Collider::static_box(Vec3::new(20.0, 1.0, 20.0)),
+        ));
+    }
+
+    /// 动态球（可指定质量），返回实体。
+    fn ball(
+        world: &mut World,
+        pos: Vec3,
+        vel: Vec3,
+        radius: f32,
+        restitution: f32,
+        friction: f32,
+        mass: f32,
+    ) -> Entity {
+        world.spawn((
+            Transform::from_xyz(pos.x, pos.y, pos.z),
+            Collider::dynamic_sphere(radius, restitution),
+            RigidBody {
+                velocity: vel,
+                mass,
+                friction,
+                ..RigidBody::default()
+            },
+        ))
+    }
+
+    fn state(world: &World, entity: Entity) -> (Vec3, Vec3, Vec3) {
+        let transform = *world.get::<Transform>(entity).unwrap();
+        let rigid = *world.get::<RigidBody>(entity).unwrap();
+        (transform.position, rigid.velocity, rigid.angular_velocity)
+    }
+
+    // ---- 纯函数：shape_inertia（解析对照） ----
+
+    /// 球：精确实体球 2/5·m·r²（m=5、r=2 → 8）。
+    #[test]
+    fn inertia_sphere_exact() {
+        let (ix, iy, iz) = shape_inertia(&ColliderShape::Sphere { radius: 2.0 }, 5.0);
+        assert_eq!((ix, iy, iz), (8.0, 8.0, 8.0), "球惯性各向同性 2/5·5·4 = 8");
+    }
+
+    /// 盒：精确实体盒（半边 (1,2,3)、m=1 → Ix = (4+36)/12 = 13/3、
+    /// Iy = 10/3、Iz = 5/3）。
+    #[test]
+    fn inertia_box_exact() {
+        let shape = ColliderShape::Box {
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let (ix, iy, iz) = shape_inertia(&shape, 1.0);
+        assert!((ix - 13.0 / 3.0).abs() < 1e-6, "Ix = 13/3，实际 {ix}");
+        assert!((iy - 10.0 / 3.0).abs() < 1e-6, "Iy = 10/3，实际 {iy}");
+        assert!((iz - 5.0 / 3.0).abs() < 1e-6, "Iz = 5/3，实际 {iz}");
+    }
+
+    /// 胶囊（r=1、hh=2、m=1）：圆柱段 L=2、体积比 m_cyl = 0.6、每半球
+    /// m_h = 0.2 → I_axis = 0.3 + 0.16 = 0.46、
+    /// I_perp = 0.35 + 2·(0.08 + 0.2) = 0.91（推导见函数文档）。
+    #[test]
+    fn inertia_capsule_exact_composition() {
+        let shape = ColliderShape::Capsule {
+            radius: 1.0,
+            half_height: 2.0,
+        };
+        let (ix, iy, iz) = shape_inertia(&shape, 1.0);
+        assert!((iy - 0.46).abs() < 1e-6, "I_axis = 0.46，实际 {iy}");
+        assert!((ix - 0.91).abs() < 1e-6, "I_perp = 0.91，实际 {ix}");
+        assert_eq!(ix, iz, "胶囊轴对称：Ix = Iz");
+    }
+
+    /// 退化胶囊（hh = r）：两式同归球 2/5·m·r²——组合公式的结构性校验。
+    #[test]
+    fn inertia_capsule_degenerates_to_sphere() {
+        let capsule = ColliderShape::Capsule {
+            radius: 1.5,
+            half_height: 1.5,
+        };
+        let expected = 0.4 * 2.0 * 1.5 * 1.5;
+        let (cx, cy, _cz) = shape_inertia(&capsule, 2.0);
+        assert!(
+            (cx - expected).abs() < 1e-5,
+            "退化胶囊 I_perp 应为球值 {expected}，实际 {cx}"
+        );
+        assert!(
+            (cy - expected).abs() < 1e-5,
+            "退化胶囊 I_axis 应为球值 {expected}，实际 {cy}"
+        );
+    }
+
+    /// 非正质量：全零（静态 / 异常防御）。
+    #[test]
+    fn inertia_nonpositive_mass_is_zero() {
+        assert_eq!(
+            shape_inertia(&ColliderShape::Sphere { radius: 1.0 }, 0.0),
+            (0.0, 0.0, 0.0)
+        );
+    }
+
+    // ---- 纯函数：inv_inertia_world ----
+
+    /// 球：各向同性 → 任意旋转下逆惯性恒 5/(2r²)·inv_m·单位阵；
+    /// inv_mass = 0 → 零矩阵。
+    #[test]
+    fn inv_inertia_sphere_rotation_invariant() {
+        let shape = ColliderShape::Sphere { radius: 2.0 };
+        let inv_mass = 1.0 / 5.0;
+        let expected = Mat3::from_diagonal(Vec3::splat(0.625 * inv_mass));
+        let identity = inv_inertia_world(&shape, Quat::IDENTITY, inv_mass);
+        let rotated = inv_inertia_world(
+            &shape,
+            Quat::from_axis_angle(Vec3::new(1.0, 1.0, 1.0).normalize(), 0.7),
+            inv_mass,
+        );
+        assert_eq!(
+            identity, expected,
+            "球逆惯性 = 1/(2/5·r²)·inv_m·I（1/1.6 = 0.625）"
+        );
+        assert_eq!(identity, rotated, "各向同性：旋转不改球逆惯性");
+        assert_eq!(
+            inv_inertia_world(&shape, Quat::IDENTITY, 0.0),
+            Mat3::ZERO,
+            "inv_mass = 0（静态）→ 零矩阵"
+        );
+    }
+
+    /// 胶囊：逆惯性 = 局部对角倒数的旋转共轭 R·D·Rᵀ——躺倒（绕 Z 90°）
+    /// 后世界轴上的探查向量应与「先转回局部再乘对角」解析一致。
+    #[test]
+    fn inv_inertia_capsule_rotates_with_body() {
+        let shape = ColliderShape::Capsule {
+            radius: 0.5,
+            half_height: 2.0,
+        };
+        let inv_mass = 1.0 / 4.0;
+        let upright = inv_inertia_world(&shape, Quat::IDENTITY, inv_mass);
+        let (ix, iy, iz) = shape_inertia(&shape, 4.0);
+        assert_eq!(
+            upright,
+            Mat3::from_diagonal(Vec3::new(1.0 / ix, 1.0 / iy, 1.0 / iz)),
+            "竖直胶囊逆惯性 = 局部对角倒数"
+        );
+        assert!(iy < ix, "轴惯量 < 垂直惯量（细长体绕对称轴好转）");
+        let rot = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let lying = inv_inertia_world(&shape, rot, inv_mass);
+        for probe in [Vec3::X, Vec3::Y, Vec3::Z] {
+            let got = lying * probe;
+            let expected = rot
+                * (Mat3::from_diagonal(Vec3::new(1.0 / ix, 1.0 / iy, 1.0 / iz))
+                    * (rot.inverse() * probe));
+            assert!(
+                (got - expected).length() < 1e-6,
+                "躺倒胶囊 R·D·Rᵀ 解析对照失败：{probe:?} → {got:?} vs {expected:?}"
+            );
+        }
+    }
+
+    // ---- 纯函数：contact_point_rotated ----
+
+    /// 球-球：接触点在连心线上（法向冲量零力臂）；球-地：接触点在球心
+    /// 正下方的地面上。
+    #[test]
+    fn contact_point_sphere_pairs() {
+        let sphere = ColliderShape::Sphere { radius: 0.5 };
+        let p = contact_point_rotated(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &sphere,
+            Vec3::new(1.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            &sphere,
+        );
+        assert!(
+            (p - Vec3::new(0.5, 0.0, 0.0)).length() < 1e-6,
+            "球-球接触点 {p:?}"
+        );
+        let floor = ColliderShape::Box {
+            half_extents: Vec3::new(10.0, 1.0, 10.0),
+        };
+        let p = contact_point_rotated(
+            Vec3::new(0.3, 0.4, -0.2),
+            Quat::IDENTITY,
+            &ColliderShape::Sphere { radius: 0.4 },
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+            &floor,
+        );
+        assert!(
+            (p - Vec3::new(0.3, 0.0, -0.2)).length() < 1e-4,
+            "球-地接触点应在球心正下方的地面上，实际 {p:?}"
+        );
+    }
+
+    /// 盒-盒：接触点 = 重叠区中心（x 向重叠 [−0.3, 0.7] → 中心 0.2）。
+    #[test]
+    fn contact_point_box_box_overlap_center() {
+        let shape = ColliderShape::Box {
+            half_extents: Vec3::ONE,
+        };
+        let p = contact_point_rotated(
+            Vec3::new(-0.9, 5.0, 0.0),
+            Quat::IDENTITY,
+            &shape,
+            Vec3::new(0.7, 5.0, 0.0),
+            Quat::IDENTITY,
+            &shape,
+        );
+        // x 向：a ∈ [−1.9, 0.1]、b ∈ [−0.3, 1.7] → 重叠 [−0.3, 0.1] 中心 −0.1
+        assert!(
+            (p - Vec3::new(-0.1, 5.0, 0.0)).length() < 1e-6,
+            "盒-盒接触点 = 重叠区中心，实际 {p:?}"
+        );
+    }
+
+    /// 胶囊-地：接触点在轴正下方贴地（轴段底端最近点）。
+    #[test]
+    fn contact_point_capsule_floor() {
+        let capsule = ColliderShape::Capsule {
+            radius: 0.3,
+            half_height: 0.8,
+        };
+        let floor = ColliderShape::Box {
+            half_extents: Vec3::new(10.0, 1.0, 10.0),
+        };
+        // 竖直胶囊底端 y = 0.78 − 0.8 = −0.02（穿地 0.02）：界面点 =
+        // 底极点 (0.5, −0.02) 与地面 (0.5, 0) 的中点（重叠区内）
+        let p = contact_point_rotated(
+            Vec3::new(0.5, 0.78, 0.0),
+            Quat::IDENTITY,
+            &capsule,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+            &floor,
+        );
+        assert!(
+            (p - Vec3::new(0.5, -0.01, 0.0)).length() < 1e-4,
+            "竖直胶囊-地接触点 = 底极点与地面中点，实际 {p:?}"
+        );
+    }
+
+    // ---- 纯函数：solve_contact_impulse（解析对照） ----
+
+    /// 静态方（inv 全零）状态。
+    fn immovable() -> RigidContactState {
+        RigidContactState {
+            position: Vec3::new(0.0, -1.0, 0.0),
+            velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            inv_mass: 0.0,
+            inv_inertia: Mat3::ZERO,
+        }
+    }
+
+    /// 单位质量单位半径球（逆惯性 2.5 各向同性）。
+    fn unit_sphere(velocity: Vec3) -> RigidContactState {
+        RigidContactState {
+            position: Vec3::new(0.0, 1.0, 0.0),
+            velocity,
+            angular_velocity: Vec3::ZERO,
+            inv_mass: 1.0,
+            inv_inertia: Mat3::from_diagonal(Vec3::splat(2.5)),
+        }
+    }
+
+    /// 正碰静态地面（接触点在球心正下方——零力臂）：e=1 完全反弹、
+    /// e=0.5 反弹一半、分离中 λ 钳零不动。速度精确到解析值。
+    #[test]
+    fn impulse_head_on_restitution_exact() {
+        let cases = [
+            (1.0_f32, -2.0_f32, 2.0_f32), // (e, 入射 vy, 期望反弹 vy)
+            (0.5, -2.0, 1.0),
+        ];
+        for (e, vy_in, vy_expected) in cases {
+            let mut a = unit_sphere(Vec3::new(0.0, vy_in, 0.0));
+            let mut b = immovable();
+            let mut lambda_n = 0.0;
+            let mut lambda_t = Vec3::ZERO;
+            solve_contact_impulse(
+                Vec3::NEG_Y,
+                Vec3::ZERO,
+                &mut a,
+                &mut b,
+                ImpulseParams {
+                    friction: 0.0,
+                    target_vn: -e * 2.0,
+                },
+                &mut lambda_n,
+                &mut lambda_t,
+            );
+            assert!(
+                (a.velocity.y - vy_expected).abs() < 1e-6,
+                "e = {e}：反弹后 vy 应为 {vy_expected}，实际 {}",
+                a.velocity.y
+            );
+            assert_eq!(a.angular_velocity, Vec3::ZERO, "零力臂正碰不产生角速度");
+            assert!(lambda_n > 0.0, "接近中应有法向冲量");
+        }
+        let mut a = unit_sphere(Vec3::new(0.0, 1.0, 0.0));
+        let mut b = immovable();
+        let mut lambda_n = 0.0;
+        let mut lambda_t = Vec3::ZERO;
+        solve_contact_impulse(
+            Vec3::NEG_Y,
+            Vec3::ZERO,
+            &mut a,
+            &mut b,
+            ImpulseParams {
+                friction: 0.0,
+                target_vn: 0.0,
+            },
+            &mut lambda_n,
+            &mut lambda_t,
+        );
+        assert_eq!(a.velocity, Vec3::new(0.0, 1.0, 0.0), "分离中不施冲量");
+        assert_eq!(lambda_n, 0.0, "λ 钳零");
+    }
+
+    /// 偏心碰撞：ω = I⁻¹(r × P) 的解析对照（测试内独立手算）。
+    #[test]
+    fn impulse_off_center_torque_exact() {
+        // 球心 (0,1,0)、接触点 (0.5, 1−√3/2, 0)（表面偏心 0.5）、
+        // n = (0,−1,0)、入射 (0,−2,0)、e=0、μ=0、I⁻¹ = 2.5·I
+        let sqrt3_2 = 0.75f32.sqrt();
+        let mut a = unit_sphere(Vec3::new(0.0, -2.0, 0.0));
+        let mut b = immovable();
+        let point = Vec3::new(0.5, 1.0 - sqrt3_2, 0.0);
+        let mut lambda_n = 0.0;
+        let mut lambda_t = Vec3::ZERO;
+        solve_contact_impulse(
+            Vec3::NEG_Y,
+            point,
+            &mut a,
+            &mut b,
+            ImpulseParams {
+                friction: 0.0,
+                target_vn: 0.0,
+            },
+            &mut lambda_n,
+            &mut lambda_t,
+        );
+        // 独立手算：r = (0.5, −√3/2, 0)、r×n = (0,0,−0.5)
+        // (I⁻¹(r×n))×r 的 n 分量 = 0.625 ⇒ k_n = 1.625、λ = 2/1.625
+        // ω' = −I⁻¹(r × (λ·n))：r×n = (0,0,−0.5) ⇒ ω_z = +1.25·λ
+        let lambda = 2.0f32 / 1.625;
+        assert!(
+            (a.velocity.y - (-2.0 + lambda)).abs() < 1e-6,
+            "偏心后 vy = −2 + λ = {}，实际 {}",
+            -2.0 + lambda,
+            a.velocity.y
+        );
+        assert!(
+            (a.angular_velocity.z - 1.25 * lambda).abs() < 1e-6,
+            "ω_z = 1.25λ = {}，实际 {}",
+            1.25 * lambda,
+            a.angular_velocity.z
+        );
+        let r = point - Vec3::new(0.0, 1.0, 0.0);
+        let contact_vel = a.velocity + a.angular_velocity.cross(r);
+        assert!(
+            contact_vel.y.abs() < 1e-6,
+            "接触点法向速度应归零（target 达成），实际 {contact_vel:?}"
+        );
+    }
+
+    /// 摩擦锥：大切向 + 小 μ ⇒ |λ_t| = μ·λ_n（锥边界）、方向逆滑动；
+    /// μ = 0 ⇒ 零切向。
+    #[test]
+    fn impulse_friction_cone_clamps() {
+        let mu = 0.3f32;
+        let mut a = unit_sphere(Vec3::new(5.0, -2.0, 0.0));
+        let mut b = immovable();
+        let mut lambda_n = 0.0;
+        let mut lambda_t = Vec3::ZERO;
+        solve_contact_impulse(
+            Vec3::NEG_Y,
+            Vec3::ZERO,
+            &mut a,
+            &mut b,
+            ImpulseParams {
+                friction: mu,
+                target_vn: 0.0,
+            },
+            &mut lambda_n,
+            &mut lambda_t,
+        );
+        assert!(
+            (lambda_t.length() - mu * lambda_n).abs() < 1e-5,
+            "锥边界：|λ_t| = μ·λ_n，实际 {} vs {}",
+            lambda_t.length(),
+            mu * lambda_n
+        );
+        // λ_t 约定 = 施给 b 的冲量：沿 a 的滑动方向 +X（摩擦把 b 的接触
+        // 点往 a 的运动方向拖）——a 侧获得 −λ_t（实测 a.vx 被衰减见下）
+        assert!(
+            lambda_t.x > 0.0 && lambda_t.y.abs() < 1e-9,
+            "摩擦冲量（施给 b）应沿滑动方向 +X，实际 {lambda_t:?}"
+        );
+        let mut a = unit_sphere(Vec3::new(5.0, -2.0, 0.0));
+        let mut lambda_n = 0.0;
+        let mut lambda_t = Vec3::ZERO;
+        solve_contact_impulse(
+            Vec3::NEG_Y,
+            Vec3::ZERO,
+            &mut a,
+            &mut b,
+            ImpulseParams {
+                friction: 0.0,
+                target_vn: 0.0,
+            },
+            &mut lambda_n,
+            &mut lambda_t,
+        );
+        assert_eq!(lambda_t, Vec3::ZERO, "μ = 0 零切向冲量");
+        assert!((a.velocity.x - 5.0).abs() < 1e-6, "μ = 0 切向速度不动");
+    }
+
+    // ---- 管线集成 ----
+
+    /// 双球弹性对撞（m1=1 撞静止 m2=3、u=2）：质量加权解析对照——
+    /// v1' = (m1−m2)/(m1+m2)·u = −1、v2' = 2m1/(m1+m2)·u = +1
+    ///（连心线零力臂无角速度；单接触顺序冲量一轮即精确）。
+    #[test]
+    fn v2_elastic_collision_mass_weighted_analytic() {
+        let mut world = make_v2_world();
+        let a = ball(
+            &mut world,
+            Vec3::new(0.0, 5.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            0.5,
+            1.0,
+            0.0,
+            1.0,
+        );
+        let b = ball(
+            &mut world,
+            Vec3::new(1.2, 5.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            1.0,
+            0.0,
+            3.0,
+        );
+        for _ in 0..30 {
+            step(&world, 1.0 / 60.0);
+        }
+        let (_, va, wa) = state(&world, a);
+        let (_, vb, wb) = state(&world, b);
+        assert!(
+            (va.x - (-1.0)).abs() < 2e-3,
+            "轻球（u=2）弹性撞重球应反弹至 −1，实际 {}",
+            va.x
+        );
+        assert!((vb.x - 1.0).abs() < 2e-3, "重球应获得 +1，实际 {}", vb.x);
+        assert_eq!(wa, Vec3::ZERO, "连心线对撞零角速度");
+        assert_eq!(wb, Vec3::ZERO, "连心线对撞零角速度");
+    }
+
+    /// 滑动球落地起转：+X 滑动 ⇒ 绕 −Z 起转（向前滚动）、水平速度被
+    /// 摩擦衰减；同场景 v1（资源缺席）ω 恒零——§8.27① 原状对照。
+    #[test]
+    fn v2_sliding_ball_spins_up() {
+        let mut world = make_v2_world();
+        spawn_floor(&mut world);
+        let entity = ball(
+            &mut world,
+            Vec3::new(0.0, 0.45, 0.0),
+            Vec3::new(2.0, -0.1, 0.0),
+            0.5,
+            0.0,
+            0.8,
+            1.0,
+        );
+        for _ in 0..10 {
+            step(&world, 1.0 / 60.0);
+        }
+        let (_, v, w) = state(&world, entity);
+        assert!(
+            w.z < -0.05,
+            "+X 滑动的球应绕 −Z 起转（向前滚动），实际 ω = {w:?}"
+        );
+        assert!(
+            v.x < 2.0,
+            "摩擦应衰减水平速度（起转消耗平滑动量），实际 vx = {}",
+            v.x
+        );
+        let mut world_v1 = World::new();
+        world_v1.insert_resource(Time::default());
+        spawn_floor(&mut world_v1);
+        let entity_v1 = ball(
+            &mut world_v1,
+            Vec3::new(0.0, 0.45, 0.0),
+            Vec3::new(2.0, -0.1, 0.0),
+            0.5,
+            0.0,
+            0.8,
+            1.0,
+        );
+        for _ in 0..10 {
+            step(&world_v1, 1.0 / 60.0);
+        }
+        let (_, _, w_v1) = state(&world_v1, entity_v1);
+        assert_eq!(w_v1, Vec3::ZERO, "v1 路径接触不产生角速度（§8.27① 原状）");
+    }
+
+    /// 静止球落 v2 地面：沉降无抖（slop + beta + 低速非弹性）、终态
+    /// 近似静默、有限性全程守护。
+    #[test]
+    fn v2_ball_settles_without_jitter() {
+        let mut world = make_v2_world();
+        spawn_floor(&mut world);
+        let entity = ball(
+            &mut world,
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.4,
+            0.5,
+            1.0,
+        );
+        let mut max_drift = 0.0f32;
+        let mut last_y = 2.0f32;
+        for i in 0..240 {
+            step(&world, 1.0 / 60.0);
+            let (p, v, w) = state(&world, entity);
+            if i > 180 {
+                max_drift = max_drift.max((p.y - last_y).abs());
+            }
+            last_y = p.y;
+            assert!(v.is_finite() && w.is_finite(), "速度/角速度须有限");
+            assert!(p.y > 0.4, "球不应穿地（含 slop 容差），帧 {i} y = {}", p.y);
+        }
+        let (p, v, w) = state(&world, entity);
+        assert!(
+            p.y < 0.5 + 0.02,
+            "球应停在地面附近（slop 容差内），实际 y = {}",
+            p.y
+        );
+        assert!(
+            v.length() < 0.05 && w.length() < 0.05,
+            "4 秒后应近似静默，v = {v:?} ω = {w:?}"
+        );
+        assert!(
+            max_drift < 0.05,
+            "沉降后（末 1 秒）不应大幅抖动，最大帧间位移 {max_drift}"
+        );
+    }
+
+    /// 事件兼容：同场景注册 / 不注册求解器，**首帧**接触事件的法线与
+    /// 穿透逐位一致（采样先于任何求解——v1/v2 分支共用同一检测）。
+    #[test]
+    fn v2_first_frame_events_identical_to_v1() {
+        let build = |with_v2: bool| {
+            let mut world = World::new();
+            if with_v2 {
+                world.insert_resource(ContactSolverV2::default());
+            }
+            world.insert_resource(Time::default());
+            world.insert_resource(ContactTracker::default());
+            world.register_event::<CollisionStarted>();
+            spawn_floor(&mut world);
+            ball(
+                &mut world,
+                Vec3::new(0.0, 0.3, 0.0),
+                Vec3::ZERO,
+                0.5,
+                0.0,
+                0.0,
+                1.0,
+            );
+            world
+        };
+        let (a, b) = (build(true), build(false));
+        step(&a, 1.0 / 60.0);
+        step(&b, 1.0 / 60.0);
+        let events_a: Vec<CollisionStarted> = a.events_mut::<CollisionStarted>().drain().collect();
+        let events_b: Vec<CollisionStarted> = b.events_mut::<CollisionStarted>().drain().collect();
+        assert_eq!(events_a.len(), 1, "应恰有一个开始接触事件");
+        assert_eq!(events_a[0].normal, events_b[0].normal, "首帧法线逐位一致");
+        assert_eq!(
+            events_a[0].penetration, events_b[0].penetration,
+            "首帧穿透逐位一致"
+        );
+    }
+
+    /// 确定性：v2 场景（多体 + 摩擦 + 偏心 + 旋转胶囊）同输入两跑，
+    /// 位置 / 速度 / ω 全轨迹逐位一致。
+    #[test]
+    fn v2_simulation_is_bitwise_deterministic() {
+        fn build() -> (World, Vec<Entity>) {
+            let mut world = make_v2_world();
+            spawn_floor(&mut world);
+            let entities = vec![
+                ball(
+                    &mut world,
+                    Vec3::new(-1.0, 3.0, 0.0),
+                    Vec3::new(1.5, 0.0, 0.3),
+                    0.5,
+                    0.6,
+                    0.5,
+                    1.0,
+                ),
+                ball(
+                    &mut world,
+                    Vec3::new(0.5, 4.0, 0.5),
+                    Vec3::new(-0.8, 0.0, 0.0),
+                    0.4,
+                    0.3,
+                    0.7,
+                    2.5,
+                ),
+                ball(
+                    &mut world,
+                    Vec3::new(0.0, 1.2, -0.6),
+                    Vec3::new(2.0, -0.5, -1.0),
+                    0.3,
+                    0.8,
+                    0.2,
+                    0.5,
+                ),
+                world.spawn((
+                    Transform::from_xyz(2.0, 2.0, -1.0),
+                    Collider::dynamic_capsule(0.3, 0.8, 0.2),
+                    RigidBody {
+                        velocity: Vec3::new(-1.0, 0.0, 1.0),
+                        angular_velocity: Vec3::new(0.5, 1.5, -0.3),
+                        mass: 1.5,
+                        friction: 0.4,
+                        ..RigidBody::default()
+                    },
+                )),
+            ];
+            (world, entities)
+        }
+        let (world_a, entities_a) = build();
+        let (world_b, entities_b) = build();
+        let mut trace_a: Vec<([u32; 3], [u32; 3], [u32; 3])> = Vec::new();
+        let mut trace_b: Vec<([u32; 3], [u32; 3], [u32; 3])> = Vec::new();
+        let bits = |s: (Vec3, Vec3, Vec3)| {
+            (
+                [s.0.x.to_bits(), s.0.y.to_bits(), s.0.z.to_bits()],
+                [s.1.x.to_bits(), s.1.y.to_bits(), s.1.z.to_bits()],
+                [s.2.x.to_bits(), s.2.y.to_bits(), s.2.z.to_bits()],
+            )
+        };
+        for _ in 0..240 {
+            step(&world_a, 1.0 / 60.0);
+            step(&world_b, 1.0 / 60.0);
+            for (&a, &b) in entities_a.iter().zip(&entities_b) {
+                trace_a.push(bits(state(&world_a, a)));
+                trace_b.push(bits(state(&world_b, b)));
+            }
+        }
+        assert_eq!(trace_a, trace_b, "v2 同输入两跑应位置/速度/ω 全逐位一致");
+    }
+
+    /// v1 零变化锁：不注册资源时质量字段完全不参与（v1 不读 mass）、
+    /// 行为与既有 v1 语义一致（e=0 静止贴地、无角冲量）。
+    #[test]
+    fn v1_path_untouched_without_resource() {
+        let mut world = World::new();
+        world.insert_resource(Time::default());
+        spawn_floor(&mut world);
+        let entity = ball(
+            &mut world,
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::ZERO,
+            0.5,
+            0.0,
+            0.0,
+            7.0,
+        );
+        for _ in 0..180 {
+            step(&world, 1.0 / 60.0);
+        }
+        let (p, v, w) = state(&world, entity);
+        assert_eq!(w, Vec3::ZERO, "v1 无角冲量（mass 字段不参与）");
+        assert!(
+            p.y > 0.4 && p.y < 0.55 && v.length() < 1e-6,
+            "e=0 球应静止贴地（v1 行为不变），实际 y={} v={:?}",
+            p.y,
+            v
         );
     }
 }
