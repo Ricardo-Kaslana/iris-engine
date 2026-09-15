@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### Fixed（启动性能：GLB `buffer()` 缓存命中整段克隆——iris-exp 启动 16s → 2s）
+
+用户报 iris-exp 启动 ~5s+ 才出画面。分相计时实测（临时探针，测毕删除）：
+GPU 初始化 0.6s / **动画剪辑解析 14.6s** / PNG 解码 0.6s / 首帧上传
+0.55s——病灶是 `asset/gltf.rs::buffer()`：BIN 虽缓存进 HashMap，但返回
+owned `Vec<u8>`，**每次命中整段克隆**；`build_clip` 按通道两次调用
+`read_floats`，32MB GLB × 783 通道 ≈ 50GB memcpy 全花在启动。
+
+- 修复：缓存与返回改 `Arc<[u8]>`（命中 = O(1) 引用计数，miss 才装载），
+  四个调用点（read_floats / read_indices / JOINTS / 内嵌图片）零逻辑
+  改动——纯数据搬运路径，像素逐位不变（全量既有 FNV 基线零改动通过）。
+- 看门单测 `buffer_cache_hit_shares_allocation`（`Arc::ptr_eq` 断言，
+  退化回整段克隆即红）。
+- 实测：iris-exp Startup 15.97s → **0.52s（31×）**，总启动 ~1.6s
+  （GPU 设备 0.6s + 首帧贴图上传 0.45s 为正常成本）。
+
 ### Added（iris-exp：Idle 常态状态机 + 移速步幅匹配 + 渲染能力装配——演示轮，引擎零改动）
 
 实验项目演示升级（用户三诉求：Idle 支持 / 走路过快排查 / 用上引擎渲染能力）。

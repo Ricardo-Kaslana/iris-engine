@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use iris_core::prelude::{Quat, Transform, World};
 use serde::Deserialize;
@@ -416,7 +417,7 @@ struct GltfLoader {
     /// 内存来源（`spawn_gltf_instance_from_bytes`），外部 uri 显式报错
     /// 而非落回磁盘（静默读 cwd 是错误语义）。
     base_dir: Option<PathBuf>,
-    buffers: RefCell<HashMap<usize, Vec<u8>>>,
+    buffers: RefCell<HashMap<usize, Arc<[u8]>>>,
     mesh_handles: RefCell<HashMap<usize, MeshHandle>>,
     material_handles: RefCell<HashMap<usize, MaterialHandle>>,
     /// 纹理去重缓存：键 = (glTF texture 下标, 色彩空间)。同一张图可能
@@ -435,9 +436,14 @@ struct GltfLoader {
 
 impl GltfLoader {
     /// 读取 buffer 内容（GLB BIN chunk / 文件 / data URI，带缓存）。
-    fn buffer(&self, index: usize) -> Result<Vec<u8>, GltfError> {
+    ///
+    /// 缓存与返回均为 `Arc<[u8]>`——命中是 O(1) 引用计数。此前返回
+    /// owned `Vec<u8>`（命中即整段克隆）：32MB 级 GLB 的动画解析按通道
+    /// 成百次调用 `read_floats`，累计 memcpy 达数十 GB，实测把 iris-exp
+    /// 启动拖长 ~14 s（2026-09-16 分相计时）。
+    fn buffer(&self, index: usize) -> Result<Arc<[u8]>, GltfError> {
         if let Some(data) = self.buffers.borrow().get(&index) {
-            return Ok(data.clone());
+            return Ok(Arc::clone(data));
         }
         let buffer = self
             .doc
@@ -477,8 +483,9 @@ impl GltfLoader {
                 std::fs::read(dir.join(uri))?
             }
         };
-        self.buffers.borrow_mut().insert(index, data.clone());
-        Ok(data)
+        let shared: Arc<[u8]> = Arc::from(data);
+        self.buffers.borrow_mut().insert(index, Arc::clone(&shared));
+        Ok(shared)
     }
 
     /// accessor 的平铺 float 数据与分量数（仅 FLOAT）。
@@ -2655,5 +2662,34 @@ mod tests {
             "内存入口对外部 uri 应显式报错：{err:?}"
         );
         Ok(())
+    }
+
+    /// 性能看门（2026-09-16 启动分相计时教训）：`buffer()` 缓存命中必须
+    /// 共享同一分配（`Arc` 引用计数 O(1)）。此前返回 owned `Vec<u8>`
+    /// 且命中即整段克隆——32MB 级 GLB 的动画解析按通道成百次调用
+    /// `read_floats`，累计 memcpy 数十 GB，iris-exp 启动被拖长 ~14 s。
+    /// 若实现退化回逐次拷贝，`Arc::ptr_eq` 断言即失败。
+    #[test]
+    fn buffer_cache_hit_shares_allocation() {
+        let doc = parse_document(triangle_gltf().into_bytes()).expect("解析 data URI glTF");
+        let loader = GltfLoader {
+            node_entities: RefCell::new(Vec::new()),
+            node_parts: RefCell::new(Vec::new()),
+            doc: doc.json,
+            bin: doc.bin,
+            base_dir: None,
+            buffers: RefCell::new(HashMap::new()),
+            mesh_handles: RefCell::new(HashMap::new()),
+            material_handles: RefCell::new(HashMap::new()),
+            texture_handles: RefCell::new(HashMap::new()),
+            registered_textures: RefCell::new(Vec::new()),
+        };
+        let a = loader.buffer(0).expect("buffer 0 可读");
+        let b = loader.buffer(0).expect("buffer 0 二次可读");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "buffer() 命中应返回同一 Arc 分配（O(1)），不得整段克隆"
+        );
+        assert_eq!(a.len(), b.len());
     }
 }
