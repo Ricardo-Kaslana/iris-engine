@@ -17,17 +17,19 @@
 //!   `Transform`——headless / 离屏路径（无输入注入）与窗口静态帧的
 //!   逐位行为与 R66b 之前一致，外部机位覆盖（如快照 example 的
 //!   `EXP_CAM_HEAD` 诊断特写）不会被运行期系统改写。
-//! - **动画播放状态随移动**：步行剪辑仅在有移动输入时播放（停下定格
-//!   当前帧），跳跃单次播放不受移动影响（原地跳）；播完回落步行后同样
-//!   按移动状态决定播放或定格。因此**依赖「无输入推进动画」的旧测试台
-//!   需显式注入移动键**（headless 测试与快照 example 已同轮更新）。
+//! - **常态 Idle + 动画随移动切换**：`Mixamo_Idle` 是常态——停止且无
+//!   进行中的单次动作时循环播放；移动即切步行循环，`空格` 跳跃单次，
+//!   播完自动回落 Idle（此刻仍按住移动键则随即切步行）。无移动输入的
+//!   帧不写角色 `Transform`（恒等语义不变），但动画照常推进（Idle 呼吸
+//!   循环是确定性的 dt-based 采样，双跑逐位一致不受影响）。
 
 use iris_core::prelude::{Entity, Stage};
 use iris_engine::prelude::{
-    Access, ActiveCamera, AnimationClip, AnimationPlayer, AnimationPlugin, App, Camera,
+    Access, ActiveCamera, AnimationClip, AnimationPlayer, AnimationPlugin, AoSettings, App, Camera,
     DirectionalLight, HierarchyPlugin, Input, KeyCode, MaterialDef, MaterialStore, MeshData,
-    MeshStore, MipSettings, MouseButton, Name, OffscreenRenderer, Plugin, Quat, Resource, Schedule,
-    TextureStore, Time, Transform, Vec3, Visibility, World, asset_path, spawn_gltf_instance,
+    MeshStore, MipSettings, MotionBlurSettings, MouseButton, Name, OffscreenRenderer, Plugin, Quat,
+    Resource, Schedule, TaaSettings, TextureStore, Time, Transform, Vec3, VignetteSettings,
+    Visibility, World, asset_path, spawn_gltf_instance,
 };
 
 /// 角色 GLB 路径（`asset_path` 解析：CWD 相对优先，workspace 根相对回退）。
@@ -36,8 +38,10 @@ use iris_engine::prelude::{
 pub const MODEL_PATH: &str = "assets/exp_weiqing.glb";
 /// 步行循环剪辑名（GLB 剪辑名即契约）。
 pub const WALK_CLIP: &str = "Mixamo_Walk";
-/// 跳跃单次剪辑名（播完自动回落步行）。
+/// 跳跃单次剪辑名（播完自动回落 Idle）。
 pub const JUMP_CLIP: &str = "Mixamo_Jump";
+/// 待机循环剪辑名——**常态动作**：无移动、无进行中单次动作时播放。
+pub const IDLE_CLIP: &str = "Mixamo_Idle";
 
 /// 轨道相机注视点**初始**高度（世界坐标 y 偏移；角色约 4 m 高，取胸腹
 /// 位）。运行期由 Q/E 连续调节（[`OrbitCamera::focus_h`]，区间
@@ -63,8 +67,13 @@ pub const PITCH_MAX: f32 = 85.0_f32.to_radians();
 pub const DIST_MIN: f32 = 0.3;
 /// 轨道距离上限（m）：拉远看全景（地面 24 m 尺度之上再留余量）。
 pub const DIST_MAX: f32 = 60.0;
-/// 角色移动速度（m/s）。
-pub const MOVE_SPEED: f32 = 3.0;
+/// 角色移动速度（m/s）。**步幅匹配值**：Walk 剪辑 58 键 @60fps =
+/// 0.967 s/循环，常速步行步幅 ≈1.8 m → 1.8 m/s 起步脚不打滑。
+/// （「走路过快」排查结论：**非帧率问题**——引擎动画推进 dt-based
+/// [`AnimationPlayer::advanced`] 读 `Time::delta_secs()`，帧率无关；
+/// GLB 剪辑时长口径正确。旧值 3.0 m/s 是慢跑速度，与步行动画的
+/// 步频不匹配 → 位移快于步幅、视觉打滑。）
+pub const MOVE_SPEED: f32 = 1.8;
 /// 朝向转身速率（1/s；帧率无关指数趋近，见 [`exp_approach`]）。
 pub const TURN_RATE: f32 = 12.0;
 /// 角色活动范围半宽（m）：地面 24×24，留 1 m 边防止走出地面悬空。
@@ -120,17 +129,20 @@ impl Default for ExpCharacter {
     }
 }
 
-/// 场景实体表：相机 + 角色模型根（加载失败为 None）+ 两个剪辑的索引。
+/// 场景实体表：相机 + 角色模型根（加载失败为 None）+ 三个剪辑的索引。
 #[derive(Clone, Copy, Resource)]
 pub struct ExpEntities {
     /// 轨道相机实体（`update_orbit_camera` 的写目标）。
     pub camera: Entity,
     /// 角色模型根实体（GLB 收编后的顶层；`None` = 资产缺席降级）。
     pub model: Option<Entity>,
-    /// 步行剪辑下标。
+    /// 步行循环剪辑下标。
     pub walk: usize,
-    /// 跳跃剪辑下标。
+    /// 跳跃单次剪辑下标。
     pub jump: usize,
+    /// 待机循环剪辑下标（常态；GLB 缺 Idle 时回退指 walk——
+    /// 行为退化为「停止 = 步行剪辑定格」的旧语义，不 panic）。
+    pub idle: usize,
 }
 
 /// 实验项目插件：Startup 装配场景与角色，Update 接线动作切换、角色
@@ -220,6 +232,38 @@ fn setup_resources(world: &mut World) {
     if !world.contains_resource::<MipSettings>() {
         world.insert_resource(MipSettings { anisotropy: 8 });
     }
+    // ---- 引擎渲染能力装配（后处理链 opt-in 资源，全部「缺席 = 关」，
+    // 游戏层显式开启；headless 路径无渲染器，资源在场无害）----
+    // GTAO（R77）：角色-地面接触、衣褶锁骨缝隙的环境光遮蔽。radius 0.5
+    // 对 4 m 高角色的手指级缝隙合适（世界半径口径）。
+    if !world.contains_resource::<AoSettings>() {
+        world.insert_resource(AoSettings {
+            enabled: true,
+            intensity: 1.0,
+            radius: 0.5,
+        });
+    }
+    // TAA：发片/睫毛高频 alpha 边缘与地面网格线的时域抗锯齿。
+    if !world.contains_resource::<TaaSettings>() {
+        world.insert_resource(TaaSettings { enabled: true });
+    }
+    // 暗角：轻微电影感（0.35 = 不抢戏的边角压暗）。
+    if !world.contains_resource::<VignetteSettings>() {
+        world.insert_resource(VignetteSettings { strength: 0.35 });
+    }
+    // 运动模糊：装配就位但暂关（enabled = false，缺席语义逐位一致）。
+    // 快照实测：跳跃腾空段肢体帧速度大，strength 32/16 档拖影都长到读作
+    // 残影糊块，反损验收图判读；窗口游玩想开拖影把 enabled 翻真值即可。
+    if !world.contains_resource::<MotionBlurSettings>() {
+        world.insert_resource(MotionBlurSettings {
+            enabled: false,
+            strength: 16.0,
+            ..Default::default()
+        });
+    }
+    // 泛光 BloomSettings 未注册即默认启用（0.15），不动；SSR 不开
+    //（场景无反射面，地面哑光）、遮挡剔除不开（24 m 小场景无收益）——
+    // 诚实理由见模块文档。
     if !world.contains_resource::<Camera>() {
         world.insert_resource(Camera::default());
     }
@@ -295,14 +339,15 @@ fn build_scene(world: &mut World) {
             let clips = instance.clips.clone();
             let walk = clip_index(&clips, WALK_CLIP);
             let jump = clip_index(&clips, JUMP_CLIP);
+            let idle = clip_index(&clips, IDLE_CLIP);
             let model = instance.roots[0];
             world.insert(model, Name("exp/character".to_string()));
             world.insert(model, Visibility::VISIBLE);
             let mut player = instance.player();
-            // 步行循环自动开播（`player()` 默认播第一个剪辑——按名改指步行；
-            // 首帧 Update 无移动输入即定格——播放状态随移动，见模块文档）
-            if let Some(walk) = walk {
-                player.active = walk;
+            // 常态 Idle 循环开播（缺 Idle 时回退步行剪辑——退化为旧语义）。
+            // 首帧 Update 按移动意图自动切 walk/idle，见 update_exp_control。
+            if let Some(start) = idle.or(walk) {
+                player.active = start;
                 player.looping = true;
                 player.playing = true;
             }
@@ -311,7 +356,7 @@ fn build_scene(world: &mut World) {
             log::info!(
                 "ExpPlugin：角色已装配（{} 节点 / {} 剪辑），\
                  控制：WASD 移动 / 右键拖拽视角 / 滚轮缩放 / Q·E 注视点高度 / \
-                 空格 跳跃 / 1 步行",
+                 空格 跳跃（停止即回落 Idle）",
                 instance.node_entities.len(),
                 clips.len()
             );
@@ -320,6 +365,7 @@ fn build_scene(world: &mut World) {
                 model: Some(model),
                 walk: walk.unwrap_or(0),
                 jump: jump.unwrap_or(0),
+                idle: idle.or(walk).unwrap_or(0),
             }
         }
         Err(err) => {
@@ -333,16 +379,26 @@ fn build_scene(world: &mut World) {
                 model: None,
                 walk: 0,
                 jump: 0,
+                idle: 0,
             }
         }
     };
     world.insert_resource(entities);
 }
 
-/// Update：动作切换 + WASD 角色移动 + 朝向转身。`空格` 跳跃单次
-/// （`looping = false`，播完自动回落步行）；`1` 步行循环；步行动画的
-/// 播放状态随移动输入（停下定格当前帧）。无移动输入的帧不写角色
-/// `Transform`（恒等）；角色缺席（资产降级）时整帧空转。
+/// Update：常态 Idle 状态机 + WASD 角色移动 + 朝向转身。状态语义：
+///
+/// - `空格` 跳跃单次（`looping = false`），播完自动回落 **Idle**；
+/// - 非跳跃期 walk ↔ idle 随移动意图自动切换（移动即步行循环、停止即
+///   Idle 循环，切入时 `time = 0` 从头播放）；
+/// - 跳跃进行中被按住移动键不切走（落地回落 Idle 后若仍按住，同帧随即
+///   切步行——「动作停止且无立即下一步动作 = Idle」精确成立）；
+/// - 无移动输入的帧不写角色 `Transform`（恒等）；角色缺席（资产降级）
+///   时整帧空转。
+///
+/// GLB 缺 jump/idle 的退化：jump 索引与 walk/idle 重合时视为「无跳跃」
+/// （不锁死状态机）；idle 缺席时 `ExpEntities::idle` 回退指 walk（停止
+/// = 步行剪辑从头循环，观感近似旧定格语义），均不 panic。
 fn update_exp_control(world: &World) {
     let Some(ents) = world.try_resource::<ExpEntities>() else {
         return;
@@ -384,35 +440,37 @@ fn update_exp_control(world: &World) {
     let dir = if moving { dir.normalize_or_zero() } else { dir };
 
     let space_pressed = input.key_pressed(KeyCode::Space);
-    let one_pressed = input.key_pressed(KeyCode::Digit1);
 
     let Some(mut player) = world.get_mut::<AnimationPlayer>(model) else {
         return;
     };
-    // 跳跃播完（非循环到尾）自动回落步行
-    if player.active == ents.jump
-        && player.active != ents.walk
-        && (!player.playing || player.time >= player.clips[player.active].duration)
-    {
-        player.active = ents.walk;
+    let jump_is_real = ents.jump != ents.walk && ents.jump != ents.idle;
+    let in_jump = jump_is_real && player.active == ents.jump;
+    // 1) 跳跃播完（非循环到尾）→ 回落常态 Idle
+    if in_jump && (!player.playing || player.time >= player.clips[player.active].duration) {
+        player.active = ents.idle;
         player.time = 0.0;
         player.looping = true;
         player.playing = true;
     }
-    if space_pressed && player.active != ents.jump {
+    // 2) 空格 → 跳跃单次
+    if space_pressed && !in_jump {
         player.active = ents.jump;
         player.time = 0.0;
         player.looping = false;
         player.playing = true;
-    } else if one_pressed && player.active != ents.walk {
-        player.active = ents.walk;
-        player.time = 0.0;
-        player.looping = true;
-        player.playing = moving;
     }
-    // 步行播放状态随移动（停下定格当前帧；跳跃播放不受影响——原地跳）
-    if player.active == ents.walk {
-        player.playing = moving;
+    // 3) 常态切换：非跳跃期 walk ↔ idle 随移动意图（跳跃不被移动打断）。
+    //    谓词在空格分支之后重算——本帧刚触发的跳跃不被切走；退化重合
+    //    （jump 索引 == walk/idle）时 jump_is_real 恒 false，永不锁死。
+    if !(jump_is_real && player.active == ents.jump) {
+        let want = if moving { ents.walk } else { ents.idle };
+        if player.active != want {
+            player.active = want;
+            player.time = 0.0;
+            player.looping = true;
+            player.playing = true;
+        }
     }
 
     // ---- 位置积分 + 朝向转身（有移动输入才写，无输入恒等）----

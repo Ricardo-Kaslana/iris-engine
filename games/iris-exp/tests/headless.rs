@@ -120,10 +120,14 @@ fn clip_contract_and_animation_progress() {
             .expect("播放器在位");
         assert!(player.clips.iter().any(|c| c.name == iris_exp::WALK_CLIP));
         assert!(player.clips.iter().any(|c| c.name == iris_exp::JUMP_CLIP));
+        assert!(player.clips.iter().any(|c| c.name == iris_exp::IDLE_CLIP));
         assert!(player.node_entity_by_name("gMan Head").is_some());
         assert!(player.node_entity_by_name("gMan Pelvis").is_some());
         let bones = player.node_names.iter().filter(|n| n.is_some()).count();
         assert!(bones >= 87, "gMan 骨架应有 ≥87 个具名节点，实际 {bones}");
+        // 初始常态：Idle 循环开播
+        assert_eq!(player.active, ents.idle, "装配后初始应播 Idle（常态）");
+        assert!(player.playing && player.looping, "Idle 应为循环播放态");
     }
 
     // ---- 步行推进：按住 W（移动 → 步行播放），采样关节位姿逐帧变化 ----
@@ -147,6 +151,14 @@ fn clip_contract_and_animation_progress() {
     game.hold(KeyCode::KeyW);
     game.frame();
     game.frame();
+    {
+        let player = game
+            .app
+            .world
+            .get::<iris_engine::prelude::AnimationPlayer>(model)
+            .expect("播放器在位");
+        assert_eq!(player.active, ents.walk, "移动后应自动切步行循环");
+    }
     let pose_a = sample_joint(&mut game);
     for _ in 0..30 {
         game.frame();
@@ -188,14 +200,87 @@ fn clip_contract_and_animation_progress() {
         z_max - z_min > 1.0,
         "跳跃全程骨盆 z 应有 >1 m 起伏（腾空 3.36 / 蓄力 1.08），实际 {z_min} -> {z_max}"
     );
-    // 播完自动回落步行（移动中回落 → playing 应为 true）
+    // 播完自动回落常态；此刻 W 仍按住 → 同帧常态切换随即指步行
     let player = game
         .app
         .world
         .get::<iris_engine::prelude::AnimationPlayer>(model)
         .expect("播放器在位");
-    assert_eq!(player.active, ents.walk, "跳跃非循环播完应自动回落步行剪辑");
-    assert!(player.playing, "移动中回落步行应继续播放");
+    assert_eq!(
+        player.active, ents.walk,
+        "跳跃播完回落 Idle 后，移动中同帧应切步行（无移动则停 Idle，见 idle_default_state 测试）"
+    );
+    assert!(player.playing, "移动中回落应处于播放态");
+}
+
+#[test]
+fn idle_default_state() {
+    if !asset_available() {
+        return;
+    }
+    let mut game = Harness::new();
+    let ents = *game
+        .app
+        .world
+        .try_resource::<iris_exp::ExpEntities>()
+        .expect("实体表在位");
+    let model = ents.model.expect("资产在位时角色应装配成功");
+    let player_of = |game: &Harness| -> (usize, f32, bool, bool) {
+        let p = game
+            .app
+            .world
+            .get::<iris_engine::prelude::AnimationPlayer>(model)
+            .expect("播放器在位");
+        (p.active, p.time, p.playing, p.looping)
+    };
+
+    // ---- 无输入：Idle 常态循环推进（不再定格）----
+    let (active0, time0, playing0, looping0) = player_of(&game);
+    assert_eq!(active0, ents.idle, "初始常态应为 Idle");
+    assert!(playing0 && looping0, "Idle 初始即循环播放");
+    for _ in 0..10 {
+        game.frame();
+    }
+    let (active1, time1, playing1, _) = player_of(&game);
+    assert_eq!(active1, ents.idle, "无输入帧应停在 Idle");
+    assert!(
+        time1 > time0,
+        "Idle 应随时间推进（循环播放）：{time0} -> {time1}"
+    );
+    assert!(playing1, "Idle 循环保持播放");
+
+    // ---- 移动 → 步行；停止 → Idle 从头 ----
+    game.hold(KeyCode::KeyW);
+    game.frame();
+    game.frame();
+    let (active_w, _, _, _) = player_of(&game);
+    assert_eq!(active_w, ents.walk, "移动应自动切步行");
+    game.release(KeyCode::KeyW);
+    game.frame();
+    let (active_i, time_i, playing_i, _) = player_of(&game);
+    assert_eq!(active_i, ents.idle, "停止应回落 Idle");
+    assert!(
+        time_i < 0.1,
+        "回落 Idle 应从头播放（time 归零后至多推进一帧）：{time_i}"
+    );
+    assert!(playing_i, "回落 Idle 处于播放态");
+
+    // ---- 跳跃（无移动）播完 → 回落 Idle 并保持循环 ----
+    {
+        let mut input = game.app.world.resource_mut::<Input>();
+        input.press(iris_engine::prelude::KeyCode::Space);
+    }
+    game.frame();
+    let (active_j, _, _, looping_j) = player_of(&game);
+    assert_eq!(active_j, ents.jump, "空格应进跳跃单次");
+    assert!(!looping_j, "跳跃应为非循环");
+    // Jump 1.9 s ≈ 114 帧 @60fps，推进 130 帧确保播完
+    for _ in 0..130 {
+        game.frame();
+    }
+    let (active_after, _, playing_after, looping_after) = player_of(&game);
+    assert_eq!(active_after, ents.idle, "无移动时跳跃播完应回落常态 Idle");
+    assert!(playing_after && looping_after, "回落 Idle 应为循环播放态");
 }
 
 #[test]
@@ -644,7 +729,7 @@ fn character_move_camera_follow() {
         );
     }
 
-    // ---- 停下定格：无移动输入 → 播放停 + 位置/朝向/相机逐位恒等 ----
+    // ---- 停止回落常态：无移动输入 → 切 Idle 播放 + 位置/朝向/相机逐位恒等 ----
     game.release(KeyCode::KeyS);
     game.frame();
     {
@@ -654,8 +739,8 @@ fn character_move_camera_follow() {
             .get::<iris_engine::prelude::AnimationPlayer>(model)
             .expect("播放器在位");
         assert!(
-            player.active == ents.walk && !player.playing,
-            "停下后步行剪辑应定格（playing = false）"
+            player.active == ents.idle && player.playing,
+            "停下后应回落常态 Idle 并播放（旧「步行定格」语义已被状态机取代）"
         );
     }
     let t_stop = |game: &Harness| -> [u32; 7] {

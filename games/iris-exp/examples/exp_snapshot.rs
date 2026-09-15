@@ -4,8 +4,8 @@
 //! （640×360，横向拼接）：
 //!
 //! - **帧 A「步行」**：按住 `S` 朝相机方向行走 30 帧（迈步姿态 + 正脸，
-//!   相机注视点跟随角色）——步行动画的播放状态随移动（frictions ⑥），
-//!   必须注入移动键才会播放；
+//!   相机注视点跟随角色）——移动即自动切步行动画（常态 Idle ↔ 步行，
+//!   见 `ExpPlugin` 状态机）；
 //! - **帧 B「跳跃」**：松开 `S` 后注入空格，推进到腾空段（骨盆最高点
 //!   附近，原地正脸跳）。
 //!
@@ -15,8 +15,8 @@
 //! ```
 //!
 //! 同帧打印 FrameStats 并断言有实例被渲染（角色确实入画）。
-//! `EXP_CAM_HEAD=1` 走头部特写诊断机位——该路径无移动注入，动画定格
-//! 在 t=0（静止姿态，仍可验收面部渲染）。
+//! `EXP_CAM_HEAD=1` 走头部特写诊断机位——该路径无移动注入，角色停在
+//! 常态 Idle（推进 30 帧 ≈ 呼吸循环开头，面部渲染验收不受影响）。
 //!
 //! ```sh
 //! cargo run -p iris-exp --example exp_snapshot --release
@@ -123,13 +123,21 @@ fn main() {
     }
 
     // ---- 帧 A：按住 S 朝相机行走 30 帧（迈步姿态 + 正脸）----
-    // 诊断特写模式（EXP_CAM_HEAD）不注入移动：动画随移动，无输入即定格
+    // 诊断特写模式（EXP_CAM_HEAD）不注入移动：角色停在常态 Idle 循环
     if std::env::var("EXP_CAM_HEAD").is_err() {
         game.hold_s();
     }
     for _ in 0..30 {
         game.frame();
     }
+    // 定格 = reset_taa + 三连渲：两张定格之间只推进模拟不渲染，跨帧时域
+    // 状态（TAA 历史 / GTAO 上帧深度副本）全是上一张的——reset_taa 清
+    // TAA/SSR 历史但**不清 AO 深度副本**（引擎缺口，frictions 记录），
+    // 故再连渲两帧让 AO（上帧深度 = 本姿势首帧）与 TAA 历史都收敛到
+    // 本姿势，定格图无跨张残影。确定性：固定帧序，跨运行逐位一致。
+    renderer.renderer_mut().reset_taa();
+    renderer.render(&game.app.world);
+    renderer.render(&game.app.world);
     renderer.render(&game.app.world);
     renderer.save_bmp("exp_walk.bmp").expect("写步行帧");
     let stats = renderer.renderer().stats();
@@ -175,6 +183,9 @@ fn main() {
             break;
         }
     }
+    renderer.renderer_mut().reset_taa();
+    renderer.render(&game.app.world);
+    renderer.render(&game.app.world);
     renderer.render(&game.app.world);
     renderer.save_bmp("exp_jump.bmp").expect("写跳跃帧");
     let stats = renderer.renderer().stats();

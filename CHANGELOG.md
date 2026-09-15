@@ -5,6 +5,38 @@
 
 ## [Unreleased]
 
+### Added（iris-exp：Idle 常态状态机 + 移速步幅匹配 + 渲染能力装配——演示轮，引擎零改动）
+
+实验项目演示升级（用户三诉求：Idle 支持 / 走路过快排查 / 用上引擎渲染能力）。
+
+- **常态 Idle 状态机**（`games/iris-exp/src/plugin.rs`）：新剪辑契约常量
+  `IDLE_CLIP = "Mixamo_Idle"`（GLB 三剪辑齐备，Idle 6.0 s 呼吸循环）；
+  `ExpEntities` 加 `idle` 下标（缺 Idle 回退指 walk，退化不 panic）。切换
+  语义：移动即 Walk、停止即回落 Idle 从头循环、Jump 单次播完 → Idle
+  （若仍按住移动键同帧随即切 Walk——「动作停止且无立即下一步动作 = Idle」
+  精确成立）；旧「停下定格」语义与 `1` 手动切换键一并退役（走停全自动）。
+  跳跃索引与 walk/idle 重合的退化态视为「无跳跃」，状态机不锁死。
+- **走路过快排查：非帧率问题**——引擎动画推进 dt-based
+  （`update_animations` 读 `Time::delta_secs()`，帧率无关），GLB 剪辑时长
+  口径实测正确（Walk 58 键 @60fps = 0.967 s/循环）。真因 = `MOVE_SPEED`
+  3.0 m/s 是慢跑速度、与步行动画步幅（≈1.8 m/循环）不匹配 → 位移快于
+  步幅、脚底打滑。修正 3.0 → **1.8 m/s**（步幅匹配）。
+- **渲染能力装配**（`setup_resources`，窗口/headless/离屏三路共享；全部
+  「缺席 = 关」opt-in 资源的游戏层显式启用）：`AoSettings`（R77 GTAO，
+  radius 0.5 世界半径）+ `TaaSettings` + `VignetteSettings` 0.35；
+  `MotionBlurSettings` 装配就位但暂关（腾空段肢体拖影在定格图读作残影，
+  窗口游玩可开）；SSR / 遮挡剔除按场景特性不开（无反射面 / 24 m 小场景），
+  理由写进装配注释。Bloom 默认档不动。
+- **快照定格协议升级**（`examples/exp_snapshot.rs`）：两张定格间只推进
+  模拟不渲染 ⇒ 跨帧时域状态全是上一张——**`reset_taa` 清 TAA/SSR 历史但
+  不清 GTAO 上帧深度副本**（引擎缺口，frictions ⑬），故定格 =
+  `reset_taa()` + 三连渲让 AO 深度与 TAA 历史都收敛到本姿势；实测跳跃帧
+  地面腿形残影闭合。`docs/exp.png` 重生成。
+- **测试**：headless 新增 `idle_default_state`（初始 Idle / 无输入推进 /
+  走停切换 / 跳跃回落四段精确断言）；`clip_contract` 扩 Idle 契约 + 初始
+  常态断言；`character_move_camera_follow` 的「停下定格」旧断言更新为
+  「停止回落 Idle 播放」。既有确定性/轨道相机测试零改动通过。
+
 ### Added（R77：GTAO 环境光遮蔽——切片水平角 × 上帧深度副本）
 
 路线图 v5 第一梯队第七轮（战斗底座）。`iris-render` 新增**屏幕空间环境
