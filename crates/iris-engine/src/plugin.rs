@@ -131,8 +131,9 @@ impl Plugin for HierarchyPlugin {
 }
 
 /// 动画插件：在 Update 阶段推进所有 [`iris_render::animation::AnimationPlayer`]，
-/// 并在同一阶段执行足部 IK（v3，按 `FootIk` 组件开关）与手部 IK
-/// （v4，按 `HandIk` 组件开关）。
+/// 并在同一阶段按序执行足部 IK（v3，`FootIk` 开关）、手部 IK（v4，
+/// `HandIk` 开关）、链式 IK v2（R75，`ChainIk`——FABRIK 任意长链）与
+/// look-at 瞄准（R75，`LookIk`——链上均分摆动）。
 ///
 /// 已包含在 [`DefaultPlugins`] 中。动画在 Update 写局部变换，随后的
 /// PostUpdate（[`HierarchyPlugin`]）当帧即完成全局传播——「动画写入的
@@ -151,6 +152,14 @@ impl Plugin for HierarchyPlugin {
 /// 层级传播之前写回局部 `Transform`，当帧传播全局生效。目标差异与
 /// 不可达门语义见 hand_ik 模块文档。均注册为**并行系统**（只读世界 +
 /// 组件写访问走尝试型锁）。
+///
+/// **链式 / look-at IK 的注册序（R75，[`iris_render::chain_ik`] 的
+/// `update_chain_ik` / `update_look_ik`，紧跟手部 IK）**：同段四系统
+/// 依次作用于同一份本帧局部姿势，注册序确定 ⇒ 结果确定；look-at 收尾
+/// ——瞄准是姿态的最后一笔，读到的位形含全部前序修正。两系统与足 /
+/// 手部共用节点映射（`IkRig` / 播放器二选一）与目标语义（`IkTarget`
+/// 全局位），语义与诚实边界（近目标残差、无关节角限制）见 chain_ik
+/// 模块文档。
 #[derive(Default)]
 pub struct AnimationPlugin;
 
@@ -159,7 +168,9 @@ impl Plugin for AnimationPlugin {
         use iris_core::prelude::{
             Access, ChildOf, Collider, GlobalTransform, RigidBody, Stage, Transform,
         };
-        use iris_render::prelude::{AnimationPlayer, FootIk, HandIk, IkRig, IkTarget};
+        use iris_render::prelude::{
+            AnimationPlayer, ChainIk, FootIk, HandIk, IkRig, IkTarget, LookIk,
+        };
         use iris_render::visibility::Visibility;
         app.schedule.add_parallel_system(
             Stage::Update,
@@ -199,6 +210,38 @@ impl Plugin for AnimationPlugin {
                 .read::<GlobalTransform>()
                 .read::<Visibility>(),
             iris_render::hand_ik::update_hand_ik,
+        );
+        // 链式 IK v2（R75）：手部 IK 之后、层级传播之前——FABRIK 任意
+        // 长链（触手 / 尾巴 / 脊柱）追 IkTarget 目标，与两骨解析解并存
+        // 不替换（语义见 chain_ik 模块文档）
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<Transform>()
+                .read::<ChainIk>()
+                .read::<IkTarget>()
+                .read::<IkRig>()
+                .read::<AnimationPlayer>()
+                .read::<ChildOf>()
+                .read::<GlobalTransform>()
+                .read::<Visibility>(),
+            iris_render::chain_ik::update_chain_ik,
+        );
+        // look-at 瞄准（R75）：链式 IK 之后收尾——瞄准是姿态的最后一笔，
+        // 读到的链位形包含全部前序修正（单遍分布份额 S^(w/n)，残差边界
+        // 见 chain_ik 模块文档）
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<Transform>()
+                .read::<LookIk>()
+                .read::<IkTarget>()
+                .read::<IkRig>()
+                .read::<AnimationPlayer>()
+                .read::<ChildOf>()
+                .read::<GlobalTransform>()
+                .read::<Visibility>(),
+            iris_render::chain_ik::update_look_ik,
         );
     }
 }

@@ -78,6 +78,7 @@ pub mod asset;
 pub mod bake;
 pub mod bake_uv;
 pub mod camera;
+pub mod chain_ik;
 pub mod context;
 pub mod decal;
 pub mod environment;
@@ -133,6 +134,9 @@ pub mod prelude {
     };
     pub use crate::camera::{
         ActiveCamera, Camera, screen_ray_from_global, view_from_global, view_proj_from_global,
+    };
+    pub use crate::chain_ik::{
+        ChainIk, LookIk, solve_fabrik, swing_fraction, update_chain_ik, update_look_ik,
     };
     pub use crate::context::Gpu;
     pub use crate::decal::{Decal, DecalInstanceRaw};
