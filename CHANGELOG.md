@@ -5,6 +5,57 @@
 
 ## [Unreleased]
 
+### Added（R77：GTAO 环境光遮蔽——切片水平角 × 上帧深度副本）
+
+路线图 v5 第一梯队第七轮（战斗底座）。`iris-render` 新增**屏幕空间环境
+光遮蔽**：动态物体落在墙角、柱脚、箱堆时的环境光互遮蔽此前没有来源
+（ORM ao 只描述材质级遮蔽、光照贴图天空 AO 只覆盖静态烘焙几何）。
+
+- **兼容形态（硬约束）**：`AoSettings` 资源**缺席/关闭 = R76 逐位不变**
+  ——不分配可见度图、不编码 pass；globals 组新增 binding 14（R61/R62a/
+  R62b「不扩 Globals 前缀」扩容先例，skybox 并行布局零触碰）回落常驻
+  1×1 R16Float 哑纹理，**纹素恰为 1.0（f16 0x3C00）**——`standard.wgsl`
+  无条件采样后 `× 1.0` 由 IEEE 754 逐位精确，零分支实现零开销默认路径。
+  全部既有 GPU FNV 基线（post / ssr / taa / probe / lightmap / fxaa /
+  bloom / env / shadow_v2 / sss / decal / transparent / irradiance 等
+  37 个测试二进制 541 项）零改动通过。探针捕获面 / RT 相机同样哑纹素
+  （屏幕空间语义只对主相机成立，§4.31 裁决 2 同款）。
+- **GTAO pass**（`shaders/ao.wgsl`，主 pass 之前编码，读上一帧深度副本
+  ——与 SSR 同款「上帧」语义）：①深度纹素中心重建视空间位置（CPU 镜像
+  `post::ao_view_pos` 经 glam 透视正反算互锁）；②法线 = ±1 纹素深度
+  差分叉积（纯 textureLoad，无导数内建）；③4 切片 × 正负 8 步世界半径
+  搜索，切片方向按像素整数哈希 dither 旋转（`post::ao_dither` 逐行
+  镜像）；④可见度 = (1 − 切片平均 0.5·(sinθ↑+sinθ↓))^intensity，写
+  半分辨率 R16Float。
+- **乘点与 ORM ao 同靶**：`ibl_final`（IBL / 光照贴图 / 探针镜面）与
+  常量环境项乘可见度；直接光不乘——R41「AO 描述环境光损失」语义的
+  屏幕空间扩展。
+- **重置语义**：`ao_depth_frame` 记账深度副本最近运行帧号，本帧恰为
+  +1 才编码 GTAO，否则清中性 1.0（首帧启用 / 上帧无几何 / 副本重建帧
+  与关闭帧逐位一致）；`FrameStats::ao_on` 观测字段。
+- **三个实现级归因（实测定位，测试锁定）**：①**半纹素错配**——样本
+  连续 uv 配 floor 后纹素深度会在斜面上注入 ~1e-2 假仰角（半径 0.2 m
+  时假遮蔽 5%），重建一律取深度纹素中心后平面样本仰角精确归零；
+  ②**越界样本弃权**——钳制读取会配出不存在的表面几何；③**screen uv
+  弃用顶点 varying**——`clip.x/w` 是投影量，地面/墙等大三角形常有顶点
+  在相机背后，近平面裁剪后 x/w 爆炸，插值出越界坐标把可见度图采样扭曲
+  成大片假遮蔽（梯度注入实测定位）；改用 `@builtin(position)`（片元
+  输入 = 帧缓冲像素坐标，纯仿射）除以 `textureDimensions(ao_tex)×2`，
+  哑纹理路径值恒 1.0 与坐标无关，兼容性不受影响。
+- **CPU 镜像纯函数**（`post::{ao_dither, ao_view_pos, ao_uv_offset,
+  ao_sample_sin, ao_falloff, ao_slice_occlusion, ao_visibility}` +
+  `AO_SLICES/AO_STEPS`）：含重建公式与 glam DirectX RH 透视的正反算
+  互锁、步进换算保世界半径解析证明、可见度曲线单调与锚点。
+- **测试**：`tests/ao_render.rs`（GPU_SERIAL 串行化，缺席=显式关逐位、
+  启用首帧中性 + `ao_on` 翻转、角落严格变暗 / 开阔地容差内不变且暗化
+  差可判别、强度指数单调、双会话含物体运动逐帧逐位）+ post.rs CPU
+  单测 6 项。基线 **debug 1276 / release 1273**（+10）。
+- **验收图**：`docs/ao.png`（三排 关|开：日光房间 / 强度两档 / 纯间接
+  光）——接触阴影贴合几何、开阔地逐位不变；快照 example 跨运行逐字节
+  一致（FNV 打印比对）。诚实限制 → ARCHITECTURE §8.46（掠射角低估 /
+  深度断裂光晕 / 光照贴图叠加过暗 / 无时域滤波 / 奇数分辨率口径差 /
+  透明贴花不参与）。
+
 ### Added（R76：接触求解 v2——角冲量 + 库仑摩擦锥 + 顺序冲量迭代）
 
 路线图 v5 第一梯队第六轮（战斗底座），闭合 §8.27①「接触不产生角

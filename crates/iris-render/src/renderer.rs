@@ -583,6 +583,13 @@ pub struct Renderer {
     /// 发 write_buffer，退场的那一帧才回写零值（探针 params_active
     /// 同款记账——关闭后残留 flags.x = 1 会拿陈旧上帧资源做步进）。
     ssr_uniform_live: bool,
+    /// AO 常驻 GPU 资源（R77，哑纹理恒在——布局要求的 binding 14 占位）。
+    ao: AoGpu,
+    /// scene_depth pass 最近一次运行的帧号（R77，`occ_frame` 口径）：
+    /// GTAO 读的是「上一帧」深度——本帧编号恰好等于该值 + 1 才允许编码
+    /// AO pass，否则可见度图清成中性 1.0（首帧启用 / 上帧无几何 / 深度
+    /// 副本因分辨率变化重建时自然落进中性路径）。`None` = 从未运行。
+    ao_depth_frame: Option<u64>,
     /// UI 字形图集纹理（初始化时一次性构建；字段仅为保持 view 存活）。
     #[allow(dead_code)]
     ui_atlas: wgpu::Texture,
@@ -815,6 +822,37 @@ struct SsrPrevColor {
     view: wgpu::TextureView,
 }
 
+/// AO（GTAO，R77）的常驻 GPU 资源。globals 布局的 binding 14 恒需合法
+/// 绑定，1×1 哑纹理**始终存在**（R16Float，纹素恰为 1.0——standard 无
+/// 条件采样后 `× 1.0` 逐位精确，缺席路径零分支）；真实可见度图只有半
+/// 分辨率 R16Float 一张（`AoSettings` 首次开启时惰性分配，尺寸随窗口）。
+struct AoGpu {
+    /// 32B 参数缓冲（AoParamsRaw；AO 开启帧每帧写——半径/强度/相机投影
+    /// 常量 + 远平面天空标记。关闭帧不写：哑纹理路径不读参数）。
+    params_buf: wgpu::Buffer,
+    /// 1×1 R16Float 哑纹理 / 视图（纹素 1.0 = 中性可见度；探针捕获面 /
+    /// RT 相机的绑定组也用它——捕获 / RT 视口无屏幕空间语义，与 SSR 的
+    /// 哑资源纪律同款）。
+    #[allow(dead_code)]
+    dummy: wgpu::Texture,
+    dummy_view: wgpu::TextureView,
+    /// 半分辨率可见度图 + 视图。`None` = 从未启用（哑纹理占位）。
+    target: Option<AoTarget>,
+    /// 可见度图当前尺寸（复用判定键）。
+    target_size: (u32, u32),
+    /// 绑定裁决：`true` = binding 14 指向真实可见度图（AO 本帧开启），
+    /// `false` = 指向哑纹理（关闭——即使 target 还在，陈旧内容也不得
+    /// 被采样）。draw 逐帧设置，globals 绑定组重建时消费。
+    bind_real: bool,
+}
+
+/// GTAO 半分辨率可见度图（R16Float；本体保活字段仅供视图有效性依赖）。
+struct AoTarget {
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
 /// 遮挡查询的常驻 GPU 资源（R53，首次启用时惰性创建，见
 /// `ensure_occ_gpu`）。查询槽上限 = `wgpu::QUERY_SET_MAX_QUERIES`
 /// （4096）：超出部分不查询、恒可见（保守方向，见 occlusion.rs 限制③）。
@@ -939,6 +977,21 @@ struct SsrParamsRaw {
 const _: () = assert!(
     std::mem::size_of::<SsrParamsRaw>() == 96,
     "SsrParams 必须与 WGSL 布局一致"
+);
+
+/// 与 WGSL `AoParams` 对齐（32 字节，POD）：GTAO pass 参数（R77）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AoParamsRaw {
+    /// x: 搜索半径（米）, y: 强度指数, z: tan(fov_y/2), w: 宽高比
+    scalars: [f32; 4],
+    /// x: 远平面（scene_depth 的天空清空值）, y/z/w: 保留
+    extra: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<AoParamsRaw>() == 32,
+    "AoParams 必须与 WGSL 布局一致"
 );
 
 /// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
@@ -1075,6 +1128,11 @@ pub struct FrameStats {
     /// 或重置帧（首帧启用 / 关→开 / 分辨率变化 / 切镜 / 上帧或本帧无不
     /// 透明几何——该帧输出与 SSR 关闭帧逐位一致）。
     pub ssr_on: u32,
+    /// 本帧 GTAO 是否实际执行（R77，观测字段，不进任何排序键）：1 =
+    /// `AoSettings` 开启且上一帧深度副本有效（可见度图被真实重算）；0 =
+    /// 关闭或重置帧（首帧启用 / 上帧无不透明几何 / 深度副本重建——该帧
+    /// 可见度图清成中性 1.0，输出与 AO 关闭帧逐位一致）。
+    pub ao_on: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -1158,15 +1216,18 @@ struct GlobalsBuffers<'a> {
     csm_params: &'a wgpu::Buffer,
 }
 
-/// 全局绑定组里的 SSR 三路资源（R62b）：参数缓冲（binding 13）+ 上帧
-/// 颜色副本视图（binding 11）+ 上帧深度副本视图（binding 12）。主视图
-/// 传真实资源；探针捕获面 / RT 相机的绑定组传**零参数 + 哑纹理**（捕获
-/// / RT 视口不做屏幕空间反射——上帧语义只对主相机成立，见 §4.31 裁决 2）。
+/// 全局绑定组里的屏幕空间效果资源（R62b 立组，R77 起同组携带 AO 一路）：
+/// SSR 参数缓冲（binding 13）+ 上帧颜色副本视图（binding 11）+ 上帧深度
+/// 副本视图（binding 12）+ GTAO 可见度图视图（binding 14）。主视图传真实
+/// 资源；探针捕获面 / RT 相机的绑定组传**零参数 + 哑纹理**（捕获 / RT
+/// 视口不做屏幕空间效果——上帧 / 屏幕坐标语义只对主相机成立，见 §4.31
+/// 裁决 2；AO 哑纹素恒 1.0，捕获 / RT 的间接光不受遮蔽）。
 #[derive(Clone, Copy)]
 struct SsrGlobalsResources<'a> {
     params_buf: &'a wgpu::Buffer,
     color_view: &'a wgpu::TextureView,
     depth_view: &'a wgpu::TextureView,
+    ao_view: &'a wgpu::TextureView,
 }
 
 fn build_globals_bind_group(
@@ -1261,6 +1322,12 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 13,
                 resource: ssr.params_buf.as_entire_binding(),
+            },
+            // GTAO 可见度图（R77）：真实半分辨率图或 1×1 哑纹理（纹素
+            // 1.0——关闭 / 捕获 / RT 路径采样后 × 1.0 逐位精确）
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::TextureView(ssr.ao_view),
             },
         ],
     })
@@ -2190,13 +2257,69 @@ impl Renderer {
             prev_color: None,
             prev_size: (0, 0),
         };
-        // 主视图绑定组初建时的 SSR 三路：参数走**活跃**缓冲（此后由 draw
-        // 逐帧管理），颜色 / 深度此时只有哑纹理（prev_color / scene_depth
-        // 均未创建；二者就位时重建绑定组，见 draw 的接线）。
+        // AO 常驻资源（R77）：1×1 R16Float 哑纹理（纹素 = 1.0 中性可见度，
+        // f16 位型 0x3C00）+ 32B 参数缓冲。布局要求 binding 14 恒需合法
+        // 绑定，哑资源始终存在；真实半分辨率可见度图由 `ensure_ao_targets`
+        // 在 `AoSettings` 首次开启时惰性创建。
+        let ao_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.ao.params"),
+            size: std::mem::size_of::<AoParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ao_dummy = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ao.dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // 纹素写 1.0（f16 0x3C00 小端 = [0x00, 0x3C]）：关闭 / 捕获 / RT
+        // 路径采样后 × 1.0，IEEE 754 下与不乘逐位一致。
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ao_dummy,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0x00u8, 0x3C],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(2),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ao_dummy_view = ao_dummy.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao = AoGpu {
+            params_buf: ao_params_buf,
+            dummy: ao_dummy,
+            dummy_view: ao_dummy_view,
+            target: None,
+            target_size: (0, 0),
+            bind_real: false,
+        };
+        // 主视图绑定组初建时的屏幕空间资源（SSR 三路 + AO）：参数走
+        // **活跃**缓冲（此后由 draw 逐帧管理），颜色 / 深度 / AO 此时只有
+        // 哑纹理（prev_color / scene_depth / ao target 均未创建；就位时
+        // 重建绑定组，见 draw 的接线）。
         let ssr_main_res = SsrGlobalsResources {
             params_buf: &ssr.params_buf,
             color_view: &ssr.dummy_color_view,
             depth_view: &ssr.dummy_depth_view,
+            ao_view: &ao.dummy_view,
         };
         // 捕获期每面一份 Globals 缓冲 + 绑定组（面矩阵 / 眼点逐面不同）
         let probe_face_globals_bufs: [wgpu::Buffer; 6] = std::array::from_fn(|_| {
@@ -2231,6 +2354,7 @@ impl Renderer {
                     params_buf: &ssr.off_params_buf,
                     color_view: &ssr.dummy_color_view,
                     depth_view: &ssr.dummy_depth_view,
+                    ao_view: &ao.dummy_view,
                 },
             )
         });
@@ -2631,6 +2755,8 @@ impl Renderer {
             ssr_prev_valid: false,
             ssr_was_on: false,
             ssr_uniform_live: false,
+            ao,
+            ao_depth_frame: None,
             ui_atlas,
             ui_bind_group,
             ui_sampler,
@@ -2701,9 +2827,9 @@ impl Renderer {
         );
     }
 
-    /// SSR 绑定资源的「主相机」形态（R62b）：活跃参数缓冲 + 真实上帧
-    /// 资源（尚未创建的一路回落哑纹理——flags = 0 时不会被采样；二者
-    /// 就位时由 draw 重建绑定组）。
+    /// 屏幕空间资源的「主相机」形态（R62b 立法，R77 扩容）：活跃参数缓冲
+    /// + 真实上帧资源 + AO 可见度图（`bind_real` 裁决——AO 关闭帧即使
+    ///   target 还在也回落哑纹理，陈旧内容不得被采样）。
     fn ssr_main_resources(&self) -> SsrGlobalsResources<'_> {
         SsrGlobalsResources {
             params_buf: &self.ssr.params_buf,
@@ -2718,6 +2844,10 @@ impl Renderer {
                 .as_ref()
                 .map(|sd| &sd.view)
                 .unwrap_or(&self.ssr.dummy_depth_view),
+            ao_view: match self.ao.bind_real.then_some(self.ao.target.as_ref()) {
+                Some(Some(target)) => &target.view,
+                _ => &self.ao.dummy_view,
+            },
         }
     }
 
@@ -3589,6 +3719,36 @@ impl Renderer {
         true
     }
 
+    /// GTAO 可见度图按需资源（R77）：半分辨率 R16Float（RENDER_ATTACHMENT
+    /// | TEXTURE_BINDING）。仅 [`crate::post::AoSettings`] 开启时在 `draw`
+    /// 开头、`hdr` 不可变借用建立之前调用；尺寸不符整体重建（旧纹理随之
+    /// 释放）。返回 true = 本次（重）建——新纹理内容不是上一帧深度的产物
+    /// ⇒ binding 14 需重新指向（全局绑定组重建）。
+    fn ensure_ao_targets(&mut self, width: u32, height: u32) -> bool {
+        let size = ((width / 2).max(1), (height / 2).max(1));
+        if self.ao.target.is_some() && self.ao.target_size == size {
+            return false;
+        }
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ao.visibility"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ao.target = Some(AoTarget { texture, view });
+        self.ao.target_size = size;
+        true
+    }
+
     pub fn set_clear_color(&mut self, color: wgpu::Color) {
         self.clear_color = color;
     }
@@ -3919,9 +4079,29 @@ impl Renderer {
         // 本帧执行开关（重置语义：无效帧整段跳过 = 与 SSR 关闭帧逐位一致）；
         // 切镜（reset_taa 跟随置位）已在上游把 ssr_prev_valid 清掉。
         let ssr_active = ssr_on && self.ssr_prev_valid;
-        if ssr_needs_globals_rebuild {
-            // 上帧颜色副本 / 场景深度纹理的视图变化 ⇒ 全局绑定组的
-            // binding 11/12 需要重新指向（与 env 重烘同款重建路径）
+        // AO（R77）：开启 = 半分辨率可见度图（惰性、随窗口）+ 复用主相机
+        // 深度副本；缺席/关闭 = 不分配、binding 14 回落哑纹理（零开销默认
+        // 路径，全部既有 FNV 基线原值）。分配必须在 hdr 不可变借用建立
+        // 之前（与 TAA/DOF/MB/SSR 同款纪律）。
+        let ao_settings = world.try_resource::<crate::post::AoSettings>().map(|a| *a);
+        let ao_on = ao_settings.is_some_and(|a| a.enabled);
+        let ao_rebuilt = if ao_on {
+            // 可见度图 + 主相机深度副本（GTAO 的输入——AO 单独开启时副本
+            // 也必须跑）。副本（重）建的帧 ao_depth_frame 编号对不上，本
+            // 帧自然走中性清屏路径，无需额外记账。
+            self.ensure_scene_depth(width, height);
+            self.ensure_ao_targets(width, height)
+        } else {
+            false
+        };
+        // binding 14 的指向裁决变化（开 ↔ 关）或可见度图（重）建 ⇒ 全局
+        // 绑定组需要重新编码（与 SSR 上帧资源就位同款重建路径）。
+        let ao_bind_changed = self.ao.bind_real != ao_on;
+        self.ao.bind_real = ao_on;
+        if ssr_needs_globals_rebuild || ao_rebuilt || ao_bind_changed {
+            // 上帧颜色副本 / 场景深度纹理 / AO 可见度图的视图变化 ⇒ 全局
+            // 绑定组的 binding 11/12/14 需要重新指向（与 env 重烘同款
+            // 重建路径）
             self.rebuild_globals_bind_group();
         }
         // 遮挡剔除（R53）：开启语义、保守性论证与「读回迟到一帧 ⇒ 本帧
@@ -4955,6 +5135,81 @@ impl Renderer {
             );
             self.ssr_uniform_live = false;
         }
+        // AO（R77）：GTAO 可见度图 pass——编码在主 pass **之前**（点光
+        // 阴影之后），读上一帧深度副本：scene_depth pass 在本帧编码于主
+        // pass 之后，同一编码器按序执行 ⇒ 此处读到的恒为上一帧内容（与
+        // SSR 同款「上帧」语义，§4.31 裁决 2）。有效帧（上一帧副本确实
+        // 跑过——`ao_depth_frame` 编号恰好 = 本帧 − 1）重算可见度图；
+        // 无效帧（首帧启用 / 上帧无几何 / 上帧 AO 关闭且无人跑副本）只
+        // 以清屏值 1.0 覆写——输出与 AO 关闭帧逐位一致（重置语义）。
+        // 关闭帧整段跳过（哑纹素 × 1.0 兜底，零编码开销）。
+        let ao_active = ao_on && self.ao_depth_frame == Some(self.occ_frame - 1);
+        if ao_on {
+            let cfg = ao_settings.expect("ao_on 蕴含资源在");
+            let ao_target = self.ao.target.as_ref().expect("ao_on 时可见度图应已创建");
+            self.gpu.queue.write_buffer(
+                &self.ao.params_buf,
+                0,
+                bytemuck::bytes_of(&AoParamsRaw {
+                    // 半径/强度钳非负（与 SSR 参数的钳制纪律一致）；tan/
+                    // aspect 是重建公式的投影常量，z_far 是天空标记
+                    scalars: [
+                        cfg.radius.max(1e-3),
+                        cfg.intensity.max(0.0),
+                        (fov * 0.5).tan(),
+                        width as f32 / height.max(1) as f32,
+                    ],
+                    extra: [z_far, 0.0, 0.0, 0.0],
+                }),
+            );
+            let mut ao_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.ao"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &ao_target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // 中性可见度 1.0：无效帧整帧保持此值（无绘制），
+                        // 有效帧被全屏三角形覆写（Clear 只是兜底）
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if ao_active {
+                // 深度副本有效 ⇒ scene_depth 纹理必在（ao_depth_frame 只
+                // 在副本编码处写入）
+                let sd = self
+                    .scene_depth
+                    .as_ref()
+                    .expect("AO 有效帧必有场景深度副本");
+                let bind_group = self
+                    .gpu
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("iris.ao.bg"),
+                        layout: &self.bundle.ao_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.ao.params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&sd.view),
+                            },
+                        ],
+                    });
+                ao_pass.set_pipeline(&self.bundle.ao_pipeline);
+                ao_pass.set_bind_group(0, &bind_group, &[]);
+                ao_pass.draw(0..3, 0..1);
+            }
+            self.stats.ao_on = if ao_active { 1 } else { 0 };
+        }
         // 主 pass：场景渲染到 HDR MSAA 中间缓冲，解析到单采样 HDR
         let hdr = self.hdr.as_ref().expect("HDR 中间缓冲已就绪");
         {
@@ -5416,7 +5671,11 @@ impl Renderer {
         // 2 的「不 ping-pong」偏离）；SSR 开启但本帧无几何 ⇒ 副本没跑，
         // 「上帧深度」作废（ssr_prev_valid 记账，下帧跳过）。深度着色只
         // 用顶点变换，SSR 是否活跃不影响副本内容。
-        if (dof_on || mb_on || taa_on || ssr_on) && opaque_total > 0 {
+        // GTAO（R77）是副本的第四个消费者（主 pass **之前**读上一帧）：
+        // `ao_depth_frame` 记录本帧副本已跑——下一帧编号恰好 +1 才允许
+        // 编码 AO pass（首帧启用 / 上帧无几何的帧自然落进中性路径）。
+        if (dof_on || mb_on || taa_on || ssr_on || ao_on) && opaque_total > 0 {
+            self.ao_depth_frame = Some(self.occ_frame);
             let sd = self
                 .scene_depth
                 .as_ref()
@@ -6281,6 +6540,7 @@ impl Renderer {
                 params_buf: &self.ssr.off_params_buf,
                 color_view: &self.ssr.dummy_color_view,
                 depth_view: &self.ssr.dummy_depth_view,
+                ao_view: &self.ao.dummy_view,
             },
         );
         // ACES 色调映射绑定组：hdr_view → color_view；bloom 槽绑定白色

@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1266 / release 1263**（每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1276 / release 1273**（每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -120,7 +120,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1266 / release 1263）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1276 / release 1273）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -138,7 +138,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1266 / release 1263；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1276 / release 1273；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -153,8 +153,11 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     + FOV punch + 取景呼吸，引擎零改动）、R75 IK v2 ✅（FABRIK 任意长链
     + look-at 单遍分布式瞄准，与两骨 IK 并存；末端位置不写防吸收态
     漂移）、R76 接触求解 v2 ✅（ContactSolverV2 资源 opt-in：角冲量 +
-    摩擦锥 + 顺序冲量；缺席 = v1 逐位不变，闭合 §8.27①）、R77 SSAO、
-    R78 SpotLight+光源扩容
+    摩擦锥 + 顺序冲量；缺席 = v1 逐位不变，闭合 §8.27①）、R77 GTAO
+    ✅（AoSettings 缺席 = binding 14 哑纹素 1.0 逐位不变；4 切片×8 步
+    世界半径 + dither，半分辨率 R16Float，@builtin(position) 采样乘
+    间接光；三个实现级归因：半纹素错配 / 越界弃权 / screen uv 投影量
+    弃用 varying）、R78 SpotLight+光源扩容
   - 第二梯队（环境底座）：R79 天空 v2+大气+体积雾、R80 昼夜+风场、R81 平面水体
     v1、R82 粒子 v2（GPU 化+拖尾）、R83 GI 逐片元化（探针 SH）
   - 第三梯队（硬科技）：R84–R87 虚拟几何体 V1–V4（opaque-only MVP，裁定接受）、

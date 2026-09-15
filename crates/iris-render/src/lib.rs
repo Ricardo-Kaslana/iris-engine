@@ -172,9 +172,11 @@ pub mod prelude {
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };
     pub use crate::post::{
-        BloomSettings, DepthOfFieldSettings, ExposureSettings, FxaaSettings, MotionBlurSettings,
-        SsrSettings, TaaSettings, VignetteSettings, halton, jitter_projection,
-        resolve_focus_distance, ssr_edge_fade, ssr_roughness_fade, taa_jitter,
+        AO_SLICES, AO_STEPS, AoSettings, BloomSettings, DepthOfFieldSettings, ExposureSettings,
+        FxaaSettings, MotionBlurSettings, SsrSettings, TaaSettings, VignetteSettings, ao_dither,
+        ao_falloff, ao_sample_sin, ao_slice_occlusion, ao_uv_offset, ao_view_pos, ao_visibility,
+        halton, jitter_projection, resolve_focus_distance, ssr_edge_fade, ssr_roughness_fade,
+        taa_jitter,
     };
     pub use crate::probe::{
         MAX_REFLECTION_PROBES, PROBE_CAPTURE_FAR, PROBE_CAPTURE_NEAR, PROBE_DEFAULT_FALLOFF,

@@ -347,6 +347,140 @@ pub fn ssr_edge_fade(uv: [f32; 2], margin: f32) -> f32 {
     fx * fy
 }
 
+// ---------- GTAO 环境光遮蔽（R77，资源缺席 = 关 = 逐位不变） ----------
+
+/// GTAO（Ground-Truth 环境光遮蔽的简化变体）设置（R77）。主 pass **之前**
+/// 的独立全屏 pass：读**上一帧**主相机深度副本（scene_depth，与 SSR 同款
+/// 上帧语义），按「切片水平角」法估算逐像素环境可见度，写半分辨率 R16Float
+/// 可见度图；`standard.wgsl` 在主 pass 按屏幕坐标采样后乘在**间接光**
+/// （IBL / 光照贴图 / 环境常量）上——与 ORM 的 ao 同靶：直接光不乘
+/// （AO 描述小尺度互遮蔽的环境光损失，与 R41 既有语义一致）。
+///
+/// **资源缺席语义**：未注册或 `enabled = false` 时整段关闭——不分配可见
+/// 度图、不编码 pass、标准着色器采样常驻 1×1 哑纹理（纹素恰为 1.0，
+/// `x × 1.0` 逐位精确），渲染与 R76 逐位一致（零开销默认路径，全部既有
+/// GPU FNV 基线原值）；`DefaultPlugins` 不注册本资源。
+///
+/// **重置语义**：可见度图依赖上一帧深度。深度副本没跑过（启用首帧 /
+/// 上帧无不透明几何 / 分辨率变化重建）的帧不编码 GTAO、只把可见度图清成
+/// 中性 1.0——该帧输出与 AO 关闭帧逐位一致（记账见
+/// `Renderer::ao_depth_frame`）。
+///
+/// 算法细节与诚实限制（掠射角低估、深度断裂光晕、光照贴图叠加过暗等）
+/// 见 ARCHITECTURE §4.33 与 §8。
+#[derive(Clone, Copy, Debug, iris_core::Resource)]
+pub struct AoSettings {
+    /// 是否启用 GTAO（`Default = false` = 关，与「缺席 = 关」语义一致）。
+    pub enabled: bool,
+    /// 遮蔽强度指数：可见度 = `(1 − 遮蔽)^intensity`。1.0 = 线性（物理
+    /// 权重）；越大角落越黑。0.0 = 恒 1（不可见，等同关闭但仍有 pass 开销）。
+    pub intensity: f32,
+    /// 屏幕空间搜索半径（米，世界尺度）：该距离内的深度样本参与水平角
+    /// 估计，之外按 `1 − (d/r)²` 衰减到 0。0.3–1.0 为常用区间。
+    pub radius: f32,
+}
+
+impl Default for AoSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            intensity: 1.0,
+            radius: 0.5,
+        }
+    }
+}
+
+/// 每像素切片数（固定常量，非设置项——切片 × 步数决定 pass 成本与
+/// 条带伪影水平，dither 旋转已压制大部分条带；调参与确定性收益不成比）。
+pub const AO_SLICES: u32 = 4;
+
+/// 每切片沿正负两方向各步进的样本数（固定常量，理由同 [`AO_SLICES`]）。
+pub const AO_STEPS: u32 = 8;
+
+/// 像素坐标 → [0, 1) 的确定性抖动值（与 `shaders/ao.wgsl` 的 `ao_dither`
+/// 同一整数哈希逐行镜像，CPU 单测锁定）：整数乘法按 `wrapping` 语义，
+/// WGSL 侧 u32 运算天然回绕，两侧位级一致。用途 = 按像素旋转 GTAO 切片
+/// 方向（交错式 dither），把切片量化噪声打碎成不显眼的高频颗粒——
+/// 纯像素坐标函数，无状态、无时域依赖，跨运行逐位一致。
+pub fn ao_dither(pixel: [u32; 2]) -> f32 {
+    let mut h = pixel[0].wrapping_mul(73_856_093) ^ pixel[1].wrapping_mul(19_349_663);
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    h ^= h >> 16;
+    (h & 0x00FF_FFFF) as f32 / 16_777_216.0
+}
+
+/// 深度副本存储值（线性视距 `clip.w`）+ 屏幕 uv → 视空间位置重建（与
+/// `shaders/ao.wgsl` 的 `ao_view_pos` 同一公式，CPU 单测经
+/// `glam::camera::rh::proj::directx::perspective` 正反算锁定）：DirectX
+/// RH 透视下 `clip.w = −view_z`，故 `p_view = (ndc·d·(aspect·tan, tan),
+/// −d)`。
+pub fn ao_view_pos(uv: glam::Vec2, view_d: f32, tan_half_fov: f32, aspect: f32) -> glam::Vec3 {
+    let ndc = uv * 2.0 - glam::Vec2::ONE;
+    glam::Vec3::new(
+        ndc.x * view_d * aspect * tan_half_fov,
+        ndc.y * view_d * tan_half_fov,
+        -view_d,
+    )
+}
+
+/// 世界尺度搜索步的世界偏移 → 屏幕 uv 偏移（与 `shaders/ao.wgsl` 的
+/// 步进换算同一公式）：视平面上「每 uv 的世界尺寸」随深度线性放大
+/// （x 轴再乘宽高比），`dir` 是切片方向上的**单位**向量（世界域）。
+pub fn ao_uv_offset(
+    dir: glam::Vec2,
+    radius: f32,
+    t: f32,
+    view_d: f32,
+    tan_half_fov: f32,
+    aspect: f32,
+) -> glam::Vec2 {
+    let world_per_uv = glam::Vec2::new(
+        2.0 * view_d * tan_half_fov * aspect,
+        2.0 * view_d * tan_half_fov,
+    );
+    dir * (radius * t) / world_per_uv
+}
+
+/// 单样本对水平角的贡献（与 `shaders/ao.wgsl` 的 `ao_sample` 同一公式）：
+/// 样本相对**切平面**（法线 `n`）的仰角正弦 × 距离衰减。切平面下方的
+/// 样本（`dot < 0`）自然给出负值，调用方取 max 即「水平线只在上方抬高」；
+/// 衰减 `1 − (d/r)²` 同时把半径外样本压到 ≤ 0（可判别地退出水平角竞争）。
+pub fn ao_sample_sin(view_delta: glam::Vec3, normal: glam::Vec3, radius: f32) -> f32 {
+    let dist = view_delta.length();
+    if dist < 1e-4 {
+        return 0.0;
+    }
+    let falloff = ao_falloff(dist, radius);
+    if falloff <= 0.0 {
+        // 半径外：负值保证在 max() 中不可能抬高水平线（0 也不行——
+        // 半径外样本不得与「切片内切平面上的样本」竞争）
+        return -1.0;
+    }
+    view_delta.dot(normal) / dist * falloff
+}
+
+/// 距离衰减（与着色器同式）：`1 − (d/r)²` 钳到 [0, 1]——半径内边缘平滑
+/// 过渡、半径外恰 0。`r ≤ 0` 视为无搜索（恒 0，调用方钳半径 ≥ 1e-3）。
+pub fn ao_falloff(distance: f32, radius: f32) -> f32 {
+    if radius <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - (distance / radius) * (distance / radius)).clamp(0.0, 1.0)
+}
+
+/// 单切片遮蔽（与着色器循环体同式）：正负两方向水平角正弦（负值钳 0）
+/// 之和的一半。N 片取平均后进 [`ao_visibility`]。
+pub fn ao_slice_occlusion(sin_up: f32, sin_down: f32) -> f32 {
+    0.5 * (sin_up.max(0.0) + sin_down.max(0.0))
+}
+
+/// 遮蔽 → 可见度（与着色器同式）：`(1 − occ)` 钳到 [0, 1] 后按
+/// `intensity` 取幂。intensity = 1 线性；物理意义 = 把强度作为对比度
+/// 指数（`pow(1, x) = 1` 恒精确，未遮蔽像素在任意强度下逐位不变）。
+pub fn ao_visibility(occlusion: f32, intensity: f32) -> f32 {
+    (1.0 - occlusion).clamp(0.0, 1.0).powf(intensity.max(0.0))
+}
+
 /// TAA（时域抗锯齿）设置（R60）。后处理链首的 HDR 域时域累加：主相机
 /// 投影按 Halton(2,3) 8 点序列做亚像素抖动，TAA pass 用当前帧抖动色 +
 /// 深度副本 + 上帧历史做相机重投影与 3×3 邻域钳制混合（详见
@@ -1295,5 +1429,168 @@ mod tests {
         assert_eq!(ssr_edge_fade([0.5, 0.5], 0.1), 1.0);
         // 带宽外（距边 ≥ margin）恒全量
         assert_eq!(ssr_edge_fade([0.11, 0.5], 0.1), 1.0);
+    }
+
+    // ---- GTAO 纯函数（R77，ao.wgsl 同名函数的 CPU 侧锚点） ----
+
+    /// 抖动哈希：确定性复现、值域 [0, 1)、不同像素大体给出不同值、
+    /// 对坐标离群值稳定（u32 全域无 panic）。
+    #[test]
+    fn ao_dither_is_deterministic_in_range_and_varied() {
+        for px in [[0u32, 0], [1, 1], [640, 360], [u32::MAX, u32::MAX]] {
+            let d = ao_dither(px);
+            assert!(
+                (0.0..1.0).contains(&d),
+                "抖动值必须在 [0,1)，实际 {d:?} @ {px:?}"
+            );
+            assert_eq!(ao_dither(px), d, "同像素必须确定性复现 @ {px:?}");
+        }
+        // 分散性（统计口径）：1024 个像素 → 8-bit 量化桶期望命中
+        // 256·(1 − (255/256)^1024) ≈ 251 桶（生日碰撞下期望约 5 桶为空，
+        // 「全 256 桶命中 / 逐像素唯一」是统计上不可达的伪标准）。
+        let mut seen = std::collections::HashSet::new();
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                seen.insert((ao_dither([x, y]) * 256.0) as u32);
+            }
+        }
+        assert!(
+            seen.len() >= 200,
+            "1024 个像素的量化抖动应高度分散，实际只有 {} 桶",
+            seen.len()
+        );
+    }
+
+    /// 重建公式与 glam 的 DirectX RH 透视**正反算互锁**：视空间点经投影
+    /// 得 (uv, d)，重建必须还原原点（1e-6 相对容差——f32 在 d·tan 链上的
+    /// 舍入）。这条测试是「重建与光栅化同口径」的解析证明：ao.wgsl 的
+    /// 步进换算全建立在这个公式上。
+    #[test]
+    fn ao_view_pos_roundtrips_through_directx_perspective() {
+        let fov = 60f32.to_radians();
+        let aspect = 16.0 / 9.0;
+        let proj = glam::camera::rh::proj::directx::perspective(fov, aspect, 0.1, 100.0);
+        let tan_half = (fov * 0.5).tan();
+        for view_p in [
+            Vec3::new(0.0, 0.0, -5.0),
+            Vec3::new(1.7, -2.3, -8.0),
+            Vec3::new(-3.1, 4.2, -20.0),
+        ] {
+            let clip = proj * view_p.extend(1.0);
+            let d = clip.w;
+            let uv = (Vec2::new(clip.x, clip.y) / clip.w) * 0.5 + Vec2::splat(0.5);
+            let rebuilt = ao_view_pos(uv, d, tan_half, aspect);
+            let err = (rebuilt - view_p).length();
+            assert!(
+                err <= 1e-4 * view_p.length().max(1.0),
+                "重建必须还原视空间点：{view_p} → {rebuilt}（误差 {err}）"
+            );
+        }
+    }
+
+    /// 步进换算：沿切片方向（世界域单位向量）按 `radius·t` 取世界偏移，
+    /// 换算成 uv 偏移后以**同一深度**重建，落点与中心的水平距离必须恰为
+    /// `radius·t`（方向分量按 dir 定义）——世界尺度搜索半径的解析证明。
+    #[test]
+    fn ao_uv_offset_preserves_world_radius() {
+        let fov = 90f32.to_radians();
+        let tan_half = (fov * 0.5).tan();
+        let aspect = 1.0;
+        let d = 10.0f32;
+        let radius = 2.0f32;
+        for t in [0.125f32, 0.5, 1.0] {
+            let dir = Vec2::new(1.0, 0.0); // 世界 x 方向
+            let off = ao_uv_offset(dir, radius, t, d, tan_half, aspect);
+            let center = ao_view_pos(Vec2::splat(0.5), d, tan_half, aspect);
+            let sample = ao_view_pos(Vec2::splat(0.5) + off, d, tan_half, aspect);
+            let delta = sample - center;
+            assert!(
+                (delta.x - radius * t).abs() <= 1e-3,
+                "世界偏移必须等于 radius·t：t={t} 实际 {}",
+                delta.x
+            );
+            assert!(
+                delta.y.abs() <= 1e-4,
+                "x 方向步进不得串到 y（实际 {}）",
+                delta.y
+            );
+            assert!(delta.z.abs() <= 1e-4, "同深度平面内步进 z 不变");
+        }
+    }
+
+    /// 距离衰减锚点：距离 0 全量、半半径 0.75、半径处恰 0、半径外恒 0、
+    /// 非正半径 = 无搜索恒 0。
+    #[test]
+    fn ao_falloff_anchors() {
+        assert_eq!(ao_falloff(0.0, 0.5), 1.0, "距离 0 全量");
+        assert_eq!(ao_falloff(0.25, 0.5), 0.75, "半半径 1 − ¼");
+        assert_eq!(ao_falloff(0.5, 0.5), 0.0, "半径处恰归零");
+        assert_eq!(ao_falloff(1.0, 0.5), 0.0, "半径外恒 0");
+        assert_eq!(ao_falloff(0.1, 0.0), 0.0, "零半径 = 无搜索");
+        assert_eq!(ao_falloff(0.1, -1.0), 0.0, "负半径 = 无搜索");
+    }
+
+    /// 单样本仰角正弦：切平面上的样本贡献 0；沿法线上方距离 δ 的样本
+    /// 贡献 `sinθ·falloff`（解析值对照）；切平面下方为负；半径外给 -1
+    /// （可判别地退出水平角竞争）；重合点退化 0。
+    #[test]
+    fn ao_sample_sin_anchors() {
+        let n = Vec3::Y; // 切平面 = xz 平面
+        let p = Vec3::ZERO;
+        // 切平面内样本：dot(vv, n) = 0
+        let flat = ao_sample_sin(Vec3::new(0.3, 0.0, -0.1), n, 1.0);
+        assert_eq!(flat, 0.0, "切平面上的样本不遮蔽");
+        // 法线上方 30° 仰角、距离 0.5 的样本：sin = 0.5，falloff = 0.75
+        let raised = ao_sample_sin(Vec3::new(0.25 * 3f32.sqrt(), 0.25, 0.0), n, 1.0);
+        let expected = 0.5 * 0.75;
+        assert!(
+            (raised - expected).abs() <= 1e-6,
+            "仰角正弦 × 衰减应为 {expected}，实际 {raised}"
+        );
+        // 切平面下方：负值（max 竞争中恒输给 0 水平线）
+        let below = ao_sample_sin(Vec3::new(0.0, -0.25, 0.0), n, 1.0);
+        assert!(below < 0.0, "切平面下方样本必为负，实际 {below}");
+        // 半径外：-1（不得抬高水平线）
+        assert_eq!(
+            ao_sample_sin(Vec3::new(0.0, 2.0, 0.0), n, 1.0),
+            -1.0,
+            "半径外样本给 -1"
+        );
+        // 重合点：0（除零保护）
+        assert_eq!(ao_sample_sin(p - p, n, 1.0), 0.0, "重合点退化为 0");
+    }
+
+    /// 切片遮蔽与可见度曲线：锚点 + 单调性。未遮蔽像素（occ = 0）在任意
+    /// 强度下可见度**逐位恰 1**（`pow(1, x) = 1` 的精确性是「AO 开启但
+    /// 无遮蔽的像素不变」的根据）；强度指数单调；负强度按 0 处理。
+    #[test]
+    fn ao_visibility_curve_and_slice_anchors() {
+        assert_eq!(ao_slice_occlusion(0.0, 0.0), 0.0);
+        assert_eq!(ao_slice_occlusion(1.0, 0.0), 0.5);
+        assert_eq!(ao_slice_occlusion(-1.0, 0.4), 0.2, "负水平角钳 0");
+        // 可见度锚点
+        assert_eq!(ao_visibility(0.0, 1.0), 1.0);
+        assert_eq!(ao_visibility(0.0, 2.5), 1.0, "未遮蔽在任意强度下恰 1");
+        assert_eq!(ao_visibility(1.0, 1.0), 0.0, "全遮蔽可见度 0");
+        assert_eq!(ao_visibility(1.5, 1.0), 0.0, "超界遮蔽钳 0");
+        let half = ao_visibility(0.5, 1.0);
+        assert!((half - 0.5).abs() <= 1e-6);
+        assert!(
+            (ao_visibility(0.5, 2.0) - 0.25).abs() <= 1e-6,
+            "强度 = 指数：0.5² = 0.25"
+        );
+        assert_eq!(
+            ao_visibility(0.5, -1.0),
+            1.0,
+            "负强度按 0 处理（无遮蔽效果）"
+        );
+        // 遮蔽增大 → 可见度单调不增
+        let mut prev = 1.0;
+        for i in 0..=20 {
+            let occ = i as f32 / 20.0;
+            let v = ao_visibility(occ, 1.5);
+            assert!(v <= prev, "可见度必须单调不增：occ = {occ}");
+            prev = v;
+        }
     }
 }

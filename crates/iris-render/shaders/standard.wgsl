@@ -164,6 +164,16 @@ struct SsrParams {
 };
 
 @group(0) @binding(13) var<uniform> ssr: SsrParams;
+
+// GTAO 可见度图（R77，排在 SSR 之后、不扩 Globals 前缀——skybox.wgsl 的
+// 并行布局陷阱不触碰）：R16Float 半分辨率，R 通道 = 环境可见度 [0,1]，
+// 由主 pass 之前的独立 pass 写出（shaders/ao.wgsl，读上一帧深度副本）。
+// **缺席/关闭 = 1×1 哑纹理、纹素恰为 1.0**：无条件采样后 `× 1.0` 逐位
+// 精确——不需要分支，缺席路径的零开销由纹素值承担（与探针/光照贴图的
+// select 零算术同目标的另一形态）。采样复用 binding 6 的 Filtering 采样
+// 器（R16Float 可过滤）；半分辨率 → 全分辨率的线性上采样即 AO 的低成本
+// 恢复滤波（低频量，双线性足够）。
+@group(0) @binding(14) var ao_visibility_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -736,6 +746,9 @@ fn perturbed_normal(in: VertexOutput, n_geo: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
+// 注：VertexOutput 的 @builtin(position)（字段名 clip_position 沿用顶点
+// 侧语义）作为片元入口输入时，WGSL 规定其值为**帧缓冲像素坐标**——
+// 下文的 in.clip_position.xy 即 frag coord。
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let base = material.base_color * textureSample(base_texture, base_sampler, in.uv);
     let albedo = base.rgb;
@@ -923,10 +936,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // IBL 实体走同一份镜面项
         ibl_final = ibl + spec_refl_w * globals.env_params.y * ao;
     }
+    // GTAO 屏幕空间环境光遮蔽（R77）：无条件采样可见度图（缺席/关闭 =
+    // 常驻 1×1 哑纹理、纹素恰为 1.0 ⇒ `× 1.0` 逐位精确——零分支由纹素
+    // 值承担，与探针 select 零算术殊途同归）。乘点与 ORM 的 ao 同靶：
+    // 间接光（ibl_final = IBL / 光照贴图 / 探针镜面）与常量环境项；
+    // 直接光（方向光 / 点光）不乘——AO 描述小尺度互遮蔽的**环境**光
+    // 损失，是 R41「直接光不乘 ao」语义的屏幕空间扩展。
+    // 屏幕坐标 = 帧缓冲像素坐标 / 屏幕尺寸。尺寸取可见度图纹素数 ×2
+    // （半分辨率）——不扩 Globals（skybox 并行布局零触碰）；AO 关闭时
+    // 绑定的是 1×1 哑纹理，坐标失去意义但采样值恒 1.0，× 1.0 逐位精确。
+    // 罕见奇数分辨率下右/下边缘有 ≤1 像素的口径差——AO 是低频量，且
+    // 采样为 ClampToEdge，不可见（诚实限制见 §8）。
+    // 为什么不用顶点 varying：screen uv = clip.x/w 是投影量，地面/墙等
+    // 大三角形常有顶点在相机背后，近平面裁剪后新顶点的 x/w 爆炸，插值
+    // 出越界坐标把可见度图采样扭曲成大片假遮蔽（R77 实测归因）；
+    // @builtin(position) 是帧缓冲像素坐标（纯仿射），逐片元精确。
+    let ao_dims = vec2<f32>(textureDimensions(ao_visibility_tex)) * 2.0;
+    let ao_ss = textureSampleLevel(ao_visibility_tex, env_sampler,
+                                   in.clip_position.xy / ao_dims, 0.0).r;
     // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
-    color = color + ibl_final
-          + mix(albedo, f_env, metallic) * globals.ambient.rgb * ao
+    color = color + ibl_final * ao_ss
+          + mix(albedo, f_env, metallic) * globals.ambient.rgb * ao * ao_ss
           + material.emissive.rgb;
 
     return vec4<f32>(color, base.a);

@@ -70,6 +70,10 @@ pub(crate) struct PipelineBundle {
     pub scene_depth_pipeline: wgpu::RenderPipeline,
     /// 场景深度副本蒙皮变体（组 1 绑定关节矩阵，深度随骨骼变形）。
     pub scene_depth_skinned_pipeline: wgpu::RenderPipeline,
+    /// GTAO 可见度图管线（R77）：全屏三角形 → R16Float 半分辨率目标，
+    /// `ao_layout`（组 0 = 参数 uniform + 上帧深度副本，textureLoad 读取），
+    /// 见 `shaders/ao.wgsl` 与 post.rs 的 AoSettings。
+    pub ao_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
@@ -147,6 +151,9 @@ pub(crate) struct PipelineBundle {
     /// 基础上多一路 binding 3 = 深度副本纹理（R32Float 非过滤——该格式
     /// 不可过滤，声明 filterable = false 不依赖 float32-filterable 扩展）。
     pub post_depth_layout: wgpu::BindGroupLayout,
+    /// GTAO 组布局（R77）：binding 0 = 参数 uniform（32B AoParamsRaw）、
+    /// 1 = 上帧场景深度副本（R32Float 非过滤，textureLoad 读取）。
+    pub ao_layout: wgpu::BindGroupLayout,
     /// TAA 组布局（R60）：`post_depth_layout` 的基础上再多一路
     /// binding 4 = 上帧历史纹理（Rgba16Float，可过滤——历史重投影采样
     /// 在亚纹素位置，线性过滤是其定义的一部分）。
@@ -335,6 +342,21 @@ pub(crate) fn create_pipeline(
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size: None,
+                },
+                count: None,
+            },
+            // GTAO 可见度图（R77，「不扩 Globals 前缀」扩容先例的延续）：
+            // R16Float 半分辨率（可过滤——standard 线性采样按屏幕坐标取
+            // 遮蔽），缺席/关闭 = 1×1 哑纹理（纹素恰为 1.0，× 1.0 逐位
+            // 精确）。排在现有最大 binding 13 之后，skybox.wgsl 的并行
+            // 布局不受影响。
+            wgpu::BindGroupLayoutEntry {
+                binding: 14,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
                 },
                 count: None,
             },
@@ -1455,6 +1477,73 @@ pub(crate) fn create_pipeline(
     let motion_blur_pipeline =
         make_post_depth_pipeline("iris.pipeline.motion_blur", &motion_blur_shader, "fs_main");
 
+    // GTAO（R77）：主 pass 之前的全屏 pass——组 0 = 参数 uniform + 上帧
+    // 场景深度副本（R32Float 非过滤，textureLoad 整数纹素读取，与 DOF/MB
+    // 的深度消费同款）；目标 = R16Float 半分辨率可见度图（不在 post 家族
+    // 的 HDR 目标里——AO 是照明输入不是后处理，格式与分辨率独立裁制）。
+    let ao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.ao"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/ao.wgsl").into()),
+    });
+    let ao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.ao"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+        ],
+    });
+    let ao_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.ao.pipeline.layout"),
+        bind_group_layouts: &[Some(&ao_layout)],
+        immediate_size: 0,
+    });
+    let ao_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.ao"),
+        layout: Some(&ao_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &ao_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &ao_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
     // TAA（R60）：组布局在 post_depth_layout 基础上再加 binding 4 = 上帧
     // 历史（Rgba16Float 可过滤）；目标 = 本帧历史槽（HDR 格式，与链上
     // 其他中间 pass 同构）。编码走 post.rs 的 encode_taa_pass。
@@ -2028,6 +2117,7 @@ pub(crate) fn create_pipeline(
         fxaa_pipeline,
         taa_pipeline,
         occlusion_pipeline,
+        ao_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,
@@ -2037,6 +2127,7 @@ pub(crate) fn create_pipeline(
         post_layout,
         post_depth_layout,
         taa_layout,
+        ao_layout,
         ui_layout,
         particle_layout,
         decal_layout,
