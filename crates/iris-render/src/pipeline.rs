@@ -360,6 +360,42 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // 前向光源分箱（R78，「不扩 Globals 前缀」扩容先例的延续）：
+            // 15 = 参数 uniform（32B，counts.x = mode，0 = 分箱分支死码）；
+            // 16 = 灯表 read-only storage（512 × 80B 定长）；
+            // 17 = tile 索引 read-only storage（ranges 区 + indices 区）。
+            // 缺席/关闭/捕获/RT = 全零哑缓冲（mode = 0），skybox.wgsl 的
+            // 并行布局不受影响。
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 16,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 17,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 

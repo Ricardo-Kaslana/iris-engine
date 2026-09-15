@@ -3871,6 +3871,82 @@ ao_sample_sin, ao_falloff, ao_slice_occlusion, ao_visibility}`）含重建
 公式与 glam 透视的正反算互锁。验收图 `docs/ao.png`（三排 关|开 对照：
 日光 / 强度两档 / 纯间接光）。
 
+### 4.35 前向光源分箱与 SpotLight（CPU 屏幕空间 tile 分箱 × storage 灯表 × 双路径位等价，R78）
+
+**问题**：Globals 均摊路径把点光硬顶在 `MAX_POINT_LIGHTS = 8`（uniform
+数组随 Globals 一起 640 B 定长），且没有锥光——手电筒 / 聚光灯只能用
+「点光 + 人为调暗锥外」approximate，第 9 盏点光直接被丢弃。R78 给
+`iris-render` 补上**前向光源分箱**（clustered forward 的 2D tile 子集）：
+CPU 侧把全部点光 + 锥光按屏幕 tile 分箱进 storage 灯表，片元按
+`@builtin(position)` 查本 tile 的灯表下标求和；`SpotLight` 组件随之入库。
+
+**数据路径（globals 组 binding 15/16/17，R61/R62a/R62b/R77「不扩
+Globals 前缀」扩容先例的延续——skybox.wgsl 并行布局零触碰）**：
+15 = 参数 uniform（32 B：屏幕尺寸 / tile 数 / mode 0|1 / 灯数与 index
+总数）；16 = 灯表 read-only storage（`MAX_BINNED_LIGHTS = 512` 条 × 80 B，
+前 3×vec4 与 `Globals.PointLight` 同布局——前 8 盏点光的阴影开关与
+cubemap 槽位逐字段镜像，锥光条目追加 `cone` / `outer` 两个 vec4 携带
+单位轴向量与 CPU 预计算的 cos(inner)/cos(outer)）；17 = tile 索引
+read-only storage（固定 1 MiB：前 `2 × tile 数` 个 u32 是每 tile 的
+`[start, count]`，其后是灯下标展平区）。`LIGHT_TILE_SIZE = 32` 像素。
+
+**CPU 分箱（`light_bins::bin_lights` 纯函数）**：逐灯①近平面门——视
+空间球心深度满足 `z_view < −0.05` 才可能可见（DirectX/RH 透视下
+`clip.w = −z_view`，门即 `clip.w ≥ near`），球心在近平面之后的灯整盏
+跳过；②投影包围盒——球心 ± range 沿相机 right/up/back 三轴的 8 角逐个
+投影取 NDC 包围矩形（轴取自 `view_proj⁻¹` 的方向列；角深度各自钳到
+近平面再除——球可跨越近平面，越过相机的角直接除会 w 翻转出伪矩形，
+钳制后是屏幕上的保守外扩）；③NDC 矩形 clamp 到屏幕后 `floor(px/32)`
+展开成 tile 集合。**覆盖保守性**（双路径位等价的根据）：包围盒 3D 包含
+range 球 ⇒ 投影矩形的凸包包含球的剪影 ⇒ 任何 `dist < range` 有贡献的
+片元所在 tile 必在覆盖集合内——分箱不漏灯；多覆盖的灯由 `dist ≥ range`
+早退兜底，不影响数值。**确定性**：tile → 灯下标映射用
+`BTreeMap`（展平顺序只取决于 tile 下标，与构建次序无关——`HashMap`
+迭代序逐进程漂移会烧穿逐位复现），tile 内下标按灯数组序升序（灯数组序
+即求和序，与 Globals 旧路径同序累加）。
+
+**SpotLight 组件**（`light.rs`）：`color / intensity / range`（衰减与
+`PointLight` 同模型）/ `direction`（**显式世界空间**锥轴）/ `inner_cutoff
+/ outer_cutoff`（弧度，inner 内全强、inner→outer 线性衰减到 0）。锥光
+因子 `spot_cone_factor(cos_theta, cos_inner, cos_outer)` CPU 与 WGSL
+逐行镜像（同式同序）：`denom = cos_inner − cos_outer ≤ 1e-6` 走硬边
+（正是「inner > outer 钳到硬边」的实现机制），否则线性插值 clamp；NaN
+输入按 0 贡献处理不外溢。零长度方向 = 不发光（上传时颜色置零）。
+
+**双路径位等价（本设计的中枢）**：逐灯贡献从 fs_main 的点光循环体
+**逐式提取**为 `point_light_contrib` 共享函数（经由 `ptr<function>`
+出参累计而非返回增量——保持「color + pbr 再 color + sss」的原加法
+结合序，返回值方案会把它重结合成 `color + (pbr + sss)`，SSS 场景
+±1 LSB）。mode = 1 时旧点光循环由**均匀门**（`bins_params.counts.x <
+0.5`）整体跳过——灯表前段就是 Globals 的那 8 盏，两路同开会把它们计
+两次；mode = 0 时该门恒真、分箱分支死码。于是：同一灯集合两条路径
+逐像素加出同一串位（同函数 × 同序 × 保守覆盖），且**灯表资源缺席/
+关闭 = 全零哑缓冲 + 零 write_buffer**（命令流与 R77 逐位一致）——
+兼容硬约束「既有渲染快照逐字节复现」由 10 个既有 FNV 基线套件与
+force-对-缺席的逐字节 GPU 测试双重实证。锥光因子乘在灯色（radiance）
+上——贡献各项对 radiance 线性，与「乘在最终贡献」数学一致且贡献函数
+零改动。分箱矩阵用主相机最终 `view_proj`（含 TAA 抖动）；真缓冲仅
+mode = 1 帧每帧重传（params + 灯表 + tile 索引三 `write_buffer`）。
+
+**兼容形态**：`LightBinningSettings` 资源缺席 = 自动阈值
+（`light_bins_enabled`：点光 > 8 或有锥光即启用）；`force` 字段为调试
+/验收强制入口。探针捕获面与 RT 相机的绑定组**恒绑哑资源**（mode = 0
+——捕获不渲染锥光与第 9+ 盏点光，捕获视口的 8 盏点光语义与 R77
+一致）。超容量口径与点光超限一致：灯表 > 512 按（点光查询序 → 锥光
+查询序）截断 + `log::warn`；tile 索引超 1 MiB 按序截断（保留数组序
+靠前的，受影响 tile 及其后清零计数）。
+
+**测试**（`tests/light_bins_render.rs`，GPU_SERIAL 串行化）：①双路径
+位等价——5 盏点光（含 1 盏投影阴影灯）force 对缺席逐字节相等（阴影
+字段镜像的实证）；②第 9 盏点光——8 盏聚簇基线的暗角在加第 9 盏后
+显著变亮、range 外远点不变（自动阈值）；③锥光形状——斜轴下照的锥内
+点显著亮于锥外**同灯距**点（等距消衰减、同平面消 NdotL 混淆），
+force 复跑；④双会话逐字节一致 + 移动锥光改变全帧哈希（防恒黑假
+通过）。CPU 纯函数（`bin_lights` 覆盖/近平面/clamp/升序/排列无关/
+确定性、`spot_cone_factor` 解析解与 NaN、阈值边界）单测全带。验收图
+`docs/spotlight.png`（2×2：8 灯基线 / 12 灯分箱 / spot 关 / spot 开，
+跨运行逐字节一致）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -5029,6 +5105,24 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     右/下边缘 ≤1 像素的采样坐标偏差（ClampToEdge 下不可见）；⑥ **透明/
     贴花/粒子不写深度副本**——其脚下的 GTAO 遮蔽由其后的不透明几何
     间接提供，自身不接收也不投射遮蔽。
+
+47. **前向光源分箱与 SpotLight v1 的诚实限制（R78）**——完整清单在
+    `iris_render::light_bins` 模块文档与 §4.35，此处索引：
+    ①**SpotLight 不投影阴影**（点光 cubemap 阴影不覆盖锥光，shadow
+    字段恒 0——手电筒场景的遮挡硬边照不亮影）；②**锥轴是显式世界
+    空间向量、不随 `Transform` 旋转**（跟随旋转需逐帧读层级，v1 让
+    作者直接改字段）；③**探针捕获与 RT 相机不渲染锥光与第 9+ 盏点光**
+    （捕获绑定组恒绑哑灯表 mode = 0——捕获视口的 8 盏点光语义与 R77
+    一致，屏幕 tile 只对主相机成立）；④**2D tile 对深度不敏感**（同一
+    屏幕列的墙前墙后共享灯表——墙后的灯仍进 tile 列表，逐灯
+    `dist < range` 早退保证正确性但白付求和成本，不做 3D 分箱）；
+    ⑤**超容量按序截断**（灯表 > 512 条、tile 索引 > 1 MiB：按点光
+    查询序 → 锥光查询序保留靠前的并 `log::warn`，不做重要性排序）；
+    ⑥**分箱路径每帧重传三缓冲**（params + 灯表 + tile 索引约
+    几十 KB @1080p，mode = 0 帧零 write_buffer——常态 ≤ 8 盏点光
+    零锥光的场景零成本）；⑦**投影包围盒保守**（8 角 NDC 矩形是球
+    剪影的超集，多覆盖的 tile 白付无效求和——正确性由
+    `dist < range` 早退兜底，不追求 tight 覆盖）。
 
 ## 9. 关键设计取舍记录
 

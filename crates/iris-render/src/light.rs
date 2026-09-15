@@ -500,6 +500,73 @@ impl PointLight {
     }
 }
 
+/// 锥光源组件（R78，前向光源分箱路径）。位置取自同一实体的
+/// `GlobalTransform`（层级系统每帧更新）。
+///
+/// 形状语义：光只落在以 `direction` 为轴的圆锥内——`inner_cutoff` 内全强，
+/// `inner_cutoff` → `outer_cutoff` 之间线性衰减到 0，锥外无贡献
+/// （`spot_cone_factor`，CPU/WGSL 同式）。衰减与覆盖同 [`PointLight`]：
+/// `saturate(1 - d/range)²` 平方衰减 + `range` 平滑窗口。
+///
+/// **诚实限制（v1，详见 ARCHITECTURE §8.47）**：
+/// - `direction` 是**显式世界空间指向**，不随 `Transform` 旋转（跟随旋转
+///   需要逐帧读层级，v1 让作者直接改本字段）；
+/// - 不投影阴影（点光 cubemap 阴影不覆盖锥光）；
+/// - 经屏幕空间分箱路径渲染（[`crate::light_bins`]），反射探针与 RT 相机
+///   的捕获视口不渲染锥光（捕获恒绑哑灯表）。
+/// - 零长度 `direction` = 不发光（渲染器把颜色置零，锥光因子无从定义）；
+/// - `inner_cutoff > outer_cutoff` 由实现层钳到硬边（inner = outer），
+///   组件本身原样存储两个值。
+#[derive(Clone, Copy, Debug, Component)]
+pub struct SpotLight {
+    /// 光的颜色（线性空间）。
+    pub color: Vec3,
+    /// 强度倍率。
+    pub intensity: f32,
+    /// 有效半径（世界单位），超出后无贡献（同 [`PointLight`] 衰减模型）。
+    pub range: f32,
+    /// 锥轴的**世界空间**单位化前的指向（上传时归一化；零长度 = 不发光）。
+    pub direction: Vec3,
+    /// 全强锥角（弧度）。
+    pub inner_cutoff: f32,
+    /// 锥外归零角（弧度）。
+    pub outer_cutoff: f32,
+}
+
+impl Default for SpotLight {
+    fn default() -> Self {
+        Self {
+            color: Vec3::ONE,
+            intensity: 8.0,
+            range: 12.0,
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            inner_cutoff: 30.0f32.to_radians(),
+            outer_cutoff: 45.0f32.to_radians(),
+        }
+    }
+}
+
+impl SpotLight {
+    /// 逐字段构造（角度收弧度）。
+    pub fn new(
+        color: Vec3,
+        intensity: f32,
+        range: f32,
+        direction: Vec3,
+        inner_cutoff: f32,
+        outer_cutoff: f32,
+    ) -> Self {
+        Self {
+            color,
+            intensity,
+            range,
+            direction,
+            inner_cutoff,
+            outer_cutoff,
+        }
+    }
+}
+
 /// 立方体某一面的视图投影矩阵（点光阴影与反射探针捕获共用）：
 /// 90° 透视、宽高比 1，面序与观察方向取 [`POINT_SHADOW_FACES`]
 /// （wgpu 立方体贴图层序），返回矩阵已对 NDC y 取反。
@@ -952,5 +1019,42 @@ mod tests {
         );
         // 空集合：无投射器（零开销默认路径）
         assert!(select_point_shadow_casters(&[], POINT_SHADOW_BUDGET).is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // R78：SpotLight 组件
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 默认值与构造器逐字段核对：白光 / 强度 8 / 半径 12 / 垂直下照 /
+    /// 内角 30°、外角 45°（弧度值精确到 f32 最近表示）。
+    #[test]
+    fn spot_light_defaults_and_constructor() {
+        let d = SpotLight::default();
+        assert_eq!(d.color, Vec3::ONE, "默认颜色应为白");
+        assert_eq!(d.intensity, 8.0);
+        assert_eq!(d.range, 12.0);
+        assert_eq!(d.direction, Vec3::new(0.0, -1.0, 0.0), "默认垂直下照");
+        assert_eq!(d.inner_cutoff, 30.0f32.to_radians(), "默认全强锥角 30°");
+        assert_eq!(d.outer_cutoff, 45.0f32.to_radians(), "默认锥外归零角 45°");
+        assert!(
+            d.inner_cutoff < d.outer_cutoff,
+            "默认内角必须小于外角（软边语义）"
+        );
+        // 构造器逐字段透传（不做钳制——inner > outer 由渲染器上传时钳到
+        // 硬边，组件层保留作者原值）
+        let s = SpotLight::new(
+            Vec3::new(1.0, 0.5, 0.25),
+            20.0,
+            6.0,
+            Vec3::new(0.0, 0.0, -1.0),
+            0.2,
+            0.9,
+        );
+        assert_eq!(s.color, Vec3::new(1.0, 0.5, 0.25));
+        assert_eq!(s.intensity, 20.0);
+        assert_eq!(s.range, 6.0);
+        assert_eq!(s.direction, Vec3::new(0.0, 0.0, -1.0));
+        assert_eq!(s.inner_cutoff, 0.2);
+        assert_eq!(s.outer_cutoff, 0.9);
     }
 }

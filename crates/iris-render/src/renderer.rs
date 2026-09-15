@@ -30,8 +30,12 @@ use crate::irradiance::IrradianceProbeSet;
 use crate::light::{
     DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY, POINT_SHADOW_BIAS_MIN,
     POINT_SHADOW_BUDGET, POINT_SHADOW_NORMAL_SCALE, POINT_SHADOW_SLOPE_SCALE, PointLight,
-    PointShadowCandidate, SHADOW_BIAS_LEGACY, SHADOW_BIAS_MIN, cascade_fit_params, cascade_splits,
-    select_point_shadow_casters,
+    PointShadowCandidate, SHADOW_BIAS_LEGACY, SHADOW_BIAS_MIN, SpotLight, cascade_fit_params,
+    cascade_splits, select_point_shadow_casters,
+};
+use crate::light_bins::{
+    LIGHT_TILE_SIZE, LightBinInput, LightBinningSettings, MAX_BINNED_LIGHTS, bin_lights,
+    light_bins_enabled,
 };
 use crate::lightmap::{LightmapBinding, LightmapHandle, LightmapStore, NO_LIGHTMAP};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
@@ -88,6 +92,49 @@ struct GlobalsRaw {
 const _: () = assert!(
     std::mem::size_of::<GlobalsRaw>() == 640,
     "Globals 必须与 WGSL 布局一致"
+);
+
+/// 与 WGSL `BinnedLight` 结构对齐（80 字节 = 5×vec4，POD）：分箱灯表
+/// （[`MAX_BINNED_LIGHTS`] 条定长 storage 数组）的条目。
+///
+/// 前 3 个 vec4 与 [`PointLightRaw`] 逐字段同布局（位置 / 颜色×强度×range /
+/// 阴影参数）——灯表前段（前 8 盏点光）与 `Globals.point_lights` 逐字段
+/// 一致，是双路径位等价的数据根据；后 2 个 vec4 携带锥光形状（R78）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BinnedLightRaw {
+    /// xyz: 世界位置，w = 0.0 点光 / 1.0 锥光。
+    pos_type: [f32; 4],
+    /// rgb × intensity, w = range（与 [`PointLightRaw::color`] 同布局）。
+    color_range: [f32; 4],
+    /// 逐字复制 [`PointLightRaw::shadow`] 语义：x 投影开关 y cubemap 槽位；
+    /// 灯表前段与 Globals 逐字段一致，SpotLight 恒 0（v1 不投影阴影）。
+    shadow: [f32; 4],
+    /// xyz: 单位化锥轴方向，w = cos(inner_cutoff)。
+    cone: [f32; 4],
+    /// x = cos(outer_cutoff)，yzw 保留。
+    outer: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<BinnedLightRaw>() == 80,
+    "BinnedLight 必须与 WGSL 布局一致（5×vec4 = 80 B）"
+);
+
+/// 与 WGSL `LightBinsParams` 结构对齐（32 字节，POD）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightBinsParamsRaw {
+    /// 宽、高、tiles_x、tiles_y（像素与 tile 数，片元 tile 定位用）。
+    screen: [f32; 4],
+    /// x = mode（0 = 关——着色器分箱分支死码；1 = 灯表生效），
+    /// y = 灯总数，z = index 总数，w = 保留。
+    counts: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<LightBinsParamsRaw>() == 32,
+    "LightBinsParams 必须与 WGSL 布局一致（2×vec4 = 32 B）"
 );
 
 /// 与 WGSL `CsmParams` 对齐（256 字节，POD）：方向光级联阴影参数
@@ -585,6 +632,9 @@ pub struct Renderer {
     ssr_uniform_live: bool,
     /// AO 常驻 GPU 资源（R77，哑纹理恒在——布局要求的 binding 14 占位）。
     ao: AoGpu,
+    /// 前向光源分箱（R78）常驻资源：哑资源恒在（mode = 0 分支死码），
+    /// 真缓冲按帧写（mode = 1），`bind_real` 决定 binding 15/16/17 指向。
+    light_bins: LightBinsGpu,
     /// scene_depth pass 最近一次运行的帧号（R77，`occ_frame` 口径）：
     /// GTAO 读的是「上一帧」深度——本帧编号恰好等于该值 + 1 才允许编码
     /// AO pass，否则可见度图清成中性 1.0（首帧启用 / 上帧无几何 / 深度
@@ -851,6 +901,36 @@ struct AoTarget {
     #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+/// tiles 索引缓冲的固定容量（1 MiB）：前 `2 × tile 数` 个 u32 是每 tile
+/// 的 [start, count]（ranges 区），其余是灯下标展平区（indices 区）。
+/// 1 MiB = 262144 u32：8K×8K 屏的 ranges 区（131072 u32）也放得下，
+/// indices 超出剩余容量按序截断（确定性：保留数组序靠前的，见
+/// `upload_light_bins`）。
+const LIGHT_BINS_TILES_BYTES: u64 = 1024 * 1024;
+
+/// 前向光源分箱（R78）的常驻 GPU 资源。globals 布局的 binding 15/16/17
+/// 恒需合法绑定，哑资源（全零参数 / 零灯表 / 零索引，mode = 0 = 着色器
+/// 分箱分支死码）**始终存在**（SSR/AO 哑资源同款纪律——缺席路径零分配
+/// 大资源、零 write_buffer，命令流与 R77 逐位一致）。
+struct LightBinsGpu {
+    /// 32B 参数（LightBinsParamsRaw 布局；mode=1 帧每帧写）。
+    params_buf: wgpu::Buffer,
+    /// 灯表 storage（512 × 80 B 定长；mode=1 帧每帧写）。
+    lights_buf: wgpu::Buffer,
+    /// tile 索引 storage（固定 1 MiB；mode=1 帧每帧写）。
+    tiles_buf: wgpu::Buffer,
+    /// 32B 全零参数（捕获 / RT / 关闭帧绑定——mode = 0）。
+    off_params_buf: wgpu::Buffer,
+    /// 80B 全零灯表（哑占位，永不读——mode = 0 分支死码）。
+    off_lights_buf: wgpu::Buffer,
+    /// 16B 全零索引（哑占位，永不读）。
+    off_tiles_buf: wgpu::Buffer,
+    /// 绑定裁决：`true` = binding 15/16/17 指向真实缓冲（本帧分箱生效），
+    /// `false` = 指向哑资源（关闭——即使上一帧写过真数据也不得被采样）。
+    /// draw 逐帧设置，globals 绑定组重建时消费（AO 的 bind_real 同款）。
+    bind_real: bool,
 }
 
 /// 遮挡查询的常驻 GPU 资源（R53，首次启用时惰性创建，见
@@ -1216,18 +1296,26 @@ struct GlobalsBuffers<'a> {
     csm_params: &'a wgpu::Buffer,
 }
 
-/// 全局绑定组里的屏幕空间效果资源（R62b 立组，R77 起同组携带 AO 一路）：
-/// SSR 参数缓冲（binding 13）+ 上帧颜色副本视图（binding 11）+ 上帧深度
-/// 副本视图（binding 12）+ GTAO 可见度图视图（binding 14）。主视图传真实
-/// 资源；探针捕获面 / RT 相机的绑定组传**零参数 + 哑纹理**（捕获 / RT
-/// 视口不做屏幕空间效果——上帧 / 屏幕坐标语义只对主相机成立，见 §4.31
-/// 裁决 2；AO 哑纹素恒 1.0，捕获 / RT 的间接光不受遮蔽）。
+/// 全局绑定组里的屏幕空间效果资源（R62b 立组，R77 携带 AO 一路，R78
+/// 再携带光源分箱三路）：SSR 参数缓冲（binding 13）+ 上帧颜色副本视图
+/// （binding 11）+ 上帧深度副本视图（binding 12）+ GTAO 可见度图视图
+/// （binding 14）+ 分箱参数 / 灯表 / tile 索引缓冲（binding 15/16/17）。
+/// 主视图传真实资源；探针捕获面 / RT 相机的绑定组传**零参数 + 哑纹理 /
+/// 哑缓冲**（捕获 / RT 视口不做屏幕空间效果、不渲染锥光与第 9+ 盏点光
+/// ——上帧 / 屏幕坐标语义只对主相机成立，见 §4.31 裁决 2；AO 哑纹素恒
+/// 1.0，bins 哑参数 mode = 0 = 分支死码）。
 #[derive(Clone, Copy)]
-struct SsrGlobalsResources<'a> {
+struct ScreenSpaceGlobalsResources<'a> {
     params_buf: &'a wgpu::Buffer,
     color_view: &'a wgpu::TextureView,
     depth_view: &'a wgpu::TextureView,
     ao_view: &'a wgpu::TextureView,
+    /// 分箱参数 uniform（binding 15）：主相机 mode=1 走真缓冲，其余哑零。
+    bins_params: &'a wgpu::Buffer,
+    /// 分箱灯表 storage（binding 16）。
+    bins_lights: &'a wgpu::Buffer,
+    /// 分箱 tile 索引 storage（binding 17）。
+    bins_tiles: &'a wgpu::Buffer,
 }
 
 fn build_globals_bind_group(
@@ -1237,7 +1325,7 @@ fn build_globals_bind_group(
     shadows: ShadowMapViews<'_>,
     env: &crate::environment::EnvironmentMaps,
     probe: ProbeGlobalsResources<'_>,
-    ssr: SsrGlobalsResources<'_>,
+    screen: ScreenSpaceGlobalsResources<'_>,
 ) -> wgpu::BindGroup {
     let globals_buf = buffers.globals;
     let csm_params_buf = buffers.csm_params;
@@ -1313,21 +1401,36 @@ fn build_globals_bind_group(
             // 深度为 textureLoad 读取，不需要采样器）
             wgpu::BindGroupEntry {
                 binding: 11,
-                resource: wgpu::BindingResource::TextureView(ssr.color_view),
+                resource: wgpu::BindingResource::TextureView(screen.color_view),
             },
             wgpu::BindGroupEntry {
                 binding: 12,
-                resource: wgpu::BindingResource::TextureView(ssr.depth_view),
+                resource: wgpu::BindingResource::TextureView(screen.depth_view),
             },
             wgpu::BindGroupEntry {
                 binding: 13,
-                resource: ssr.params_buf.as_entire_binding(),
+                resource: screen.params_buf.as_entire_binding(),
             },
             // GTAO 可见度图（R77）：真实半分辨率图或 1×1 哑纹理（纹素
             // 1.0——关闭 / 捕获 / RT 路径采样后 × 1.0 逐位精确）
             wgpu::BindGroupEntry {
                 binding: 14,
-                resource: wgpu::BindingResource::TextureView(ssr.ao_view),
+                resource: wgpu::BindingResource::TextureView(screen.ao_view),
+            },
+            // 前向光源分箱（R78）：参数 + 灯表 + tile 索引（主相机 mode=1
+            // 走真缓冲；捕获 / RT / 关闭帧走全零哑缓冲——mode = 0 使着色器
+            // 分箱分支死码，Globals 均摊旧路径逐位不变）
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: screen.bins_params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: screen.bins_lights.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: screen.bins_tiles.as_entire_binding(),
             },
         ],
     })
@@ -2311,15 +2414,63 @@ impl Renderer {
             target_size: (0, 0),
             bind_real: false,
         };
-        // 主视图绑定组初建时的屏幕空间资源（SSR 三路 + AO）：参数走
-        // **活跃**缓冲（此后由 draw 逐帧管理），颜色 / 深度 / AO 此时只有
-        // 哑纹理（prev_color / scene_depth / ao target 均未创建；就位时
-        // 重建绑定组，见 draw 的接线）。
-        let ssr_main_res = SsrGlobalsResources {
+        // 光源分箱常驻资源（R78）：真缓冲（32B 参数 + 512×80B 灯表 +
+        // 1 MiB tile 索引）与哑资源（32B / 80B / 16B 全零——mode = 0 使
+        // 着色器分箱分支死码）各一套。wgpu 缓冲零初始化 ⇒ 哑资源无需
+        // 写入即满足「全零 mode=0」语义；真缓冲只在分箱生效帧写。
+        let make_bins_buf = |label: &'static str, size: u64, usage: wgpu::BufferUsages| {
+            gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let light_bins = LightBinsGpu {
+            params_buf: make_bins_buf(
+                "iris.bins.params",
+                std::mem::size_of::<LightBinsParamsRaw>() as u64,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            lights_buf: make_bins_buf(
+                "iris.bins.lights",
+                (MAX_BINNED_LIGHTS * std::mem::size_of::<BinnedLightRaw>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            tiles_buf: make_bins_buf(
+                "iris.bins.tiles",
+                LIGHT_BINS_TILES_BYTES,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            off_params_buf: make_bins_buf(
+                "iris.bins.params_off",
+                std::mem::size_of::<LightBinsParamsRaw>() as u64,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            off_lights_buf: make_bins_buf(
+                "iris.bins.lights_off",
+                std::mem::size_of::<BinnedLightRaw>() as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            off_tiles_buf: make_bins_buf(
+                "iris.bins.tiles_off",
+                16,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            bind_real: false,
+        };
+        // 主视图绑定组初建时的屏幕空间资源（SSR 三路 + AO + 分箱三路）：
+        // 参数走**活跃**缓冲（此后由 draw 逐帧管理），颜色 / 深度 / AO /
+        // 分箱此时只有哑资源（prev_color / scene_depth / ao target 均未
+        // 创建、bins bind_real = false；就位时重建绑定组，见 draw 的接线）。
+        let ssr_main_res = ScreenSpaceGlobalsResources {
             params_buf: &ssr.params_buf,
             color_view: &ssr.dummy_color_view,
             depth_view: &ssr.dummy_depth_view,
             ao_view: &ao.dummy_view,
+            bins_params: &light_bins.off_params_buf,
+            bins_lights: &light_bins.off_lights_buf,
+            bins_tiles: &light_bins.off_tiles_buf,
         };
         // 捕获期每面一份 Globals 缓冲 + 绑定组（面矩阵 / 眼点逐面不同）
         let probe_face_globals_bufs: [wgpu::Buffer; 6] = std::array::from_fn(|_| {
@@ -2332,7 +2483,8 @@ impl Renderer {
         });
         // 捕获绑定组：绑定 0..8 与主组同源（阴影贴图 / env / CSM / 点光阴影），
         // 绑定 9/10 指向**哑资源 + 零参数**（捕获不做探针自反馈），
-        // SSR 三路同样走零参数 + 哑纹理（捕获不做屏幕空间反射）
+        // SSR 三路同样走零参数 + 哑纹理（捕获不做屏幕空间反射），
+        // 分箱三路走哑零缓冲（捕获不渲染锥光与第 9+ 盏点光——mode = 0）
         let probe_face_globals_bgs: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
             build_globals_bind_group(
                 &gpu,
@@ -2350,11 +2502,14 @@ impl Renderer {
                     params_buf: &probe_capture_params_buf,
                     cube_view: &probe_dummy_view,
                 },
-                SsrGlobalsResources {
+                ScreenSpaceGlobalsResources {
                     params_buf: &ssr.off_params_buf,
                     color_view: &ssr.dummy_color_view,
                     depth_view: &ssr.dummy_depth_view,
                     ao_view: &ao.dummy_view,
+                    bins_params: &light_bins.off_params_buf,
+                    bins_lights: &light_bins.off_lights_buf,
+                    bins_tiles: &light_bins.off_tiles_buf,
                 },
             )
         });
@@ -2756,6 +2911,7 @@ impl Renderer {
             ssr_was_on: false,
             ssr_uniform_live: false,
             ao,
+            light_bins,
             ao_depth_frame: None,
             ui_atlas,
             ui_bind_group,
@@ -2827,11 +2983,25 @@ impl Renderer {
         );
     }
 
-    /// 屏幕空间资源的「主相机」形态（R62b 立法，R77 扩容）：活跃参数缓冲
-    /// + 真实上帧资源 + AO 可见度图（`bind_real` 裁决——AO 关闭帧即使
-    ///   target 还在也回落哑纹理，陈旧内容不得被采样）。
-    fn ssr_main_resources(&self) -> SsrGlobalsResources<'_> {
-        SsrGlobalsResources {
+    /// 屏幕空间资源的「主相机」形态（R62b 立法，R77 扩 AO，R78 再扩
+    /// 分箱三路）：活跃参数缓冲 + 真实上帧资源 + AO 可见度图（`bind_real`
+    /// 裁决——AO 关闭帧即使 target 还在也回落哑纹理）+ 分箱真缓冲
+    /// （`light_bins.bind_real` 裁决，关闭帧绑哑零缓冲 mode = 0）。
+    fn ssr_main_resources(&self) -> ScreenSpaceGlobalsResources<'_> {
+        let (bins_params, bins_lights, bins_tiles) = if self.light_bins.bind_real {
+            (
+                &self.light_bins.params_buf,
+                &self.light_bins.lights_buf,
+                &self.light_bins.tiles_buf,
+            )
+        } else {
+            (
+                &self.light_bins.off_params_buf,
+                &self.light_bins.off_lights_buf,
+                &self.light_bins.off_tiles_buf,
+            )
+        };
+        ScreenSpaceGlobalsResources {
             params_buf: &self.ssr.params_buf,
             color_view: self
                 .ssr
@@ -2848,7 +3018,76 @@ impl Renderer {
                 Some(Some(target)) => &target.view,
                 _ => &self.ao.dummy_view,
             },
+            bins_params,
+            bins_lights,
+            bins_tiles,
         }
+    }
+
+    /// 分箱真缓冲上传（R78，mode = 1 的 draw 每帧调用）：灯表与 tile
+    /// 索引、参数三缓冲。tile 索引缓冲为**固定容量**
+    /// （[`LIGHT_BINS_TILES_BYTES`]）——前 `2 × tile 数` 个 u32 是
+    /// ranges 区、indices 区接续；indices 超出剩余容量时**按序截断**
+    /// （确定性：保留数组序靠前的灯），受影响 tile 及其后全部清零计数
+    /// 并 `log::warn`（与点光超限同口径：不是静默丢弃）。
+    fn upload_light_bins(&self, lights: &[BinnedLightRaw], vp: Mat4, width: u32, height: u32) {
+        let inputs: Vec<LightBinInput> = lights
+            .iter()
+            .map(|l| LightBinInput {
+                position: Vec3::new(l.pos_type[0], l.pos_type[1], l.pos_type[2]),
+                range: l.color_range[3],
+            })
+            .collect();
+        let bins = bin_lights(&inputs, vp, width, height, LIGHT_TILE_SIZE);
+        let tile_count = bins.tiles_x as usize * bins.tiles_y as usize;
+        let capacity_u32 = (LIGHT_BINS_TILES_BYTES / 4) as usize;
+        let ranges_u32 = tile_count * 2;
+        let indices_capacity = capacity_u32.saturating_sub(ranges_u32);
+        // ranges 区 + indices 区（超容量按序截断）
+        let mut ranges_part: Vec<u32> = Vec::with_capacity(ranges_u32);
+        let mut indices_part: Vec<u32> = Vec::with_capacity(bins.indices.len());
+        let mut truncated = false;
+        let mut written = 0usize;
+        for r in &bins.ranges {
+            let count = r[1] as usize;
+            let take = count.min(indices_capacity.saturating_sub(written));
+            truncated |= take < count;
+            ranges_part.push(written as u32);
+            ranges_part.push(take as u32);
+            indices_part.extend_from_slice(&bins.indices[r[0] as usize..r[0] as usize + take]);
+            written += take;
+        }
+        ranges_part.extend(indices_part);
+        if truncated {
+            log::warn!(
+                "分箱 tile 索引超出缓冲容量（{} u32），已按序截断（保留数组序靠前的灯）",
+                capacity_u32
+            );
+        }
+        self.gpu
+            .queue
+            .write_buffer(&self.light_bins.lights_buf, 0, bytemuck::cast_slice(lights));
+        // 病态大屏（ranges 区本身超 1 MiB）下只上传放得下的前缀：WGSL 对
+        // storage 越界读取返回 0 ⇒ 未覆盖 tile 恒无灯（优雅降级，诚实限制
+        // 见 §8.47）
+        let upload_len = ranges_part.len().min(capacity_u32);
+        self.gpu.queue.write_buffer(
+            &self.light_bins.tiles_buf,
+            0,
+            bytemuck::cast_slice(&ranges_part[..upload_len]),
+        );
+        let params = LightBinsParamsRaw {
+            screen: [
+                width as f32,
+                height as f32,
+                bins.tiles_x as f32,
+                bins.tiles_y as f32,
+            ],
+            counts: [1.0, lights.len() as f32, written as f32, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.light_bins.params_buf, 0, bytemuck::bytes_of(&params));
     }
 
     /// 环境源失效检查：`SkySource` 资源的 generation 与缓存不同（资源缺席
@@ -4271,11 +4510,28 @@ impl Renderer {
         // 不参与选择；乱序插入的两次世界选中同一批灯）。
         let mut caster_candidates: Vec<ShadowCandidateSlot> = Vec::new();
         let mut caster_total = 0usize;
+        // R78 分箱：全部点光（查询序）同时进灯表（容量 [`MAX_BINNED_LIGHTS`]），
+        // 前 8 盏照旧进 `Globals.point_lights`（语义不变）；`point_total`
+        // 记总数供自动阈值判断（超容量的部分只计数，与超限日志口径一致）。
+        let mut bin_points: Vec<([f32; 4], [f32; 4])> = Vec::new();
+        let mut point_total = 0usize;
         world.query::<(Entity, &GlobalTransform, &PointLight)>(|(e, gt, pl)| {
+            point_total += 1;
+            let position = gt.position();
+            if bin_points.len() < MAX_BINNED_LIGHTS {
+                bin_points.push((
+                    [position.x, position.y, position.z, 0.0],
+                    [
+                        pl.color.x * pl.intensity,
+                        pl.color.y * pl.intensity,
+                        pl.color.z * pl.intensity,
+                        pl.range,
+                    ],
+                ));
+            }
             if point_count >= MAX_POINT_LIGHTS {
                 return;
             }
-            let position = gt.position();
             if pl.shadows {
                 caster_total += 1;
                 caster_candidates.push(ShadowCandidateSlot {
@@ -4316,6 +4572,24 @@ impl Renderer {
             let light_slot = caster_candidates[candidate].light_slot;
             point_lights[light_slot].shadow = [1.0, slot as f32, 0.0, 0.0];
         }
+        // R78：组装灯表前段 = 全部点光（查询序）；前 8 盏的阴影参数与
+        // `Globals.point_lights` 逐字段一致（双路径位等价的数据根据），
+        // 第 9 盏起不投影（本就进不了阴影预算）。
+        let mut binned_lights: Vec<BinnedLightRaw> = bin_points
+            .iter()
+            .enumerate()
+            .map(|(i, &(position, color_range))| BinnedLightRaw {
+                pos_type: position,
+                color_range,
+                shadow: if i < point_count {
+                    point_lights[i].shadow
+                } else {
+                    [0.0; 4]
+                },
+                cone: [0.0; 4],
+                outer: [0.0; 4],
+            })
+            .collect();
         let point_shadow_params = [
             if caster_count > 0 { 1.0 } else { 0.0 },
             if self.legacy_shadow_bias {
@@ -4335,15 +4609,63 @@ impl Renderer {
             },
         ];
         self.stats.point_shadow_casters = caster_count as u32;
-        if point_count == MAX_POINT_LIGHTS {
-            // 有可能恰好还有更多点光被截断；再探一次数量仅用于日志
-            let mut extra = 0;
-            world.query::<&PointLight>(|_| extra += 1);
-            if extra > MAX_POINT_LIGHTS {
-                log::warn!("点光数量 {extra} 超过上限 {MAX_POINT_LIGHTS}，多余的已被忽略");
-            }
+        if point_total > MAX_POINT_LIGHTS {
+            log::warn!("点光数量 {point_total} 超过上限 {MAX_POINT_LIGHTS}，多余的已被忽略");
         }
         let shadow_enabled = light.shadows;
+        // ---- R78：SpotLight 收集（查询序追加在点光之后）----
+        //
+        // 锥光不进 Globals（8 盏均摊装不下也不该挤占点光），只进灯表；
+        // v1 不投影阴影（shadow 恒 0）、`inner > outer` 钳到硬边、零长度
+        // 方向 = 不发光（颜色置零——锥光因子对零向量无从定义）。
+        let mut spot_total = 0usize;
+        world.query::<(&GlobalTransform, &SpotLight)>(|(gt, sl)| {
+            spot_total += 1;
+            if binned_lights.len() >= MAX_BINNED_LIGHTS {
+                return;
+            }
+            let position = gt.position();
+            let direction = sl.direction.normalize_or_zero();
+            let zero_color = [0.0f32; 3];
+            let rgb = if sl.direction.length_squared() == 0.0 {
+                zero_color
+            } else {
+                [
+                    sl.color.x * sl.intensity,
+                    sl.color.y * sl.intensity,
+                    sl.color.z * sl.intensity,
+                ]
+            };
+            // inner > outer 钳到硬边：cos(inner) - cos(outer) ≤ 0 落入
+            // spot_cone_factor 的硬边分支（denom ≤ 1e-6）
+            let inner = sl.inner_cutoff.min(sl.outer_cutoff);
+            binned_lights.push(BinnedLightRaw {
+                pos_type: [position.x, position.y, position.z, 1.0],
+                color_range: [rgb[0], rgb[1], rgb[2], sl.range],
+                shadow: [0.0; 4],
+                cone: [direction.x, direction.y, direction.z, inner.cos()],
+                outer: [sl.outer_cutoff.cos(), 0.0, 0.0, 0.0],
+            });
+        });
+        if point_total + spot_total > MAX_BINNED_LIGHTS {
+            log::warn!(
+                "灯表数量 {} 超过上限 {MAX_BINNED_LIGHTS}，多余的已被忽略",
+                point_total + spot_total
+            );
+        }
+        // 分箱裁决：`LightBinningSettings` 缺席 = 自动阈值
+        // （[`light_bins_enabled`]）；`force` 为强制入口（双路径位等价
+        // 验收用）。绑定指向变化时重建全局绑定组（AO bind_real 同款）。
+        let bins_force = world
+            .try_resource::<LightBinningSettings>()
+            .map(|s| s.force)
+            .unwrap_or(false);
+        let bins_on = bins_force || light_bins_enabled(point_total, spot_total);
+        let bins_bind_changed = self.light_bins.bind_real != bins_on;
+        self.light_bins.bind_real = bins_on;
+        if bins_bind_changed {
+            self.rebuild_globals_bind_group();
+        }
         // 反射探针（R62a）：收集「挂了组件**且已烘焙**（登记表命中）」的
         // 探针，按（相机到影响域距离升序, 实体位模式升序）取预算内一批，
         // 再按实体位模式升序填 uniform（= 着色器的 tie-break 序）。
@@ -4448,6 +4770,12 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        // 分箱真缓冲上传（R78，仅 mode=1）：mode=0 帧一个 write_buffer
+        // 都不发（零开销默认路径，命令流与 R77 一致）。分箱矩阵用主相机
+        // 最终 view_proj（含 TAA 抖动——与片元实际所见同一投影）。
+        if bins_on {
+            self.upload_light_bins(&binned_lights, vp, width, height);
+        }
         // 级联参数上传（恒写，含阴影关闭帧）：片元着色器的采样路径无条件
         // 执行（uniform 控制流要求），关闭语义由 shadow_params.w 掩码兜底
         // 混向受光，但 uniform 本身必须有定义。主 pass 读 CsmParamsRaw
@@ -6536,11 +6864,14 @@ impl Renderer {
                 params_buf: &self.probe_params_buf,
                 cube_view: &self.probe_cube_view,
             },
-            SsrGlobalsResources {
+            ScreenSpaceGlobalsResources {
                 params_buf: &self.ssr.off_params_buf,
                 color_view: &self.ssr.dummy_color_view,
                 depth_view: &self.ssr.dummy_depth_view,
                 ao_view: &self.ao.dummy_view,
+                bins_params: &self.light_bins.off_params_buf,
+                bins_lights: &self.light_bins.off_lights_buf,
+                bins_tiles: &self.light_bins.off_tiles_buf,
             },
         );
         // ACES 色调映射绑定组：hdr_view → color_view；bloom 槽绑定白色

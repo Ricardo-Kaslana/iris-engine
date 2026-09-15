@@ -88,6 +88,7 @@ pub mod hand_ik;
 pub mod instance;
 pub mod irradiance;
 pub mod light;
+pub mod light_bins;
 pub mod lightmap;
 pub mod material;
 pub mod mesh;
@@ -153,10 +154,14 @@ pub mod prelude {
     pub use crate::light::{
         CascadeFit, DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY,
         POINT_SHADOW_BIAS_MIN, POINT_SHADOW_BUDGET, POINT_SHADOW_FACES, PointLight,
-        PointShadowCandidate, SHADOW_BIAS_LEGACY, SHADOW_BIAS_MIN, cascade_fit, cascade_fit_params,
-        cascade_splits, point_shadow_bias_meters, point_shadow_texel_world,
+        PointShadowCandidate, SHADOW_BIAS_LEGACY, SHADOW_BIAS_MIN, SpotLight, cascade_fit,
+        cascade_fit_params, cascade_splits, point_shadow_bias_meters, point_shadow_texel_world,
         select_point_shadow_casters, shadow_bias_ndc, shadow_normal_offset_world, slope_tan,
         snap_aabb_to_texels,
+    };
+    pub use crate::light_bins::{
+        LIGHT_TILE_SIZE, LightBinInput, LightBinningSettings, LightBins, MAX_BINNED_LIGHTS,
+        bin_lights, light_bins_enabled, spot_cone_factor,
     };
     pub use crate::lightmap::{
         LIGHTMAP_DILATE_ITERATIONS, LightmapBinding, LightmapHandle, LightmapInstall, LightmapItem,

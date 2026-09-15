@@ -5,6 +5,45 @@
 
 ## [Unreleased]
 
+### Added（R78：SpotLight + 前向光源分箱——CPU 屏幕空间 tile 分箱 × storage 灯表 × 双路径位等价）
+
+路线图 v5 第一梯队收官轮（战斗底座）。`iris-render` 新增 **SpotLight
+锥光组件** 与 **前向光源分箱**：突破 `MAX_POINT_LIGHTS = 8` 的全局均摊
+（第 9+ 盏点光从「静默丢弃」变为「灯表生效」），并补上锥光——手电筒 /
+聚光灯类玩法光源此前只能用点光近似。
+
+- **SpotLight 组件**（`light.rs`）：`color / intensity / range`（衰减与
+  点光同模型）+ `direction`（显式世界空间锥轴）+ `inner_cutoff /
+  outer_cutoff`（软边锥形，CPU/WGSL 同式的 `spot_cone_factor`；inner >
+  outer 实现层钳到硬边、零长度方向 = 不发光）。prelude 导出。
+- **分箱纯函数**（新模块 `light_bins.rs`）：`bin_lights` 把灯按屏幕
+  32² tile 分箱——近平面门（球心 `clip.w ≥ 0.05` 才可见，整盏跳过）+
+  相机轴 8 角投影 NDC 矩形（角深度钳近平面，保守外扩）+ clamp 展开；
+  `BTreeMap` 展平保证与构建次序无关的确定性，tile 内下标升序（灯数组
+  序即求和序）。`light_bins_enabled` 自动阈值（点光 > 8 或有锥光）。
+- **GPU 资源**（globals 组 binding 15/16/17，「不扩 Globals 前缀」
+  扩容先例延续，skybox 并行布局零触碰）：32 B 参数 uniform + 512×80 B
+  灯表 storage（前 8 盏点光的阴影开关 / cubemap 槽位与 `Globals`
+  逐字段镜像）+ 1 MiB tile 索引 storage（ranges 区 + indices 区，超容量
+  按序截断 + warn）。`LightBinningSettings` 资源缺席 = 自动阈值，
+  `force` 为验收强制入口；探针捕获 / RT 相机恒绑哑资源（mode = 0）。
+- **双路径位等价**：fs_main 点光循环体**逐式提取**为
+  `point_light_contrib` 共享函数（`ptr<function>` 出参累计，保加法
+  结合序）；mode = 1 时旧循环由均匀门跳过（防前 8 盏计双）、分箱分支
+  只在 mode = 1 执行。同一灯集合两路逐像素同串位；灯表缺席/关闭 =
+  全零哑缓冲 + 零 `write_buffer`（命令流与 R77 一致）。**全部既有
+  FNV 基线零改动原值通过**（10 个 GPU 基线套件亲验）。
+- **测试**：CPU 纯函数 9 项（分箱覆盖/近平面/越界 clamp/升序/排列
+  无关/确定性、锥光因子解析解与 NaN 不外溢、阈值边界、SpotLight
+  构造）+ GPU 4 项（`tests/light_bins_render.rs`，GPU_SERIAL 串行：
+  force 对缺席逐字节相等含阴影灯 / 第 9 盏照亮暗角且远点不变 /
+  锥内显著亮于锥外同灯距点×force 复跑 / 双会话逐位 + 移动锥光变帧）。
+  快照 example `lights_snapshot.rs`（2×2 验收图，跨运行逐字节一致）
+  → `docs/spotlight.png`。
+- **诚实限制**（ARCHITECTURE §8.47）：锥光不投影阴影；锥轴不随
+  `Transform` 旋转；探针/RT 捕获不渲染锥光与第 9+ 盏点光；2D tile
+  对深度不敏感（墙后灯白付求和成本）；灯表与 tile 索引超容量按序截断。
+
 ### Fixed（启动性能：GLB `buffer()` 缓存命中整段克隆——iris-exp 启动 16s → 2s）
 
 用户报 iris-exp 启动 ~5s+ 才出画面。分相计时实测（临时探针，测毕删除）：

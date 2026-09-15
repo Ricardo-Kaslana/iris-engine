@@ -1,5 +1,8 @@
 // Iris 标准材质着色器：Cook-Torrance PBR（金属度/粗糙度工作流）。
-// 照明 = 环境光（Lambert 近似）+ 1 个方向光 + 最多 8 个点光（物理平方衰减）。
+// 照明 = 环境光（Lambert 近似）+ 1 个方向光 + 最多 8 个点光（物理平方衰减，
+// Globals 均摊路径）**或**屏幕空间分箱灯表（R78：点光不限盏数 + 锥光
+// SpotLight，mode = 1 时旧点光循环由均匀门跳过，两路共用同一逐灯贡献
+// 函数保证双路径位等价）。
 // 方向光带级联阴影 CSM v2（R29）：3 层 2D 数组深度贴图（R通道存光空间
 // 深度），片元按 view 深度选级联后做 3×3 手工比较 PCF；点光带 cubemap
 // **数组**阴影贴图（R61 预算化多盏：逐灯开关 + 槽位，R 通道存归一化线性
@@ -174,6 +177,50 @@ struct SsrParams {
 // 器（R16Float 可过滤）；半分辨率 → 全分辨率的线性上采样即 AO 的低成本
 // 恢复滤波（低频量，双线性足够）。
 @group(0) @binding(14) var ao_visibility_tex: texture_2d<f32>;
+
+// 前向光源分箱（R78，排在 GTAO binding 14 之后、不扩 Globals 前缀——
+// skybox.wgsl 的并行布局陷阱不触碰）。三路资源：
+//   15 = 参数 uniform（32B）：screen = (宽, 高, tiles_x, tiles_y)；
+//        counts.x = mode（0 = 关——缺席/捕获/RT 绑全零哑缓冲，分箱分支
+//        死码，Globals 均摊旧路径逐位不变；1 = 灯表生效，旧点光循环由
+//        下方的 uniform 门跳过，两路互斥不重复计灯）；counts.y/z =
+//        灯总数 / index 总数（诊断口径）；w 保留。
+//   16 = 灯表 read-only storage：BinnedLight 定长数组（容量 512，与 Rust
+//        侧 BinnedLightRaw 逐字段对齐，5×vec4 = 80 B/条——前 3×vec4 与
+//        Globals.PointLight 同布局，灯表前段（前 8 盏点光）与 Globals 逐
+//        字段一致，阴影参数原样携带）。
+//   17 = tile 索引 read-only storage：前 2·tiles_x·tiles_y 个 u32 是每
+//        tile 的 [start, count]（行主序 tile_id = ty·tiles_x + tx，ty 自
+//        屏幕顶端起算——与 @builtin(position) 同向），其后是灯下标展平区
+//        （tile 内按灯数组序升序——灯数组序即求和序，双路径位等价的根基
+//        之一；CPU 侧 bin_lights 用 BTreeMap 保证展平确定性）。
+// 锥光因子 cos(inner)/cos(outer) 由 CPU 预计算进 cone.w / outer.x（CPU
+// 侧 spot_cone_factor 与下方 WGSL 镜像同式同序，两侧必须同步修改）。
+struct BinnedLight {
+    // xyz: 世界位置, w: 0.0 点光 / 1.0 锥光
+    pos_type: vec4<f32>,
+    // rgb × intensity, w: 有效半径（与 Globals.PointLight.color 同布局）
+    color_range: vec4<f32>,
+    // 与 Globals.PointLight.shadow 同语义：x 投影开关, y cubemap 槽位
+    // （灯表前段与 Globals 逐字段一致；锥光恒 0——v1 不投影阴影）
+    shadow: vec4<f32>,
+    // xyz: 单位化锥轴方向, w: cos(inner_cutoff)
+    cone: vec4<f32>,
+    // x: cos(outer_cutoff), yzw: 保留
+    outer: vec4<f32>,
+};
+
+// 32B 参数块（与 Rust 侧 LightBinsParamsRaw 逐字段对齐）
+struct LightBinsParams {
+    // 宽、高、tiles_x、tiles_y
+    screen: vec4<f32>,
+    // x: mode（0/1）, y: 灯总数, z: index 总数, w: 保留
+    counts: vec4<f32>,
+};
+
+@group(0) @binding(15) var<uniform> bins_params: LightBinsParams;
+@group(0) @binding(16) var<storage, read> binned_lights: array<BinnedLight>;
+@group(0) @binding(17) var<storage, read> bins_tiles: array<u32>;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -745,6 +792,96 @@ fn perturbed_normal(in: VertexOutput, n_geo: vec3<f32>) -> vec3<f32> {
     return t * ts.x + b * ts.y + n_geo * ts.z;
 }
 
+// ---- 前向光源分箱（R78）----
+//
+// tile 边长（与 Rust 侧 light_bins::LIGHT_TILE_SIZE 同值；WGSL 无
+// 「Rust 常量导入」，靠这条注释 + 双路径位等价 GPU 测试看门）。
+const BIN_TILE_SIZE: f32 = 32.0;
+
+// 锥光强度因子（CPU 镜像：light_bins::spot_cone_factor，同式同序，
+// 两侧必须同步修改）。denom ≤ 1e-6（含 inner ≥ outer 的钳制形态）走
+// 硬边；NaN 输入按 0 贡献处理不外溢（软边分支用 `t != t` 自比较判定
+// ——WGSL 无 is_nan 内建，与 CPU 侧 is_nan 同义；硬边分支的 >= 比较
+// 对 NaN 恒假）。
+fn spot_cone_factor(cos_theta: f32, cos_inner: f32, cos_outer: f32) -> f32 {
+    let denom = cos_inner - cos_outer;
+    if (denom <= 1e-6) {
+        return select(0.0, 1.0, cos_theta >= cos_outer);
+    }
+    let t = (cos_theta - cos_outer) / denom;
+    if (t != t) { // NaN 自比较判定（WGSL 无 is_nan 内建；与 CPU 侧 is_nan 同义）
+        return 0.0;
+    }
+    return clamp(t, 0.0, 1.0);
+}
+
+// 单盏点光的完整贡献（R78 从 fs_main 的点光循环体**逐式提取**——算术
+// 逐式同序，这是双路径位等价的根基：Globals 均摊旧循环与分箱新路径
+// 调用同一函数；改动必须与旧循环体逐式核对）。通过函数指针累计进
+// `*color` 而非返回增量：保持「color + pbr 再 color + sss」的原加法
+// 结合序（返回值方案会把它变成 color + (pbr + sss)，浮点加法不结合，
+// SSS 场景会 ±1 LSB——R63 的编译期副作用教训同源）。
+fn point_light_contrib(
+    color: ptr<function, vec3<f32> >,
+    world_pos: vec3<f32>, n: vec3<f32>, v: vec3<f32>, n_geo: vec3<f32>,
+    light_pos: vec3<f32>, light_rgb: vec3<f32>, light_range: f32,
+    light_shadow: vec4<f32>,
+    albedo: vec3<f32>, f0: vec3<f32>, metallic: f32, roughness: f32,
+    sss_strength: f32, sss_curvature: f32,
+) {
+    let to_light = light_pos - world_pos;
+    let dist = length(to_light);
+    let lp = to_light / max(dist, 1e-4);
+
+    // 点光阴影系数（R61 预算化多盏）：逐灯读 light_shadow.x（0/1 开关）
+    // 与 light_shadow.y（cubemap 数组槽位），对对应 cube 单采样（无 PCF）。
+    // 采样在 `dist < range` 分支之外无条件执行（textureSampleLevel 带
+    // 显式 mip 不依赖导数，掩码模式与 shadow_factor 一致）；开关与槽位
+    // 都由 uniform 派生，分支本身均匀。
+    // 偏移 v2：bias = clamp(bias_min + 坡度系数 · texel_world(dist) · tanθ,
+    // bias_min, MAX)，texel_world(dist) = dist · 2/512（90° 面摊在 512
+    // 纹素上）；采样点沿几何法线推移「法线偏移系数 · texel_world ·
+    // (1 − NdotL)」——两项的系数由 uniform 给出（对照模式为 0）。
+    // 比较口径与 v1 一致：bias 以米存、除以 range 后与归一化距离比较。
+    var shadow = 1.0;
+    if (light_shadow.x > 0.5) {
+        let nol = max(dot(n_geo, lp), 0.0);
+        let texel_w = dist * POINT_SHADOW_TEXEL_SCALE;
+        let bias_m = clamp(
+            globals.point_shadow_params.y
+                + globals.point_shadow_params.z * texel_w * slope_tan(nol),
+            globals.point_shadow_params.y,
+            POINT_SHADOW_BIAS_MAX,
+        );
+        let n_off = min(
+            globals.point_shadow_params.w * texel_w * (1.0 - nol),
+            POINT_SHADOW_NORMAL_MAX,
+        );
+        let dir = (world_pos + n_geo * n_off - light_pos)
+            / max(dist, 1e-4);
+        let range = max(light_range, 1e-4);
+        let stored = textureSampleLevel(point_shadow_cube, shadow_sampler, dir,
+                                        i32(light_shadow.y), 0.0).r;
+        shadow = select(0.0, 1.0, stored >= dist / range - bias_m / range);
+    }
+
+    if (dist < light_range) {
+        let t = dist / light_range;
+        let window = 1.0 - t * t;
+        let atten = (window * window) / max(dist * dist, 0.01);
+        let pl = light_rgb * atten * shadow;
+        *color = *color + pbr_light(n, v, lp, pl, albedo, f0, metallic, roughness);
+        // 预积分 SSS 补项（R63）：点光同样适用——终结线软化是方向
+        // 无关的漫反射现象，且 pl 已含距离窗口衰减与 cubemap 阴影，
+        // 补项自动继承两者（阴影内 / 有效半径外为 0）。成本 = 每盏
+        // 生效光源多一次 64×64 LUT 采样（显式 mip、常驻缓存）。
+        if (sss_strength > 0.0) {
+            *color = *color + sss_diffuse(n, lp, pl, albedo, metallic,
+                                          sss_strength, sss_curvature);
+        }
+    }
+}
+
 @fragment
 // 注：VertexOutput 的 @builtin(position)（字段名 clip_position 沿用顶点
 // 侧语义）作为片元入口输入时，WGSL 规定其值为**帧缓冲像素坐标**——
@@ -783,60 +920,56 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // 点光：物理平方衰减 + range 平滑窗口；投影灯（预算内多盏）各自受
-    // 自己的 cubemap 阴影调制
+    // 自己的 cubemap 阴影调制。循环体已逐式提取为 point_light_contrib
+    // （R78）——Globals 均摊旧循环与分箱新路径共用同一函数，算术逐式
+    // 同序。**均匀门**：mode = 1（分箱生效）时本循环整体跳过（灯表的
+    // 前段就是这 8 盏，重复执行会把它们计两次）——uniform 条件，mode = 0
+    // （缺席/关闭/捕获/RT）时恒真，执行路径与 R77 逐位一致。
     let count = u32(globals.point_count.x);
-    for (var i = 0u; i < count; i = i + 1u) {
-        let light = globals.point_lights[i];
-        let to_light = light.position.xyz - in.world_pos;
-        let dist = length(to_light);
-        let lp = to_light / max(dist, 1e-4);
-
-        // 点光阴影系数（R61 预算化多盏）：逐灯读 light.shadow.x（0/1 开关）
-        // 与 light.shadow.y（cubemap 数组槽位），对对应 cube 单采样（无 PCF）。
-        // 采样在 `dist < range` 分支之外无条件执行（textureSampleLevel 带
-        // 显式 mip 不依赖导数，掩码模式与 shadow_factor 一致）；开关与槽位
-        // 都由 uniform 派生，分支本身均匀。
-        // 偏移 v2：bias = clamp(bias_min + 坡度系数 · texel_world(dist) · tanθ,
-        // bias_min, MAX)，texel_world(dist) = dist · 2/512（90° 面摊在 512
-        // 纹素上）；采样点沿几何法线推移「法线偏移系数 · texel_world ·
-        // (1 − NdotL)」——两项的系数由 uniform 给出（对照模式为 0）。
-        // 比较口径与 v1 一致：bias 以米存、除以 range 后与归一化距离比较。
-        var shadow = 1.0;
-        if (light.shadow.x > 0.5) {
-            let nol = max(dot(n_geo, lp), 0.0);
-            let texel_w = dist * POINT_SHADOW_TEXEL_SCALE;
-            let bias_m = clamp(
-                globals.point_shadow_params.y
-                    + globals.point_shadow_params.z * texel_w * slope_tan(nol),
-                globals.point_shadow_params.y,
-                POINT_SHADOW_BIAS_MAX,
-            );
-            let n_off = min(
-                globals.point_shadow_params.w * texel_w * (1.0 - nol),
-                POINT_SHADOW_NORMAL_MAX,
-            );
-            let dir = (in.world_pos + n_geo * n_off - light.position.xyz)
-                / max(dist, 1e-4);
-            let range = max(light.color.w, 1e-4);
-            let stored = textureSampleLevel(point_shadow_cube, shadow_sampler, dir,
-                                            i32(light.shadow.y), 0.0).r;
-            shadow = select(0.0, 1.0, stored >= dist / range - bias_m / range);
+    if (bins_params.counts.x < 0.5) {
+        for (var i = 0u; i < count; i = i + 1u) {
+            let light = globals.point_lights[i];
+            point_light_contrib(&color, in.world_pos, n, v, n_geo,
+                                light.position.xyz, light.color.rgb, light.color.w,
+                                light.shadow,
+                                albedo, f0, metallic, roughness,
+                                material.sss.x, material.sss.y);
         }
+    }
 
-        if (dist < light.color.w) {
-            let t = dist / light.color.w;
-            let window = 1.0 - t * t;
-            let atten = (window * window) / max(dist * dist, 0.01);
-            let pl = light.color.rgb * atten * shadow;
-            color = color + pbr_light(n, v, lp, pl, albedo, f0, metallic, roughness);
-            // 预积分 SSS 补项（R63）：点光同样适用——终结线软化是方向
-            // 无关的漫反射现象，且 pl 已含距离窗口衰减与 cubemap 阴影，
-            // 补项自动继承两者（阴影内 / 有效半径外为 0）。成本 = 每盏
-            // 生效光源多一次 64×64 LUT 采样（显式 mip、常驻缓存）。
-            if (material.sss.x > 0.0) {
-                color = color + sss_diffuse(n, lp, pl, albedo, metallic,
-                                            material.sss.x, material.sss.y);
+    // 分箱路径（R78）：mode = 1 时片元按 @builtin(position) 定位 tile，
+    // 遍历本 tile 的灯表下标（升序 = 灯数组序 = 旧路径求和序；tile 覆盖
+    // 是 range 球投影矩形的保守超集 ⇒ 不漏灯，多覆盖的灯由 dist < range
+    // 早退兜底）。点光与旧路径调同一贡献函数；锥光把 spot_cone_factor
+    // 乘在灯色（radiance）上——贡献的每一项（漫反射/镜面/SSS 补项）对
+    // radiance 线性，与「乘在最终贡献」数学一致，且贡献函数零改动。
+    // mode = 0 时本分支死码不执行 ⇒ 既有像素逐位不变（哑缓冲 counts = 0）。
+    if (bins_params.counts.x >= 0.5) {
+        let tiles_x = u32(bins_params.screen.z);
+        let tiles_y = u32(bins_params.screen.w);
+        // 片元 tile（@builtin(position) 是帧缓冲像素坐标，.5 结尾；u32
+        // 截断即 floor，min 钳到合法 tile——右/下边缘的精确触界防御）
+        let tx = min(u32(in.clip_position.x / BIN_TILE_SIZE), tiles_x - 1u);
+        let ty = min(u32(in.clip_position.y / BIN_TILE_SIZE), tiles_y - 1u);
+        let tile_id = ty * tiles_x + tx;
+        let start = bins_tiles[tile_id * 2u];
+        let num = bins_tiles[tile_id * 2u + 1u];
+        // 灯下标展平区紧跟 ranges 区（2·tile 数个 u32）之后
+        let indices_base = 2u * tiles_x * tiles_y;
+        for (var k = 0u; k < num; k = k + 1u) {
+            let light = binned_lights[bins_tiles[indices_base + start + k]];
+            var light_rgb = light.color_range.rgb;
+            if (light.pos_type.w > 0.5) {
+                let cos_theta = dot(normalize(in.world_pos - light.pos_type.xyz),
+                                    light.cone.xyz);
+                light_rgb = light_rgb
+                    * spot_cone_factor(cos_theta, light.cone.w, light.outer.x);
             }
+            point_light_contrib(&color, in.world_pos, n, v, n_geo,
+                                light.pos_type.xyz, light_rgb, light.color_range.w,
+                                light.shadow,
+                                albedo, f0, metallic, roughness,
+                                material.sss.x, material.sss.y);
         }
     }
 
