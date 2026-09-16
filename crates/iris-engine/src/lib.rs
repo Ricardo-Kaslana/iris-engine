@@ -19,6 +19,7 @@ pub mod assets;
 pub mod async_loading;
 pub mod audio;
 pub mod camera_rig;
+pub mod daynight;
 pub mod gltf_builder;
 pub mod level;
 pub mod manifest;
@@ -48,9 +49,9 @@ pub mod prelude {
     pub use crate::manifest::{AssetManifest, ManifestEntry, ManifestError};
     pub use crate::pack::{PackError, PackReader, PackWriter};
     pub use crate::plugin::{
-        AnimationPlugin, AudioPlugin, CommandsPlugin, DefaultPlugins, HierarchyPlugin, InputPlugin,
-        ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin, SpatialPlugin, TimePlugin,
-        TimelinePlugin, Viewport, WindowPlugin,
+        AnimationPlugin, AudioPlugin, CommandsPlugin, DayNightPlugin, DefaultPlugins,
+        HierarchyPlugin, InputPlugin, ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin,
+        SpatialPlugin, TimePlugin, TimelinePlugin, Viewport, WindowPlugin,
     };
     pub use crate::vfs::{AssetError, AssetMount, AssetSource};
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记；
@@ -74,6 +75,8 @@ pub mod prelude {
     pub use crate::gltf_builder::{AnimChannel, GltfBuilder, GltfMaterialTextures, GltfNodeDesc};
     // 平滑追随范式（打磨 IV）：子实体相机 + 帧率无关指数趋近
     pub use crate::camera_rig::{SmoothFollow, update_smooth_follow};
+    // 昼夜循环（R80）：相位 → 方向光派生系统（DayNightPlugin 的系统体）
+    pub use crate::daynight::update_day_night;
     // 空间音频 v1（听者 / 声源组件与每帧同步系统）
     pub use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
     // 演出时间线（R47）：轨道数据 + 采样纯函数 + 播放器与托管入口

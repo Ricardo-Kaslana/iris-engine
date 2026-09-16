@@ -19,6 +19,7 @@ pub mod broadphase;
 pub mod character;
 pub mod commands;
 pub mod component;
+pub mod daynight;
 pub mod entity;
 pub mod event;
 pub mod hierarchy;
@@ -34,6 +35,7 @@ pub mod schedule;
 pub(crate) mod sync;
 pub mod time;
 pub mod transform;
+pub mod wind;
 pub mod world;
 
 /// 派生宏：`#[derive(Component)]` / `#[derive(Resource)]` / `#[derive(Event)]`。
@@ -53,6 +55,8 @@ pub mod prelude {
     };
     pub use crate::commands::{Command, CommandQueue, apply_commands};
     pub use crate::component::Component;
+    // 昼夜循环（R80）：相位资源 + 太阳方向 / 光照包络纯函数
+    pub use crate::daynight::{DayNightCycle, ambient_envelope, is_night, sun_direction};
     pub use crate::entity::Entity;
     pub use crate::event::{AppExit, Event, Events};
     pub use crate::hierarchy::{ChildOf, Children, GlobalTransform, propagate_transforms};
@@ -82,6 +86,8 @@ pub mod prelude {
     };
     pub use crate::time::Time;
     pub use crate::transform::Transform;
+    // 全局风场（R80）：接口轮——粒子 v2 / 毛发 / 降水 / 布料植被四线共用
+    pub use crate::wind::{Wind, wind_sample};
     pub use crate::world::{Bundle, World};
     pub use crate::{Component, Event, Resource};
     pub use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec3A, Vec4};

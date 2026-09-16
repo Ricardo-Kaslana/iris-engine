@@ -396,6 +396,35 @@ impl Plugin for CommandsPlugin {
     }
 }
 
+/// 昼夜循环插件（R80）：注册 Update 阶段的
+/// [`crate::daynight::update_day_night`] 并行系统——读
+/// [`iris_core::daynight::DayNightCycle`] 相位推进并把太阳方向 /
+/// 色温 / 强度 / 环境光写进 [`DirectionalLight`] 四字段（写入边界与
+/// 方向换算见 `crate::daynight` 模块文档；`shadows` / `shadow_range`
+/// 不动，`SkySettings` / `FogSettings` 不自动联动）。
+///
+/// **资源缺席语义**：`DayNightCycle` 未注册 = 系统空转一次资源查询即
+/// 过，`DirectionalLight` 一个字段都不被触碰（`RenderPlugin` 插入的
+/// 默认日光保持原样）。已包含在 [`DefaultPlugins`] 中（`RenderPlugin`
+/// 之后——默认方向光先就位，首帧派生即有目标）；自建 App 时手动添加。
+#[derive(Default)]
+pub struct DayNightPlugin;
+
+impl Plugin for DayNightPlugin {
+    fn build(&self, app: &mut App) {
+        use iris_core::daynight::DayNightCycle;
+        use iris_core::prelude::{Access, Stage, Time};
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<DayNightCycle>()
+                .write::<DirectionalLight>()
+                .read::<Time>(),
+            crate::daynight::update_day_night,
+        );
+    }
+}
+
 /// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 +
 /// 粒子 + 空间音频 + UI + 命令队列。
 ///
@@ -435,6 +464,9 @@ impl Plugin for DefaultPlugins {
         TimePlugin.build(app);
         InputPlugin.build(app);
         RenderPlugin.build(app);
+        // 昼夜循环（R80）：默认方向光就位后注册派生系统（缺席 cycle =
+        // 零触碰，见 DayNightPlugin 文档）
+        DayNightPlugin.build(app);
         AudioPlugin.build(app);
         AnimationPlugin.build(app);
         // 演出时间线（R47）：动画之后、物理之前（编排理由见 TimelinePlugin

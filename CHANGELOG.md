@@ -5,6 +5,55 @@
 
 ## [Unreleased]
 
+### Added（R80：昼夜循环 + 全局风场——纯相位解析解 × mix64 阵风采样，四条下游线共用接口轮）
+
+路线图 v5 第二梯队 2/5。`iris-core` 新增**昼夜循环**（`daynight`）与
+**全局风场**（`wind`）两个纯函数模块——零渲染依赖、无 rand、无全局
+状态，同输入 to_bits 逐位一致；`iris-render` 渲染路径**零改动**
+（唯一触碰点是新增快照 example），全部既有 GPU FNV 基线原值通过。
+
+- **昼夜循环**（`iris-core::daynight`）：`DayNightCycle` 资源 = 归一化
+  相位（0 日出 / 0.25 正午 / 0.5 日落 / 0.75 午夜）+ 速率（Default
+  1/600，10 分钟一天）+ 暂停；`advance` f64 推进 + `rem_euclid` 回绕
+  ——**纯相位函数无累积漂移**（固定步长推荐）。太阳方向 = 倾斜平面
+  圆弧解析解（`sun_direction`，默认倾角 35°：正午仰角 55° 不在头顶、
+  日出日落点钉在地平线；`normalize_or_zero` 兜底）；光照包络 = 正弦
+  仰角驱动的分段线性曲线（`sun_envelope` 地平暖橙 → 正午白、夜间强度
+  归零；`ambient_envelope` 昼间微冷白 ↔ **夜间下限底光
+  (0.035, 0.045, 0.07) 不黑屏**；`is_night` = 严格低于地平线）。
+  单测 12 项：四象限解析解对照 / 全周期无 NaN 扫描 / 包络端点精确值
+  （sin(π) 舍入伪影 ±1e-5 容差写明）/ 单调分段 / 逐位确定性 / 回绕。
+- **插件接线**（`iris-engine` `DayNightPlugin`，已含于
+  `DefaultPlugins`，RenderPlugin 之后）：Update 阶段并行系统把
+  sun_direction / sun_envelope / ambient_envelope 写进
+  `DirectionalLight` 的 direction（**= −sun，光传播方向换算**）/
+  color / intensity / ambient 四字段；`shadows` / `shadow_range`
+  不动；SkySettings / FogSettings 不自动联动（§8.49）。**缺席语义**：
+  `DayNightCycle` 缺席 = 零操作（方向光逐位零触碰——headless 测试
+  实证）；方向光缺席 = 相位照常推进；Time 缺席 = dt 0。
+- **全局风场**（`iris-core::wind`，**接口轮——诚实声明在案**）：R82
+  粒子 v2 / R90–R91 毛发 / R92 降水 / 闭合池布料与植被四线的共用采样
+  接口，v1 引擎内无消费者（`DefaultPlugins` 不注册 `Wind`，消费姿势
+  写进模块头文档）。`wind_sample(wind, pos, t)` = 恒风（水平单位风向
+  × strength）+ 阵风调制（`1 + gustiness × g`，g ∈ [−1, 1] 为 (x, z,
+  t) 格点三线性值噪声，格点值 = splitmix64 哈希流——`particles.rs`
+  mix64 范式移植，量化步长 2 m / 0.25 s 定稿写明，五次平滑插值 C2
+  连续）。单测 10 项：逐位确定性 / strength 0 → 精确零向量 /
+  gustiness 0 → 恒风逐位 / 异 seed 异场 / 构造上界
+  `strength × (1 + |gustiness|)` / 零方向安全退化 / 时间空间连续性 +
+  格点角点锚定 / smootherstep 端点单调。
+- **快照**：`examples/daynight_snapshot.rs`（2×2：日出 0.04 | 正午
+  0.25 / 黄昏 0.46 | 午夜 0.75，环形箱体山野 + 大气天空 + 适度雾 +
+  `EnvironmentSettings intensity 0` 关 IBL——环境下限包络才是夜景
+  唯一底光）→ `docs/daynight.png`：正午地面 427 vs 午夜 74
+  （Δ353 ≫ 阈值 40）、黄昏太阳侧 R−B = 90 可判别、午夜地面 74 不
+  黑屏、四相位 FNV 双会话逐字节一致。
+- **诚实限制**（ARCHITECTURE §8.49 / §3.12）：星空 / 月亮不做；
+  SkySettings / FogSettings 不随相位自动联动；Wind v1 无引擎内消费者
+  （接口轮）；相位推进 dt 积分（可变步长 dt 序列不可复现——回放走
+  固定步长）；太阳弧单平面无季节倾角模型；阵风只调幅值不旋风向、
+  高度无关、单八度；包络艺术化分段线性非物理量纲。
+
 ### Added（R79：天空 v2 + 大气散射 + 体积雾——解析单次散射 × 链头光线步进）
 
 路线图 v5 第二梯队首轮（环境底座）。`iris-render` 新增**程序化大气
