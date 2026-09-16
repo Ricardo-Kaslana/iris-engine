@@ -74,6 +74,10 @@ pub(crate) struct PipelineBundle {
     /// `ao_layout`（组 0 = 参数 uniform + 上帧深度副本，textureLoad 读取），
     /// 见 `shaders/ao.wgsl` 与 post.rs 的 AoSettings。
     pub ao_pipeline: wgpu::RenderPipeline,
+    /// 体积雾管线（R79）：后处理链头的全屏 pass——链头 HDR + 上帧深度
+    /// 副本光线步进，组 0 复用 `post_depth_layout`（与 DOF / MB 同构），
+    /// 见 `shaders/fog.wgsl` 与 fog.rs 的 FogSettings。
+    pub fog_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
@@ -154,6 +158,15 @@ pub(crate) struct PipelineBundle {
     /// GTAO 组布局（R77）：binding 0 = 参数 uniform（32B AoParamsRaw）、
     /// 1 = 上帧场景深度副本（R32Float 非过滤，textureLoad 读取）。
     pub ao_layout: wgpu::BindGroupLayout,
+    /// 天空盒组布局（R79）：binding 0 = Globals uniform（640B，与
+    /// `globals_layout` 的 binding 0 同缓冲）、4 = 预滤波环境立方体贴图、
+    /// 6 = 过滤采样器（三者与 globals 组同资源）、**7 = SkyParams uniform
+    /// （64B，R79 大气散射）**。sky/probe_sky 两条管线由此专用布局驱动
+    /// （globals 组的 binding 7 已是点光 cubemap 阴影贴图，不能在原布局
+    /// 上扩号——专用布局让 skybox.wgsl 的 binding 编号 0/4/6/7 与声明
+    /// 逐一对齐，Globals 并行前缀结构零触碰）。绑定组由
+    /// `build_sky_bind_group` 在全部天空绘制点创建。
+    pub sky_layout: wgpu::BindGroupLayout,
     /// TAA 组布局（R60）：`post_depth_layout` 的基础上再多一路
     /// binding 4 = 上帧历史纹理（Rgba16Float，可过滤——历史重投影采样
     /// 在亚纹素位置，线性过滤是其定义的一部分）。
@@ -886,13 +899,61 @@ pub(crate) fn create_pipeline(
 
     // 天空盒：全屏三角形按像素射线采样预滤波环境贴图 0 级 mip（= 原始天空）。
     // 主 pass 内最先绘制；深度只测不写（Always + write false），几何体随后覆盖。
+    // R79：管线布局换成专用 `sky_layout`（bindings 0/4/6 同资源 + 7 =
+    // SkyParams uniform 大气参数），skybox.wgsl 的绑定声明与布局逐一对齐。
     let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("iris.shader.skybox"),
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/skybox.wgsl").into()),
     });
+    let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.sky"),
+        entries: &[
+            // Globals uniform（640B）——与 globals_layout 的 binding 0 同
+            // 资源同布局（skybox.wgsl 的并行 Globals 前缀声明一字未动）
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 预滤波环境立方体贴图（旧渐变路径的采样源，mode = 0）
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::Cube,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // SkyParams uniform（64B，R79 大气散射——缺席 = 全零哑参数，
+            // mode = 0 死码分支）
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
     let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("iris.sky.pipeline.layout"),
-        bind_group_layouts: &[Some(&globals_layout)],
+        bind_group_layouts: &[Some(&sky_layout)],
         immediate_size: 0,
     });
     let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1580,6 +1641,16 @@ pub(crate) fn create_pipeline(
         cache: None,
     });
 
+    // 体积雾（R79）：链头全屏 pass——组 0 与 DOF / MB 同构（post_depth_
+    // layout：参数 uniform + 链头色 + 采样器 + 非过滤深度副本），目标 =
+    // HDR 全分辨率槽（链上中间 pass 同构）。着色器做逐像素 16 步光线
+    // 步进（算法与缺席语义见 fog.rs 模块文档与 ARCHITECTURE §4.36）。
+    let fog_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.fog"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fog.wgsl").into()),
+    });
+    let fog_pipeline = make_post_depth_pipeline("iris.pipeline.fog", &fog_shader, "fs_main");
+
     // TAA（R60）：组布局在 post_depth_layout 基础上再加 binding 4 = 上帧
     // 历史（Rgba16Float 可过滤）；目标 = 本帧历史槽（HDR 格式，与链上
     // 其他中间 pass 同构）。编码走 post.rs 的 encode_taa_pass。
@@ -2154,6 +2225,7 @@ pub(crate) fn create_pipeline(
         taa_pipeline,
         occlusion_pipeline,
         ao_pipeline,
+        fog_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,
@@ -2164,6 +2236,7 @@ pub(crate) fn create_pipeline(
         post_depth_layout,
         taa_layout,
         ao_layout,
+        sky_layout,
         ui_layout,
         particle_layout,
         decal_layout,

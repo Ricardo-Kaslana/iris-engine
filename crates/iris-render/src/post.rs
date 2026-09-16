@@ -481,6 +481,50 @@ pub fn ao_visibility(occlusion: f32, intensity: f32) -> f32 {
     (1.0 - occlusion).clamp(0.0, 1.0).powf(intensity.max(0.0))
 }
 
+// ---------- 天空 v2（R79，资源缺席 = 旧渐变天空逐位不变） ----------
+
+/// 程序化大气散射天空设置（R79）。`skybox.wgsl` 的片元在 mode = 1 时按
+/// **片元内解析单次散射**（无 LUT——确定性零基础设施的裁定，质量对照旧
+/// 渐变量级提升；LUT 路线留闭合池）计算 Rayleigh + Mie 散射与 HDR 太阳盘，
+/// mode = 0（资源缺席或 [`Self::atmosphere`] = false）走旧 env cubemap
+/// 采样路径——与引入前逐位一致（零开销默认路径，全部既有 GPU FNV 基线
+/// 原值通过）；`DefaultPlugins` 不注册本资源。
+///
+/// **捕获相机同样生效**：天空参数经 skybox 组 binding 7 的 uniform 进入
+/// 同一着色器，反射探针看到的天空与主相机一致（同源渲染是特性不是限制；
+/// 但 IBL env cubemap 仍是旧渐变内容——大气不联动反射与环境光，见
+/// ARCHITECTURE §8.48）。
+///
+/// 算法（平面指数大气 + Kasten 风格气团近似）与诚实限制（艺术化解析近似
+/// 非物理量纲、行星曲率不可测等）见 ARCHITECTURE §4.36。
+#[derive(Clone, Copy, Debug, iris_core::Resource)]
+pub struct SkySettings {
+    /// 是否启用大气散射（`Default = false`，与「缺席 = 旧渐变天空」语义
+    /// 一致）。
+    pub atmosphere: bool,
+    /// Rayleigh（分子瑞利散射）项强度倍率。1.0 = 校准基线；0 = 关蓝天。
+    pub rayleigh_strength: f32,
+    /// Mie（气溶胶米氏散射）项强度倍率（太阳周向光晕的来源）。
+    pub mie_strength: f32,
+    /// 太阳盘 HDR 强度（盘面在色调映射前叠加 `sun_disk_intensity ×
+    /// 太阳色 × 盘内 smoothstep`；32 ≈ ACES 后近白且参与泛光）。
+    pub sun_disk_intensity: f32,
+    /// 地平线以下的淡出色（世界空间 ray.y < 0 的视线按仰角淡到此色）。
+    pub ground_color: glam::Vec3,
+}
+
+impl Default for SkySettings {
+    fn default() -> Self {
+        Self {
+            atmosphere: false,
+            rayleigh_strength: 1.0,
+            mie_strength: 1.0,
+            sun_disk_intensity: 32.0,
+            ground_color: glam::Vec3::new(0.05, 0.05, 0.06),
+        }
+    }
+}
+
 /// TAA（时域抗锯齿）设置（R60）。后处理链首的 HDR 域时域累加：主相机
 /// 投影按 Halton(2,3) 8 点序列做亚像素抖动，TAA pass 用当前帧抖动色 +
 /// 深度副本 + 上帧历史做相机重投影与 3×3 邻域钳制混合（详见
@@ -956,6 +1000,84 @@ pub(crate) fn full_chain_slots(dof_on: bool, mb_on: bool, vignette_on: bool) -> 
         head,
         vignette_dst,
         blit_hdr,
+    }
+}
+
+/// 体积雾入链后的全链槽位（R79）。`slots` = 下游链（DOF/MB/暗角/blit）
+/// 实际消费的槽位表——雾关闭时与 [`full_chain_slots`] 的返回**逐字段相同**
+/// （渲染器走旧路径，命令流与 R78 逐位一致）；雾开启时整体轮转（见
+/// [`full_chain_slots_with_fog`]）。`fog_dst` = 雾 pass 的目标槽位
+/// （`None` = 雾不入链）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FogChainSlots {
+    /// 下游链槽位（雾关 = 既有拓扑原样；雾开 = 轮转后的拓扑）。
+    pub slots: FullChainSlots,
+    /// 雾 pass 目标槽位（恒全分辨率 A 槽；`None` = 雾不入链）。
+    pub fog_dst: Option<PingPongSlot>,
+}
+
+/// 全分辨率链的槽位分配（含体积雾，R79；纯函数，单测见模块尾）。
+///
+/// **旧函数零改动的红线**：[`full_chain_slots`] 及其既有单测保持原样，
+/// 本函数单点定义雾开启后的新拓扑——雾槽 = 全分辨率 A 槽，插在链头
+/// （链源 → 雾 → 其余原序）。槽位只有 A/B 一对，雾占据 A 的「场景级」
+/// 位置后整条相机级链顺移一格（A→B→A 轮转）：
+///
+/// - 雾：链源（主解析缓冲 / TAA 输出）→ **A**；
+/// - DOF：雾输出（A）→ **B**；
+/// - MB：源 = DOF 输出（B，DOF 开）或雾输出（A，DOF 关），目标恒写
+///   源的**对面**槽（ping-pong 铁律）；
+/// - 链头 = 最后入链 pass 的输出（全关时 = 雾输出）；暗角写链头对面槽
+///   （与旧规则同式），blit 源 = 暗角输出（暗角开）或链头。
+///
+/// 每种组合下「pass 读的槽位 ≠ 自己写的槽位」且「读到的槽位内容是该
+/// pass 链上前驱的最新输出」——拓扑不变量由新增单测守护。
+pub(crate) fn full_chain_slots_with_fog(
+    dof_on: bool,
+    mb_on: bool,
+    vignette_on: bool,
+    fog_on: bool,
+) -> FogChainSlots {
+    let base = full_chain_slots(dof_on, mb_on, vignette_on);
+    if !fog_on {
+        return FogChainSlots {
+            slots: base,
+            fog_dst: None,
+        };
+    }
+    let fog_dst = Some(PingPongSlot::A);
+    let dof_dst = dof_on.then_some(PingPongSlot::B);
+    // MB：源 = DOF 输出（DOF 开）或雾输出（DOF 关），写对面槽
+    let (mb_src, mb_dst) = if mb_on {
+        match dof_dst {
+            Some(PingPongSlot::B) => (Some(PingPongSlot::B), Some(PingPongSlot::A)),
+            _ => (Some(PingPongSlot::A), Some(PingPongSlot::B)),
+        }
+    } else {
+        (None, None)
+    };
+    let head = if mb_on {
+        mb_dst
+    } else if dof_on {
+        dof_dst
+    } else {
+        fog_dst
+    };
+    let vignette_dst = vignette_on.then_some(match head {
+        Some(PingPongSlot::A) => PingPongSlot::B,
+        _ => PingPongSlot::A,
+    });
+    let blit_hdr = if vignette_on { vignette_dst } else { head };
+    FogChainSlots {
+        slots: FullChainSlots {
+            dof_dst,
+            mb_src,
+            mb_dst,
+            head,
+            vignette_dst,
+            blit_hdr,
+        },
+        fog_dst,
     }
 }
 
@@ -1591,6 +1713,98 @@ mod tests {
             let v = ao_visibility(occ, 1.5);
             assert!(v <= prev, "可见度必须单调不增：occ = {occ}");
             prev = v;
+        }
+    }
+
+    // ---- 体积雾链拓扑（R79） ----
+
+    /// 雾关闭 = 既有拓扑**逐字段相同**（渲染器走旧路径的根据——命令流
+    /// 与 R78 逐位一致）+ 雾槽恒 `None`。
+    #[test]
+    fn fog_chain_slots_off_matches_legacy_exactly() {
+        for dof_on in [false, true] {
+            for mb_on in [false, true] {
+                for vignette_on in [false, true] {
+                    let legacy = full_chain_slots(dof_on, mb_on, vignette_on);
+                    let with_fog = full_chain_slots_with_fog(dof_on, mb_on, vignette_on, false);
+                    assert_eq!(
+                        with_fog,
+                        FogChainSlots {
+                            slots: legacy,
+                            fog_dst: None,
+                        },
+                        "雾关闭必须与既有 full_chain_slots 逐字段相同：dof={dof_on} mb={mb_on} vig={vignette_on}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 雾开启的全部 8 种组合的拓扑不变量：
+    /// 1. 雾槽恒全分辨率 A；
+    /// 2. 任一 pass 的源槽位 ≠ 目标槽位（ping-pong 铁律）；
+    /// 3. 链连续：链源 → 雾(A) → DOF(B) → MB(对面槽) → (泛光/暗角读链头)
+    ///    → blit——每个下游 pass 的源槽位内容 = 其链上前驱的最新输出；
+    /// 4. 暗角写链头对面槽；blit 源 = 暗角输出（暗角开）或链头。
+    #[test]
+    fn fog_chain_slots_invariants_for_all_combinations() {
+        for dof_on in [false, true] {
+            for mb_on in [false, true] {
+                for vignette_on in [false, true] {
+                    let s = full_chain_slots_with_fog(dof_on, mb_on, vignette_on, true);
+                    let label = format!("dof={dof_on} mb={mb_on} vig={vignette_on}");
+                    assert_eq!(
+                        s.fog_dst,
+                        Some(PingPongSlot::A),
+                        "雾槽恒 A（场景级位置）：{label}"
+                    );
+                    // 雾读链源（主解析缓冲 / TAA 输出，不在 A/B 槽）、写 A
+                    // ——DOF 的源必须是雾输出
+                    if let Some(dof_dst) = s.slots.dof_dst {
+                        assert_eq!(s.fog_dst, Some(PingPongSlot::A), "雾槽恒 A：{label}");
+                        assert_ne!(dof_dst, PingPongSlot::A, "DOF 读写同槽：{label}");
+                        assert_eq!(dof_dst, PingPongSlot::B, "DOF 槽位约定 = B：{label}");
+                    }
+                    // MB：源 = DOF 输出（DOF 开）或雾输出（DOF 关），目标
+                    // 恒为源的对面槽
+                    if let Some(mb_dst) = s.slots.mb_dst {
+                        let mb_src = s.slots.mb_src.expect("MB 入链必有源槽位");
+                        assert_ne!(mb_dst, mb_src, "MB 读写同槽：{label}");
+                        let expected_src = if dof_on {
+                            PingPongSlot::B
+                        } else {
+                            PingPongSlot::A
+                        };
+                        assert_eq!(mb_src, expected_src, "MB 源 = DOF 输出 / 雾输出：{label}");
+                    }
+                    // 链头 = 最后入链 pass 的输出
+                    let expected_head = if mb_on {
+                        s.slots.mb_dst
+                    } else if dof_on {
+                        s.slots.dof_dst
+                    } else {
+                        s.fog_dst
+                    };
+                    assert_eq!(s.slots.head, expected_head, "链头定义：{label}");
+                    // 暗角写链头对面槽（同 pass 读写互斥）
+                    if let Some(dst) = s.slots.vignette_dst {
+                        assert_ne!(
+                            Some(dst),
+                            s.slots.head,
+                            "暗角与链头同槽（同 pass 读写冲突）：{label}"
+                        );
+                    }
+                    assert_eq!(
+                        s.slots.blit_hdr,
+                        if vignette_on {
+                            s.slots.vignette_dst
+                        } else {
+                            s.slots.head
+                        },
+                        "blit 源 = 暗角输出（暗角开）或链头：{label}"
+                    );
+                }
+            }
         }
     }
 }

@@ -5,6 +5,55 @@
 
 ## [Unreleased]
 
+### Added（R79：天空 v2 + 大气散射 + 体积雾——解析单次散射 × 链头光线步进）
+
+路线图 v5 第二梯队首轮（环境底座）。`iris-render` 新增**程序化大气
+散射天空**（`SkySettings`）与**逐像素体积雾**（`FogSettings`），全部
+走「资源缺席 = 像素与命令流逐位不变」兼容形态（`DefaultPlugins` 不
+注册；全部既有 GPU FNV 基线零改动原值通过）。
+
+- **大气散射天空**（`shaders/skybox.wgsl`，片元内解析单次散射——无
+  LUT，确定性零基础设施裁定，LUT 路线留闭合池）：平面指数大气 +
+  Kasten 风格气团近似的 Rayleigh + Mie（Cornette-Shanks，g = 0.76）
+  + 解析积分 `∫₀^D e^(−σt)dt = (1−T)/σ` 逐通道闭合 + HDR 太阳盘
+  （smoothstep 双阈，乘太阳路径透射——日落红化）+ 地平线以下淡出。
+  β_R 蓝端 33.1→52e-6 艺术化增强补饱和、亮度以 `SKY_INTENSITY = 48`
+  常量折算到本仓 HDR 域（非物理量纲，诚实声明见 §8.48④）。
+- **sky 组 binding 7 与专用布局**：`SkyParams` uniform（64B，含
+  Rust 侧 static assert）挂在**新建专用 `sky_layout`**（bindings
+  0/4/6 与 globals 组同资源）——globals 组 7 号已是点光 cubemap 阴影
+  贴图不能扩号，`sky` / `probe_sky` 两条管线换用该布局，Globals 并行
+  前缀结构**一字未动**（看门单测保持绿）。天空绑定组在全部三个创建
+  点生成（主相机初建 / env 重烘焙重建 / 六捕获面）；mode = 0 帧渲染器
+  **不发 write_buffer**（缓冲零初始化 = 死码分支）。捕获相机同样生效
+  （探针内天空与主视口同源——特性）；IBL env 不联动（§8.48③）。
+- **体积雾**（新 `shaders/fog.wgsl` + 新模块 `fog.rs`）：链头全屏
+  pass（主 pass / TAA 之后、DOF / MB / 泛光之前），逐像素 16 步
+  发射-吸收积分（起点像素哈希抖动去条带），密度场 =
+  `density·exp(−(h−offset)·falloff)`、HG 相位（g 钳 ±0.999）、
+  天空像素射线长取 `max_distance`；组布局复用 `post_depth_layout`，
+  深度 = scene_depth **链上同帧**消费（与 DOF / MB 同款；**对规格
+  偏离声明**：原规格按 SSR/AO 直觉写「上帧语义」，核实编码器顺序后
+  确认链上消费者读到本帧深度，按实际情况记录不虚构滞后限制——
+  §8.48①）。CPU 纯函数（`fog_density_at` / `fog_phase_hg` /
+  `fog_dither` / `fog_transmittance`）与 WGSL 逐行镜像、单测全带
+  （解析解 / 端点 / 单调 / 抖动分散性）；`FOG_STEPS` 常量导出。
+- **槽位拓扑**：新纯函数 `full_chain_slots_with_fog` 单点定义雾开
+  拓扑（雾占全分辨率 A、相机级链 A→B→A 轮转）；旧 `full_chain_slots`
+  及其既有单测**零改动**，雾关时新函数返回值与旧函数逐字段相同。
+- **测试**：CPU 纯函数 + Default 语义 9 项（fog.rs）+ 链拓扑 2 项
+  （post.rs）；GPU 5 项（`tests/sky_fog_render.rs`，GPU_SERIAL 串行：缺席与显式
+  关两两逐位 / 雾距单调（纯消光隔离，远墙 ≥ 2× 近墙）/ 相机升高雾
+  变薄 / 大气色移 + 太阳盘可判别 / 双会话逐位含物体运动 + `phase_g`
+  变哈希防恒等）。快照 example `sky_fog_snapshot.rs`（2×2：旧渐变 |
+  大气抬头构图 / 平视雾关 | 雾开，跨运行逐字节一致）→
+  `docs/sky_fog.png`。
+- **诚实限制**（ARCHITECTURE §8.48）：雾深度与 DOF/MB 同帧（偏离
+  声明）；捕获 / RT 相机不吃雾；IBL env cubemap 不与大气联动（反射
+  与环境光仍是旧渐变内容——联动属探针重烘焙，R83/GI 线）；大气为
+  艺术化解析近似非物理量纲；雾不参与 TAA 抖动前处理；max_distance
+  截断。
+
 ### Added（R78：SpotLight + 前向光源分箱——CPU 屏幕空间 tile 分箱 × storage 灯表 × 双路径位等价）
 
 路线图 v5 第一梯队收官轮（战斗底座）。`iris-render` 新增 **SpotLight

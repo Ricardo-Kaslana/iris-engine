@@ -577,6 +577,18 @@ pub struct Renderer {
     /// 此字段保持纹理存活）。`SkySource` 资源变更时整体重烘焙替换。
     #[allow(dead_code)]
     env: crate::environment::EnvironmentMaps,
+    /// 大气散射天空参数缓冲（R79，64B SkyParamsRaw，sky 组 binding 7）。
+    /// 缺席 / 关闭帧不写（保持零初始化 mode = 0 死码分支——命令流与
+    /// R78 逐位一致）。
+    sky_params_buf: wgpu::Buffer,
+    /// 主相机天空绑定组（R79，`sky_layout`：Globals + env + 采样器 +
+    /// SkyParams）。env 重烘焙（视图更换）时随 `rebuild_globals_bind_group`
+    /// 一并重建。
+    sky_bg: wgpu::BindGroup,
+    /// 探针捕获面的天空绑定组（R79，每面一份——面 Globals 缓冲不同；
+    /// 与 `probe_face_globals_bgs` 同生命周期，探针内的天空与主视口
+    /// 同一 `skybox.wgsl` 同一参数——大气对捕获相机同样生效）。
+    probe_face_sky_bgs: [wgpu::BindGroup; 6],
     /// 已烘焙环境源对应的 generation（0 = 程序化天空；与 `SkySource`
     /// 资源上的 generation 不一致时在下一帧 `draw` 触发重烘焙）。
     env_baked_generation: u64,
@@ -750,6 +762,8 @@ struct HdrTargets {
     dof_params: wgpu::Buffer,
     /// 运动模糊参数缓冲（MbParamsRaw 布局；pass 关闭时不写）。
     motion_blur_params: wgpu::Buffer,
+    /// 体积雾参数缓冲（R79，FogParamsRaw 布局；pass 关闭时不写）。
+    fog_params: wgpu::Buffer,
     /// blit 合成参数（16B，PostParamsRaw：x 泛光强度 / y 曝光 / z 暗角 /
     /// w 保留）。每帧整体覆写。
     post_params: wgpu::Buffer,
@@ -1072,6 +1086,71 @@ struct AoParamsRaw {
 const _: () = assert!(
     std::mem::size_of::<AoParamsRaw>() == 32,
     "AoParams 必须与 WGSL 布局一致"
+);
+
+/// 与 WGSL `SkyParams` 对齐（64 字节，POD）：大气散射天空参数（R79，
+/// skybox 组 binding 7——专用 `sky_layout`，Globals 并行前缀零触碰）。
+/// 缺席 / `SkySettings.atmosphere = false` 时**不写**此缓冲（保持 wgpu
+/// 零初始化 = mode 0 死码分支），命令流与 R78 逐位一致。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyParamsRaw {
+    /// x: mode（0 旧渐变 / env 采样，1 大气解析散射）, y: Rayleigh 强度,
+    /// z: Mie 强度, w: 太阳盘 HDR 强度。
+    mode_params: [f32; 4],
+    /// xyz: 单位太阳方向（世界空间，= −light_dir 归一化）, w: 太阳盘
+    /// smoothstep 内阈 cos（0.99985）。
+    sun_dir: [f32; 4],
+    /// rgb: 太阳辐照色（线性 HDR = light.color × intensity）, w: 太阳盘
+    /// smoothstep 外阈 cos（0.99995）。
+    sun_color: [f32; 4],
+    /// rgb: 地平线以下淡出色, w: 天空整体强度校准（SKY_INTENSITY = 48.0
+    /// ——物理量级的散射亮度折算到本仓 HDR 域的常量）。
+    ground: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<SkyParamsRaw>() == 64,
+    "SkyParams 必须与 WGSL 布局一致（64B）"
+);
+
+/// 太阳盘 smoothstep 内阈 cos（约 0.99° 视半径——真实太阳 0.26° 过小，
+/// 艺术化放大；外阈 0.99995 给盘缘一圈软过渡）。
+const SKY_DISK_COS_INNER: f32 = 0.999_85;
+
+/// 太阳盘 smoothstep 外阈 cos。
+const SKY_DISK_COS_OUTER: f32 = 0.999_95;
+
+/// 天空整体强度校准常量（CPU 传入 SkyParams.ground.w）：散射积分沿用
+/// 物理量级的系数（β_R ~1e-5/m 量级 ⇒ 天空辐射 ~1e-5 × 太阳辐照），
+/// 本仓 HDR 域以方向光强度 1 ≈ 画面白为锚，乘本常量把天顶亮度抬到
+/// ~0.3–0.4、地平线 ~2.5（ACES 后的常规白日天空观感）。
+const SKY_INTENSITY: f32 = 48.0;
+
+/// 与 WGSL `FogParams` 对齐（160 字节，POD）：体积雾 pass 参数（R79）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FogParamsRaw {
+    /// 主相机（proj × view）⁻¹——NDC → 世界重建（与 MB 同矩阵同口径）。
+    inv_view_proj: [[f32; 4]; 4],
+    /// xyz: 相机世界位, w: 保留。
+    eye: [f32; 4],
+    /// xyz: 单位太阳方向（= −light_dir 归一化）, w: 保留。
+    sun_dir: [f32; 4],
+    /// rgb: 太阳辐照色（线性 HDR），w: 保留。
+    sun_color: [f32; 4],
+    /// x: 零高度消光密度, y: 高度衰减, z: 高度偏移, w: 内散射强度。
+    a: [f32; 4],
+    /// x: HG 相位 g（钳 ±0.999）, y: 步进距离上限, z: 远平面（深度副本
+    /// 天空清空值）, w: a_coef（z_ndc = a − b/d 的 a）。
+    b: [f32; 4],
+    /// x: b_coef（z_ndc = a − b/d 的 b）, y/z/w: 保留。
+    c: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<FogParamsRaw>() == 160,
+    "FogParams 必须与 WGSL 布局一致（160B：mat4 + 6×vec4）"
 );
 
 /// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
@@ -1431,6 +1510,60 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 17,
                 resource: screen.bins_tiles.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+/// 天空绑定组（R79）的共享要素：Globals 缓冲 + 预滤波环境视图 + SkyParams
+/// 缓冲。主相机（`globals_buf`）与六个捕获面（`probe_face_globals_bufs`）
+/// 共用本清单——天空绘制点全部经 `build_sky_bind_group` 创建绑定组，
+/// 避免条目清单漂移。
+struct SkyBindResources<'a> {
+    globals: &'a wgpu::Buffer,
+    sky_params: &'a wgpu::Buffer,
+}
+
+/// 构建天空绑定组（R79）：`sky_layout` 的四个 binding（0 = Globals
+/// uniform、4 = 预滤波环境立方体贴图、6 = 过滤采样器、7 = SkyParams）。
+/// 采样器描述与 `build_globals_bind_group` 的 env 采样器逐字段一致
+///（ClampToEdge + Linear + Nearest mipmap）——mode = 0 路径采样行为与
+/// 既有 globals 组逐位一致（缺席帧 FNV 基线的保证）。
+fn build_sky_bind_group(
+    gpu: &Gpu,
+    bundle: &crate::pipeline::PipelineBundle,
+    env: &crate::environment::EnvironmentMaps,
+    resources: SkyBindResources<'_>,
+) -> wgpu::BindGroup {
+    let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("iris.sky.env_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("iris.sky.bg"),
+        layout: &bundle.sky_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: resources.globals.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&env.prefiltered_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: resources.sky_params.as_entire_binding(),
             },
         ],
     })
@@ -2513,6 +2646,27 @@ impl Renderer {
                 },
             )
         });
+        // 大气散射天空（R79）：64B 参数缓冲（零初始化 = mode 0 死码分支
+        // ——缺席帧一个 write_buffer 都不发，命令流与 R78 逐位一致）+
+        // 每捕获面一份天空绑定组（与面 Globals 缓冲一一对应——探针内的
+        // 天空与主视口同一着色器同一参数）。
+        let sky_params_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.sky.params"),
+            size: std::mem::size_of::<SkyParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let probe_face_sky_bgs: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
+            build_sky_bind_group(
+                &gpu,
+                &bundle,
+                &env,
+                SkyBindResources {
+                    globals: &probe_face_globals_bufs[face],
+                    sky_params: &sky_params_buf,
+                },
+            )
+        });
 
         // 内置 0 号白色兜底纹理：材质未指定贴图时使用
         let white = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -2800,6 +2954,17 @@ impl Renderer {
             },
             ssr_main_res,
         );
+        // 主相机天空绑定组（R79）：与 globals 组同 env / 同 Globals 缓冲，
+        // 多一路 SkyParams（mode = 0 旧路径——缺席帧 FNV 基线的保证）
+        let sky_bg = build_sky_bind_group(
+            &gpu,
+            &bundle,
+            &env,
+            SkyBindResources {
+                globals: &globals_buf,
+                sky_params: &sky_params_buf,
+            },
+        );
         // 粒子相机 uniform + 绑定组（粒子管线的组 1；内容每帧有粒子时覆写）
         let particle_camera_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("iris.particle.camera"),
@@ -2883,6 +3048,9 @@ impl Renderer {
             probe_raw_depth_face_views,
             probe_face_globals_bufs,
             probe_face_globals_bgs,
+            sky_params_buf,
+            sky_bg,
+            probe_face_sky_bgs,
             probe_dummy_tex,
             probe_dummy_view,
             probe_instance_buf: None,
@@ -2980,6 +3148,18 @@ impl Renderer {
                 cube_view: &self.probe_cube_view,
             },
             self.ssr_main_resources(),
+        );
+        // 天空绑定组（R79）随重建同步更新：env 重烘焙会更换 prefiltered
+        // 视图，sky 组的 binding 4 必须跟着指向新视图（Globals / SkyParams
+        // 缓冲不变，仅视图与采样器重建）。
+        self.sky_bg = build_sky_bind_group(
+            &self.gpu,
+            &self.bundle,
+            &self.env,
+            SkyBindResources {
+                globals: &self.globals_buf,
+                sky_params: &self.sky_params_buf,
+            },
         );
     }
 
@@ -3190,6 +3370,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // 体积雾参数（R79）：160B（矩阵 + 相机/太阳 + 三组标量）
+        let fog_params = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.fog.params"),
+            size: std::mem::size_of::<FogParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let post_sampler = self
             .gpu
             .device
@@ -3217,6 +3404,7 @@ impl Renderer {
             vignette_params,
             dof_params,
             motion_blur_params,
+            fog_params,
             post_params,
             fxaa: None,
             taa: None,
@@ -3738,9 +3926,10 @@ impl Renderer {
                     multiview_mask: None,
                 });
                 // 天空（含天空决策，见方法文档）：同一 skybox.wgsl，面矩阵的
-                // 逆给出该像素在立方体面上的方向
+                // 逆给出该像素在立方体面上的方向。R79 起用专用 sky 绑定组
+                // （大气参数与主相机同一份——探针里的天空与主视口同源）
                 pass.set_pipeline(&self.bundle.probe_sky_pipeline);
-                pass.set_bind_group(0, &self.probe_face_globals_bgs[face], &[]);
+                pass.set_bind_group(0, &self.probe_face_sky_bgs[face], &[]);
                 pass.draw(0..3, 0..1);
                 // 不透明几何（捕获变体：单采样 Rgba16Float 目标 + cull None——
                 // 面矩阵的 NDC y 翻转会反转环绕方向，Back 剔除会剔错面）
@@ -4268,7 +4457,12 @@ impl Renderer {
             .unwrap_or_default();
         let dof_on = dof.enabled;
         let mb_on = mb.enabled;
-        if vignette_strength > 0.0 || dof_on || mb_on {
+        // 体积雾（R79）：开启语义在此先读（按需资源分配的前置裁决），
+        // 参数在链编码段复用。缺席/关闭 = 不分配、不编码 pass、不写参数
+        // （零开销默认路径，链拓扑走 full_chain_slots 旧函数）。
+        let fog_settings = world.try_resource::<crate::fog::FogSettings>().map(|f| *f);
+        let fog_on = fog_settings.is_some_and(|f| f.enabled);
+        if vignette_strength > 0.0 || dof_on || mb_on || fog_on {
             self.ensure_full_targets(width, height);
         }
         if dof_on || mb_on {
@@ -4333,6 +4527,14 @@ impl Renderer {
         } else {
             false
         };
+        // 体积雾深度副本（R79）：与 DOF / MB 同款链上消费，同一编码器内
+        // 副本在雾 pass 之前编码，读到本帧深度。分配在 hdr 不可变借用建
+        // 立之前（与 TAA/DOF/MB/SSR/AO 同款纪律）。
+        if fog_on {
+            self.ensure_scene_depth(width, height);
+        }
+        // 天空大气（R79）：只读开关（参数缓冲恒存在，缺席/关闭帧不写）。
+        let sky_settings = world.try_resource::<crate::post::SkySettings>().map(|s| *s);
         // binding 14 的指向裁决变化（开 ↔ 关）或可见度图（重）建 ⇒ 全局
         // 绑定组需要重新编码（与 SSR 上帧资源就位同款重建路径）。
         let ao_bind_changed = self.ao.bind_real != ao_on;
@@ -4770,6 +4972,41 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        // 大气散射天空参数（R79，仅 mode=1 帧写）：缺席 / 关闭帧一个
+        // write_buffer 都不发——缓冲保持零初始化（mode = 0 死码分支），
+        // 命令流与 R78 逐位一致。太阳方向 = −light_dir（Globals.light_dir
+        // 是从光源指向场景的传播方向，太阳视线方向取其反），太阳色 =
+        // light.color × intensity（与 Globals.light_color 同口径）。
+        if let Some(sky) = sky_settings {
+            if sky.atmosphere {
+                let sun_dir = (-light.direction).normalize_or_zero();
+                self.gpu.queue.write_buffer(
+                    &self.sky_params_buf,
+                    0,
+                    bytemuck::bytes_of(&SkyParamsRaw {
+                        mode_params: [
+                            1.0,
+                            sky.rayleigh_strength.max(0.0),
+                            sky.mie_strength.max(0.0),
+                            sky.sun_disk_intensity.max(0.0),
+                        ],
+                        sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, SKY_DISK_COS_INNER],
+                        sun_color: [
+                            light.color.x * light.intensity,
+                            light.color.y * light.intensity,
+                            light.color.z * light.intensity,
+                            SKY_DISK_COS_OUTER,
+                        ],
+                        ground: [
+                            sky.ground_color.x.max(0.0),
+                            sky.ground_color.y.max(0.0),
+                            sky.ground_color.z.max(0.0),
+                            SKY_INTENSITY,
+                        ],
+                    }),
+                );
+            }
+        }
         // 分箱真缓冲上传（R78，仅 mode=1）：mode=0 帧一个 write_buffer
         // 都不发（零开销默认路径，命令流与 R77 一致）。分箱矩阵用主相机
         // 最终 view_proj（含 TAA 抖动——与片元实际所见同一投影）。
@@ -5568,9 +5805,12 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // 天空盒背景最先绘制（深度只读，几何体随后覆盖）
+            // 天空盒背景最先绘制（深度只读，几何体随后覆盖）。R79 起
+            // 用专用 sky 绑定组（sky_layout：Globals + env + SkyParams），
+            // 随后几何切回 globals 组——mode = 0 时采样行为与旧 globals
+            // 组逐位一致。
             pass.set_pipeline(&self.bundle.sky_pipeline);
-            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(0, &self.sky_bg, &[]);
             pass.draw(0..3, 0..1);
             pass.set_pipeline(&self.bundle.pipeline);
             pass.set_bind_group(0, &self.globals_bg, &[]);
@@ -6002,7 +6242,9 @@ impl Renderer {
         // GTAO（R77）是副本的第四个消费者（主 pass **之前**读上一帧）：
         // `ao_depth_frame` 记录本帧副本已跑——下一帧编号恰好 +1 才允许
         // 编码 AO pass（首帧启用 / 上帧无几何的帧自然落进中性路径）。
-        if (dof_on || mb_on || taa_on || ssr_on || ao_on) && opaque_total > 0 {
+        // 体积雾（R79）是第五个消费者（链头读深度——链上同帧：副本在
+        // 雾 pass 之前编码，读到本帧内容；无记账门）。
+        if (dof_on || mb_on || taa_on || ssr_on || ao_on || fog_on) && opaque_total > 0 {
             self.ao_depth_frame = Some(self.occ_frame);
             let sd = self
                 .scene_depth
@@ -6180,17 +6422,85 @@ impl Renderer {
                 _reserved: 0.0,
             }),
         );
-        // 全分辨率链（DOF / MB / 暗角）的槽位分配：纯函数单点定义（
-        // post.rs，离线单测守护拓扑不变量）。TAA 开启不改变槽位拓扑，
+        // 全分辨率链（雾 / DOF / MB / 暗角）的槽位分配：纯函数单点定义
+        // （post.rs，离线单测守护拓扑不变量）。TAA 开启不改变槽位拓扑，
         // 只把「主解析缓冲」这一源整体替换为本帧 TAA 输出（chain_source
         // 单点定义：有链头槽位取槽位，无链头时 TAA 开 = TAA 输出、关 =
-        // 主解析缓冲——R59 拓扑原样）。
-        let slots = crate::post::full_chain_slots(dof_on, mb_on, vignette_strength > 0.0);
+        // 主解析缓冲——R59 拓扑原样）。雾开启时相机级链 A→B→A 轮转（
+        // full_chain_slots_with_fog 单点定义），雾关时与旧函数逐字段
+        // 相同（命令流与 R78 逐位一致）。
+        let chain_slots =
+            crate::post::full_chain_slots_with_fog(dof_on, mb_on, vignette_strength > 0.0, fog_on);
+        let slots = chain_slots.slots;
+        let fog_dst = chain_slots.fog_dst;
         let scene_or_taa =
             |slot: Option<crate::post::PingPongSlot>| crate::post::chain_source(slot, taa_on);
-        // 链头（泛光与暗角的源）：DOF/MB 输出槽、TAA 输出或主解析缓冲
+        // 链头（泛光与暗角的源）：雾/DOF/MB 输出槽、TAA 输出或主解析缓冲
         let head_input = scene_or_taa(slots.head);
-        // 景深（DOF）：主解析缓冲 → 全分辨率 A 槽。CoC 按逐像素线性视距
+        // 体积雾（R79，链头）：链源（主解析缓冲 / TAA 输出）→ 全分辨率
+        // A 槽。逐像素 16 步光线步进（发射-吸收积分），深度 = 本帧副本
+        // （链上同帧——见 fog.rs 模块文档的偏离声明；天空像素射线长 =
+        // max_distance）。位于 DOF / MB / 泛光之前——雾是场景内容的大气
+        // 调制，理应参与焦外 / 拖影 / 亮度提取（与「相机级效果在 HDR
+        // 线性域」的既有链序同理）。
+        if let Some(fog_slot) = fog_dst {
+            let fog = fog_settings.expect("雾开启时设置必已读取");
+            // 深度 → NDC z 的两个预计算系数（与 MB / TAA 同款，DirectX
+            // [0,1] 约定）：z_ndc = f/(f−n) − (n·f/(f−n))/d
+            let z_den = (z_far - z_near).max(1e-6);
+            let sun_dir = (-light.direction).normalize_or_zero();
+            self.gpu.queue.write_buffer(
+                &hdr.fog_params,
+                0,
+                bytemuck::bytes_of(&FogParamsRaw {
+                    inv_view_proj: vp.inverse().to_cols_array_2d(),
+                    eye: [eye.x, eye.y, eye.z, 0.0],
+                    sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
+                    sun_color: [
+                        light.color.x * light.intensity,
+                        light.color.y * light.intensity,
+                        light.color.z * light.intensity,
+                        0.0,
+                    ],
+                    a: [
+                        fog.density.max(0.0),
+                        fog.height_falloff.max(0.0),
+                        fog.height_offset,
+                        fog.inscatter_strength.max(0.0),
+                    ],
+                    b: [
+                        fog.phase_g.clamp(-0.999, 0.999),
+                        fog.max_distance.max(1e-3),
+                        z_far,
+                        z_far / z_den,
+                    ],
+                    c: [z_near * z_far / z_den, 0.0, 0.0, 0.0],
+                }),
+            );
+            let depth_view = &self
+                .scene_depth
+                .as_ref()
+                .expect("雾开启时应已创建深度副本")
+                .view;
+            let views = hdr.post_views(taa_curr_view);
+            crate::post::encode_post_pass(
+                &mut encoder,
+                &self.gpu.device,
+                &views,
+                &hdr.post_sampler,
+                crate::post::PostPassDesc {
+                    label: "iris.pass.fog",
+                    pipeline: &self.bundle.fog_pipeline,
+                    layout: &self.bundle.post_depth_layout,
+                    params: &hdr.fog_params,
+                    // 源 = 链源：TAA 输出（TAA 开，链首）或主解析缓冲
+                    src: scene_or_taa(None),
+                    dst: crate::post::PostScratchRef::Full(fog_slot),
+                    extra_texture: Some(depth_view),
+                },
+            );
+        }
+        // 景深（DOF）：雾输出（雾开）或主解析缓冲 → 全分辨率槽。CoC 按逐像素线性视距
         // 计算，12-tap 泊松盘 HDR 平均；位于泛光之前（HDR 线性域——焦外
         // 亮源参与亮度提取更物理）。
         if dof_on {
@@ -6231,8 +6541,9 @@ impl Renderer {
                     pipeline: &self.bundle.dof_pipeline,
                     layout: &self.bundle.post_depth_layout,
                     params: &hdr.dof_params,
-                    // 源 = TAA 输出（TAA 开，链首）或主解析缓冲（TAA 关）
-                    src: scene_or_taa(None),
+                    // 源 = 雾输出槽（雾开——链头前插了一级）或链首
+                    // （TAA 输出 / 主解析缓冲）
+                    src: scene_or_taa(fog_dst),
                     dst: crate::post::PostScratchRef::Full(
                         slots.dof_dst.expect("DOF 开启时必有目标槽位"),
                     ),

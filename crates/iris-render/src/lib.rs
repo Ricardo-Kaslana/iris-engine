@@ -82,6 +82,7 @@ pub mod chain_ik;
 pub mod context;
 pub mod decal;
 pub mod environment;
+pub mod fog;
 pub mod foot_ik;
 pub mod frustum;
 pub mod hand_ik;
@@ -142,6 +143,9 @@ pub mod prelude {
     pub use crate::context::Gpu;
     pub use crate::decal::{Decal, DecalInstanceRaw};
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
+    pub use crate::fog::{
+        FOG_STEPS, FogSettings, fog_density_at, fog_dither, fog_phase_hg, fog_transmittance,
+    };
     pub use crate::foot_ik::{FootIk, IkRig, solve_two_bone_ik, update_foot_ik};
     pub use crate::frustum::Frustum;
     pub use crate::hand_ik::{HandIk, IkTarget, update_hand_ik};
@@ -178,10 +182,10 @@ pub mod prelude {
     };
     pub use crate::post::{
         AO_SLICES, AO_STEPS, AoSettings, BloomSettings, DepthOfFieldSettings, ExposureSettings,
-        FxaaSettings, MotionBlurSettings, SsrSettings, TaaSettings, VignetteSettings, ao_dither,
-        ao_falloff, ao_sample_sin, ao_slice_occlusion, ao_uv_offset, ao_view_pos, ao_visibility,
-        halton, jitter_projection, resolve_focus_distance, ssr_edge_fade, ssr_roughness_fade,
-        taa_jitter,
+        FxaaSettings, MotionBlurSettings, SkySettings, SsrSettings, TaaSettings, VignetteSettings,
+        ao_dither, ao_falloff, ao_sample_sin, ao_slice_occlusion, ao_uv_offset, ao_view_pos,
+        ao_visibility, halton, jitter_projection, resolve_focus_distance, ssr_edge_fade,
+        ssr_roughness_fade, taa_jitter,
     };
     pub use crate::probe::{
         MAX_REFLECTION_PROBES, PROBE_CAPTURE_FAR, PROBE_CAPTURE_NEAR, PROBE_DEFAULT_FALLOFF,
