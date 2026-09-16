@@ -58,19 +58,25 @@
 //!   **视差修正**（反射射线 × 盒求交重定向，经典 box projection），域外 /
 //!   无探针回落全局 env；挂光照贴图的实体的镜面也由探针补回（闭合 §8.31④）。
 //!   无探针场景**逐位不变**（FNV-1a 全帧基线锁，见 `tests/probe_render.rs`）；
-//! - 光照探针 GI（R64，`irradiance» 模块）：烘焙 irradiance 探针云 + 四面体
+//! - 光照探针 GI（R64 / R83，`irradiance» 模块）：烘焙 irradiance 探针云 + 四面体
 //!   重心插值——`IrradianceProbe» 组件定义探针位置（取 `GlobalTransform»），
 //!   `bake_irradiance_probes» 逐探针复用 `bake_sample»（六轴平均，与光照贴图
 //!   同口径的间接辐照）并做**自研确定性 Delaunay 四面体化**（增量
 //!   Bowyer-Watson：BFS 连通空腔 + 幽灵胞元凸包接入 + 最胖初始单纯形 +
 //!   三线性哈希抖动 ±1e-6 + 抖动幅度阶梯重试），运行时对**无光照贴图实体**
-//!   按位置插值（逐实体 CPU 侧，拒绝逐片元）注入实例载荷
+//!   按位置插值（逐实体 CPU 侧）注入实例载荷
 //!   `InstanceRaw::probe»（xyz = E/π、w = 标志位）；着色器以
 //!   `select(env_irradiance, in.probe.rgb, in.probe.w > 0.5)» 取代全局 env 的
 //!   漫反射辐照。探针缺席 / 空集 / 实体挂光照贴图 ⇒ 载荷恒零 ⇒ **逐位不变**
 //!   （全部既有 FNV 基线原值通过，见 `tests/irradiance_render.rs»）；
 //!   包外取最近凸包面投影（连续延拓）。语义：静态漫反射 = 光照贴图 /
 //!   动态漫反射 = 探针 / 镜面 = 反射探针 → SSR → env。
+//!   **R83 追加逐片元支**：`bake_irradiance_probes_sh` 给探针追加**三阶 SH**
+//!   （L0–L2 每通道 9 系数，六面 × 32² 精确固体角投影 + Lambert 带通卷积除 π
+//!   ⇒ E/π 直读）+ 影响半径（最近邻 × 1.5 自动派生），渲染器在探针集带 SH 时
+//!   走 mode = 1（binding 18/19，片端径向权重 × 9 项点积逐片元求值——空间
+//!   梯度 + 方向性）；不带 SH ⇒ mode = 0，v1 逐实体路径**逐位不变**。
+//!   见 ARCHITECTURE §4.39 / §8.52 与 `tests/gi_sh_render.rs`。
 //! - 平面水体 v1（R81，`water` 模块）：`WaterSurface` 组件声明世界空间
 //!   水平面（多实体确定性选择键取首盏），Gerstner 4 波顶点位移（解析
 //!   法线，CPU 纯函数与 WGSL 逐式镜像）+ 反射 / 折射半分辨率捕获
@@ -158,9 +164,14 @@ pub mod prelude {
     pub use crate::hand_ik::{HandIk, IkTarget, update_hand_ik};
     pub use crate::instance::InstanceRaw;
     pub use crate::irradiance::{
-        IrradianceProbe, IrradianceProbeInstall, IrradianceProbeSet, MAX_IRRADIANCE_PROBES,
-        PROBE_AXES, ProbeBakeStats, TetraStats, TetraValidation, Tetrahedralization,
-        bake_irradiance_probes, install_irradiance_probes,
+        IrradianceProbe, IrradianceProbeInstall, IrradianceProbeRadius, IrradianceProbeSet,
+        MAX_IRRADIANCE_PROBES, PROBE_AXES, PROBE_RADIUS_NEIGHBOR_FACTOR, ProbeBakeStats, SH_BANDS,
+        SH_BLEND_EPS, SH_COEFFS, SH_CUBE_FACES, SH_CUBE_GRID, SH_LAMBERT_BANDS, SH_VALUES, SH_Y0,
+        SH_Y1, SH_Y2A, SH_Y2B, SH_Y2C, ShCoeffs, ShProbeRaw, TetraStats, TetraValidation,
+        Tetrahedralization, bake_irradiance_probes, bake_irradiance_probes_sh, cube_face_direction,
+        cube_texel_solid_angle, derive_probe_radii, install_irradiance_probes,
+        probe_influence_weight, probe_sh_coefficients, probe_sh_radiance, project_probe_sh,
+        sh_basis, sh_blend, sh_blend_l0, sh_dc, sh_eval, sh_lambert_convolve,
     };
     pub use crate::light::{
         CascadeFit, DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY,

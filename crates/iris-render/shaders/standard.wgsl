@@ -221,6 +221,34 @@ struct LightBinsParams {
 @group(0) @binding(15) var<uniform> bins_params: LightBinsParams;
 @group(0) @binding(16) var<storage, read> binned_lights: array<BinnedLight>;
 @group(0) @binding(17) var<storage, read> bins_tiles: array<u32>;
+
+// GI 探针三阶 SH（R83，排在分箱 binding 17 之后、不扩 Globals 前缀——
+// skybox.wgsl 的并行布局陷阱不触碰）。两路资源：
+//   18 = 探针表 read-only storage：GiProbe 定长数组（容量 256 = Rust 侧
+//        MAX_IRRADIANCE_PROBES，与 irradiance::ShProbeRaw 逐字段对齐，
+//        10×vec4 = 160 B/探针）。
+//   19 = 16B 小参数 uniform：params.x = mode（0 = 关——缺席 / 无 SH 探针集 /
+//        捕获 / RT 绑全零哑缓冲，逐片元分支死码，loc14 逐实体路径逐位不变；
+//        1 = 逐片元 SH 求值替代 GI 探针项），params.y = 探针数（循环上界），
+//        zw 保留。
+// 系数存的是 **E/π 直读**值（Lambert 带通已在 CPU 侧卷积进系数，见
+// irradiance.rs 的 sh_lambert_convolve）⇒ 求值是 9 项纯点积，与
+// irradiance_map 采样值 / loc14 载荷同口径。
+struct GiProbe {
+    // xyz: 探针世界位置, w: 影响半径（米；inf = 覆盖全场）
+    pos_radius: vec4<f32>,
+    // 9 组「E/π 直读」SH 系数：sh[k] = (R_k, G_k, B_k, 保留)
+    sh: array<vec4<f32>, 9>,
+};
+
+// 16B 参数块（与 Rust 侧 GiShParamsRaw 逐字段对齐）
+struct GiShParams {
+    // x: mode（0/1）, y: 探针数, zw: 保留
+    params: vec4<f32>,
+};
+
+@group(0) @binding(18) var<storage, read> gi_probes: array<GiProbe>;
+@group(0) @binding(19) var<uniform> gi_params: GiShParams;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -882,6 +910,97 @@ fn point_light_contrib(
     }
 }
 
+// ---- GI 探针三阶 SH（R83）----
+//
+// 实球谐归一化常数（L0–L2）。**与 Rust 侧 irradiance.rs 的 SH_Y0 / SH_Y1 /
+// SH_Y2A / SH_Y2B / SH_Y2C 同一张表逐值一致**（同步契约：改一侧必须改另一侧；
+// 看门单测 irradiance.rs::wgsl_sh_constants_match_cpu_table 源码层比对位模式，
+// 照 pipeline.rs::skybox_globals_prefix_matches_standard_layout 的先例）。
+const SH_Y0: f32 = 0.28209479177387814;
+const SH_Y1: f32 = 0.4886025119029199;
+const SH_Y2A: f32 = 1.0925484305920792;
+const SH_Y2B: f32 = 0.31539156525252005;
+const SH_Y2C: f32 = 0.5462742152960396;
+
+// 加权混合的分母下限（CPU 镜像：irradiance::SH_BLEND_EPS）。
+const GI_BLEND_EPS: f32 = 1e-8;
+
+// 三阶实球谐基（CPU 镜像：irradiance::sh_basis，**逐式同序**——连
+// `SH_Y2A * n.x * n.y` 的左结合顺序也是契约的一部分）。n 必须已归一化。
+// 序：L0 = 1；L1 = y, z, x；L2 = xy, yz, 3z²−1, xz, x²−y²。
+fn gi_sh_basis(n: vec3<f32>) -> array<f32, 9> {
+    var y: array<f32, 9>;
+    y[0] = SH_Y0;
+    y[1] = SH_Y1 * n.y;
+    y[2] = SH_Y1 * n.z;
+    y[3] = SH_Y1 * n.x;
+    y[4] = SH_Y2A * n.x * n.y;
+    y[5] = SH_Y2A * n.y * n.z;
+    y[6] = SH_Y2B * (3.0 * n.z * n.z - 1.0);
+    y[7] = SH_Y2A * n.x * n.z;
+    y[8] = SH_Y2C * (n.x * n.x - n.y * n.y);
+    return y;
+}
+
+// 单探针 SH 求值 → E/π（CPU 镜像：irradiance::sh_eval，同 k 升序 vec3 累加）。
+// 钳 ≥ 0 在调用方 gi_sh_irradiance 的出口做一次（混合后再钳，保留加权平均语义）。
+fn gi_sh_eval(p: GiProbe, n: vec3<f32>) -> vec3<f32> {
+    let y = gi_sh_basis(n);
+    var acc = vec3<f32>(0.0);
+    for (var k = 0u; k < 9u; k = k + 1u) {
+        acc = acc + p.sh[k].xyz * y[k];
+    }
+    return acc;
+}
+
+// 径向影响权重（CPU 镜像：irradiance::probe_influence_weight）——与点光衰减窗
+// **同式同源**（point_light_contrib 的 `window * window`，1 − (d/r)² 的平方）。
+// `!(d < r)` 而不是 `d >= r`：NaN 距离同样落进 0 贡献（不外溢）。
+fn gi_probe_weight(d: f32, r: f32) -> f32 {
+    if (!(d < r)) {
+        return 0.0;
+    }
+    let t = d / r;
+    let window = 1.0 - t * t;
+    return window * window;
+}
+
+// 逐片元 GI 求值（CPU 镜像：irradiance::sh_blend）：固定序循环全部探针 →
+// 径向权重 → 加权平均。**固定循环序 = 固定累加序** ⇒ 会话内逐位确定。
+// Σw ≤ ε（片元在全部影响球之外）⇒ 回退**最近探针**的 SH：与加权支在球边界
+// 处连续（边界上 w = 0、最近探针即该探针），且延续 v1「包外无距离衰减」的
+// 语义（§8.40⑦）。最近探针用严格 `<` 裁决 ⇒ 等距时下标小者胜（探针表按
+// 实体位升序，全序）。无四面体搜索、无可见性加权（§8.40③ 维持拒绝）。
+fn gi_sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let count = u32(gi_params.params.y);
+    if (count == 0u) {
+        // mode = 1 恒有 ≥ 1 探针（CPU 侧裁决），此支只为参数错配兜底
+        return vec3<f32>(0.0);
+    }
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    var best_d = 3.402823466e+38; // f32::MAX（哨兵：任何有限距离都更小）
+    var best = 0u;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let p = gi_probes[i];
+        let d = distance(world_pos, p.pos_radius.xyz);
+        let w = gi_probe_weight(d, p.pos_radius.w);
+        if (w > 0.0) {
+            acc = acc + gi_sh_eval(p, n) * w;
+            wsum = wsum + w;
+        }
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    var gi = acc / max(wsum, GI_BLEND_EPS);
+    if (wsum <= GI_BLEND_EPS) {
+        gi = gi_sh_eval(gi_probes[best], n);
+    }
+    return max(gi, vec3<f32>(0.0));
+}
+
 @fragment
 // 注：VertexOutput 的 @builtin(position)（字段名 clip_position 沿用顶点
 // 侧语义）作为片元入口输入时，WGSL 规定其值为**帧缓冲像素坐标**——
@@ -985,7 +1104,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 而不是浮点恒等式）。探针缺席 / 空集 / 实体挂光照贴图（CPU 侧直接不发
     // 标志位）⇒ 走原全局 env 路径，全部既有 FNV 基线原值通过。
     let env_irradiance = textureSampleLevel(irradiance_map, env_sampler, n, 0.0).rgb;
-    let irradiance = select(env_irradiance, in.probe.rgb, in.probe.w > 0.5);
+    // ---- GI 探针 SH（R83）：mode 均匀门（R78 分箱同款形态）----
+    // mode = 0（探针集缺席 / 无 SH / 捕获 / RT）⇒ 走 R64 的 loc14 逐实体
+    // 载荷支，**执行的语句与 R82 逐条相同**（同一个 select、同一串位）；
+    // mode = 1 ⇒ GI 探针项由逐片元 SH 求值替代（空间梯度 + 方向性）。
+    // 两支都只替换 `in.probe.w > 0.5` 的实体：天空 irradiance_map 兜底与
+    // R52c 的 lightmap `select` 混合语义**零触碰**（正交，见 §4.39）。
+    var irradiance = env_irradiance;
+    if (gi_params.params.x < 0.5) {
+        irradiance = select(env_irradiance, in.probe.rgb, in.probe.w > 0.5);
+    } else {
+        irradiance = select(env_irradiance,
+                            gi_sh_irradiance(in.world_pos, n), in.probe.w > 0.5);
+    }
     let nov = max(dot(n, v), 0.0);
     let f_amb = fresnel_schlick_roughness(nov, f0, roughness);
     let kd_amb = (vec3<f32>(1.0) - f_amb) * (1.0 - metallic);

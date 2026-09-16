@@ -95,11 +95,11 @@
 //! 平面外的查询被凸包投影钳制（等价于「该层辐照」，比整体回退 env 更
 //! 接近真值）。
 //!
-//! # 求值点 = 逐实体 CPU 侧（拒绝逐片元 GPU 插值）
+//! # 求值点 = 逐实体 CPU 侧（v1）→ 逐片元 GPU SH（R83）
 //!
 //! 每帧对**无光照贴图实体**在 CPU 侧取实体根 `GlobalTransform 位置做一次
 //! 插值，结果随实例数据上传（[`InstanceRaw::probe](crate::instance::InstanceRaw)），
-//! 着色器按标志位整项替换全局 env 的漫反射辐照。**不做逐片元 GPU 插值**
+//! 着色器按标志位整项替换全局 env 的漫反射辐照。**v1 不做逐片元 GPU 插值**
 //! （拒绝清单，理由写全）：
 //!
 //! - 逐片元要上传整张四面体表 + 逐探针辐照（GPU 存储缓冲 + 逐片元搜索 /
@@ -112,6 +112,27 @@
 //!   探针网格边界（含门洞）时角色整体的辐照连续变化，不会闪；
 //! - 代价（诚实限制）：**角色自身没有空间梯度**（头与脚吃同一份辐照），
 //!   大体积动态物体（车辆 / 飞船）需要逐片元才能正确（§8.40）。
+//!
+//! **R83 把「逐片元」从拒绝清单移进实现**——但不是把四面体搬上 GPU，而是
+//! 换一套**逐片元便宜得多的表示**：三阶球谐（SH）+ 径向权重。四面体逐片元
+//! 要逐像素做点定位（搜索），而 SH 探针的逐片元求值是「固定序循环探针表 →
+//! 距离权重 → 9 项点积」，无搜索、无空间结构，成本与反射探针（R62a 的
+//! `probe_weight` 循环）同量级。于是：
+//!
+//! - **数据形状**：每探针 9 组 RGB 系数（[`ShCoeffs`]，存 **E/π 直读**值）+
+//!   影响半径，GPU 侧 binding 18 的定长 storage 表（[`ShProbeRaw`]）；
+//! - **混合**：径向权重 `w = (1 − (d/r)²)²`（与点光衰减窗同式同源），
+//!   `E/π = Σ(w·SH(n)) / Σw`，Σw ≈ 0 时回退**最近探针**（连续性 + 与 v1
+//!   「包外无衰减」同族语义）——[`sh_blend`] 是 CPU 镜像、
+//!   `standard.wgsl::gi_sh_irradiance` 是 GPU 实现；
+//! - **均匀门**：探针集带 SH ⇒ mode = 1（逐片元支）；不带（含资源缺席）⇒
+//!   mode = 0（loc14 逐实体支**逐位不变**）。mode 由 binding 19 的 16B 小
+//!   uniform 给出， Globals 一字节不动、顶点布局不动（loc14 属性保留）；
+//! - **方向性**：SH 天生带方向（L1/L2 项），闭合 §8.40②——同一探针内法线
+//!   朝亮面与朝暗面得到不同的 E/π，v1 的六轴平均会把这个信号摊平。
+//!
+//! 拒绝清单**维持**：四面体 GPU 化（逐片元点定位）、可见性（occlusion）
+//! 加权（§8.40③，隔着墙的探针仍会串味——半径是唯一的隔离手段）。
 //!
 //! # 烘焙源 = 复用 bake_sample
 //!
@@ -171,12 +192,35 @@
 //! mix(a, b, 0) 的浮点恒等式论证强）。全部既有 GPU FNV 基线原值通过
 //! （本轮不重锁）。
 //!
-//! # v1 诚实限制（详见 ARCHITECTURE §8.40）
+//! # 三阶 SH 烘焙（R83）：cube 投影 + Lambert 带通卷积
 //!
-//! 逐片元 GPU 插值；球谐 SH / 方向性探针（L1 及更高）；可见性（occlusion）
-//! 加权插值；探针磁盘持久化与 pack 集成；编辑器集成；动态重烘焙 / 脏标记；
-//! 共面点云的 2D 降级；超预算探针的重要性排序；探针自遮挡（探针落在几何
-//! 内部时烘出的是几何内部的辐照，需作者自己把探针放在空腔里）。
+//! 系数从**同一份烘焙口径**来（同一 BVH、同一 [`BakeParams`]、同一「天空 or
+//! 一次反弹」辐射率公式——见 [`probe_sh_radiance`]），只是把「六轴各积一次
+//! 半球」换成「六面 × 32² 方向各取一次辐射率再投影」：
+//!
+//! 1. **方向网格**：面序固定 = [`PROBE_AXES`]（+X, −X, +Y, −Y, +Z, −Z），
+//!    每面 [`SH_CUBE_GRID`]² 中点规则，权重 = [`cube_texel_solid_angle`] 的
+//!    **精确固体角**（六面合计 4π，单测钉到 f64 的 1e-12）；
+//! 2. **投影**：`c_k = Σ L(ω)·Y_k(ω)·dω`（f64 定序累加，基函数用 f32 的
+//!    [`sh_basis`]——单一事实源，不为投影另写一份 f64 基）；
+//! 3. **Lambert 卷积 + 除 π**：[`sh_lambert_convolve`] 逐带乘
+//!    [`SH_LAMBERT_BANDS`]（= A_l/π，A = π, 2π/3, π/4）⇒ 存的就是
+//!    「**E/π 直读**」系数，着色器对任意 n 的求值退化为 9 项纯点积
+//!    （[`sh_eval`]），无逐片元卷积、与 `irradiance_map` / loc14 同口径。
+//!
+//! **解析锚点**（单测）：常量辐射率 C ⇒ 任意方向求值恒 = C（L0 正交性给出
+//! 精确解，只有 f32 舍入）；纯 L1 场 `L = C·ω_y` ⇒ `E(+Y)/π = 2C/3`
+//! （Lambert 因子 A₁/π = 2/3 的精确锚点）；上下半球异色 ⇒ 上下求值显著分离
+//! （L2 截断对阶跃场的固有偏差一并写明）。**无去振铃窗**：强对比角落可有
+//! 轻微振铃（求值钳 ≥ 0 是安全侧兜底，不是去振铃）。
+//!
+//! # v1 / R83 诚实限制（详见 ARCHITECTURE §8.40 / §8.52）
+//!
+//! 可见性（occlusion）加权插值（**维持拒绝**）；四面体 GPU 化（逐片元点定位，
+//! **维持拒绝**）；SH 去振铃窗；探针磁盘持久化与 pack 集成；编辑器集成；
+//! 动态重烘焙 / 脏标记；共面点云的 2D 降级；超预算探针的重要性排序；探针
+//! 自遮挡（探针落在几何内部时烘出的是几何内部的辐照，需作者自己把探针放在
+//! 空腔里）。
 
 use std::collections::BTreeMap;
 
@@ -1456,14 +1500,22 @@ pub struct ProbeBakeStats {
     pub dropped_budget: usize,
     /// 位置坐标非有限被跳过的探针数。
     pub skipped_non_finite: usize,
+    /// 本次烘焙是否产出了三阶 SH 系数（R83；`false` = 只有 v1 的无方向值）。
+    pub sh: bool,
     /// 四面体化统计。
     pub tetra: TetraStats,
 }
 
-/// 探针集（World 资源）：逐探针辐照 + 四面体表 + 逐顶点取值。
+/// 探针集（World 资源）：逐探针辐照 + 四面体表 + 逐顶点取值 +
+/// （R83）逐探针三阶 SH 与影响半径。
 ///
 /// **缺席语义**：资源缺席 / 空集 ⇒ 渲染器逐实例发标志位 0，着色器走原全局
 /// env 路径（逐位不变，见模块文档「兼容铁律」）。
+///
+/// **SH 缺席语义（R83）**：[`Self::sh_coefficients`] 为空 ⇒ 渲染器绑哑参数
+/// （mode = 0）⇒ 逐片元分支死码，走 v1 的 loc14 逐实体路径（逐位不变）。
+/// 只有 [`bake_irradiance_probes_sh`] 或 [`Self::from_probes_sh`] 产出的集
+/// 才带 SH。
 #[derive(Clone, Debug, Default, Resource)]
 pub struct IrradianceProbeSet {
     /// 逐探针世界位置（与 [`Self::values] 同序）。
@@ -1474,6 +1526,10 @@ pub struct IrradianceProbeSet {
     vertex_values: Vec<Vec3>,
     /// 四面体化（位置云）。
     tetra: Tetrahedralization,
+    /// 逐探针三阶 SH 系数（**E/π 直读**，R83）；空 = 无 SH（mode = 0）。
+    sh: Vec<ShCoeffs>,
+    /// 逐探针影响半径（米，R83；与 [`Self::sh`] 同时在场）。
+    radii: Vec<f32>,
     /// 烘焙统计。
     stats: ProbeBakeStats,
 }
@@ -1486,12 +1542,49 @@ impl IrradianceProbeSet {
 
     /// 从「逐探针位置 + 逐探针取值」构造（四面体化在此完成；确定性）。
     pub fn from_probes(positions: Vec<Vec3>, values: Vec<Vec3>) -> Self {
+        Self::assemble(positions, values, Vec::new(), Vec::new())
+    }
+
+    /// 从「位置 + v1 取值 + 三阶 SH 系数 + 影响半径」构造（R83）。
+    ///
+    /// SH 与半径必须同时在场且等长（⇒ 渲染器 mode = 1）。四面体化照常构建：
+    /// mode = 0 的路径（探针捕获 / RT 相机）仍按 v1 语义消费 [`Self::values`]，
+    /// SH 只是**追加**的一层数据。
+    pub fn from_probes_sh(
+        positions: Vec<Vec3>,
+        values: Vec<Vec3>,
+        sh: Vec<ShCoeffs>,
+        radii: Vec<f32>,
+    ) -> Self {
+        assert_eq!(
+            sh.len(),
+            radii.len(),
+            "SH 系数数（{}）与影响半径数（{}）必须一致",
+            sh.len(),
+            radii.len()
+        );
+        Self::assemble(positions, values, sh, radii)
+    }
+
+    /// 公共装配（长度一致性 + 四面体化 + 逐顶点取值展开）。
+    fn assemble(
+        positions: Vec<Vec3>,
+        values: Vec<Vec3>,
+        sh: Vec<ShCoeffs>,
+        radii: Vec<f32>,
+    ) -> Self {
         assert_eq!(
             positions.len(),
             values.len(),
             "探针位置数（{}）与取值数（{}）必须一致",
             positions.len(),
             values.len()
+        );
+        assert!(
+            sh.is_empty() || sh.len() == positions.len(),
+            "SH 系数数（{}）必须为空或与探针数（{}）一致",
+            sh.len(),
+            positions.len()
         );
         let tetra = Tetrahedralization::build(&positions);
         let vertex_values = tetra
@@ -1504,6 +1597,8 @@ impl IrradianceProbeSet {
             values,
             vertex_values,
             tetra,
+            sh,
+            radii,
             stats: ProbeBakeStats::default(),
         }
     }
@@ -1528,6 +1623,21 @@ impl IrradianceProbeSet {
         &self.values
     }
 
+    /// 逐探针三阶 SH 系数（**E/π 直读**；空 = 本集无 SH，R83）。
+    pub fn sh_coefficients(&self) -> &[ShCoeffs] {
+        &self.sh
+    }
+
+    /// 逐探针影响半径（米；与 [`Self::sh_coefficients`] 同时在场）。
+    pub fn radii(&self) -> &[f32] {
+        &self.radii
+    }
+
+    /// 本集是否带 SH（⇒ 渲染器 mode = 1，逐片元求值生效）。
+    pub fn has_sh(&self) -> bool {
+        !self.sh.is_empty()
+    }
+
     /// 四面体化。
     pub fn tetrahedralization(&self) -> &Tetrahedralization {
         &self.tetra
@@ -1546,6 +1656,53 @@ impl IrradianceProbeSet {
         self.tetra.interpolate(position, &self.vertex_values)
     }
 
+    /// 世界位置 + 法线 → **逐片元** SH 辐照 E/π（R83；无 SH / 空集 ⇒ `None`）。
+    ///
+    /// 与着色器 `gi_sh_irradiance` 同式同序（径向权重 + 最近探针兜底 +
+    /// 钳 ≥ 0），是 GPU 路径的 CPU 对照轨。
+    pub fn sh_irradiance_at(&self, position: Vec3, normal: Vec3) -> Option<Vec3> {
+        if !self.has_sh() {
+            return None;
+        }
+        sh_blend(&self.positions, &self.radii, &self.sh, position, normal)
+    }
+
+    /// 世界位置 → SH 的**零阶（方向平均）**辐照 E/π（R83）。
+    ///
+    /// 带 SH 的集在 mode = 0 路径（探针捕获 / RT 相机）上的逐实体口径；
+    /// 不依赖四面体化 ⇒ 1–3 个探针（四面体化为空）同样有定义。
+    pub fn sh_dc_at(&self, position: Vec3) -> Option<Vec3> {
+        if !self.has_sh() {
+            return None;
+        }
+        sh_blend_l0(&self.positions, &self.radii, &self.sh, position)
+    }
+
+    /// GPU 上传形态（globals binding 18 的 storage 内容，R83）。
+    ///
+    /// 容量 = [`MAX_IRRADIANCE_PROBES`]（= GPU 探针表的定长）；超出按序截断并
+    /// `log::warn`（烘焙入口本就按同一预算截断，这里防的是手工构造的集）。
+    /// 无 SH ⇒ 空 `Vec`（渲染器据此走 mode = 0，一个字节都不上传）。
+    pub fn gpu_probes(&self) -> Vec<ShProbeRaw> {
+        if !self.has_sh() {
+            return Vec::new();
+        }
+        if self.positions.len() > MAX_IRRADIANCE_PROBES {
+            log::warn!(
+                "SH 探针数 {} 超 GPU 探针表容量 {}，按序截断",
+                self.positions.len(),
+                MAX_IRRADIANCE_PROBES
+            );
+        }
+        self.positions
+            .iter()
+            .zip(self.radii.iter())
+            .zip(self.sh.iter())
+            .take(MAX_IRRADIANCE_PROBES)
+            .map(|((p, &r), c)| ShProbeRaw::new(*p, r, c))
+            .collect()
+    }
+
     /// 世界位置 → 实例载荷（xyz = E/π、w = 标志位）——渲染器注入口径。
     ///
     /// 存 **E/π**（而不是 E）：着色器里这一项直接替换
@@ -1553,9 +1710,21 @@ impl IrradianceProbeSet {
     /// E/π，见 environment.wgsl 的 fs_irradiance），于是着色器**零换算**、
     /// `select 是纯值替换。空集 / 非有限位置 ⇒ [0, 0, 0, 0]（标志位 0 =
     /// 走原全局 env 路径）。
+    ///
+    /// **带 SH 的集（R83）**：xyz 改由 [`Self::sh_dc_at`] 给出（径向权重混合
+    /// 的零阶项），标志位对任何有限位置恒 1——逐片元 SH 路径不依赖四面体化，
+    /// 退化 / 少于 4 个探针的点云同样生效（v1 在这种情况下整体回退 env）。
+    /// 这份载荷只被 **mode = 0 的路径**消费（探针捕获 / RT 相机）；主视图在
+    /// mode = 1 时只读它的标志位。
     pub fn instance_payload(&self, position: Vec3) -> [f32; 4] {
         if !position.is_finite() {
             return [0.0; 4];
+        }
+        if self.has_sh() {
+            return match self.sh_dc_at(position) {
+                Some(v) => [v.x, v.y, v.z, 1.0],
+                None => [0.0; 4],
+            };
         }
         match self.irradiance_at(position) {
             Some(e) => {
@@ -1569,6 +1738,7 @@ impl IrradianceProbeSet {
     /// CPU 内存占用（字节，观测口径）。
     pub fn memory_bytes(&self) -> u64 {
         (self.positions.len() + self.values.len() + self.vertex_values.len()) as u64 * 12
+            + (self.sh.len() * SH_VALUES * 4 + self.radii.len() * 4) as u64
             + self.tetra.memory_bytes()
     }
 }
@@ -1586,18 +1756,52 @@ impl IrradianceProbeSet {
 /// **确定性**：全部环节无 RNG、无哈希迭代序、无并行 ⇒ 同世界两次烘焙
 /// 逐位一致（单测 to_bits 钉住）。
 pub fn bake_irradiance_probes(world: &World, params: &BakeParams) -> IrradianceProbeSet {
+    bake_probes(world, params, false)
+}
+
+/// 探针烘焙 **+ 三阶 SH**（R83）：v1 的六轴平均值与四面体化走**同一条代码
+/// 路径**（逐位不变），额外逐探针做 cube 投影得到方向性系数、按最近邻派生
+/// 影响半径 ⇒ 渲染器 mode = 1（逐片元求值）。
+///
+/// 成本：每探针多 6 × [`SH_CUBE_GRID`]² = 6144 个方向的辐射率求值（命中方向
+/// 还要一次反弹的直接光射线），约为 v1 六轴烘焙（6 × `sky_samples` 条）的
+/// `6144 / (6·sky_samples)` 倍——默认 `sky_samples = 64` 下约 16×。一次性
+/// 烘焙支出，运行时零增量（系数是常量表，逐片元只做 9 项点积）。
+///
+/// **确定性**：同 [`bake_irradiance_probes`]（固定面序 × 固定行列序 × f64
+/// 定序累加，无 RNG / 无哈希迭代序 / 无并行）。
+pub fn bake_irradiance_probes_sh(world: &World, params: &BakeParams) -> IrradianceProbeSet {
+    bake_probes(world, params, true)
+}
+
+/// 两个烘焙入口的公共实现（`with_sh` = 是否追加三阶 SH 与影响半径）。
+///
+/// `with_sh = false` 的路径与 R64 的实现**逐语句同构**（既有测试的
+/// 「探针值与直接调用积分器逐位一致」/「烘焙两跑逐位」原值通过）。
+fn bake_probes(world: &World, params: &BakeParams, with_sh: bool) -> IrradianceProbeSet {
     let triangles = collect_bake_triangles(world);
     let bvh = build_bvh(triangles);
 
-    // 两阶段（收集 → 处理）：查询闭包内不借任何存储（AGENTS.md 系统规约）
-    let mut probes: Vec<(u64, Vec3)> = Vec::new();
-    world.query::<(Entity, &GlobalTransform, &IrradianceProbe)>(|(entity, global, _)| {
-        probes.push((entity.to_bits(), global.position()));
+    // 两阶段（收集 → 处理）：查询闭包内不借任何存储（AGENTS.md 系统规约）。
+    // 半径覆盖用 Option 查询（组件类型从未注册 ⇒ 恒 None = 自动派生）。
+    let mut probes: Vec<(u64, Vec3, f32)> = Vec::new();
+    world.query::<(
+        Entity,
+        &GlobalTransform,
+        &IrradianceProbe,
+        Option<&IrradianceProbeRadius>,
+    )>(|(entity, global, _, radius)| {
+        probes.push((
+            entity.to_bits(),
+            global.position(),
+            radius.map_or(0.0, |r| r.0),
+        ));
     });
     probes.sort_unstable_by_key(|probe| probe.0);
 
     let mut stats = ProbeBakeStats {
         entities: probes.len(),
+        sh: with_sh,
         ..Default::default()
     };
     if probes.len() > MAX_IRRADIANCE_PROBES {
@@ -1612,7 +1816,13 @@ pub fn bake_irradiance_probes(world: &World, params: &BakeParams) -> IrradianceP
 
     let mut positions = Vec::with_capacity(probes.len());
     let mut values = Vec::with_capacity(probes.len());
-    for (_, position) in &probes {
+    let mut sh = Vec::new();
+    let mut overrides = Vec::new();
+    if with_sh {
+        sh = Vec::with_capacity(probes.len());
+        overrides = Vec::with_capacity(probes.len());
+    }
+    for (_, position, radius_override) in &probes {
         if !position.is_finite() {
             log::warn!("光照探针位置非有限（{position:?}），跳过");
             stats.skipped_non_finite += 1;
@@ -1625,10 +1835,20 @@ pub fn bake_irradiance_probes(world: &World, params: &BakeParams) -> IrradianceP
         positions.push(*position);
         // 除以 6（一次正确舍入）而不是乘 1/6（两次舍入）
         values.push(sum / PROBE_AXES.len() as f32);
+        if with_sh {
+            sh.push(probe_sh_coefficients(&bvh, *position, params));
+            overrides.push(*radius_override);
+        }
     }
     stats.baked = positions.len();
 
-    let mut set = IrradianceProbeSet::from_probes(positions, values);
+    let mut set = if with_sh {
+        // 半径派生在「位置表定型之后」做（最近邻是点集的函数，与烘焙序无关）
+        let radii = derive_probe_radii(&positions, &overrides);
+        IrradianceProbeSet::from_probes_sh(positions, values, sh, radii)
+    } else {
+        IrradianceProbeSet::from_probes(positions, values)
+    };
     stats.tetra = set.tetra.stats();
     set.stats = stats;
     set
@@ -1653,13 +1873,19 @@ pub struct IrradianceProbeInstall {
     pub dropped_budget: usize,
     /// 点云退化（共面 / 共线 / 有效点 < 4）⇒ 空四面体化（查询全回退 env）。
     pub degenerate: bool,
+    /// 本集是否带三阶 SH（R83；`true` ⇒ 渲染器 mode = 1 逐片元求值）。
+    pub sh: bool,
 }
 
 /// 把烘焙产物接进世界（R64 的装配入口）：插入 / 覆盖 [`IrradianceProbeSet]
-/// 资源。渲染器下一帧即读到（逐实体插值），无需任何 GPU 侧上传。
+/// 资源。渲染器下一帧即读到（逐实体插值），调用方无需任何 GPU 侧操作。
 ///
 /// **覆盖语义**：重复调用 = 重新烘焙（资源整体替换），旧探针集被丢弃；
 /// 实体上的 [`IrradianceProbe] 组件与资源解耦（增删探针实体后重新烘焙即可）。
+///
+/// **R83**：带 SH 的集（[`bake_irradiance_probes_sh`] 产出）由渲染器在
+/// mode = 1 的帧自行上传 binding 18/19（每帧重传，与 R78 分箱三缓冲同纪律），
+/// 装配入口与调用形态不变——编辑器 / 游戏侧零改动。
 pub fn install_irradiance_probes(
     world: &mut World,
     probes: IrradianceProbeSet,
@@ -1674,10 +1900,461 @@ pub fn install_irradiance_probes(
         skipped: stats.tetra.skipped,
         dropped_budget: stats.dropped_budget,
         degenerate: stats.tetra.degenerate,
+        sh: probes.has_sh(),
     };
     world.insert_resource(probes);
     report
 }
+
+// ---------------------------------------------------------------------------
+// 三阶球谐（R83）：方向性探针 + 逐片元求值
+// ---------------------------------------------------------------------------
+
+/// SH 频带数（**三阶 = L0–L2**）。
+pub const SH_BANDS: usize = 3;
+
+/// 每通道系数数（1 + 3 + 5 = 9）。
+pub const SH_COEFFS: usize = SH_BANDS * SH_BANDS;
+
+/// 每探针系数总量（RGB × 9 = 27 个 f32）。
+pub const SH_VALUES: usize = SH_COEFFS * 3;
+
+/// 系数下标 → 频带（L0 = {0}、L1 = {1,2,3}、L2 = {4..8}）。
+pub const SH_BAND_OF: [usize; SH_COEFFS] = [0, 1, 1, 1, 2, 2, 2, 2, 2];
+
+/// cube 投影的每面网格边长：32 × 32 × 6 面 = 6144 个方向 / 探针。
+///
+/// 定标依据：L2 是低频量（最高频项 x²−y² 的一个周期覆盖半个球面），32² 的
+/// 中点求积对它的截断误差远小于「无去振铃窗」的固有误差；再往上翻一倍只把
+/// 烘焙成本翻四倍（每探针 6144 → 24576 条射线）而观感不动。
+pub const SH_CUBE_GRID: u32 = 32;
+
+/// cube 面数（面序固定 = [`PROBE_AXES`]：+X, −X, +Y, −Y, +Z, −Z）。
+pub const SH_CUBE_FACES: usize = 6;
+
+/// Lambert 带通因子 **A_l / π**（A = π, 2π/3, π/4）。
+///
+/// 投影后逐带乘上它 ⇒ 存的系数是「**E/π 直读**」：着色器对任意法线 n 的
+/// 求值退化为 9 项纯点积（`Σ_k d_k·Y_k(n)`），无逐片元卷积、无 π 换算，
+/// 与 `irradiance_map` 采样值 / loc14 载荷**同口径**（都是 E/π）。
+pub const SH_LAMBERT_BANDS: [f32; SH_BANDS] = [1.0, 2.0 / 3.0, 0.25];
+
+/// 实球谐归一化常数的**解析源**（f64 硬编码，L0–L2 共五个不同值）：
+/// `1/(2√π)`、`√3/(2√π)`、`√15/(2√π)`、`√5/(4√π)`、`√15/(4√π)`。
+/// f32 表（[`SH_Y0`] 等）由它**正确舍入**而来；WGSL 侧
+/// `standard.wgsl` 的 `SH_Y0 / SH_Y1 / SH_Y2A / SH_Y2B / SH_Y2C` 字面量与本表
+/// 同数字 ⇒ 两侧 f32 逐位相同（同步契约，看门单测
+/// `wgsl_sh_constants_match_cpu_table` 源码层比对位模式）。
+const SH_Y0_F64: f64 = 0.28209479177387814;
+/// 见 [`SH_Y0_F64`]（L1 三项共用）。
+const SH_Y1_F64: f64 = 0.4886025119029199;
+/// 见 [`SH_Y0_F64`]（L2 的 xy / yz / xz 三项共用）。
+const SH_Y2A_F64: f64 = 1.0925484305920792;
+/// 见 [`SH_Y0_F64`]（L2 的 3z²−1 项）。
+const SH_Y2B_F64: f64 = 0.31539156525252005;
+/// 见 [`SH_Y0_F64`]（L2 的 x²−y² 项 = [`SH_Y2A_F64`] / 2）。
+const SH_Y2C_F64: f64 = 0.5462742152960396;
+
+/// 实球谐归一化常数（f32，由 [`SH_Y0_F64`] 正确舍入；WGSL 同表逐位一致）。
+pub const SH_Y0: f32 = SH_Y0_F64 as f32;
+/// 见 [`SH_Y0`]（L1 三项共用）。
+pub const SH_Y1: f32 = SH_Y1_F64 as f32;
+/// 见 [`SH_Y0`]（L2 的 xy / yz / xz 三项共用）。
+pub const SH_Y2A: f32 = SH_Y2A_F64 as f32;
+/// 见 [`SH_Y0`]（L2 的 3z²−1 项）。
+pub const SH_Y2B: f32 = SH_Y2B_F64 as f32;
+/// 见 [`SH_Y0`]（L2 的 x²−y² 项 = [`SH_Y2A`] / 2）。
+pub const SH_Y2C: f32 = SH_Y2C_F64 as f32;
+
+/// 加权混合的分母下限：`Σw ≤ ε` ⇒ 片元在全部影响球之外（或恰在边界上
+/// 权重下溢），回退最近探针的 SH 求值。
+pub const SH_BLEND_EPS: f32 = 1e-8;
+
+/// 影响半径的最近邻倍率（自动派生：`r = 最近邻距离 × 1.5`）。
+///
+/// 1.5 的依据：等间距网格下最近邻距离 = 间距 d，取 r = 1.5d 让相邻探针的
+/// 影响球在连线中点处**重叠**（中点权 = (1 − 0.25²)² ≈ 0.88，不是 0）⇒
+/// 场处处有覆盖、跨探针边界连续；再大（≥ 2d）会让远探针参与加权，隔着墙的
+/// 探针串味面变大（§8.40③ 的可见性加权仍在拒绝清单，半径是唯一的隔离手段）。
+pub const PROBE_RADIUS_NEIGHBOR_FACTOR: f32 = 1.5;
+
+/// 单探针的 SH 系数（RGB × 9，下标 = `系数 k`、内层 = 通道 c）。
+///
+/// 存的是 [`SH_LAMBERT_BANDS`] 卷积后的 **E/π 直读**值（见
+/// [`sh_lambert_convolve`]）。
+pub type ShCoeffs = [[f32; 3]; SH_COEFFS];
+
+/// 三阶实球谐基（L0–L2 共 9 项，标准序：L1 = y, z, x；L2 = xy, yz,
+/// 3z²−1, xz, x²−y²）。
+///
+/// `n` **必须已归一化**（着色器传的是已归一化的着色法线；本函数不再归一化，
+/// 免得两侧多一次 `normalize` 的位级差异）。表达式与
+/// `standard.wgsl::gi_sh_basis` **逐式同序**（`SH_Y2A * n.x * n.y` 的左结合
+/// 顺序也算契约的一部分），改一侧必须改另一侧。
+pub fn sh_basis(n: Vec3) -> [f32; SH_COEFFS] {
+    [
+        SH_Y0,
+        SH_Y1 * n.y,
+        SH_Y1 * n.z,
+        SH_Y1 * n.x,
+        SH_Y2A * n.x * n.y,
+        SH_Y2A * n.y * n.z,
+        SH_Y2B * (3.0 * n.z * n.z - 1.0),
+        SH_Y2A * n.x * n.z,
+        SH_Y2C * (n.x * n.x - n.y * n.y),
+    ]
+}
+
+/// 单探针 SH 求值 → **E/π**（Lambert 出射辐照度除 π，与 `irradiance_map`
+/// 采样值同口径）。
+///
+/// 累加序 = k 升序、vec3 整体加，**不钳负**——与
+/// `standard.wgsl::gi_sh_eval` 逐式镜像（钳 ≥ 0 是混合出口的事，见
+/// [`sh_blend`]；在这里钳会让「一个探针振铃出负值、另一个为正」的加权平均
+/// 两侧不同式）。跨适配器不做位级声明（GPU 编译器有 fma / 重结合自由），
+/// 同适配器双会话逐字节由 GPU 测试钉住。
+pub fn sh_eval(coeffs: &ShCoeffs, n: Vec3) -> Vec3 {
+    let y = sh_basis(n);
+    let mut acc = Vec3::ZERO;
+    for (k, c) in coeffs.iter().enumerate() {
+        acc += Vec3::new(c[0], c[1], c[2]) * y[k];
+    }
+    acc
+}
+
+/// 单探针 SH 的**零阶（方向平均）**项 = `d_0 · Y_0`。
+///
+/// 用途：带 SH 的探针集在 **mode = 0 的路径**（探针捕获 / RT 相机恒绑哑参数）
+/// 上的逐实体载荷——与 v1「六轴平均 = 辐照度函数的方向零阶平均」同族语义，
+/// 且对 1–3 个探针（四面体化为空）同样有定义。
+pub fn sh_dc(coeffs: &ShCoeffs) -> Vec3 {
+    Vec3::new(coeffs[0][0], coeffs[0][1], coeffs[0][2]) * SH_Y0
+}
+
+/// cube 面局部坐标 (u, v) ∈ [−1, 1] → 单位方向（固定面序 + 固定局部轴）。
+///
+/// 局部轴约定：±X 面 (u → y, v → z)、±Y 面 (u → x, v → z)、±Z 面
+/// (u → x, v → y)。任何一一映射都合法（只要六面合起来把球面**恰好覆盖一次**
+/// 且固体角权重与面平面上的矩形一致）；固定下来是为了「同数据两次投影
+/// 逐位一致」。
+pub fn cube_face_direction(face: usize, u: f32, v: f32) -> Vec3 {
+    assert!(face < SH_CUBE_FACES, "cube 面下标越界：{face}");
+    let (a, b) = match face {
+        0 | 1 => (Vec3::Y, Vec3::Z),
+        2 | 3 => (Vec3::X, Vec3::Z),
+        _ => (Vec3::X, Vec3::Y),
+    };
+    (PROBE_AXES[face] + a * u + b * v).normalize()
+}
+
+/// 单位立方体面上一个矩形纹素的**精确固体角**（立体弧度，f64）。
+///
+/// 面局部坐标 (u, v)（面平面到原点距离 1），纹素 = `[u0, u1] × [v0, v1]`。
+/// 闭合式（经典「矩形对一点的立体角」，四角带符号 inclusion–exclusion）：
+///
+/// ```text
+/// F(x, y) = atan2(x·y, sqrt(x² + y² + 1))
+/// Ω = F(u1,v1) − F(u0,v1) − F(u1,v0) + F(u0,v0)
+/// ```
+///
+/// `atan2` 而不是 `atan`：分子 x·y 可负，`atan2` 与恒正的分母一起给出四象限
+/// 正确的有符号角，跨轴矩形无需额外分支。自校验：整面 [−1,1]² ⇒
+/// Ω = 4·atan2(1, √3) = 2π/3，六面 ⇒ **4π**（单测钉到 f64 的 1e-12）。
+pub fn cube_texel_solid_angle(u0: f64, u1: f64, v0: f64, v1: f64) -> f64 {
+    let corner = |x: f64, y: f64| (x * y).atan2((x * x + y * y + 1.0).sqrt());
+    corner(u1, v1) - corner(u0, v1) - corner(u1, v0) + corner(u0, v0)
+}
+
+/// 沿单条方向的**间接辐射率** L（探针 cube 捕获的一个「纹素」）。
+///
+/// 与 [`bake_sample`](crate::bake::bake_sample) **同口径**（同一 BVH、同一
+/// 阴影偏移、同一「天空 or 一次反弹」三项口径）：
+///
+/// - 未命中 ⇒ `sky_color`（天空辐射率；`bake_sample` 的天空项 =
+///   `Σ sky_color × π/n` 对均匀场恰为 `π·sky_color`，与此处的 L = sky_color
+///   同义）；
+/// - 命中且 `bounces > 0` ⇒ `albedo/π × (命中点直接光 + π·sky_color)`
+///   （= `bake_sample` 里 bounce 项的被求和项，L = albedo/π × E）；
+/// - 命中且 `bounces = 0` ⇒ 0（与 `bake_sample` 一致：被挡方向既无天空也无反弹）。
+///
+/// 直接光复用 [`direct_irradiance`](crate::bake::direct_irradiance)（不复制
+/// 公式），命中法线同样翻向射线来向（薄板背面照实受光）。
+pub fn probe_sh_radiance(
+    bvh: &crate::bake::Bvh,
+    position: Vec3,
+    dir: Vec3,
+    params: &BakeParams,
+) -> Vec3 {
+    let origin = position + dir * crate::bake::BAKE_SHADOW_BIAS;
+    match crate::bake::raycast_bvh(bvh, origin, dir, f32::INFINITY) {
+        None => params.sky_color,
+        Some(hit) => {
+            if params.bounces == 0 {
+                return Vec3::ZERO;
+            }
+            let hit_point = origin + dir * hit.t;
+            let m = if hit.normal.dot(-dir) >= 0.0 {
+                hit.normal
+            } else {
+                -hit.normal
+            };
+            let albedo = bvh.triangle(hit.triangle).albedo;
+            let incident = crate::bake::direct_irradiance(bvh, hit_point, m, params, false)
+                + params.sky_color * std::f32::consts::PI;
+            albedo * incident * std::f32::consts::FRAC_1_PI
+        }
+    }
+}
+
+/// 把探针位置的辐射率场投影到三阶 SH（**未卷积**的原始投影
+/// `c_k = ∫ L(ω) Y_k(ω) dω`）。
+///
+/// 求积 = 6 面 × [`SH_CUBE_GRID`]² 中点规则 + [`cube_texel_solid_angle`] 的
+/// 精确固体角权重（不是「等权 × 4π/N」的近似——纹素固体角在面心与面角差
+/// 约 1.9 倍，等权会把 L2 项系统性压偏）。累加用 f64（6144 项的和，f32 会
+/// 把小系数淹进大系数的舍入里），基函数用 f32 的 [`sh_basis`]（**单一事实源**：
+/// 不为投影再写一份 f64 基，漂移风险大于 1e-7 的精度收益）。
+///
+/// **确定性**：固定面序（[`PROBE_AXES`]）× 固定行/列序 × 固定 k 序累加 ⇒
+/// 同数据两次投影 `to_bits` 逐位一致（单测钉住）。
+pub fn project_probe_sh(bvh: &crate::bake::Bvh, position: Vec3, params: &BakeParams) -> ShCoeffs {
+    assert!(position.is_finite(), "探针位置非有限：{position:?}");
+    let grid = SH_CUBE_GRID;
+    let step = 2.0 / f64::from(grid);
+    let mut acc = [[0.0f64; 3]; SH_COEFFS];
+    for face in 0..SH_CUBE_FACES {
+        for row in 0..grid {
+            let v0 = -1.0 + step * f64::from(row);
+            let v1 = v0 + step;
+            let v = (0.5 * (v0 + v1)) as f32;
+            for col in 0..grid {
+                let u0 = -1.0 + step * f64::from(col);
+                let u1 = u0 + step;
+                let u = (0.5 * (u0 + u1)) as f32;
+                let dw = cube_texel_solid_angle(u0, u1, v0, v1);
+                let dir = cube_face_direction(face, u, v);
+                let l = probe_sh_radiance(bvh, position, dir, params);
+                let y = sh_basis(dir);
+                for (k, c) in acc.iter_mut().enumerate() {
+                    c[0] += f64::from(l.x) * f64::from(y[k]) * dw;
+                    c[1] += f64::from(l.y) * f64::from(y[k]) * dw;
+                    c[2] += f64::from(l.z) * f64::from(y[k]) * dw;
+                }
+            }
+        }
+    }
+    std::array::from_fn(|k| [acc[k][0] as f32, acc[k][1] as f32, acc[k][2] as f32])
+}
+
+/// Lambert 带通卷积 **+ 除 π**：原始投影 `c_k` → 「E/π 直读」系数 `d_k`。
+///
+/// 依据（Ramamoorthi & Hanrahan, *An Efficient Representation for Irradiance
+/// Environment Maps*）：clamped-cosine 的 SH 系数只有三个非零频带
+/// `A = (π, 2π/3, π/4)`，于是
+/// `E(n) = Σ_l A_l Σ_m c_lm Y_lm(n)`；两边除 π 得
+/// `E(n)/π = Σ_k (A_l/π)·c_k·Y_k(n)` = [`sh_eval`] 的 9 项点积。
+/// 因子表 = [`SH_LAMBERT_BANDS`]（`A/π`，精确常数 1、2/3、1/4）。
+pub fn sh_lambert_convolve(projected: ShCoeffs) -> ShCoeffs {
+    std::array::from_fn(|k| {
+        let band = SH_LAMBERT_BANDS[SH_BAND_OF[k]];
+        [
+            projected[k][0] * band,
+            projected[k][1] * band,
+            projected[k][2] * band,
+        ]
+    })
+}
+
+/// 探针的完整 SH 烘焙（投影 + Lambert 卷积）——**E/π 直读**系数。
+pub fn probe_sh_coefficients(
+    bvh: &crate::bake::Bvh,
+    position: Vec3,
+    params: &BakeParams,
+) -> ShCoeffs {
+    sh_lambert_convolve(project_probe_sh(bvh, position, params))
+}
+
+/// 径向影响权重（**与点光衰减窗同式同源**：`(1 − (d/r)²)²`，见
+/// `standard.wgsl::point_light_contrib` 的 `window`）。
+///
+/// `d ≥ r` 截断为 0；NaN（距离或半径）同样落进 0 贡献（不外溢）——与 WGSL 的
+/// `!(d < r)` 同义（NaN 在两种写法下比较恒假 ⇒ 截断支）。
+/// **WGSL 侧 `standard.wgsl::gi_probe_weight` 逐式镜像**（同式同序，两侧
+/// 必须同步修改）。
+pub fn probe_influence_weight(distance: f32, radius: f32) -> f32 {
+    if distance.is_nan() || radius.is_nan() || distance >= radius {
+        return 0.0;
+    }
+    let t = distance / radius;
+    let window = 1.0 - t * t;
+    window * window
+}
+
+/// 逐探针影响半径派生（纯函数）：`overrides[i] > 0` 且有限 ⇒ 用覆盖值，
+/// 否则 = **最近邻距离 × [`PROBE_RADIUS_NEIGHBOR_FACTOR`]**。
+///
+/// 边界语义：
+/// - 单探针（无邻居）⇒ `+∞`（覆盖全场；着色器里 `d/∞ = 0` ⇒ 权恒 1）；
+/// - 重合探针（最近邻距离 0）⇒ 半径 0 ⇒ 该探针不参与加权（`d < 0` 恒假），
+///   由「最近探针兜底」取值——与四面体路径的重合点合并语义相容；
+/// - 覆盖值非有限或 ≤ 0 ⇒ 自动派生（0 = 自动，与规格一致）。
+///
+/// **确定性 / 全序裁决**：最近邻用平方距离 + `f32::total_cmp` 取最小（严格
+/// `<`，等距时下标小者胜）⇒ 输入点的**任意重排**给出同一组半径值（半径是
+/// 「点集」的函数，不是「插入序」的函数；单测用置换钉住）。
+pub fn derive_probe_radii(positions: &[Vec3], overrides: &[f32]) -> Vec<f32> {
+    assert_eq!(
+        positions.len(),
+        overrides.len(),
+        "位置数（{}）与半径覆盖数（{}）必须一致",
+        positions.len(),
+        overrides.len()
+    );
+    positions
+        .iter()
+        .zip(overrides)
+        .map(|(p, &over)| {
+            if over.is_finite() && over > 0.0 {
+                return over;
+            }
+            let mut best = f32::INFINITY;
+            for q in positions {
+                if std::ptr::eq(p, q) {
+                    continue; // 自己不是自己的邻居（按地址判定，重合点仍算邻居）
+                }
+                let d2 = (*p - *q).length_squared();
+                if d2.total_cmp(&best) == std::cmp::Ordering::Less {
+                    best = d2;
+                }
+            }
+            if best.is_infinite() {
+                return f32::INFINITY; // 单探针：覆盖全场
+            }
+            best.sqrt() * PROBE_RADIUS_NEIGHBOR_FACTOR
+        })
+        .collect()
+}
+
+/// 逐片元 GI 求值的 **CPU 镜像**（WGSL：`standard.wgsl::gi_sh_irradiance`）。
+///
+/// ```text
+/// w_i = (1 − (d_i/r_i)²)²          （d_i ≥ r_i ⇒ 0）
+/// E/π = Σ(w_i · SH_i(n)) / max(Σw_i, ε)
+/// Σw ≤ ε ⇒ 回退**最近探针**的 SH 求值（严格 `<` 裁决 ⇒ 等距时下标小者胜）
+/// 结果钳 ≥ 0
+/// ```
+///
+/// 固定循环序 = 固定累加序 ⇒ 会话内逐位确定。**回退支的连续性**：片元在
+/// 影响球边界上时 w = 0，最近探针正是那个探针 ⇒ 两支同值（球外无衰减地
+/// 吃最近探针，与 v1「包外 = 最近凸包面投影」同族语义，见 §8.40⑦）。
+/// 空表 ⇒ `None`（调用方回退全局 env）。
+pub fn sh_blend(
+    positions: &[Vec3],
+    radii: &[f32],
+    sh: &[ShCoeffs],
+    position: Vec3,
+    normal: Vec3,
+) -> Option<Vec3> {
+    blend_probes(positions, radii, sh, position, |c| sh_eval(c, normal))
+}
+
+/// [`sh_blend`] 的零阶形态：每探针取 [`sh_dc`]（方向平均）而不是按法线求值。
+/// 带 SH 的探针集在 mode = 0 路径（捕获 / RT 相机）上的逐实体载荷口径。
+pub fn sh_blend_l0(
+    positions: &[Vec3],
+    radii: &[f32],
+    sh: &[ShCoeffs],
+    position: Vec3,
+) -> Option<Vec3> {
+    blend_probes(positions, radii, sh, position, sh_dc)
+}
+
+/// 径向权重混合的公共核（[`sh_blend`] / [`sh_blend_l0`] 只差「每探针取值」）。
+fn blend_probes(
+    positions: &[Vec3],
+    radii: &[f32],
+    sh: &[ShCoeffs],
+    position: Vec3,
+    per_probe: impl Fn(&ShCoeffs) -> Vec3,
+) -> Option<Vec3> {
+    assert!(
+        positions.len() == radii.len() && positions.len() == sh.len(),
+        "探针三表长度必须一致：{} / {} / {}",
+        positions.len(),
+        radii.len(),
+        sh.len()
+    );
+    if positions.is_empty() || !position.is_finite() {
+        return None;
+    }
+    let mut acc = Vec3::ZERO;
+    let mut wsum = 0.0f32;
+    let mut best_d = f32::INFINITY;
+    let mut best = 0usize;
+    for (i, p) in positions.iter().enumerate() {
+        let d = (position - *p).length();
+        let w = probe_influence_weight(d, radii[i]);
+        if w > 0.0 {
+            acc += per_probe(&sh[i]) * w;
+            wsum += w;
+        }
+        if d.total_cmp(&best_d) == std::cmp::Ordering::Less {
+            best_d = d;
+            best = i;
+        }
+    }
+    let gi = if wsum > SH_BLEND_EPS {
+        acc / wsum.max(SH_BLEND_EPS)
+    } else {
+        per_probe(&sh[best])
+    };
+    Some(gi.max(Vec3::ZERO))
+}
+
+/// 单探针的 GPU 上传布局（与 WGSL `GiProbe` 逐字段对齐，10×vec4 = 160 B）。
+///
+/// **偏离声明**：规格写的是「7×vec4 SH = 112 B」（27 个 f32 线性打包）。
+/// 线性打包在 WGSL 里没有动态 swizzle，取第 k 系数第 c 通道要做
+/// `(k·3+c)/4` 的 vec4 索引 + 三次 `select`（27 × 3 = 81 次 select / 探针 /
+/// 片元）；改成**每系数一个 vec4**（xyz = RGB、w 保留）后求值是 9 次
+/// `p.sh[k].xyz * y[k]`，CPU 镜像也逐式对齐。代价 = 每探针 160 B 而非
+/// 128 B（256 探针满载 40 KiB 而非 32 KiB，显存与带宽都可忽略）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShProbeRaw {
+    /// xyz: 探针世界位置，w: 影响半径（米；`+∞` = 覆盖全场）。
+    pub pos_radius: [f32; 4],
+    /// 9 组「E/π 直读」SH 系数：`sh[k] = (R_k, G_k, B_k, 保留)`。
+    pub sh: [[f32; 4]; SH_COEFFS],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<ShProbeRaw>() == 160,
+    "GiProbe 必须与 WGSL 布局一致（10×vec4 = 160 B）"
+);
+
+impl ShProbeRaw {
+    /// 从「位置 + 半径 + E/π 系数」打包（w 分量保留 0）。
+    pub fn new(position: Vec3, radius: f32, coeffs: &ShCoeffs) -> Self {
+        Self {
+            pos_radius: [position.x, position.y, position.z, radius],
+            sh: std::array::from_fn(|k| [coeffs[k][0], coeffs[k][1], coeffs[k][2], 0.0]),
+        }
+    }
+}
+
+/// 探针影响半径的**手动覆盖**组件（R83，可选）。
+///
+/// **缺席语义**：组件缺席 = 自动派生（最近邻距离 × 1.5，见
+/// [`derive_probe_radii`]）；在场但值 ≤ 0 或非有限 = 同样自动派生。
+///
+/// 规格原文是「`IrradianceProbe` 组件加可选覆盖字段」——**偏离声明**：
+/// [`IrradianceProbe`] 是**单元结构体**，加字段会把仓库里全部
+/// `IrradianceProbe` 值表达式（含既有测试与快照 example 的 spawn 元组）
+/// 变成编译错误，撞上「既有测试零改动全过」的硬约束；独立可选组件的
+/// 缺席语义（缺席 = 自动）与仓库文化一致，且覆盖能力等价。
+#[derive(Clone, Copy, Debug, Default, PartialEq, iris_core::Component)]
+pub struct IrradianceProbeRadius(pub f32);
 
 #[cfg(test)]
 mod tests {
@@ -2527,5 +3204,904 @@ mod tests {
             // 四面体数与体积和一致性的粗口径：非空且有限
             set.tetrahedralization().tetrahedron_count() + 1
         });
+    }
+
+    // ---- 三阶 SH（R83）----
+
+    /// 空 BVH（无几何）：辐射率场恒 = `sky_color`，是 SH 的解析锚点场景。
+    fn empty_bvh() -> crate::bake::Bvh {
+        build_bvh(Vec::new())
+    }
+
+    /// 两层异色板世界：红地板（y = −0.1）+ 绿天花板（y = 4.1），探针在
+    /// y = 2 ⇒ 下半球偏红、上半球偏绿（方向性锚点场景）。
+    fn two_tone_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(MeshStore::new());
+        world.insert_resource(MaterialStore::new());
+        let slab = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let red = world
+            .resource_mut::<MaterialStore>()
+            .add(MaterialDef::solid(0.9, 0.08, 0.06, 1.0));
+        let green = world
+            .resource_mut::<MaterialStore>()
+            .add(MaterialDef::solid(0.08, 0.9, 0.12, 1.0));
+        world.spawn((
+            Transform {
+                position: Vec3::new(0.0, -0.1, 0.0),
+                scale: Vec3::new(24.0, 0.2, 24.0),
+                ..Transform::IDENTITY
+            },
+            slab,
+            red,
+        ));
+        world.spawn((
+            Transform {
+                position: Vec3::new(0.0, 4.1, 0.0),
+                scale: Vec3::new(24.0, 0.2, 24.0),
+                ..Transform::IDENTITY
+            },
+            slab,
+            green,
+        ));
+        propagate_transforms(&mut world);
+        world
+    }
+
+    /// 归一化常数表钉在解析定义上（防止「表被改成一个自洽但错误的值」——
+    /// 求值 / 投影两侧会同错，只有对照解析式才抓得到）。判据 = **表值必须是
+    /// 解析式的正确舍入 f32**（逐位相等，不是容差比较）。
+    #[test]
+    fn sh_normalization_constants_match_their_analytic_definitions() {
+        let pi = std::f64::consts::PI;
+        let want = [
+            1.0 / (2.0 * pi.sqrt()),
+            3.0f64.sqrt() / (2.0 * pi.sqrt()),
+            15.0f64.sqrt() / (2.0 * pi.sqrt()),
+            5.0f64.sqrt() / (4.0 * pi.sqrt()),
+            15.0f64.sqrt() / (4.0 * pi.sqrt()),
+        ];
+        let names = ["SH_Y0", "SH_Y1", "SH_Y2A", "SH_Y2B", "SH_Y2C"];
+        let got = [SH_Y0, SH_Y1, SH_Y2A, SH_Y2B, SH_Y2C];
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                (w as f32).to_bits(),
+                "{} 必须是解析值 {w} 的正确舍入 f32（实得 {g}）",
+                names[i]
+            );
+        }
+        // 正交归一的自校验（∫Y_lm² dω = 1 的代数改写：`C² · ∫多项式² dω = 1`，
+        // 下面第三列 = `C² · 4π` 的应有值）。多项式的球面均方：1（L0）、
+        // ⟨y²⟩·4π = 4π/3（L1）、⟨(xy)²⟩·4π = 4π/15（L2 的 xy）、
+        // ⟨(3z²−1)²⟩·4π = 32π/5（L2 的 3z²−1，**多项式自带因子** ⇒ 这条的
+        // 4π·C² = 5/4 而不是 5）、⟨(x²−y²)²⟩·4π = 16π/15（L2 的 x²−y²）。
+        // 容差 2e-5 的依据：常数是 f32（相对精度 6e-8）⇒ 平方后相对误差
+        // 1.2e-7，乘上 4π ≈ 12.6 与 15 的量级后绝对误差 ≤ 2e-5——这几条是
+        // 「表值自洽」的粗筛，精确判据是上面的**正确舍入**逐位比较。
+        for (name, value, want) in [
+            ("Y_0", SH_Y0, 1.0),
+            ("Y_1", SH_Y1, 3.0),
+            ("Y_2A", SH_Y2A, 15.0),
+            ("Y_2B", SH_Y2B, 5.0 / 4.0),
+            ("Y_2C", SH_Y2C, 15.0 / 4.0),
+        ] {
+            let got = f64::from(value) * f64::from(value) * 4.0 * pi;
+            assert!(
+                (got - want).abs() < 2e-5,
+                "{name} 必须满足 4π·Y² = {want}（实得 {got}）"
+            );
+        }
+        assert_eq!(SH_Y2C * 2.0, SH_Y2A, "√15/(4√π) 必须是 √15/(2√π) 的一半");
+    }
+
+    /// 基函数在坐标轴上的解析值（序：L0；L1 = y, z, x；L2 = xy, yz, 3z²−1,
+    /// xz, x²−y²）——钉住「哪一项配哪个轴」，配错会让方向性探针整体错向。
+    #[test]
+    fn sh_basis_matches_analytic_values_on_the_axes() {
+        let y_up = sh_basis(Vec3::Y);
+        assert_eq!(y_up[0], SH_Y0);
+        assert_eq!(y_up[1], SH_Y1, "L1 的第一项必须是 y");
+        assert_eq!(y_up[2], 0.0, "z 项在 +Y 上为 0");
+        assert_eq!(y_up[3], 0.0, "x 项在 +Y 上为 0");
+        assert_eq!(y_up[4], 0.0, "xy 项在 +Y 上为 0");
+        assert_eq!(y_up[5], 0.0, "yz 项在 +Y 上为 0");
+        assert_eq!(y_up[6], -SH_Y2B, "3z²−1 在 z = 0 时为 −1");
+        assert_eq!(y_up[7], 0.0, "xz 项在 +Y 上为 0");
+        assert_eq!(y_up[8], -SH_Y2C, "x²−y² 在 +Y 上为 −1");
+        // +Z：只有 z 相关项非零
+        let z_fwd = sh_basis(Vec3::Z);
+        assert_eq!(z_fwd[2], SH_Y1, "L1 的第二项必须是 z");
+        assert_eq!(z_fwd[1], 0.0);
+        assert_eq!(z_fwd[6], SH_Y2B * 2.0, "3z²−1 在 +Z 上为 +2");
+        assert_eq!(z_fwd[8], 0.0, "x²−y² 在 x = y = 0 上为 0");
+        // +X
+        let x_right = sh_basis(Vec3::X);
+        assert_eq!(x_right[3], SH_Y1, "L1 的第三项必须是 x");
+        assert_eq!(x_right[6], -SH_Y2B, "3z²−1 在 z = 0 上为 −1");
+        assert_eq!(x_right[8], SH_Y2C, "x²−y² 在 +X 上为 +1");
+        // 对角方向：xy / yz / xz 三项同值，x²−y² 恒 0
+        let diag = sh_basis(Vec3::new(1.0, 1.0, 1.0) / 3.0f32.sqrt());
+        let third = 1.0 / 3.0;
+        assert!(
+            (diag[4] - SH_Y2A * third).abs() < 1e-7,
+            "xy 项在 (1,1,1)/√3 上必须是 √15/(2√π)·(1/3)：{}",
+            diag[4]
+        );
+        assert!((diag[5] - diag[4]).abs() < 1e-7, "yz 与 xy 同值（对称）");
+        assert!((diag[7] - diag[4]).abs() < 1e-7, "xz 与 xy 同值（对称）");
+        assert_eq!(diag[8], 0.0, "x²−y² 在 x = y 上恒 0（同位模式相减）");
+        assert!(
+            diag[6].abs() < 1e-6,
+            "3z²−1 在 z² = 1/3 上为 0（f32 的 1/√3 平方残差 ~1e-7）：{}",
+            diag[6]
+        );
+        // L1 三项在对角方向同值 = Y_1/√3
+        assert!((diag[1] - SH_Y1 / 3.0f32.sqrt()).abs() < 1e-7);
+    }
+
+    /// WGSL 源码看门：`standard.wgsl` 的五个 SH 常数必须与 CPU 表**逐位相同**
+    /// （照 `pipeline.rs::skybox_globals_prefix_matches_standard_layout` 的先例
+    /// ——影子契约靠源码层单测拦漂移，不靠记忆）。
+    #[test]
+    fn wgsl_sh_constants_match_cpu_table() {
+        let src = include_str!("../shaders/standard.wgsl");
+        let table = [
+            ("SH_Y0", SH_Y0),
+            ("SH_Y1", SH_Y1),
+            ("SH_Y2A", SH_Y2A),
+            ("SH_Y2B", SH_Y2B),
+            ("SH_Y2C", SH_Y2C),
+        ];
+        for (name, cpu) in table {
+            let key = format!("const {name}: f32 = ");
+            let at = src
+                .find(&key)
+                .unwrap_or_else(|| panic!("standard.wgsl 缺少 SH 常数 {name}"));
+            let rest = &src[at + key.len()..];
+            let literal = rest
+                .split(';')
+                .next()
+                .unwrap_or_else(|| panic!("{name} 的字面量没有分号结尾"));
+            let wgsl: f32 = literal
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} 的字面量 {literal:?} 解析失败：{e}"));
+            assert_eq!(
+                wgsl.to_bits(),
+                cpu.to_bits(),
+                "SH 常数 {name} 两侧必须逐位相同：WGSL {literal} = {wgsl} vs CPU {cpu}"
+            );
+        }
+        // 权重窗与混合下限也在同一张契约表里（值漂移同样会烧穿镜像）
+        assert!(
+            src.contains("const GI_BLEND_EPS: f32 = 1e-8;"),
+            "standard.wgsl 的 GI_BLEND_EPS 必须与 CPU 侧 SH_BLEND_EPS 同值"
+        );
+        assert_eq!(SH_BLEND_EPS.to_bits(), 1e-8f32.to_bits());
+    }
+
+    /// 固体角权重：整面 = 2π/3、六面合计 = **4π**（f64 的 1e-12）；面心纹素
+    /// 的权重显著大于面角纹素（这就是「不能用等权 4π/N」的量化依据）。
+    #[test]
+    fn cube_texel_solid_angles_sum_to_four_pi() {
+        let grid = SH_CUBE_GRID;
+        let step = 2.0 / f64::from(grid);
+        let mut face_total = 0.0f64;
+        let mut center = 0.0f64;
+        let mut corner = 0.0f64;
+        for row in 0..grid {
+            let v0 = -1.0 + step * f64::from(row);
+            for col in 0..grid {
+                let u0 = -1.0 + step * f64::from(col);
+                let w = cube_texel_solid_angle(u0, u0 + step, v0, v0 + step);
+                assert!(w > 0.0, "每个纹素的固体角必须为正：{w}");
+                face_total += w;
+                if row == grid / 2 && col == grid / 2 {
+                    center = w;
+                }
+                if row == 0 && col == 0 {
+                    corner = w;
+                }
+            }
+        }
+        let two_pi_over_three = 2.0 * std::f64::consts::PI / 3.0;
+        assert!(
+            (face_total - two_pi_over_three).abs() < 1e-12,
+            "单面固体角必须是 2π/3：{face_total}"
+        );
+        assert!(
+            (face_total * 6.0 - 4.0 * std::f64::consts::PI).abs() < 1e-11,
+            "六面合计必须是 4π：{}",
+            face_total * 6.0
+        );
+        // 整面闭式对照：4·atan2(1, √3) = 2π/3
+        assert!(
+            (cube_texel_solid_angle(-1.0, 1.0, -1.0, 1.0) - two_pi_over_three).abs() < 1e-15,
+            "整面闭式必须精确给出 2π/3"
+        );
+        let ratio = center / corner;
+        // 解析对照：小纹素的固体角 dΩ ≈ dA / r³（r² = u² + v² + 1，面法线
+        // 余弦 = 1/r）⇒ 面心 / 面角之比 = (r_corner / r_center)³。32² 网格下
+        // 面心纹素中心 u = v = step/2、面角纹素中心 u = v = −1 + step/2。
+        let half = step * 0.5;
+        let r_center = (1.0 + 2.0 * half * half).sqrt();
+        let edge = -1.0 + half;
+        let r_corner = (1.0 + 2.0 * edge * edge).sqrt();
+        let want_ratio = (r_corner / r_center).powi(3);
+        assert!(
+            (ratio - want_ratio).abs() < 0.02 * want_ratio,
+            "面心 / 面角纹素权重比必须 ≈ (r_corner/r_center)³ = {want_ratio}：{ratio}"
+        );
+        assert!(
+            ratio > 4.0,
+            "面心权重必须显著大于面角（这就是不能用等权 4π/N 的量化依据）：{ratio}"
+        );
+    }
+
+    /// cube 面方向：六面各自把对应半球盖住、方向恒单位长、面序 = [`PROBE_AXES`]。
+    #[test]
+    fn cube_face_directions_cover_the_sphere_once() {
+        let mut seen = [0usize; 6];
+        for face in 0..SH_CUBE_FACES {
+            for row in 0..8 {
+                for col in 0..8 {
+                    let u = -1.0 + 2.0 * (col as f32 + 0.5) / 8.0;
+                    let v = -1.0 + 2.0 * (row as f32 + 0.5) / 8.0;
+                    let d = cube_face_direction(face, u, v);
+                    assert!((d.length() - 1.0).abs() < 1e-6, "方向必须单位长：{d:?}");
+                    // 最大分量轴 = 本面的轴（⇒ 六面互不重叠地覆盖球面）
+                    let ax = d.x.abs();
+                    let ay = d.y.abs();
+                    let az = d.z.abs();
+                    let dominant = match face {
+                        0 | 1 => ax,
+                        2 | 3 => ay,
+                        _ => az,
+                    };
+                    assert!(
+                        dominant >= ax && dominant >= ay && dominant >= az,
+                        "面 {face} 的方向必须以该面的轴为主导分量：{d:?}"
+                    );
+                    assert!(
+                        d.dot(PROBE_AXES[face]) > 0.0,
+                        "面 {face} 的方向必须朝向该面的轴：{d:?}"
+                    );
+                    seen[face] += 1;
+                }
+            }
+        }
+        assert_eq!(seen, [64; 6]);
+    }
+
+    /// 解析锚点①：常量辐射率 C 的场 ⇒ 任意方向求值恒 = C（E = Cπ ⇒ E/π = C）。
+    /// L0 的正交性让这条**精确**成立（高阶项在对称网格上成对相消），残差只有
+    /// f32 舍入 ⇒ 容差 1e-5（相对）。
+    #[test]
+    fn constant_radiance_field_evaluates_to_itself_in_every_direction() {
+        let bvh = empty_bvh();
+        let params = BakeParams {
+            sky_color: Vec3::new(0.31, 0.47, 0.62),
+            ..test_params()
+        };
+        let coeffs = probe_sh_coefficients(&bvh, Vec3::new(0.0, 1.0, 0.0), &params);
+        // 高阶系数必须≈ 0（对称网格 + 常量场的正交性）
+        for (k, row) in coeffs.iter().enumerate().skip(1) {
+            for (c, v) in row.iter().enumerate() {
+                assert!(v.abs() < 1e-5, "常量场的高阶系数 {k}[{c}] 必须≈0：{v}");
+            }
+        }
+        // L0 系数 = C·Y_0·4π（卷积因子 A_0/π = 1）
+        let want_l0 = params.sky_color * SH_Y0 * 4.0 * std::f32::consts::PI;
+        for c in 0..3 {
+            assert!(
+                (coeffs[0][c] - want_l0[c]).abs() < 1e-4 * want_l0[c].abs(),
+                "L0 系数必须是 C·Y_0·4π：{} vs {}",
+                coeffs[0][c],
+                want_l0[c]
+            );
+        }
+        // 任意方向求值恒 = C
+        let dirs = [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::new(1.0, 1.0, 1.0) / 3.0f32.sqrt(),
+            Vec3::new(-0.2, 0.7, -0.68).normalize(),
+        ];
+        for d in dirs {
+            let got = sh_eval(&coeffs, d);
+            let err = (got - params.sky_color).abs().max_element();
+            assert!(
+                err < 1e-5,
+                "常量场在方向 {d:?} 的求值必须 = C：{got:?} vs {:?}（err {err}）",
+                params.sky_color
+            );
+        }
+        // 零阶（方向平均）项同样 = C
+        let dc = sh_dc(&coeffs);
+        assert!((dc - params.sky_color).abs().max_element() < 1e-5, "{dc:?}");
+    }
+
+    /// 解析锚点②（**Lambert 带通因子**）：纯 L1 场 `L(ω) = C·ω_y` 的解析投影
+    /// 只有 k = 1（y 项，见 [`sh_basis`] 的序）非零，`c_1 = C·Y_1·(4π/3)`；
+    /// 卷积后 `E(+Y)/π = c_1·(A_1/π)·Y_1 = 2C/3`——这条把 `A_1/π = 2/3` 钉死
+    /// （因子写错立刻不过），且不含任何求积误差。
+    #[test]
+    fn lambert_band_factors_are_exact_for_an_l1_field() {
+        let c = 1.7f32;
+        // 解析投影：∫ C·ω_y·Y_k dω = C·Y_1·∫y² dω = C·Y_1·(4π/3)，只有 k = 1
+        let mut projected: ShCoeffs = [[0.0; 3]; SH_COEFFS];
+        projected[1] = [c * SH_Y1 * 4.0 * std::f32::consts::PI / 3.0, 0.0, 0.0];
+        let coeffs = sh_lambert_convolve(projected);
+        assert_eq!(
+            coeffs[1][0].to_bits(),
+            (projected[1][0] * SH_LAMBERT_BANDS[1]).to_bits(),
+            "L1 项必须乘 A_1/π = 2/3"
+        );
+        assert_eq!(coeffs[0], [0.0; 3], "其余频带不受影响");
+        // E(+Y)/π = 2C/3（解析解：E(n) = ∫ C·ω_y·(n·ω)⁺ dω，n = +Y ⇒ C·2π/3）
+        let up = sh_eval(&coeffs, Vec3::Y);
+        assert!(
+            (up.x - 2.0 * c / 3.0).abs() < 1e-5,
+            "E(+Y)/π 必须 = 2C/3：{} vs {}",
+            up.x,
+            2.0 * c / 3.0
+        );
+        assert_eq!((up.y, up.z), (0.0, 0.0), "场只有 x 通道 ⇒ 其余通道恒 0");
+        // 反向法线给出对称的负值（输入辐射率本身有负半球，属非物理输入；
+        // 数学上 SH 忠实还原 ⇒ 这条同时钉住「求值不偷偷取绝对值」）
+        let down = sh_eval(&coeffs, Vec3::NEG_Y);
+        assert!(
+            (down.x + 2.0 * c / 3.0).abs() < 1e-5,
+            "E(−Y)/π 必须 = −2C/3：{}",
+            down.x
+        );
+        // 水平法线（与场正交）⇒ 0
+        let side = sh_eval(&coeffs, Vec3::X);
+        assert!(side.x.abs() < 1e-6, "E(+X)/π 必须 = 0：{}", side.x);
+        // L0 带因子 = 1：常量场的 L0 卷积后逐位不变
+        let mut constant: ShCoeffs = [[0.0; 3]; SH_COEFFS];
+        constant[0] = [1.0, 2.0, 3.0];
+        assert_eq!(sh_lambert_convolve(constant)[0], [1.0, 2.0, 3.0]);
+        // L2 带因子 = 1/4
+        let mut l2: ShCoeffs = [[0.0; 3]; SH_COEFFS];
+        l2[4] = [4.0, 0.0, 0.0];
+        assert_eq!(sh_lambert_convolve(l2)[4][0], 1.0, "A_2/π = 1/4");
+    }
+
+    /// 解析锚点③（**方向性**，§8.40② 的 CPU 半）：红地板 + 绿天花板 ⇒
+    /// 同一探针内 `E(+Y)/π` 偏绿、`E(−Y)/π` 偏红。v1 的六轴平均会把这两个
+    /// 信号摊成同一个值（同场景的六轴平均一并对照）。
+    ///
+    /// 场景是**封闭双层板**（天花板把地板遮成纯天空照明）⇒ 两板的辐射率
+    /// 各 = `albedo × sky_color`；`sky_color = 0.5`、albedo 0.9 量级下，
+    /// 上下半球的色相分离 ≈ 0.45（E/π 口径），而约 17% 的方向从板的边缘
+    /// 逃逸成中性天空（≈ 0.09 的稀释项）⇒ 比值判据 > 2.5 有充分余量。
+    #[test]
+    fn directional_field_separates_up_and_down_hemispheres() {
+        let world = two_tone_world();
+        let bvh = build_bvh(collect_bake_triangles(&world));
+        let params = BakeParams {
+            sky_color: Vec3::splat(0.5),
+            ..test_params()
+        };
+        let position = Vec3::new(0.0, 2.0, 0.0);
+        let coeffs = probe_sh_coefficients(&bvh, position, &params);
+        let up = sh_eval(&coeffs, Vec3::Y);
+        let down = sh_eval(&coeffs, Vec3::NEG_Y);
+        let side = sh_eval(&coeffs, Vec3::X);
+        println!("上 {up:?} / 下 {down:?} / 侧 {side:?}");
+        assert!(up.y / up.x > 2.5, "朝天花板方向的求值必须显著偏绿：{up:?}");
+        assert!(
+            down.x / down.y > 2.5,
+            "朝地板方向的求值必须显著偏红：{down:?}"
+        );
+        // 分离度可判别：上下的「绿减红」符号相反且量级远超 f32 噪声
+        let sep_up = up.y - up.x;
+        let sep_down = down.y - down.x;
+        assert!(
+            sep_up > 0.2 && sep_down < -0.2,
+            "上下半球必须显著分离：{sep_up} vs {sep_down}"
+        );
+        assert!(
+            sep_up - sep_down > 0.5,
+            "上下半球的色相分离差必须可判别：{sep_up} vs {sep_down}"
+        );
+        // v1 六轴平均把方向性摊平：单一标量值的色相分离远小于 SH 的上下极值
+        let mut six = Vec3::ZERO;
+        for axis in PROBE_AXES {
+            six += bake_sample(&bvh, position, axis, &params).indirect();
+        }
+        let six_axis = six / 6.0 * std::f32::consts::FRAC_1_PI; // 换成 E/π 口径
+        println!("六轴平均（E/π）{six_axis:?}");
+        assert!(
+            (six_axis.y - six_axis.x).abs() < sep_up.abs() * 0.6,
+            "六轴平均的色相分离必须显著小于 SH 的方向性分离：{six_axis:?} vs {sep_up}"
+        );
+        // 量级自校验：SH 的上下极值夹住六轴平均值（平均在两者之间）
+        assert!(
+            six_axis.x > down.x * 0.5 && six_axis.x < up.x + down.x,
+            "六轴平均的红通道必须落在上下极值张成的区间里：{six_axis:?}"
+        );
+    }
+
+    /// 投影确定性：同一 BVH / 参数两跑 `to_bits` 逐位一致（固定面序 ×
+    /// 固定行列序 × f64 定序累加）。
+    #[test]
+    fn sh_projection_is_bitwise_deterministic_across_runs() {
+        let world = floor_world();
+        let bvh = build_bvh(collect_bake_triangles(&world));
+        let params = test_params();
+        let p = Vec3::new(0.5, 1.25, -0.75);
+        let a = project_probe_sh(&bvh, p, &params);
+        let b = project_probe_sh(&bvh, p, &params);
+        for k in 0..SH_COEFFS {
+            for c in 0..3 {
+                assert_eq!(
+                    a[k][c].to_bits(),
+                    b[k][c].to_bits(),
+                    "系数 {k}[{c}] 两跑必须逐位一致"
+                );
+            }
+        }
+        // 求值同样逐位（同系数同法线）
+        let n = Vec3::new(0.3, 0.9, -0.32).normalize();
+        assert_eq!(bits3(sh_eval(&a, n)), bits3(sh_eval(&b, n)));
+        // 换位置 ⇒ 系数变化（防「恒零假通过」）
+        let c = project_probe_sh(&bvh, Vec3::new(3.0, 0.4, 3.0), &params);
+        assert_ne!(a[0], c[0], "不同位置的 L0 系数必须不同");
+    }
+
+    /// 单条方向的辐射率口径与 `bake_sample` 同源：空场景 = `sky_color`；
+    /// 命中且 `bounces = 0` ⇒ 0；命中且 `bounces = 1` ⇒ `albedo/π × 入射`。
+    #[test]
+    fn probe_sh_radiance_matches_bake_sample_conventions() {
+        let params = test_params();
+        // 空场景：任何方向都是天空辐射率
+        let bvh = empty_bvh();
+        for d in [
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::new(0.4, -0.8, 0.45).normalize(),
+        ] {
+            assert_eq!(
+                probe_sh_radiance(&bvh, Vec3::new(0.0, 1.0, 0.0), d, &params),
+                params.sky_color
+            );
+        }
+        // 地板场景：朝下命中（反弹），朝上未命中（天空）
+        let world = floor_world();
+        let floor_bvh = build_bvh(collect_bake_triangles(&world));
+        let p = Vec3::new(0.0, 1.0, 0.0);
+        let up = probe_sh_radiance(&floor_bvh, p, Vec3::Y, &params);
+        assert_eq!(up, params.sky_color, "朝上的方向必须看见天空");
+        let down = probe_sh_radiance(&floor_bvh, p, Vec3::NEG_Y, &params);
+        assert!(
+            down.length() > 0.0,
+            "朝下的方向必须拿到地板反弹（bounces = 1）：{down:?}"
+        );
+        // bounces = 0 ⇒ 命中方向恒 0（与 bake_sample 同口径）
+        let no_bounce = BakeParams {
+            bounces: 0,
+            ..params
+        };
+        assert_eq!(
+            probe_sh_radiance(&floor_bvh, p, Vec3::NEG_Y, &no_bounce),
+            Vec3::ZERO
+        );
+        assert_eq!(
+            probe_sh_radiance(&floor_bvh, p, Vec3::Y, &no_bounce),
+            params.sky_color,
+            "未命中方向与 bounces 无关"
+        );
+        // 与积分器的一致性：开阔天空下 sh_eval 的零阶项 = bake_sample 的
+        // indirect/π（两条独立求积互相印证）
+        let open = BakeParams {
+            sky_color: Vec3::new(0.2, 0.3, 0.4),
+            ..params
+        };
+        let coeffs = probe_sh_coefficients(&empty_bvh(), p, &open);
+        let six =
+            bake_sample(&empty_bvh(), p, Vec3::Y, &open).indirect() * std::f32::consts::FRAC_1_PI;
+        assert!(
+            (sh_eval(&coeffs, Vec3::Y) - six).abs().max_element() < 1e-5,
+            "开阔天空：SH 求值必须 = 积分器的 π·sky/π = sky：{:?} vs {six:?}",
+            sh_eval(&coeffs, Vec3::Y)
+        );
+    }
+
+    /// 影响半径派生：等距网格 = 间距 × 1.5；单探针 = ∞；重合点 = 0；
+    /// 覆盖值优先；**输入置换不改半径值**（全序裁决）。
+    #[test]
+    fn derive_probe_radii_uses_nearest_neighbor_with_total_order() {
+        // 3×3×1 网格，间距 2 ⇒ 最近邻 = 2（角点）/ 2（边心也是 2）
+        let mut grid = Vec::new();
+        for x in 0..3 {
+            for z in 0..3 {
+                grid.push(Vec3::new(x as f32 * 2.0, 1.0, z as f32 * 2.0));
+            }
+        }
+        let auto = vec![0.0; grid.len()];
+        let radii = derive_probe_radii(&grid, &auto);
+        for (i, r) in radii.iter().enumerate() {
+            assert_eq!(
+                *r,
+                2.0 * PROBE_RADIUS_NEIGHBOR_FACTOR,
+                "网格探针 {i} 的半径必须是间距 × 1.5：{r}"
+            );
+        }
+        // 单探针：无邻居 ⇒ ∞（覆盖全场）
+        let single = derive_probe_radii(&[Vec3::new(1.0, 2.0, 3.0)], &[0.0]);
+        assert_eq!(single, vec![f32::INFINITY]);
+        // 重合点：最近邻距离 0 ⇒ 半径 0（另一个不重合的探针照常派生）
+        let dup = derive_probe_radii(
+            &[Vec3::ZERO, Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0)],
+            &[0.0; 3],
+        );
+        assert_eq!(dup[0], 0.0);
+        assert_eq!(dup[1], 0.0);
+        assert_eq!(dup[2], 3.0 * PROBE_RADIUS_NEIGHBOR_FACTOR);
+        // 覆盖值优先；≤ 0 / 非有限 ⇒ 自动
+        let mixed = derive_probe_radii(&[Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0)], &[7.5, f32::NAN]);
+        assert_eq!(mixed[0], 7.5, "正覆盖值必须生效");
+        assert_eq!(mixed[1], 3.0 * PROBE_RADIUS_NEIGHBOR_FACTOR, "NaN ⇒ 自动");
+        assert_eq!(
+            derive_probe_radii(&[Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0)], &[-1.0, 0.0]),
+            vec![4.5, 4.5],
+            "≤ 0 的覆盖值 ⇒ 自动"
+        );
+        // 置换不变性：打乱输入序，半径跟着点走（值集合不变）
+        let permuted = vec![
+            grid[4], grid[0], grid[8], grid[2], grid[6], grid[1], grid[7], grid[3], grid[5],
+        ];
+        let perm_radii = derive_probe_radii(&permuted, &[0.0; 9]);
+        let mut a = radii.clone();
+        let mut b = perm_radii;
+        a.sort_by(|x, y| x.total_cmp(y));
+        b.sort_by(|x, y| x.total_cmp(y));
+        assert_eq!(a, b, "置换输入不得改变半径值集合");
+        // 非等距：最近邻是「最近的那个」，不是平均间距
+        let line = vec![
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(9.0, 0.0, 0.0),
+        ];
+        let line_radii = derive_probe_radii(&line, &[0.0; 3]);
+        assert_eq!(line_radii[0], 1.0 * PROBE_RADIUS_NEIGHBOR_FACTOR);
+        assert_eq!(
+            line_radii[1],
+            1.0 * PROBE_RADIUS_NEIGHBOR_FACTOR,
+            "取最近邻 1.0"
+        );
+        assert_eq!(
+            line_radii[2],
+            8.0 * PROBE_RADIUS_NEIGHBOR_FACTOR,
+            "取最近邻 8.0"
+        );
+    }
+
+    /// 径向权重窗：与点光衰减窗同式（`w(0) = 1`、`w(r) = 0`、
+    /// `w(r/2) = (1 − 0.25)²`）、单调不增、`d ≥ r` 与 NaN 一律 0、`r = ∞`
+    /// 恒 1。
+    #[test]
+    fn probe_influence_weight_matches_the_point_light_window() {
+        let r = 4.0f32;
+        assert_eq!(probe_influence_weight(0.0, r), 1.0);
+        assert_eq!(probe_influence_weight(r, r), 0.0, "边界处权重归零");
+        assert_eq!(probe_influence_weight(r * 1.5, r), 0.0, "球外恒 0");
+        // 与 point_light_contrib 的 window² 逐项对照（同式同源）
+        for i in 0..=20 {
+            let d = r * (i as f32 / 20.0);
+            let t = d / r;
+            let window = 1.0 - t * t;
+            let want = window * window;
+            assert_eq!(
+                probe_influence_weight(d, r).to_bits(),
+                want.to_bits(),
+                "d = {d} 必须与点光窗逐位同值"
+            );
+        }
+        assert_eq!(
+            probe_influence_weight(2.0, r),
+            (1.0 - 0.25f32).powi(2),
+            "d = r/2 ⇒ (1 − 0.25)²"
+        );
+        // 单调不增
+        let mut prev = f32::INFINITY;
+        for i in 0..=40 {
+            let w = probe_influence_weight(r * (i as f32 / 40.0), r);
+            assert!(w <= prev, "权重必须随距离单调不增");
+            prev = w;
+        }
+        // NaN / 负值 / 零半径 / 无穷半径
+        assert_eq!(probe_influence_weight(f32::NAN, r), 0.0, "NaN 距离 ⇒ 0");
+        assert_eq!(probe_influence_weight(1.0, f32::NAN), 0.0, "NaN 半径 ⇒ 0");
+        assert_eq!(probe_influence_weight(1.0, 0.0), 0.0, "零半径 ⇒ 0");
+        // 距离来自 length() ⇒ 非负；假想的负输入下窗是 d 的偶函数（不外溢）
+        assert_eq!(
+            probe_influence_weight(-1.0, r),
+            probe_influence_weight(1.0, r),
+            "窗是 d 的偶函数（负距离不可能出现，仅记录行为）"
+        );
+        assert_eq!(
+            probe_influence_weight(1.0e6, f32::INFINITY),
+            1.0,
+            "无穷半径（单探针）⇒ 恒 1"
+        );
+    }
+
+    /// 加权混合：单探针（r = ∞）逐位还原该探针的求值；两探针中点 = 算术平均；
+    /// 球外回退最近探针；边界处连续；空表 / 非有限位置 ⇒ `None`。
+    #[test]
+    fn sh_blend_weights_probes_and_falls_back_to_the_nearest() {
+        // 两个「常量场」探针：A 全 1、B 全 3（L0 系数取 C/Y_0 ⇒ 求值恒 C）
+        let const_coeffs = |c: f32| -> ShCoeffs {
+            let mut out = [[0.0f32; 3]; SH_COEFFS];
+            out[0] = [c / SH_Y0, c / SH_Y0, c / SH_Y0];
+            out
+        };
+        let positions = vec![Vec3::new(-2.0, 1.0, 0.0), Vec3::new(2.0, 1.0, 0.0)];
+        let sh = vec![const_coeffs(1.0), const_coeffs(3.0)];
+        let n = Vec3::new(0.3, 0.9, -0.32).normalize();
+
+        // 单探针 r = ∞：权重恒 1 ⇒ 逐位还原（1.0 的乘除是精确的）
+        let single = sh_blend(
+            &positions[..1],
+            &[f32::INFINITY],
+            &sh[..1],
+            Vec3::new(50.0, -30.0, 12.0),
+            n,
+        )
+        .unwrap();
+        assert_eq!(bits3(single), bits3(sh_eval(&sh[0], n)));
+
+        // 中点：两探针等权 ⇒ 算术平均 (1 + 3)/2 = 2
+        let mid = sh_blend(&positions, &[4.0, 4.0], &sh, Vec3::new(0.0, 1.0, 0.0), n).unwrap();
+        assert!(
+            (mid.x - 2.0).abs() < 1e-6,
+            "等权中点必须是算术平均：{mid:?}"
+        );
+
+        // 偏向 A：权重更大 ⇒ 结果更靠近 1
+        let near_a = sh_blend(&positions, &[4.0, 4.0], &sh, Vec3::new(-1.0, 1.0, 0.0), n).unwrap();
+        assert!(
+            near_a.x < mid.x && near_a.x > 1.0,
+            "靠近 A 的点必须落在 (1, 2) 区间：{near_a:?}"
+        );
+
+        // 球外（两半径都 1，查询点距两探针各 5）⇒ 回退最近探针（等距时
+        // 下标小者胜 = A）
+        let outside = sh_blend(&positions, &[1.0, 1.0], &sh, Vec3::new(0.0, 1.0, 5.0), n);
+        let want_a = sh_eval(&sh[0], n);
+        assert!(
+            (outside.unwrap() - want_a).abs().max_element() < 1e-6,
+            "球外必须回退最近探针（等距取小下标）：{:?}",
+            outside
+        );
+
+        // 边界连续性：从球内逼近边界，值收敛到边界外的回退值
+        let at_edge_in = sh_blend(
+            &positions[..1],
+            &[2.0],
+            &sh[..1],
+            Vec3::new(0.0, 1.0, 0.0) - Vec3::Z * 1.9999,
+            n,
+        )
+        .unwrap();
+        let at_edge_out = sh_blend(
+            &positions[..1],
+            &[2.0],
+            &sh[..1],
+            Vec3::new(0.0, 1.0, 0.0) - Vec3::Z * 2.0001,
+            n,
+        )
+        .unwrap();
+        assert!(
+            (at_edge_in - at_edge_out).abs().max_element() < 1e-3,
+            "影响球边界两侧必须连续：{at_edge_in:?} vs {at_edge_out:?}"
+        );
+
+        // 退化输入
+        assert!(
+            sh_blend(&[], &[], &[], Vec3::ZERO, n).is_none(),
+            "空表 ⇒ None"
+        );
+        assert!(
+            sh_blend(
+                &positions,
+                &[4.0, 4.0],
+                &sh,
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                n
+            )
+            .is_none(),
+            "非有限位置 ⇒ None"
+        );
+        // L0 形态：常量场下与法线无关，且等于 sh_dc
+        let dc = sh_blend_l0(&positions, &[4.0, 4.0], &sh, Vec3::new(0.0, 1.0, 0.0)).unwrap();
+        assert!(
+            (dc.x - 2.0).abs() < 1e-6,
+            "L0 混合必须是两探针 DC 的等权平均：{dc:?}"
+        );
+    }
+
+    /// 负值钳制：混合出口钳 ≥ 0（振铃出的小负值不会变成「负间接光」），
+    /// 而单探针求值 [`sh_eval`] **不钳**（与 WGSL 的 gi_sh_eval 逐式镜像）。
+    #[test]
+    fn sh_blend_clamps_negative_ringing_at_the_exit_only() {
+        let mut negative = [[0.0f32; 3]; SH_COEFFS];
+        negative[0] = [-1.0 / SH_Y0, 0.0, 0.0]; // 求值恒 −1
+        let raw = sh_eval(&negative, Vec3::Y);
+        assert!(raw.x < 0.0, "sh_eval 必须忠实还原负值（不钳）：{raw:?}");
+        let blended = sh_blend(
+            &[Vec3::ZERO],
+            &[f32::INFINITY],
+            &[negative],
+            Vec3::new(0.1, 0.0, 0.0),
+            Vec3::Y,
+        )
+        .unwrap();
+        assert_eq!(blended, Vec3::ZERO, "混合出口必须钳 ≥ 0：{blended:?}");
+    }
+
+    /// SH 烘焙入口：v1 的 `values` / 四面体表与 [`bake_irradiance_probes`]
+    /// **逐位一致**（SH 是纯追加），且 SH 的零阶平均与六轴平均互相印证。
+    #[test]
+    fn sh_bake_keeps_v1_data_bitwise_and_agrees_with_the_six_axis_average() {
+        let mut world = floor_world();
+        spawn_probes(
+            &mut world,
+            &[
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(2.0, 0.5, -1.0),
+                Vec3::new(-1.5, 2.0, 0.5),
+                Vec3::new(3.0, 3.0, 3.0),
+            ],
+        );
+        let params = test_params();
+        let v1 = bake_irradiance_probes(&world, &params);
+        let sh = bake_irradiance_probes_sh(&world, &params);
+        assert!(!v1.has_sh(), "v1 入口不得产出 SH（mode = 0 的前提）");
+        assert!(sh.has_sh());
+        assert!(sh.stats().sh && !v1.stats().sh);
+        assert_eq!(sh.len(), v1.len());
+        for i in 0..v1.len() {
+            assert_eq!(
+                bits3(sh.values()[i]),
+                bits3(v1.values()[i]),
+                "探针 {i} 的 v1 值必须逐位不变"
+            );
+            assert_eq!(bits3(sh.positions()[i]), bits3(v1.positions()[i]));
+        }
+        assert_eq!(
+            sh.tetrahedralization().tetrahedra(),
+            v1.tetrahedralization().tetrahedra(),
+            "四面体表必须逐位不变"
+        );
+        // 半径：4 个散点的最近邻 × 1.5（有限、正）
+        assert_eq!(sh.radii().len(), 4);
+        for (i, r) in sh.radii().iter().enumerate() {
+            assert!(
+                r.is_finite() && *r > 0.0,
+                "探针 {i} 的半径必须有限为正：{r}"
+            );
+        }
+        // 两条独立求积互相印证：SH 的六轴平均 vs v1 的六轴平均（同为 E 口径，
+        // 前者 = Σ_k d_k Y_k(axis) × π）。容差 12%：两次求积的方向集不同
+        // （6144 均匀 vs 6 × 32 余弦加权）、且 SH 只到 L2（截断误差在强
+        // 方向性场下就是这个量级——见 §8.52 的诚实限制）。
+        for i in 0..sh.len() {
+            let mut sum = Vec3::ZERO;
+            for axis in PROBE_AXES {
+                sum += sh_eval(&sh.sh_coefficients()[i], axis);
+            }
+            let sh_six_axis = sum / 6.0 * std::f32::consts::PI; // E 口径
+            let v1_value = v1.values()[i];
+            let rel = ((sh_six_axis - v1_value).abs() / v1_value.abs().max(Vec3::splat(1e-3)))
+                .max_element();
+            assert!(
+                rel < 0.12,
+                "探针 {i} 的 SH 六轴平均必须与 v1 值同量级：{sh_six_axis:?} vs {v1_value:?}（相对差 {rel}）"
+            );
+        }
+        // GPU 形态：逐字段往返
+        let raws = sh.gpu_probes();
+        assert_eq!(raws.len(), 4);
+        assert!(v1.gpu_probes().is_empty(), "无 SH 的集不得产出 GPU 探针表");
+        for (i, raw) in raws.iter().enumerate() {
+            assert_eq!(
+                raw.pos_radius,
+                [
+                    sh.positions()[i].x,
+                    sh.positions()[i].y,
+                    sh.positions()[i].z,
+                    sh.radii()[i]
+                ]
+            );
+            for k in 0..SH_COEFFS {
+                assert_eq!(
+                    raw.sh[k][0].to_bits(),
+                    sh.sh_coefficients()[i][k][0].to_bits()
+                );
+                assert_eq!(
+                    raw.sh[k][1].to_bits(),
+                    sh.sh_coefficients()[i][k][1].to_bits()
+                );
+                assert_eq!(
+                    raw.sh[k][2].to_bits(),
+                    sh.sh_coefficients()[i][k][2].to_bits()
+                );
+                assert_eq!(raw.sh[k][3], 0.0, "w 分量是保留位");
+            }
+        }
+        assert!(
+            sh.memory_bytes() > v1.memory_bytes(),
+            "带 SH 的集内存口径必须更大：{} vs {}",
+            sh.memory_bytes(),
+            v1.memory_bytes()
+        );
+    }
+
+    /// 半径覆盖组件 + 逐片元载荷：`IrradianceProbeRadius` 生效；带 SH 的集
+    /// 即使**四面体化为空**（单探针）也发标志位 1，xyz = SH 的零阶项。
+    #[test]
+    fn sh_set_payload_uses_l0_and_works_without_tetrahedra() {
+        // 单探针：四面体化为空 ⇒ v1 载荷恒 [0;4]，SH 载荷仍有效
+        let coeffs = {
+            let mut c = [[0.0f32; 3]; SH_COEFFS];
+            c[0] = [2.0 / SH_Y0, 1.0 / SH_Y0, 0.5 / SH_Y0];
+            c
+        };
+        let one = IrradianceProbeSet::from_probes_sh(
+            vec![Vec3::new(0.0, 1.0, 0.0)],
+            vec![Vec3::splat(std::f32::consts::PI)],
+            vec![coeffs],
+            vec![f32::INFINITY],
+        );
+        assert!(one.tetrahedralization().is_empty(), "单探针四面体化为空");
+        assert_eq!(one.instance_payload(Vec3::new(9.0, 1.0, 9.0))[3], 1.0);
+        let payload = one.instance_payload(Vec3::new(9.0, 1.0, 9.0));
+        assert_eq!(
+            bits3(Vec3::new(payload[0], payload[1], payload[2])),
+            bits3(sh_dc(&coeffs))
+        );
+        // v1 同构型（单探针无 SH）⇒ 标志位 0（既有语义不变）
+        let one_v1 = IrradianceProbeSet::from_probes(
+            vec![Vec3::new(0.0, 1.0, 0.0)],
+            vec![Vec3::splat(std::f32::consts::PI)],
+        );
+        assert_eq!(one_v1.instance_payload(Vec3::new(9.0, 1.0, 9.0)), [0.0; 4]);
+        // 逐片元求值：单探针 r = ∞ ⇒ 处处等于该探针的 SH 求值
+        let n = Vec3::new(-0.4, 0.8, 0.45).normalize();
+        let got = one
+            .sh_irradiance_at(Vec3::new(-30.0, 5.0, 12.0), n)
+            .unwrap();
+        assert_eq!(bits3(got), bits3(sh_eval(&coeffs, n)));
+        assert!(
+            one_v1.sh_irradiance_at(Vec3::ZERO, Vec3::Y).is_none(),
+            "无 SH 的集不得有逐片元求值"
+        );
+        // 半径覆盖组件：烘焙时读进 overrides
+        let mut world = floor_world();
+        world.spawn((
+            Transform::from_xyz(0.0, 1.0, 0.0),
+            IrradianceProbe,
+            IrradianceProbeRadius(5.25),
+        ));
+        world.spawn((Transform::from_xyz(3.0, 1.0, 0.0), IrradianceProbe));
+        propagate_transforms(&mut world);
+        let set = bake_irradiance_probes_sh(&world, &test_params());
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.radii()[0], 5.25, "覆盖值必须生效");
+        assert_eq!(
+            set.radii()[1],
+            3.0 * PROBE_RADIUS_NEIGHBOR_FACTOR,
+            "未挂覆盖组件的探针走自动派生"
+        );
     }
 }

@@ -5,6 +5,62 @@
 
 ## [Unreleased]
 
+### Added（R83：GI 探针逐片元化——三阶 SH 方向性探针 × 片端径向权重求值）
+
+路线图 v5 第二梯队收官轮（5/5）。`iris-render/irradiance.rs` 新增三阶球谐
+纯函数段，`standard.wgsl` 新增逐片元求值支：把 ARCHITECTURE §8.40 的
+**①（逐片元 GPU 插值）与②（SH 方向性探针）从拒绝清单移进实现**，③（可见性
+加权）维持拒绝。v1（§4.33）的数据与路径**一字不动**，继续作 mode = 0 的
+兼容轨与对照轨；SH 是**追加**的一层方向性数据。
+
+- **三阶 SH 烘焙（`probe_sh_coefficients`）**：与 v1 **同一份烘焙口径**
+  （同一 BVH / 同一 `BakeParams` / 同一「天空 or 一次反弹」辐射率公式
+  `probe_sh_radiance`——不新增捕获 pass），把「六轴各积一次半球」换成
+  「六面 × 32² 方向各取一次辐射率再投影」；投影 = 固定面序（`PROBE_AXES`）
+  × 固定行列序 × **精确固体角权重**（`cube_texel_solid_angle` 闭式，六面
+  合计 4π 钉到 f64 的 1e-12）；累加 f64、基函数 f32（单一事实源）。
+- **Lambert 带通卷积 + 除 π（`sh_lambert_convolve`）**：clamped-cosine 的
+  SH 只有三个非零频带 `A = (π, 2π/3, π/4)`，逐带乘 `A/π = (1, 2/3, 1/4)`
+  ⇒ 存「**E/π 直读**」系数，着色器求值退化为 **9 项纯点积每通道**，与
+  `irradiance_map` / loc14 同口径。解析锚点：常量辐射率 C ⇒ 任意方向求值
+  恒 = C；纯 L1 场 ⇒ `E(+Y)/π = 2C/3`（把 `A_1/π = 2/3` 钉死）。
+- **GPU 接线（R78 模式复刻）**：binding 18 = 探针 read-only storage
+  （256 × `ShProbeRaw` 160 B），binding 19 = 16 B 参数 uniform
+  （`x = mode`、`y = 探针数`）；**Globals 一字节不动、顶点布局不动
+  （loc14 保留）**、skybox.wgsl 并行布局不受影响。哑资源（160 B / 16 B
+  全零）恒在 ⇒ 缺席 / 无 SH / 捕获 / RT 帧 mode = 0 分支死码、**零
+  write_buffer**，命令流与 R82 逐位一致。
+- **mode 均匀门**：mode = 0 ⇒ R64 的 loc14 逐实体支**逐位不变**；mode = 1
+  ⇒ GI 探针项由逐片元 SH 求值替代（`gi_sh_irradiance`）。两支都只替换
+  `in.probe.w > 0.5` 的实体 ⇒ **天空兜底与 R52c 光照贴图 `select` 混合语义
+  零触碰**（正交）。裁决 = 探针集是否带 SH（`has_sh()`），「烘了就用」，
+  无独立开关资源。
+- **逐片元混合**：径向权重 `w = (1 − (d/r)²)²`（与点光衰减窗同式同源），
+  `E/π = Σ(w·SH(n)) / max(Σw, ε)`；`Σw ≤ ε` ⇒ 回退**最近探针**（球边界
+  处连续，延续 v1「包外无衰减」语义）；固定循环序 = 固定累加序 ⇒ 会话内
+  逐位确定；出口钳 ≥ 0（L2 振铃兜底，**无去振铃窗**）。
+- **影响半径**：自动 = **最近邻 × 1.5**（`total_cmp` 全序 ⇒ 输入重排不变；
+  单探针 = +∞、重合 = 0）；`IrradianceProbeRadius` 组件覆盖（0 = 自动）。
+  **偏离声明**：规格写「`IrradianceProbe` 加可选覆盖字段」——单元结构体加
+  字段会撞「既有测试零改动」硬约束 ⇒ 改为独立可选组件（缺席语义等价）。
+- **CPU/WGSL 同步契约**：`SH_Y0/Y1/Y2A/Y2B/Y2C` 常数表与 `sh_basis` /
+  `probe_influence_weight` / `sh_blend` 逐式镜像到 WGSL；常数表由源码层
+  看门单测逐位比对（`skybox_globals_prefix_matches_standard_layout` 先例）。
+- **兼容硬约束**：`bake_irradiance_probes` 签名与行为一字不动（无 SH ⇒
+  mode = 0）；新增 `bake_irradiance_probes_sh`；`install_irradiance_probes`
+  不变（报告多 `sh` 字段）；编辑器零改动。既有 FNV 基线（含
+  `irradiance_render` 6 项）全部原值通过。
+- **测试**：CPU 单测 16 项（解析锚点 / 投影两跑逐位 / 半径全序与置换不变 /
+  权重窗与点光窗逐位同值 / 加权混合与回退与边界连续 / v1 数据逐位不变 +
+  与六轴平均互证 / WGSL 常数看门）；GPU 5 项（`GPU_SERIAL`：缺席 = 空集 =
+  退化集逐字节 / **空间梯度**（4 m 高柱横跨红区绿区，SH 柱脚偏红柱头偏绿
+  中段单调、v1 上下同色、跨模式作差 ±50–70 级）/ **方向性**（同一探针内
+  球顶朝亮面 vs 球底朝暗面 +77/−173 级、常量场对照逐位同源、v1 差 1 级）/
+  真实烘焙贯通（天窗房间，GPU 与 CPU 同侧互证）/ 双会话逐字节 + 改单探针
+  变哈希）；快照 `examples/gi_sh_snapshot.rs` → `docs/gi_sh.png`（2×2：
+  空间梯度 v1 | SH、方向性 v1 | SH；**每世界独立渲染器**——句柄缓存按值
+  复用，跨世界复用会串味）。
+
 ### Added（R82：粒子 v2——GPU compute 模拟 × 相机面向拖尾条带）
 
 路线图 v5 第二梯队 4/5。`iris-render` 新增 `particles_v2` 模块与

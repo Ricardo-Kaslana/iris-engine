@@ -26,7 +26,7 @@ use crate::context::Gpu;
 use crate::decal::{Decal, DecalInstanceRaw, PROXY_INDEX_COUNT, PROXY_INDICES, PROXY_POSITIONS};
 use crate::frustum::Frustum;
 use crate::instance::InstanceRaw;
-use crate::irradiance::IrradianceProbeSet;
+use crate::irradiance::{IrradianceProbeSet, MAX_IRRADIANCE_PROBES, ShProbeRaw};
 use crate::light::{
     DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY, POINT_SHADOW_BIAS_MIN,
     POINT_SHADOW_BUDGET, POINT_SHADOW_NORMAL_SCALE, POINT_SHADOW_SLOPE_SCALE, PointLight,
@@ -135,6 +135,23 @@ struct LightBinsParamsRaw {
 const _: () = assert!(
     std::mem::size_of::<LightBinsParamsRaw>() == 32,
     "LightBinsParams 必须与 WGSL 布局一致（2×vec4 = 32 B）"
+);
+
+/// 与 WGSL `GiShParams` 结构对齐（16 字节，POD）——GI 探针三阶 SH（R83）的
+/// 小参数块。刻意与探针表（binding 18）分开：mode 是**逐帧裁决**的均匀门，
+/// 探针表是烘焙产物（mode = 1 帧才写），分开两个缓冲让「关闭帧零 write_buffer」
+/// 与 R78 分箱同纪律。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GiShParamsRaw {
+    /// x = mode（0 = 关——逐片元分支死码，loc14 逐实体路径逐位不变；
+    /// 1 = 逐片元 SH 求值），y = 探针数（着色器循环上界），zw = 保留。
+    params: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<GiShParamsRaw>() == 16,
+    "GiShParams 必须与 WGSL 布局一致（1×vec4 = 16 B）"
 );
 
 /// 与 WGSL `CsmParams` 对齐（256 字节，POD）：方向光级联阴影参数
@@ -647,6 +664,9 @@ pub struct Renderer {
     /// 前向光源分箱（R78）常驻资源：哑资源恒在（mode = 0 分支死码），
     /// 真缓冲按帧写（mode = 1），`bind_real` 决定 binding 15/16/17 指向。
     light_bins: LightBinsGpu,
+    /// GI 探针三阶 SH（R83）常驻资源：哑资源恒在（mode = 0 分支死码），
+    /// 真缓冲按帧写（mode = 1），`bind_real` 决定 binding 18/19 指向。
+    gi_sh: GiShGpu,
     /// scene_depth pass 最近一次运行的帧号（R77，`occ_frame` 口径）：
     /// GTAO 读的是「上一帧」深度——本帧编号恰好等于该值 + 1 才允许编码
     /// AO pass，否则可见度图清成中性 1.0（首帧启用 / 上帧无几何 / 深度
@@ -960,6 +980,24 @@ struct LightBinsGpu {
     /// 绑定裁决：`true` = binding 15/16/17 指向真实缓冲（本帧分箱生效），
     /// `false` = 指向哑资源（关闭——即使上一帧写过真数据也不得被采样）。
     /// draw 逐帧设置，globals 绑定组重建时消费（AO 的 bind_real 同款）。
+    bind_real: bool,
+}
+
+/// GI 探针三阶 SH（R83）的常驻 GPU 资源。globals 布局的 binding 18/19 恒需
+/// 合法绑定，哑资源（全零探针表 / 全零参数，mode = 0 = 着色器逐片元分支死码）
+/// **始终存在**（分箱三路 / SSR / AO 哑资源同款纪律——缺席路径零分配大资源、
+/// 零 write_buffer，命令流与 R82 逐位一致）。
+struct GiShGpu {
+    /// 探针表 storage（[`MAX_IRRADIANCE_PROBES`] × 160 B 定长；mode=1 帧每帧写）。
+    probes_buf: wgpu::Buffer,
+    /// 16B 参数（mode=1 帧每帧写）。
+    params_buf: wgpu::Buffer,
+    /// 160B 全零探针表（哑占位，永不读——mode = 0 分支死码）。
+    off_probes_buf: wgpu::Buffer,
+    /// 16B 全零参数（捕获 / RT / 关闭帧绑定——mode = 0）。
+    off_params_buf: wgpu::Buffer,
+    /// 绑定裁决：`true` = binding 18/19 指向真实缓冲（本帧逐片元 SH 生效）。
+    /// draw 逐帧设置，globals 绑定组重建时消费。
     bind_real: bool,
 }
 
@@ -1492,10 +1530,19 @@ pub fn diff_changed_ranges(
 /// clippy 的 7 参数阈值内，二是让调用点一眼看出「探针资源是一组」——主视图
 /// 传真实资源，探针捕获的每面绑定组传**零参数 + 哑 cubemap**（自反馈说明
 /// 见 [`Renderer::bake_reflection_probe`]）。
+///
+/// R83 起本组再携带 GI 探针 SH 的两路（binding 18 = 探针表 storage、
+/// 19 = 16B 参数）：主视图按 `gi_sh.bind_real` 在真 / 哑之间裁决，捕获面与
+/// RT 相机恒传哑资源（mode = 0 ⇒ 逐片元 SH 分支死码，与「捕获不渲染锥光与
+/// 第 9+ 盏点光」同一立场——见 §8.47③ / §8.52）。
 #[derive(Clone, Copy)]
 struct ProbeGlobalsResources<'a> {
     params_buf: &'a wgpu::Buffer,
     cube_view: &'a wgpu::TextureView,
+    /// GI 探针表 storage（binding 18）。
+    gi_probes: &'a wgpu::Buffer,
+    /// GI 探针参数 uniform（binding 19）：主相机 mode=1 走真缓冲，其余哑零。
+    gi_params: &'a wgpu::Buffer,
 }
 
 /// 全局绑定组里的两张阴影贴图视图：方向光级联数组（binding 1）与点光
@@ -1652,6 +1699,17 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 17,
                 resource: screen.bins_tiles.as_entire_binding(),
+            },
+            // GI 探针三阶 SH（R83）：探针表 + 16B 参数（主相机 mode=1 走真
+            // 缓冲；捕获 / RT / 无 SH 探针集帧走全零哑缓冲——mode = 0 使着色器
+            // 逐片元分支死码，loc14 逐实体路径逐位不变）
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: probe.gi_probes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: probe.gi_params.as_entire_binding(),
             },
         ],
     })
@@ -1834,12 +1892,14 @@ fn skin_world_aabb(
 /// 合批键 / 剔除包围体 / 三角形统计（蒙皮路径同口径，LOD 高低模各自
 /// 带蒙皮属性）。`eye` 由调用方从解析后的相机传入（资源相机 / 实体挂载
 /// 相机同源）。
-/// **光照探针（R64）**：世界带 [`IrradianceProbeSet`] 资源时，对**无光照
-/// 贴图**的实体按实体根 [`GlobalTransform`] 位置做一次四面体重心插值，
-/// 结果写进实例载荷 `InstanceRaw::probe`（xyz = E/π、w = 标志位）；
-/// 资源缺席 / 空集 / 实体挂图集 ⇒ 载荷恒零（着色器走原全局 env 路径，
-/// 逐位不变）。逐实体 CPU 侧求值（不做逐片元 GPU 插值）的理由见
-/// [`crate::irradiance`] 模块文档。
+/// **光照探针（R64 / R83）**：世界带 [`IrradianceProbeSet`] 资源时，对**无光照
+/// 贴图**的实体按实体根 [`GlobalTransform`] 位置求一次间接辐照，结果写进实例
+/// 载荷 `InstanceRaw::probe`（xyz = E/π、w = 标志位）；资源缺席 / 空集 /
+/// 实体挂图集 ⇒ 载荷恒零（着色器走原全局 env 路径，逐位不变）。
+/// 不带 SH 的集 = v1 的四面体重心插值（逐实体）；**带 SH 的集（R83）**载荷
+/// 改由 SH 的零阶项按径向权重给出，且这份 xyz 只被 mode = 0 的路径（探针
+/// 捕获 / RT 相机）消费——主视图在 mode = 1 时逐片元重新求值，只读标志位。
+/// 求值点选择的完整论证见 [`crate::irradiance`] 模块文档。
 /// **光照贴图解析（R52c）**：挂 [`LightmapBinding`] 的实体取其图集句柄，
 /// 但只在三个条件齐备时生效——世界有 [`LightmapStore`] 资源、句柄在目录内、
 /// 解析出的网格带 UV2（[`MeshData::uv2`](crate::mesh::MeshData)）；任一不
@@ -1895,10 +1955,11 @@ fn collect_instances(
         }
         handle
     };
-    // 光照探针集（R64）：CPU 侧逐实体插值 → 实例载荷（E/π + 标志位）。
+    // 光照探针集（R64 / R83）：CPU 侧逐实体求值 → 实例载荷（E/π + 标志位）。
     // 资源缺席 / 空集 ⇒ 恒 [0; 4]（着色器 select 取 env 采样值的同一串位）。
     // **光照贴图优先**：挂图集的实体走 R52c 的逐 texel 分支，CPU 侧就不再发
-    // 标志位（两道保险：着色器那里 select 也是整项替换）。
+    // 标志位（两道保险：着色器那里 select 也是整项替换）。带 SH 的集由
+    // `instance_payload` 内部改走 SH 零阶口径（R83，见 irradiance.rs）。
     let probes = world.try_resource::<IrradianceProbeSet>();
     let probe_payload = |position: Vec3, lightmap: u32| -> [f32; 4] {
         if lightmap != NO_LIGHTMAP {
@@ -2785,6 +2846,33 @@ impl Renderer {
             ),
             bind_real: false,
         };
+        // GI 探针 SH 常驻资源（R83）：真缓冲（256 × 160B 探针表 + 16B 参数）
+        // 与哑资源（160B / 16B 全零——mode = 0 使着色器逐片元分支死码）各一套。
+        // wgpu 缓冲零初始化 ⇒ 哑资源无需写入即满足「全零 mode=0」语义；真缓冲
+        // 只在探针集带 SH 的帧写（分箱同款纪律）。
+        let gi_sh = GiShGpu {
+            probes_buf: make_bins_buf(
+                "iris.gi_sh.probes",
+                (MAX_IRRADIANCE_PROBES * std::mem::size_of::<ShProbeRaw>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            params_buf: make_bins_buf(
+                "iris.gi_sh.params",
+                std::mem::size_of::<GiShParamsRaw>() as u64,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            off_probes_buf: make_bins_buf(
+                "iris.gi_sh.probes_off",
+                std::mem::size_of::<ShProbeRaw>() as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            off_params_buf: make_bins_buf(
+                "iris.gi_sh.params_off",
+                std::mem::size_of::<GiShParamsRaw>() as u64,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+            bind_real: false,
+        };
         // 主视图绑定组初建时的屏幕空间资源（SSR 三路 + AO + 分箱三路）：
         // 参数走**活跃**缓冲（此后由 draw 逐帧管理），颜色 / 深度 / AO /
         // 分箱此时只有哑资源（prev_color / scene_depth / ao target 均未
@@ -2827,6 +2915,8 @@ impl Renderer {
                 ProbeGlobalsResources {
                     params_buf: &probe_capture_params_buf,
                     cube_view: &probe_dummy_view,
+                    gi_probes: &gi_sh.off_probes_buf,
+                    gi_params: &gi_sh.off_params_buf,
                 },
                 ScreenSpaceGlobalsResources {
                     params_buf: &ssr.off_params_buf,
@@ -3144,6 +3234,8 @@ impl Renderer {
             ProbeGlobalsResources {
                 params_buf: &probe_params_buf,
                 cube_view: &probe_cube_view,
+                gi_probes: &gi_sh.off_probes_buf,
+                gi_params: &gi_sh.off_params_buf,
             },
             ssr_main_res,
         );
@@ -3273,6 +3365,7 @@ impl Renderer {
             ssr_uniform_live: false,
             ao,
             light_bins,
+            gi_sh,
             ao_depth_frame: None,
             water: None,
             water_size: (0, 0),
@@ -3345,10 +3438,7 @@ impl Renderer {
                 point_cube: &self.point_shadow_cube_view,
             },
             &self.env,
-            ProbeGlobalsResources {
-                params_buf: &self.probe_params_buf,
-                cube_view: &self.probe_cube_view,
-            },
+            self.probe_globals_resources(),
             self.ssr_main_resources(),
         );
         // 天空绑定组（R79）随重建同步更新：env 重烘焙会更换 prefiltered
@@ -3363,6 +3453,23 @@ impl Renderer {
                 sky_params: &self.sky_params_buf,
             },
         );
+    }
+
+    /// 探针资源（R62a 反射两路 + R83 GI SH 两路）的「主相机」形态：反射
+    /// 参数 / cubemap 数组视图恒为活跃资源，GI 两路按 `gi_sh.bind_real`
+    /// 裁决（探针集不带 SH 的帧绑哑零缓冲 ⇒ mode = 0）。
+    fn probe_globals_resources(&self) -> ProbeGlobalsResources<'_> {
+        let (gi_probes, gi_params) = if self.gi_sh.bind_real {
+            (&self.gi_sh.probes_buf, &self.gi_sh.params_buf)
+        } else {
+            (&self.gi_sh.off_probes_buf, &self.gi_sh.off_params_buf)
+        };
+        ProbeGlobalsResources {
+            params_buf: &self.probe_params_buf,
+            cube_view: &self.probe_cube_view,
+            gi_probes,
+            gi_params,
+        }
     }
 
     /// 屏幕空间资源的「主相机」形态（R62b 立法，R77 扩 AO，R78 再扩
@@ -3470,6 +3577,30 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.light_bins.params_buf, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// GI 探针表上传（R83，mode = 1 的 draw 每帧调用）：探针 storage + 16B
+    /// 参数两缓冲。
+    ///
+    /// 每帧重传（而不是「变了才传」）与 R78 分箱三缓冲同纪律：探针集是烘焙
+    /// 产物、没有 generation 字段可比，逐帧比对 40 KiB 的哈希不会比直接写更快；
+    /// 满载 256 探针 = 40 KiB/帧（分箱帧最多写 1 MiB tile 索引，同一量级）。
+    /// 只写**用到的前缀**（`count × 160 B`）：着色器循环上界 = 参数 y，尾部
+    /// 陈旧数据永不被读（与灯表 `cast_slice(lights)` 同口径）。
+    fn upload_gi_probes(&self, set: &IrradianceProbeSet) {
+        let probes = set.gpu_probes();
+        if probes.is_empty() {
+            return; // mode = 1 的裁决前提就是非空 SH 表；防御性早退不写缓冲
+        }
+        self.gpu
+            .queue
+            .write_buffer(&self.gi_sh.probes_buf, 0, bytemuck::cast_slice(&probes));
+        let params = GiShParamsRaw {
+            params: [1.0, probes.len() as f32, 0.0, 0.0],
+        };
+        self.gpu
+            .queue
+            .write_buffer(&self.gi_sh.params_buf, 0, bytemuck::bytes_of(&params));
     }
 
     /// 环境源失效检查：`SkySource` 资源的 generation 与缓存不同（资源缺席
@@ -4504,6 +4635,8 @@ impl Renderer {
                 ProbeGlobalsResources {
                     params_buf: &self.probe_capture_params_buf,
                     cube_view: &self.probe_dummy_view,
+                    gi_probes: &self.gi_sh.off_probes_buf,
+                    gi_params: &self.gi_sh.off_params_buf,
                 },
                 ScreenSpaceGlobalsResources {
                     params_buf: &self.ssr.off_params_buf,
@@ -5351,7 +5484,16 @@ impl Renderer {
         let bins_on = bins_force || light_bins_enabled(point_total, spot_total);
         let bins_bind_changed = self.light_bins.bind_real != bins_on;
         self.light_bins.bind_real = bins_on;
-        if bins_bind_changed {
+        // GI 探针 SH 裁决（R83）：探针集**带 SH** ⇒ mode = 1（逐片元求值），
+        // 资源缺席 / 空集 / 无 SH ⇒ mode = 0（loc14 逐实体路径逐位不变）。
+        // 没有独立开关资源：SH 是烘焙期的显式选择（`bake_irradiance_probes_sh`），
+        // 「烘了就用」与 R64「装了探针集就用」同一心智模型。绑定指向变化时
+        // 重建全局绑定组（bins / AO 的 bind_real 同款）。
+        let gi_set = world.try_resource::<IrradianceProbeSet>();
+        let gi_on = gi_set.as_deref().is_some_and(|set| set.has_sh());
+        let gi_bind_changed = self.gi_sh.bind_real != gi_on;
+        self.gi_sh.bind_real = gi_on;
+        if bins_bind_changed || gi_bind_changed {
             self.rebuild_globals_bind_group();
         }
         // 反射探针（R62a）：收集「挂了组件**且已烘焙**（登记表命中）」的
@@ -5498,6 +5640,13 @@ impl Renderer {
         // 最终 view_proj（含 TAA 抖动——与片元实际所见同一投影）。
         if bins_on {
             self.upload_light_bins(&binned_lights, vp, width, height);
+        }
+        // GI 探针表上传（R83，仅 mode=1）：mode=0 帧一个 write_buffer 都不发
+        // （零开销默认路径，命令流与 R82 一致）。
+        if gi_on {
+            if let Some(set) = gi_set.as_deref() {
+                self.upload_gi_probes(set);
+            }
         }
         // 级联参数上传（恒写，含阴影关闭帧）：片元着色器的采样路径无条件
         // 执行（uniform 控制流要求），关闭语义由 shadow_params.w 掩码兜底
@@ -7970,6 +8119,8 @@ impl Renderer {
             ProbeGlobalsResources {
                 params_buf: &self.probe_params_buf,
                 cube_view: &self.probe_cube_view,
+                gi_probes: &self.gi_sh.off_probes_buf,
+                gi_params: &self.gi_sh.off_params_buf,
             },
             ScreenSpaceGlobalsResources {
                 params_buf: &self.ssr.off_params_buf,

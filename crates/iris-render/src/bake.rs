@@ -756,7 +756,10 @@ pub fn bake_sample(bvh: &Bvh, position: Vec3, normal: Vec3, params: &BakeParams)
 /// 逐位同值，8/8 = 1.0 是精确的浮点常数），半影带 → `k/8` 档中间值。
 /// 不做「锥内 cos 平均」：那种写法会让一切受光面随软影角度整体变暗，把
 /// 半影的代价摊到全场景，且失去与硬影的逐位对照点。
-fn direct_irradiance(
+///
+/// `pub(crate)`（R83）：探针的 SH cube 投影要按**同一口径**求命中点的入射
+/// 辐照（`irradiance::probe_sh_radiance`），复用本函数而不是复制一份公式。
+pub(crate) fn direct_irradiance(
     bvh: &Bvh,
     position: Vec3,
     normal: Vec3,

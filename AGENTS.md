@@ -49,7 +49,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1365 / release 1362**（R82 收官：+13 项 v2 CPU 单测 + 4 项 v2 GPU 集成；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1386 / release 1383**（R83 收官：+16 项 SH CPU 单测 + 5 项 SH GPU 集成；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -131,7 +131,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1365 / release 1362）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1386 / release 1383）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -149,7 +149,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1365 / release 1362；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1386 / release 1383；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -172,8 +172,9 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     SpotLight 组件 + light_bins 分箱纯函数 + binding 15/16/17 灯表，
     fs_main 点光循环逐式提取共享函数 + 均匀门 = 双路径位等价，
     全部既有 FNV 基线零改动原值通过；诚实限制 §8.47）
-  - 第二梯队（环境底座）：R79 天空 v2+大气+体积雾、R80 昼夜+风场、R81 平面水体
-    v1、R82 粒子 v2（GPU 化+拖尾）、R83 GI 逐片元化（探针 SH）
+  - 第二梯队（环境底座）**全部收官**：R79 天空 v2+大气+体积雾 ✅、R80 昼夜+风场 ✅、
+    R81 平面水体 v1 ✅、R82 粒子 v2（GPU 化+拖尾）✅、R83 GI 逐片元化（探针三阶
+    SH + 片端径向权重，§8.40①② 移入实现、③ 维持拒绝）✅
   - 第三梯队（硬科技）：R84–R87 虚拟几何体 V1–V4（opaque-only MVP，裁定接受）、
     R88/R89 DDGI 动态 GI、R90/R91 毛发、R92 降水、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）

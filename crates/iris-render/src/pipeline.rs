@@ -435,6 +435,33 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // GI 探针三阶 SH（R83，同一扩容先例的延续）：
+            // 18 = 探针表 read-only storage（256 × 160B 定长）；
+            // 19 = 16B 参数 uniform（params.x = mode，0 = 逐片元分支死码）。
+            // 缺席 / 无 SH 探针集 / 捕获 / RT = 全零哑缓冲（mode = 0），
+            // skybox.wgsl 的并行布局不受影响。片元阶段只读 storage 缓冲
+            // 计数 = 3（16/17/18），在 WebGPU 默认的
+            // maxStorageBuffersPerShaderStage = 4 之内。
+            wgpu::BindGroupLayoutEntry {
+                binding: 18,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 19,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
