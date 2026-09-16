@@ -5,6 +5,75 @@
 
 ## [Unreleased]
 
+### Added（R81：平面水体 v1——Gerstner 波 × 平面反射/折射捕获 × 深度吸收合成）
+
+路线图 v5 第二梯队 3/5（环境底座）。`iris-render` 新增 `water` 模块
+与 `shaders/water.wgsl`：实体挂 **`WaterSurface` 组件**即得一块世界
+空间水平水体（Gerstner 波面 + 镜面反射 + 折射深度吸收 + 太阳镜面），
+**无水体实体 = 无捕获 pass、无额外 write_buffer、像素与命令流与
+引入前逐位一致**（零开销默认路径，全部既有 FNV 基线原值通过）。
+
+- **组件与选择**（`water.rs`）：`WaterSurface { height, half_extent,
+  wave_amplitude, wave_length, wave_speed, choppiness, shallow_color,
+  deep_color, absorb_depth }`（Default 0 / 16² / 0.12 / 6.0 / 1.2 /
+  0.6 / 浅青 / 深蓝 / 2.5）；多实体按**实体位模式升序**选择键
+  `select_water_surface` 取首盏（min 的交换律 ⇒ 结果与查询 / 插入
+  顺序无关，与 `select_point_shadow_casters` 同哲学），其余
+  `log::warn` 忽略。
+- **Gerstner 波纯函数 + WGSL 镜像契约**：4 波固定方向（45° 起步
+  等角对角分布）、固定波序求和——振幅 `[1, 0.5, 0.35, 0.25]` 衰减
+  （Σ = 2.1 = 波形有界上界，const 断言锁定）、波长 `[1, 0.55, 0.35,
+  0.25]` 缩短；ω = k·speed·√(λ_i/λ_0)（深水色散锚定主波相速度）；
+  x/z choppy 位移（陡度均分 Q_i = Q/(k·A·4)，Q ≤ 1 ⇒ 法线 y 分量
+  恒正不卷绕）+ 解析偏导法线（非差分）；同输入 to_bits 逐位一致。
+  **波形时间 = 世界 `Time` 资源 `elapsed_secs`**（缺席 = t = 0 静止
+  ——渲染器无内部时钟，测试可精确驱动）。CPU 函数与
+  `water.wgsl` 同式同序（fog.rs 同款镜像契约；CPU↔GPU 不做位级等价
+  声明）。水面网格 = 归一化 [−1,1]² 96² quad 静态生成（纯函数
+  `water_grid_mesh` + 良构 / 环绕 / 确定性单测），顶点着色器乘
+  half_extent 展开。
+- **反射 / 折射捕获**（主 pass 前，每帧）：反射 = **镜像相机**
+  （view × 关于 y = height 的反射矩阵；抖动与主相机同款作用于纯投
+  影）渲半分辨率 **RGBA16Float**（低频近似内容的裁定），折射 = 主
+  相机视角同格式。捕获内容 = 不透明几何 + 天空（探针捕获同款最低
+  配组装，SSR / AO / 分箱 / 探针走哑资源），**不含水体自身（无递
+  归）**、不含透明 / 贴花 / 粒子。镜像矩阵行列式为负 ⇒ 环绕反转由
+  **cull None 捕获管线吸收**（R62a 教训的「cull None 吸收」分支，
+  单面 / 双面 / 镜像 / 主相机共用两条管线）；反射捕获按镜像视锥
+  独立收集，折射捕获复用主 pass 实例区间（零额外上传）。**内部
+  捕获不占用户 RT 相机预算 2**（§4.21 / §8.20 修订：多视口编排
+  是用户能力、捕获是引擎内部实现，两个正交维度）。
+- **水体 pass**（scene_depth 之后、TAA / 后处理链之前；HDR MSAA
+  alpha 混合、深度只测不写、cull None；独立 `water_layout` 组 0
+  五槽位——不扩 globals 组，R61/R77/R78 先例）：**Fresnel**
+  （Schlick，F0 = 0.02 水的物理值）× 反射（镜像 VP 投影采样 +
+  法线波纹扰动 0.04 uv，ClampToEdge 吸收出界）+ 折射 × **深度
+  吸收**（水下厚度 = scene_depth − 水面片元视距 clip.w；
+  T = exp(−厚度/absorb_depth) Beer-Lambert 标量式，谱选择性由浅 /
+  深双色渐变承担——岸边直接见底、深水趋 deep_color）+ 太阳镜面
+  （Blinn-Phong × Fresnel）。**scene_depth 第六消费者**：水体在场
+  时 `ensure_scene_depth`（fog_on 同款门），水体 pass 编码在
+  scene_depth pass 之后 ⇒ 链上同帧读深度；**水像素不写
+  scene_depth**（下一帧雾 / AO 对水面用其后地面深度——近似，§8.50）。
+  顶部 `WaterParamsRaw` 尺寸 const 断言（240B）与 WGSL 布局互锁。
+- **测试**：CPU 单测 9 项（默认值 / t=0 原点解析解 / 单波波长平移
+  对称 / 单波与四波振幅上界 / 法线单位化与不卷绕 / 逐位确定性 /
+  网格良构环绕确定性 / 选择键乱序不变）+ GPU 集成
+  `tests/water_render.rs` 4 项（GPU_SERIAL 串行化）：生效反证（有 /
+  无水体全帧 FNV 不同）、镜面反射（亮红塔 + 掠射角，镜像几何解析
+  落点采样 R−G 有水 / 无水差 ≥ 30 可判别）、深度吸收（深水点无
+  地面 → scene_depth = 远平面 → deep_color 主导，R−G 差 ≥ 90）、
+  确定性（双会话逐位 + `wave_speed` 变哈希）。快照
+  `examples/water_snapshot.rs` → `docs/water.png`（1×2：水体关 |
+  开，海岸斜切构图——近岸浅滩 / 深水空域 / 远岸倒影塔；倒影带双
+  点采样、深浅 B−R 差、双会话逐字节断言全带，目检倒影位置 / 深度
+  渐变 / 波形起伏 / 无递归伪影）。
+- **文档**：ARCHITECTURE §4.37 新增；§4.21 / §8.20 修订（内部捕获
+  不占用户 RT 预算）；§8.50 诚实限制索引（单水面 / 无递归 / 相机
+  入水无处理 / 水像素不写 scene_depth / 4 波等角无频谱 / 网格边缘
+  露缝 / 水面后合成覆盖其前透明粒子 / height 不随 Transform / CSM
+  主相机拟合 / Time 缺席静止）。
+
 ### Added（R80：昼夜循环 + 全局风场——纯相位解析解 × mix64 阵风采样，四条下游线共用接口轮）
 
 路线图 v5 第二梯队 2/5。`iris-core` 新增**昼夜循环**（`daynight`）与

@@ -78,6 +78,12 @@ pub(crate) struct PipelineBundle {
     /// 副本光线步进，组 0 复用 `post_depth_layout`（与 DOF / MB 同构），
     /// 见 `shaders/fog.wgsl` 与 fog.rs 的 FogSettings。
     pub fog_pipeline: wgpu::RenderPipeline,
+    /// 平面水体管线（R81）：主 pass 后的水面合成网格 draw——Gerstner
+    /// 顶点位移 + 反射 / 折射捕获采样 + Fresnel + 深度吸收 + 太阳镜面，
+    /// `water_layout`（组 0 独立五槽位，不扩 globals 组），目标 = HDR
+    /// MSAA alpha 混合、深度只测不写、cull None，见 `shaders/water.wgsl`
+    /// 与 water.rs 的 WaterSurface。
+    pub water_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
@@ -167,6 +173,11 @@ pub(crate) struct PipelineBundle {
     /// 逐一对齐，Globals 并行前缀结构零触碰）。绑定组由
     /// `build_sky_bind_group` 在全部天空绘制点创建。
     pub sky_layout: wgpu::BindGroupLayout,
+    /// 平面水体组布局（R81）：binding 0 = WaterParams uniform（240B，
+    /// vertex|fragment）、1 = 反射捕获图、2 = 折射捕获图（Rgba16Float
+    /// 可过滤）、3 = scene_depth（R32Float 非过滤）、4 = 过滤采样器。
+    /// 独立组不扩 globals（R61/R77/R78 先例）。
+    pub water_layout: wgpu::BindGroupLayout,
     /// TAA 组布局（R60）：`post_depth_layout` 的基础上再多一路
     /// binding 4 = 上帧历史纹理（Rgba16Float，可过滤——历史重投影采样
     /// 在亚纹素位置，线性过滤是其定义的一部分）。
@@ -1651,6 +1662,123 @@ pub(crate) fn create_pipeline(
     });
     let fog_pipeline = make_post_depth_pipeline("iris.pipeline.fog", &fog_shader, "fs_main");
 
+    // 平面水体（R81）：主 pass 之后、TAA / 后处理链之前的水面合成 pass
+    // （三角网格 draw，非全屏三角形）。组 0 = `water_layout`（独立组，
+    // **不扩 globals 组**——R61/R77/R78 先例：0 = WaterParams uniform、
+    // 1 = 反射捕获图、2 = 折射捕获图、3 = scene_depth（R32Float 非过滤
+    // textureLoad）、4 = 过滤采样器）。目标 = HDR MSAA（alpha 混合，
+    // 片元输出 a = 1 ⇒ 等价替换——折射图已含水下内容，输出即完整合成
+    // 色）；深度只测不写（LessEqual 与贴花同款等深不丢失；水体不写主
+    // 深度附件，与「水像素不写 scene_depth」同语义）；cull None（波形
+    // 会倾斜面片，水下视角从背面看亦可见——相机入水无特殊处理是 v1
+    // 限制，见 §8.50）。
+    let water_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.water"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/water.wgsl").into()),
+    });
+    let water_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.water"),
+        entries: &[
+            // 0：WaterParams uniform（240B，vertex | fragment——顶点做
+            // Gerstner 位移与裁剪变换，片元做采样合成）
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1 / 2：反射 / 折射捕获图（Rgba16Float 半分辨率，可过滤——
+            // 波纹扰动后的采样在亚纹素位置，双线性是其定义的一部分）
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            // 3：scene_depth 副本（R32Float 非过滤，textureLoad 读取——
+            // 与 AO / 雾的深度消费同款，不依赖 float32-filterable 扩展）
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+            // 4：过滤采样器（ClampToEdge——扰动把 uv 推出捕获图边界时钳边）
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let water_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.water.pipeline.layout"),
+        bind_group_layouts: &[Some(&water_layout)],
+        immediate_size: 0,
+    });
+    let water_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.water"),
+        layout: Some(&water_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &water_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(crate::water::WaterVertex::LAYOUT)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &water_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
     // TAA（R60）：组布局在 post_depth_layout 基础上再加 binding 4 = 上帧
     // 历史（Rgba16Float 可过滤）；目标 = 本帧历史槽（HDR 格式，与链上
     // 其他中间 pass 同构）。编码走 post.rs 的 encode_taa_pass。
@@ -2226,6 +2354,7 @@ pub(crate) fn create_pipeline(
         occlusion_pipeline,
         ao_pipeline,
         fog_pipeline,
+        water_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,
@@ -2237,6 +2366,7 @@ pub(crate) fn create_pipeline(
         taa_layout,
         ao_layout,
         sky_layout,
+        water_layout,
         ui_layout,
         particle_layout,
         decal_layout,

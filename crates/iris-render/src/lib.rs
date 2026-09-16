@@ -71,6 +71,11 @@
 //!   （全部既有 FNV 基线原值通过，见 `tests/irradiance_render.rs»）；
 //!   包外取最近凸包面投影（连续延拓）。语义：静态漫反射 = 光照贴图 /
 //!   动态漫反射 = 探针 / 镜面 = 反射探针 → SSR → env。
+//! - 平面水体 v1（R81，`water` 模块）：`WaterSurface` 组件声明世界空间
+//!   水平面（多实体确定性选择键取首盏），Gerstner 4 波顶点位移（解析
+//!   法线，CPU 纯函数与 WGSL 逐式镜像）+ 反射 / 折射半分辨率捕获
+//!   （镜像相机 / 主相机，探针同款最低配组装）+ Fresnel + 深度吸收 +
+//!   太阳镜面，主 pass 后 HDR 合成；无水体实体 = 像素与命令流逐位不变。
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer»）。
 
 pub mod animation;
@@ -109,6 +114,7 @@ pub mod texture;
 pub mod texture_bcn;
 pub mod ui;
 pub mod visibility;
+pub mod water;
 
 pub mod prelude {
     pub use crate::animation::{
@@ -220,6 +226,11 @@ pub mod prelude {
         sort_focus_items, spawn_ui_button, text_width, update_ui_focus, update_ui_menus,
     };
     pub use crate::visibility::{Visibility, set_subtree_hidden};
+    pub use crate::water::{
+        WATER_F0, WATER_GRID_SUBDIVISIONS, WATER_WAVE_COUNT, WAVE_AMPLITUDE_DECAY,
+        WAVE_AMPLITUDE_SUM, WAVE_DIRECTIONS, WAVE_LENGTH_DECAY, WaterSurface, WaterVertex,
+        gerstner_evaluate, gerstner_single_wave, select_water_surface, water_grid_mesh,
+    };
 }
 
 /// 全引擎固定的多重采样倍率（4x MSAA）。
