@@ -710,6 +710,22 @@ pub struct Renderer {
     particle_v2_pools: Vec<ParticleV2Pool>,
     /// 粒子 v2 收集暂存（跨帧复用）。
     particle_v2_scratch: Vec<ParticleV2Item>,
+    /// meshlet GPU 资源束（R85；首个 meshlet 实例在场时惰性创建，缺席 =
+    /// 不创建零开销）。
+    meshlet_gpu: Option<MeshletGpu>,
+    /// meshlet GPU arena 的 CPU 镜像 + 句柄登记表（注册期追加）。
+    meshlet_arena: MeshletArena,
+    /// meshlet 在途读回（遮挡 OccInflight 同款双槽协议）。
+    meshlet_inflight: Option<MeshletInflight>,
+    /// 最近一次成功消费的紧凑结果（绘制裁决 + 三角形统计输入）。
+    meshlet_consumed: Option<MeshletConsumed>,
+    /// meshlet 帧号（每 draw 自增——奇偶槽位轮转的基准；与 occ_frame
+    /// 同款「只在真实渲染帧推进」纪律，被跳过的帧不产生「上一帧」）。
+    meshlet_frame: u64,
+    /// 上一帧实例槽 → mesh 句柄（消费读回时三角形统计的解析表）。
+    meshlet_last_handles: Vec<u32>,
+    /// meshlet 收集暂存（跨帧复用）。
+    meshlet_frame_scratch: MeshletFrame,
     /// 贴花代理几何顶点缓冲（单位盒 ±Z 端盖，初始化时一次性上传；
     /// 字段保持缓冲存活）。
     #[allow(dead_code)]
@@ -1411,6 +1427,183 @@ struct ParticleV2Item {
     draw: crate::particles_v2::DrawParamsRaw,
 }
 
+// ---------------------------------------------------------------------------
+// meshlet（R85，虚拟几何体 V2）：GPU 资源 + 帧收集结构
+// ---------------------------------------------------------------------------
+
+/// meshlet compute 剔除的工作组大小（WGSL `@workgroup_size(64)` 同值；
+/// dispatch.x = ceil(实例最大簇数 / 本值)）。
+const MESHLET_CULL_WORKGROUP: u32 = 64;
+
+/// 单帧可绘 meshlet 实例（实体）上限：实例表缓冲按此定长，超出部分
+/// warn + 跳过（确定性截断——按查询序保留前缀，与点光 uniform 填充的
+/// 既有口径一致）。
+const MAX_MESHLET_INSTANCES: usize = 256;
+
+/// 回读 staging 尺寸：4 B 存活计数 + 紧凑列表全容量（166 KB 量级分配，
+/// 典型帧只读前缀——预算见 meshlet.rs 模块头）。
+const MESHLET_STAGING_BYTES: u64 = 4 + (crate::meshlet::MAX_MESHLET_CLUSTERS * 4) as u64;
+
+/// 单个 meshlet 实例的 GPU 条目（176 B POD；与 `meshlet_cull.wgsl` /
+/// `meshlet_draw.wgsl` 的 `InstanceEntry` 逐字段对齐——影子契约，guard
+/// 单测 `meshlet_draw_shader_interfaces_match_standard` 锁定字段序）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshletInstanceEntryRaw {
+    /// 模型矩阵（列主序；值直接取自 `InstanceRaw::from_matrix` ⇒ 与常规
+    /// 路径的实例属性逐位同源）。
+    model: [[f32; 4]; 4],
+    /// 法线矩阵（模型矩阵逆转置，每列补零——同上）。
+    normal: [[f32; 4]; 3],
+    /// x = 顶点 arena 基址、y = 索引 arena 基址、z = 簇元数据 arena 基址、
+    /// w = 本实例簇数。
+    base_counts: [u32; 4],
+    /// x = 本帧全局簇号基（实例前缀和），yzw 保留（0）。
+    frame_base: [u32; 4],
+    /// 网格包围盒 min（xyz；w 保留）——簇球心归一化基。
+    bounds_min: [f32; 4],
+    /// 网格包围盒 extent（xyz；w 保留）。
+    bounds_extent: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<MeshletInstanceEntryRaw>() == 176,
+    "MeshletInstanceEntryRaw 必须为 176 字节（与 WGSL InstanceEntry 布局一致）"
+);
+
+/// meshlet 剔除参数（96 B uniform；与 WGSL `CullParams` 逐字段对齐）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshletCullParamsRaw {
+    /// 本帧主相机 VP（与 Globals.view_proj 同源，剔除与绘制同矩阵）。
+    view_proj: [[f32; 4]; 4],
+    /// xyz = 相机眼点（背面锥视线原点），w 保留。
+    eye: [f32; 4],
+    /// x = 本帧实例数、y = 本帧全局簇总数、zw 保留。
+    counts: [u32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<MeshletCullParamsRaw>() == 96,
+    "MeshletCullParamsRaw 必须为 96 字节（与 WGSL CullParams 布局一致）"
+);
+
+/// 单个 meshlet 句柄在 GPU arena 的登记位（注册期一次写入，之后不变——
+/// 追加式 arena 保证已发布帧的紧凑列表引用恒有效）。
+#[derive(Clone, Debug)]
+struct MeshletArenaSlot {
+    vertex_base: u32,
+    index_base: u32,
+    cluster_base: u32,
+    cluster_count: u32,
+    /// 网格包围盒（min, extent）——剔除端球心反归一化基。
+    bounds_min: [f32; 3],
+    bounds_extent: [f32; 3],
+    /// 逐簇三角形数（u8 直通 `triangle_count`）——`triangles_drawn`
+    /// 统计按紧凑列表精确累加用。
+    cluster_triangles: Vec<u8>,
+    /// Σ cluster_triangles（该网格全部三角形数）。
+    total_triangles: u32,
+}
+
+/// GPU arena 的 CPU 镜像（增长重建时全量重传的源数据；注册期追加）。
+#[derive(Default)]
+struct MeshletArena {
+    /// 句柄号 → 登记位；`None` = 未注册或注册被拒（超容量 warn 跳过）。
+    slots: Vec<Option<MeshletArenaSlot>>,
+    /// 顶点 storage 词镜像（每顶点 2 × [f32;4]，`vertex_storage_words`）。
+    words: Vec<[f32; 4]>,
+    /// 索引镜像。
+    indices: Vec<u32>,
+}
+
+/// meshlet GPU 资源束（首个 [`MeshletInstance`] 在场时惰性创建；之后常驻
+/// ——缺席语义 = 不创建、零 dispatch、零回读、零绘制）。
+struct MeshletGpu {
+    /// 簇元数据 arena（12×u32 词/簇，`MeshletClusterRaw` 48 B 逐字排布，
+    /// 容量 [`MAX_MESHLET_CLUSTERS`] 固定）。
+    cluster_words_buf: wgpu::Buffer,
+    /// 存活标志 / 紧凑载荷 / 紧凑列表（容量同上）/ 存活总数（4 B）。
+    /// flags / payload 仅被 compute 绑定组消费（字段本体保活）。
+    #[allow(dead_code)]
+    flags_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    payload_buf: wgpu::Buffer,
+    compact_buf: wgpu::Buffer,
+    count_buf: wgpu::Buffer,
+    /// 剔除参数 uniform（96 B，每帧 write_buffer）。
+    cull_params_buf: wgpu::Buffer,
+    /// 顶点词 / 索引 arena（注册超出容量时重建 + 全量重传）。
+    vertex_buf: wgpu::Buffer,
+    index_buf: wgpu::Buffer,
+    vertex_capacity_words: u64,
+    index_capacity: u64,
+    /// 实例表双缓冲（写入槽 = 本帧 compute，读取槽 = 产出当前所绘列表的
+    /// 那一帧——紧凑列表与实例表槽位配对，见 draw 的 meshlet 段注释）。
+    instance_tables: [wgpu::Buffer; 2],
+    /// compute 侧绑定组（instances 槽位随 parity）。
+    cull_bgs: [wgpu::BindGroup; 2],
+    /// 绘制侧组 2 绑定组（instances / compact 只读，槽位随 parity）。
+    draw_bgs: [wgpu::BindGroup; 2],
+    /// 回读 staging 双缓冲（4 B 计数 + 紧凑列表全容量；map_async 在途时
+    /// 另一槽可用——遮挡读回的成对双缓冲同款）。
+    staging: [wgpu::Buffer; 2],
+}
+
+/// 在途的 meshlet 紧凑结果读回（遮挡 [`OccInflight`] 同款：帧 N 编码期
+/// copy + 提交后 map_async，帧 N+1 的 draw 开头 poll + try_recv 消费；
+/// 在途未决时跳过本帧 compute 与 copy，绘制走「上一份有效紧凑列表 /
+/// 恒等全量」兜底）。
+struct MeshletInflight {
+    parity: usize,
+    /// 发出帧号（消费时写入 [`MeshletConsumed::frame`]——绘制端只接受
+    /// 「恰好上一帧」产出的列表，迟到的列表降级为全量兜底）。
+    frame: u64,
+    done: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// 最近一次成功消费的紧凑结果（绘制裁决与三角形统计的输入）。
+struct MeshletConsumed {
+    /// 紧凑列表（packed：实例槽 << 16 | 簇局部号），升序 = 绘制序。
+    list: Vec<u32>,
+    /// 该列表的精确三角形总数（逐簇 triangle_count 累加，消费时按产出
+    /// 帧的实例表解析——此后句柄表不再被引用）。
+    triangles: u32,
+    /// 产出帧号：绘制端要求 `frame + 1 == 当前帧`（紧凑列表与产出帧的
+    /// 实例表槽位配对；间隔帧 / 迟到列表一律降级全量兜底——保守方向）。
+    frame: u64,
+}
+
+/// 本帧 meshlet 绘制计划（收集 + 兜底裁决的产物，贯穿主 pass 与 compute
+/// 编码段）。
+struct MeshletDrawPlan {
+    /// 本帧 draw 的实例数（紧凑回读数或全量兜底数）。
+    draw_count: u32,
+    /// 精确三角形数（按所绘列表逐簇累加）。
+    triangles: u32,
+    /// 绘制读取的实例表槽位（兜底帧 = 本帧槽；紧凑帧 = 上帧槽）。
+    draw_parity: usize,
+    /// compute 剔除写入的实例表槽位（= 本帧槽）。
+    cull_parity: usize,
+    /// cull dispatch 的 x 维工作组数（ceil(实例最大簇数 / 64)）。
+    cull_blocks: u32,
+    /// 本帧实例数（cull dispatch 的 y 维）。
+    dispatch_instances: u32,
+    /// 本帧是否发出 compute + copy（读回在途时跳过——staging 不可覆写）。
+    do_compute: bool,
+}
+
+/// 单帧 meshlet 收集结果（跨帧复用 scratch）。
+#[derive(Default)]
+struct MeshletFrame {
+    /// 实例表条目（查询序 = 实例槽序；确定性截断见 collect 文档）。
+    entries: Vec<MeshletInstanceEntryRaw>,
+    /// 实例槽 → mesh 句柄（与 entries 同序；三角形统计解析用）。
+    handles: Vec<u32>,
+    /// 全局簇总数（实例前缀和的尾值；≤ [`MAX_MESHLET_CLUSTERS`]）。
+    total_clusters: u32,
+}
+
 /// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、贴花 pass、
 /// 透明 pass 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17 / §4.20）：UI pass
 /// 只计入 `draw_calls` 的单批，阴影 pass（CSM 3 级联各一遍 + 点光每投影灯
@@ -1472,6 +1665,12 @@ pub struct FrameStats {
     /// 关闭或重置帧（首帧启用 / 上帧无不透明几何 / 深度副本重建——该帧
     /// 可见度图清成中性 1.0，输出与 AO 关闭帧逐位一致）。
     pub ao_on: u32,
+    /// 本帧 meshlet 绘制提交的（紧凑后）实例数（R85，观测字段，不进任何
+    /// 排序键）：GPU compute 剔除 + 前缀和稳定紧凑化后的存活簇数——剔除
+    /// 有效性可观测（相机背对场景时显著小于簇总数）。**兜底帧 = 全量簇
+    /// 数**（读回迟到 / 首帧无上一帧结果 ⇒ 恒等列表全量绘制，像素与剔除
+    /// 帧恒等——剔除只删不可见几何）；无 meshlet 实体 = 0。
+    pub meshlet_surviving: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -2345,6 +2544,105 @@ fn collect_particles_v2(
 ///
 /// 返回被视锥剔除的实例数；收集次序即查询顺序，分批排序由调用方完成
 /// （按纹理句柄排序，同批内实体 bits 并列序——见 `decal.rs` 分批策略）。
+/// 单帧 meshlet 收集（R85）：可见 [`MeshletInstance`](crate::meshlet::MeshletInstance)
+/// 实体 → GPU 实例表条目 + 全局簇号前缀。
+///
+/// - **可见性语义与常规路径一致**：`Visibility` 自身 + 祖先级联；实例
+///   包围球视锥剔除与 `collect_instances` 同式（中心变换 + 半径按最大
+///   列缩放保守放大）。整实例出视锥 ⇒ 该实例全部簇都不进本帧枚举
+///   （剔除端与全量端都看不到它的像素——绘制对齐的前提）。
+/// - **确定性**：条目序 = 查询序（存储插入序，全仓既有口径）；容量截断
+///   按查询序保留前缀（实例表容量 / 单帧簇容量）+ warn。全局簇号 = 实例
+///   前缀和 + 簇局部号——同一网格被多实例引用时簇身份按（实例, 局部号）
+///   枚举，剔除端逐对独立裁决。
+fn collect_meshlet_instances(
+    world: &iris_core::world::World,
+    frustum: &Frustum,
+    slots: &[Option<MeshletArenaSlot>],
+    out: &mut MeshletFrame,
+) {
+    out.entries.clear();
+    out.handles.clear();
+    out.total_clusters = 0;
+    let mut warned_instances = false;
+    let mut warned_clusters = false;
+    world.query::<(
+        iris_core::prelude::Entity,
+        &GlobalTransform,
+        &crate::meshlet::MeshletInstance,
+        Option<&Visibility>,
+    )>(|(e, gt, mi, visibility)| {
+        if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
+            return;
+        }
+        let Some(Some(slot)) = slots.get(mi.mesh.0 as usize) else {
+            // 未注册 / 注册被拒 / 空网格：注册处已 warn 过，此处静默跳过
+            return;
+        };
+        if out.entries.len() >= MAX_MESHLET_INSTANCES {
+            if !warned_instances {
+                warned_instances = true;
+                log::warn!("meshlet 实例数超过单帧上限 {MAX_MESHLET_INSTANCES}，多余的已跳过");
+            }
+            return;
+        }
+        if out.total_clusters as usize + slot.cluster_count as usize
+            > crate::meshlet::MAX_MESHLET_CLUSTERS
+        {
+            if !warned_clusters {
+                warned_clusters = true;
+                log::warn!(
+                    "meshlet 簇总数超过单帧剔除容量 {}，多余的实例已跳过",
+                    crate::meshlet::MAX_MESHLET_CLUSTERS
+                );
+            }
+            return;
+        }
+        let model = gt.matrix();
+        // 实例包围球视锥剔除（与 collect_instances 同式）
+        let min = Vec3::from(slot.bounds_min);
+        let max = min + Vec3::from(slot.bounds_extent);
+        let center_local = (min + max) * 0.5;
+        let radius_local = (max - min).length() * 0.5;
+        let center_world = model.transform_point3(center_local);
+        let scale = model
+            .x_axis
+            .truncate()
+            .length()
+            .max(model.y_axis.truncate().length())
+            .max(model.z_axis.truncate().length());
+        if !frustum.intersects_sphere(center_world, radius_local * scale) {
+            return;
+        }
+        let raw = InstanceRaw::from_matrix(model);
+        out.entries.push(MeshletInstanceEntryRaw {
+            model: raw.model,
+            normal: raw.normal,
+            base_counts: [
+                slot.vertex_base,
+                slot.index_base,
+                slot.cluster_base,
+                slot.cluster_count,
+            ],
+            frame_base: [out.total_clusters, 0, 0, 0],
+            bounds_min: [
+                slot.bounds_min[0],
+                slot.bounds_min[1],
+                slot.bounds_min[2],
+                0.0,
+            ],
+            bounds_extent: [
+                slot.bounds_extent[0],
+                slot.bounds_extent[1],
+                slot.bounds_extent[2],
+                0.0,
+            ],
+        });
+        out.handles.push(mi.mesh.0);
+        out.total_clusters += slot.cluster_count;
+    });
+}
+
 fn collect_decals(
     world: &iris_core::world::World,
     frustum: &Frustum,
@@ -3411,6 +3709,13 @@ impl Renderer {
             particle_scratch: Vec::new(),
             particle_alpha_scratch: Vec::new(),
             particle_v2_pools: Vec::new(),
+            meshlet_gpu: None,
+            meshlet_arena: MeshletArena::default(),
+            meshlet_inflight: None,
+            meshlet_consumed: None,
+            meshlet_frame: 0,
+            meshlet_last_handles: Vec::new(),
+            meshlet_frame_scratch: MeshletFrame::default(),
             particle_v2_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
@@ -4976,6 +5281,14 @@ impl Renderer {
         self.stats
     }
 
+    /// 最近一次成功消费的 meshlet 紧凑列表（packed 条目：实例槽 << 16 |
+    /// 簇局部号；紧凑序 = 全局簇号升序 ⇒ 本切片恒严格升序）。GPU 测试与
+    /// 验收的观测口（稳定紧凑化的确定性断言）；`None` = 尚无有效回读
+    /// （首帧 / 读回迟到 / 映射失败）。
+    pub fn meshlet_consumed_list(&self) -> Option<&[u32]> {
+        self.meshlet_consumed.as_ref().map(|c| c.list.as_slice())
+    }
+
     /// 渲染一帧：场景渲染到内部 HDR 中间缓冲（MSAA 4x），贴花 pass、
     /// 透明 pass 与粒子 pass 依次叠加——贴花位于蒙皮之后、透明之前（不
     /// 透明表面的装饰，玻璃等透明物盖在其混合结果上，见 `decal.rs`），
@@ -5006,7 +5319,18 @@ impl Renderer {
         // 遮挡查询（R53）：帧号自增后先消费上一帧读回（非阻塞 poll +
         // try_recv，迟到即弃），裁决在本帧收集之后、主 pass 编码之前应用
         self.occ_frame += 1;
+        // meshlet 帧号同步推进（奇偶槽位轮转的基准——被跳过的帧不产生
+        // 「上一帧」，与 occ_frame 同款纪律）
+        self.meshlet_frame += 1;
         let occ_fresh = self.consume_occlusion_results();
+        // meshlet 注册 + 读回消费（R85）：arena 追加（变更时上传）与上一帧
+        // 紧凑结果的非阻塞消费（遮挡同款协议）。资源缺席 / 无实体 = 两者
+        // 皆零开销（缺席语义：零 dispatch、零回读、零绘制）。
+        let meshlet_store = world.try_resource::<crate::meshlet::MeshletMeshStore>();
+        if let Some(store) = meshlet_store.as_deref() {
+            self.ensure_meshlet_world(store);
+        }
+        self.consume_meshlet_readback();
         // 暗角 / 景深 / 运动模糊的按需资源（全分辨率中间对 + blit 接入
         // 绑定组 + 主相机深度副本）必须在贯穿全部 pass 的 hdr 不可变借用
         // 建立之前惰性分配（关闭 = 零开销跳过——与可见性、粒子同款
@@ -5757,6 +6081,39 @@ impl Renderer {
             &mut particle_v2_items,
         );
         self.ensure_particle_v2_pools(&mut particle_v2_items);
+        // 2c''. meshlet 收集 + 帧上传 + 绘制裁决（R85）：实例表条目（含
+        //       全局簇号前缀）与兜底裁决（无有效紧凑回读 ⇒ CPU 写恒等
+        //       列表全量绘制）。hdr 不可变借用之前完成全部 &mut 操作
+        //       （上传 / 默认材质预热），计划贯穿主 pass 与 compute 编码。
+        let mut meshlet_plan: Option<MeshletDrawPlan> = None;
+        if let Some(store) = meshlet_store.as_deref() {
+            if !store.is_empty() {
+                let mut frame = std::mem::take(&mut self.meshlet_frame_scratch);
+                collect_meshlet_instances(world, &frustum, &self.meshlet_arena.slots, &mut frame);
+                if frame.total_clusters > 0 {
+                    // 三角形统计的解析表（下一帧消费读回时按此对账）
+                    self.meshlet_last_handles.clear();
+                    self.meshlet_last_handles.extend_from_slice(&frame.handles);
+                    let plan = self.prepare_meshlet_frame(
+                        &frame,
+                        &material_store,
+                        texture_store.as_deref(),
+                        lightmap_store.as_deref(),
+                        vp,
+                        eye,
+                    );
+                    meshlet_plan = Some(plan);
+                }
+                self.meshlet_frame_scratch = frame;
+            } else {
+                // 本帧无 meshlet 几何：紧凑结果作废——它与产出帧的实例表
+                // 槽位配对，跳帧会破坏槽位配对契约；下一活动帧走恒等全量
+                // 兜底重新建立（像素与剔除帧恒等，无视觉跳变）
+                self.meshlet_consumed = None;
+            }
+        } else {
+            self.meshlet_consumed = None;
+        }
         // 2d. 贴花收集（R39）：Visibility 过滤 + 祖先级联 + 变换后 AABB
         //     视锥剔除，随后按纹理句柄排序分批（同纹理连续区间 = 1 draw；
         //     批内实体 bits 并列序——确定性，与收集顺序无关）。无贴花时
@@ -6053,6 +6410,7 @@ impl Renderer {
                 label: Some("iris.frame"),
             });
         let mut draw_calls = 0u32;
+        let mut meshlet_surviving = 0u32;
         let mut instances = 0u32;
         let mut triangles_drawn = 0u32;
         let mut particles_drawn = 0u32;
@@ -6626,6 +6984,70 @@ impl Renderer {
                         .get(MeshHandle(item.mesh))
                         .map_or(0, |data| data.indices.len() as u32 / 3);
                 }
+            }
+            // meshlet 几何（R85，虚拟几何体 V2）：主 pass 内、常规不透明段
+            // 之后——不透明几何 z-buffer 裁决与顺序无关（Less + REPLACE，
+            // 无混合），对既有像素流零交互；透明 / 贴花 / 粒子照常后叠。
+            // vertex-pull：实例 = 紧凑簇列表条目，无顶点 / 索引缓冲；片元
+            // = standard.wgsl fs_main 本体（跨模块管线阶段，PBR 零复制）。
+            // 缺席 = 零绘制（命令流与引入前逐位一致）。
+            if let Some(plan) = &meshlet_plan {
+                if plan.draw_count > 0 {
+                    let material = &self.material_gpu[&material_key(0, NO_LIGHTMAP)];
+                    let mg = self.meshlet_gpu.as_ref().expect("meshlet GPU 资源已就绪");
+                    pass.set_pipeline(&self.bundle.meshlet_pipeline);
+                    pass.set_bind_group(0, &self.globals_bg, &[]);
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_bind_group(2, &mg.draw_bgs[plan.draw_parity], &[]);
+                    // 固定顶点数契约：每实例 128 三角 × 3 顶点，越界槽位在
+                    // 顶点着色器输出零面积退化三角（meshlet_draw.wgsl）
+                    pass.draw(
+                        0..crate::meshlet::MESHLET_CLUSTER_MAX_TRIANGLES as u32 * 3,
+                        0..plan.draw_count,
+                    );
+                    draw_calls += 1;
+                    instances += plan.draw_count;
+                    triangles_drawn += plan.triangles;
+                    meshlet_surviving = plan.draw_count;
+                }
+            }
+        }
+        // 4e'. meshlet compute 剔除 + 稳定紧凑化（R85）：主 pass **之后**
+        //      编码——本帧 draw 消费的紧凑列表是上一帧的产物（读回一帧
+        //      延迟契约），本帧 compute 对 compact_buf 的覆写必须发生在
+        //      draw 之后（同一编码器按序执行）。读回在途 = staging 槽不
+        //      可覆写 ⇒ 整段跳过（下一帧继续消费 / 兜底）。cull（逐簇
+        //      视锥 + 背面锥，无原子）→ compact（单工作组 u32 前缀和，
+        //      紧凑序 = 全局簇号升序 ⇒ 绘制序确定），随后把存活总数 +
+        //      紧凑列表 copy 进 staging 双缓冲槽，提交后 map_async。
+        let mut meshlet_issued: Option<usize> = None;
+        if let Some(plan) = &meshlet_plan {
+            if plan.do_compute && self.meshlet_inflight.is_none() {
+                let mg = self.meshlet_gpu.as_ref().expect("meshlet GPU 资源已就绪");
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("iris.pass.meshlet_cull"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&self.bundle.meshlet_cull_pipeline);
+                    cpass.set_bind_group(0, &mg.cull_bgs[plan.cull_parity], &[]);
+                    // 恒定形状 dispatch：x = ceil(实例最大簇数 / 64)，
+                    // y = 实例数——越界线程早退（R82 范式）
+                    cpass.dispatch_workgroups(plan.cull_blocks, plan.dispatch_instances, 1);
+                    cpass.set_pipeline(&self.bundle.meshlet_compact_pipeline);
+                    cpass.set_bind_group(0, &mg.cull_bgs[plan.cull_parity], &[]);
+                    cpass.dispatch_workgroups(1, 1, 1);
+                }
+                let parity = plan.cull_parity;
+                encoder.copy_buffer_to_buffer(&mg.count_buf, 0, &mg.staging[parity], 0, 4);
+                encoder.copy_buffer_to_buffer(
+                    &mg.compact_buf,
+                    0,
+                    &mg.staging[parity],
+                    4,
+                    (crate::meshlet::MAX_MESHLET_CLUSTERS * 4) as u64,
+                );
+                meshlet_issued = Some(parity);
             }
         }
         // 5a. 遮挡查询 pass（R53，紧随主 pass）：复用本帧不透明深度
@@ -7822,10 +8244,31 @@ impl Renderer {
                 done: receiver,
             });
         }
+        // meshlet 紧凑结果读回（R85）：提交后对 staging 槽发起 map_async，
+        // 下一帧 draw 开头的 poll + try_recv 消费（遮挡同款协议——缓冲在
+        // 消费 unmap 前不可复用，在途期间跳过 compute 与 copy）。
+        if let Some(parity) = meshlet_issued {
+            let mg = self
+                .meshlet_gpu
+                .as_ref()
+                .expect("发出帧必有 meshlet GPU 资源（本帧刚使用）");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            mg.staging[parity]
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            self.meshlet_inflight = Some(MeshletInflight {
+                parity,
+                frame: self.meshlet_frame,
+                done: receiver,
+            });
+        }
         self.stats.draw_calls = draw_calls;
         self.stats.instances = instances;
         self.stats.triangles_drawn = triangles_drawn;
         self.stats.particles_drawn = particles_drawn;
+        self.stats.meshlet_surviving = meshlet_surviving;
         self.stats.taa_reset = u32::from(taa_on && taa_reset_frame);
         self.scratch = items;
         self.skinned_scratch = skinned;
@@ -7989,6 +8432,502 @@ impl Renderer {
                 pool.sim_bgs.push(bg);
             }
             item.pool = idx;
+        }
+    }
+
+    // ---- meshlet（R85，虚拟几何体 V2）----
+
+    /// 创建 meshlet GPU 资源束（首个 meshlet 注册时一次；顶点 / 索引容量
+    /// 取 CPU 镜像当前尺寸的向上余量，后续注册超出时走重建路径）。
+    fn create_meshlet_gpu(&self) -> MeshletGpu {
+        let device = &self.gpu.device;
+        let cluster_words_bytes = (crate::meshlet::MAX_MESHLET_CLUSTERS
+            * std::mem::size_of::<crate::meshlet::MeshletClusterRaw>())
+            as u64;
+        let flags_bytes = crate::meshlet::MAX_MESHLET_CLUSTERS as u64 * 4;
+        let words_cap = (self.meshlet_arena.words.len() as u64 * 2).max(1 << 14);
+        let index_cap = (self.meshlet_arena.indices.len() as u64 * 2).max(1 << 14);
+        let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.vertex_arena"),
+            size: words_cap * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.index_arena"),
+            size: index_cap * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instance_tables: [wgpu::Buffer; 2] = std::array::from_fn(|i| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("iris.meshlet.instances[{i}]")),
+                size: (MAX_MESHLET_INSTANCES * std::mem::size_of::<MeshletInstanceEntryRaw>())
+                    as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let cluster_words_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.cluster_words"),
+            size: cluster_words_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.flags"),
+            size: flags_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let payload_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.payload"),
+            size: flags_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let compact_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.compact"),
+            size: flags_bytes,
+            // COPY_SRC：帧尾 copy 进回读 staging（消费紧凑列表与计数）
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let count_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.count"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let cull_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.meshlet.cull_params"),
+            size: std::mem::size_of::<MeshletCullParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging: [wgpu::Buffer; 2] = std::array::from_fn(|i| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("iris.meshlet.staging[{i}]")),
+                size: MESHLET_STAGING_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let mk_cull_bg = |instances: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.meshlet.cull.bg"),
+                layout: &self.bundle.meshlet_cull_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: cull_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: cluster_words_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: instances.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: flags_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: payload_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: compact_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: count_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let cull_bgs = [
+            mk_cull_bg(&instance_tables[0]),
+            mk_cull_bg(&instance_tables[1]),
+        ];
+        let mk_draw_bg = |instances: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.meshlet.draw.bg"),
+                layout: &self.bundle.meshlet_draw_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: cluster_words_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: vertex_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: index_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: instances.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: compact_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let draw_bgs = [
+            mk_draw_bg(&instance_tables[0]),
+            mk_draw_bg(&instance_tables[1]),
+        ];
+        MeshletGpu {
+            cluster_words_buf,
+            flags_buf,
+            payload_buf,
+            compact_buf,
+            count_buf,
+            cull_params_buf,
+            vertex_buf,
+            index_buf,
+            vertex_capacity_words: words_cap,
+            index_capacity: index_cap,
+            instance_tables,
+            cull_bgs,
+            draw_bgs,
+            staging,
+        }
+    }
+
+    /// meshlet arena 注册（变更时上传）：把未登记的 meshlet 句柄追加进
+    /// 簇 / 顶点 / 索引 arena。追加式布局保证已发布帧的紧凑列表引用恒
+    /// 有效；顶点 / 索引容量不足时重建缓冲 + 全量重传（注册期低频）+
+    /// 重建绘制绑定组（旧缓冲随重建作废）。全部句柄已登记时零上传零
+    /// 开销（每帧调用安全）。
+    fn ensure_meshlet_world(&mut self, store: &crate::meshlet::MeshletMeshStore) {
+        if store.len() <= self.meshlet_arena.slots.len() {
+            return; // 无新句柄（句柄只追加，登记数单调追赶目录长度）
+        }
+        let mut new_slots: Vec<Option<MeshletArenaSlot>> = Vec::new();
+        let mut new_words: Vec<[f32; 4]> = Vec::new();
+        let mut new_indices: Vec<u32> = Vec::new();
+        let mut new_cluster_bytes: Vec<u8> = Vec::new();
+        let mut total_clusters = self.cluster_count();
+        let mut base_vertex = self.meshlet_arena.words.len() as u32 / 2;
+        let mut base_index = self.meshlet_arena.indices.len() as u32;
+        for handle in self.meshlet_arena.slots.len()..store.len() {
+            let Some(mesh) = store.get(crate::meshlet::MeshletMeshHandle(handle as u32)) else {
+                new_slots.push(None);
+                continue;
+            };
+            // 容量裁决（注册处校验 + warn，spec 口径）：单帧剔除容量按
+            // arena 总量计；空网格不可实例化。
+            if mesh.clusters.is_empty()
+                || mesh.vertices.is_empty()
+                || total_clusters + mesh.clusters.len() > crate::meshlet::MAX_MESHLET_CLUSTERS
+            {
+                log::warn!(
+                    "meshlet 网格 #{handle}（{} 簇）超出单帧剔除容量或为空，\
+                     已跳过注册（总量 {total_clusters}/{}）",
+                    mesh.clusters.len(),
+                    crate::meshlet::MAX_MESHLET_CLUSTERS
+                );
+                new_slots.push(None);
+                continue;
+            }
+            let Some((min, extent)) = crate::meshlet::mesh_bounds(&mesh.vertices) else {
+                new_slots.push(None);
+                continue;
+            };
+            let cluster_triangles: Vec<u8> =
+                mesh.clusters.iter().map(|c| c.triangle_count).collect();
+            let total_triangles = cluster_triangles.iter().map(|&t| t as u32).sum();
+            new_words.extend(crate::meshlet::vertex_storage_words(&mesh.vertices));
+            new_indices.extend(mesh.indices.iter().copied());
+            new_cluster_bytes.extend_from_slice(bytemuck::cast_slice(&mesh.clusters));
+            new_slots.push(Some(MeshletArenaSlot {
+                vertex_base: base_vertex,
+                index_base: base_index,
+                cluster_base: total_clusters as u32,
+                cluster_count: mesh.clusters.len() as u32,
+                bounds_min: min,
+                bounds_extent: extent,
+                cluster_triangles,
+                total_triangles,
+            }));
+            base_vertex += mesh.vertices.len() as u32;
+            base_index += mesh.indices.len() as u32;
+            total_clusters += mesh.clusters.len();
+        }
+        if self.meshlet_gpu.is_none() {
+            self.meshlet_gpu = Some(self.create_meshlet_gpu());
+        }
+        let cluster_offset = self.cluster_count() as u64
+            * std::mem::size_of::<crate::meshlet::MeshletClusterRaw>() as u64;
+        let words_offset = self.meshlet_arena.words.len() as u64 * 16;
+        let index_offset = self.meshlet_arena.indices.len() as u64 * 4;
+        // 顶点 / 索引容量检查：不足 = 重建 + 旧数据全量重传 + 重建设计侧
+        // 绑定组（compute 绑定组不引用这两个缓冲，无需重建）
+        let needed_words = (self.meshlet_arena.words.len() + new_words.len()) as u64;
+        let needed_indices = (self.meshlet_arena.indices.len() + new_indices.len()) as u64;
+        let mut rebuilt = false;
+        {
+            let mg = self.meshlet_gpu.as_mut().expect("GPU 资源束已创建");
+            if needed_words > mg.vertex_capacity_words {
+                let cap = needed_words * 2;
+                mg.vertex_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.meshlet.vertex_arena"),
+                    size: cap * 16,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                mg.vertex_capacity_words = cap;
+                self.gpu.queue.write_buffer(
+                    &mg.vertex_buf,
+                    0,
+                    bytemuck::cast_slice(&self.meshlet_arena.words),
+                );
+                rebuilt = true;
+            }
+            if needed_indices > mg.index_capacity {
+                let cap = needed_indices * 2;
+                mg.index_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.meshlet.index_arena"),
+                    size: cap * 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                mg.index_capacity = cap;
+                self.gpu.queue.write_buffer(
+                    &mg.index_buf,
+                    0,
+                    bytemuck::cast_slice(&self.meshlet_arena.indices),
+                );
+                rebuilt = true;
+            }
+        }
+        if rebuilt {
+            let mg = self.meshlet_gpu.as_mut().expect("GPU 资源束已创建");
+            let device = &self.gpu.device;
+            let draw_bgs: [wgpu::BindGroup; 2] = std::array::from_fn(|i| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("iris.meshlet.draw.bg"),
+                    layout: &self.bundle.meshlet_draw_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: mg.cluster_words_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: mg.vertex_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: mg.index_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: mg.instance_tables[i].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: mg.compact_buf.as_entire_binding(),
+                        },
+                    ],
+                })
+            });
+            mg.draw_bgs = draw_bgs;
+        }
+        // 追加上传（write_buffer 偏移均为 4 的倍数——48/16/4 天然满足）
+        let mg = self.meshlet_gpu.as_ref().expect("GPU 资源束已创建");
+        self.gpu
+            .queue
+            .write_buffer(&mg.cluster_words_buf, cluster_offset, &new_cluster_bytes);
+        self.gpu.queue.write_buffer(
+            &mg.vertex_buf,
+            words_offset,
+            bytemuck::cast_slice(&new_words),
+        );
+        self.gpu.queue.write_buffer(
+            &mg.index_buf,
+            index_offset,
+            bytemuck::cast_slice(&new_indices),
+        );
+        self.meshlet_arena.slots.extend(new_slots);
+        self.meshlet_arena.words.extend(new_words);
+        self.meshlet_arena.indices.extend(new_indices);
+    }
+
+    /// 已登记的全局簇总数（arena 占用）。
+    fn cluster_count(&self) -> usize {
+        self.meshlet_arena
+            .slots
+            .iter()
+            .flatten()
+            .map(|s| s.cluster_count as usize)
+            .sum()
+    }
+
+    /// 消费上一帧的 meshlet 紧凑结果读回（遮挡 consume_occlusion_results
+    /// 同款协议：非阻塞 poll + try_recv，迟到保持在途、映射失败废弃、
+    /// 到达即解析并构建绘制输入）。解析 = 4 B 存活计数 + 紧凑列表前缀 +
+    /// 逐簇三角形精确统计（解析表 = 产出该列表那一帧的实例槽 → 句柄）。
+    fn consume_meshlet_readback(&mut self) {
+        if self.meshlet_inflight.is_none() {
+            return;
+        }
+        let _ = self.gpu.device.poll(wgpu::PollType::Poll);
+        let (ready, map_err) = {
+            let inflight = self.meshlet_inflight.as_ref().expect("在途记录已确认存在");
+            match inflight.done.try_recv() {
+                Ok(Ok(())) => (true, false),
+                Ok(Err(e)) => {
+                    log::warn!("meshlet 紧凑结果读回映射失败：{e}，本帧走全量兜底");
+                    (true, true)
+                }
+                Err(_) => (false, false), // 回调未到：保持在途（保守方向）
+            }
+        };
+        if !ready {
+            return;
+        }
+        let inflight = self.meshlet_inflight.take().expect("刚确认回调到达");
+        if map_err {
+            self.meshlet_consumed = None;
+            return; // 缓冲未被映射，直接废弃在途记录
+        }
+        let mg = self
+            .meshlet_gpu
+            .as_ref()
+            .expect("读回缓冲随 GPU 资源束同在");
+        let list = {
+            let bytes = mg.staging[inflight.parity]
+                .get_mapped_range(..)
+                .expect("已映射的读回缓冲必须可读");
+            let count = u32::from_le_bytes(bytes[0..4].try_into().expect("计数 4 B")) as usize;
+            let count = count.min(crate::meshlet::MAX_MESHLET_CLUSTERS);
+            let words: &[u32] = bytemuck::cast_slice(&bytes[4..4 + count * 4]);
+            words.to_vec()
+        };
+        mg.staging[inflight.parity].unmap();
+        // 三角形精确统计（handles = 产出该列表那一帧的实例表；防御式
+        // 越界跳过——正规路径下 compute 产物必然良构）
+        let handles = std::mem::take(&mut self.meshlet_last_handles);
+        let mut triangles = 0u32;
+        for &e in &list {
+            let inst = (e >> 16) as usize;
+            let local = (e & 0xFFFF) as usize;
+            if let Some(Some(slot)) = handles
+                .get(inst)
+                .and_then(|h| self.meshlet_arena.slots.get(*h as usize))
+            {
+                triangles += slot.cluster_triangles.get(local).copied().unwrap_or(0) as u32;
+            }
+        }
+        self.meshlet_consumed = Some(MeshletConsumed {
+            list,
+            triangles,
+            frame: inflight.frame,
+        });
+    }
+
+    /// 本帧 meshlet 帧上传 + 绘制裁决（hdr 不可变借用之前的 `&mut self`
+    /// 段内调用）：实例表 / 剔除参数上传、兜底裁决（无已消费紧凑结果 ⇒
+    /// CPU 写恒等列表全量绘制——像素与剔除帧恒等）、默认材质绑定组预热。
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_meshlet_frame(
+        &mut self,
+        frame: &MeshletFrame,
+        materials: &MaterialStore,
+        textures: Option<&TextureStore>,
+        lightmaps: Option<&LightmapStore>,
+        vp: Mat4,
+        eye: Vec3,
+    ) -> MeshletDrawPlan {
+        let frame_index = self.meshlet_frame;
+        let cull_parity = (frame_index % 2) as usize;
+        let mg = self.meshlet_gpu.as_ref().expect("GPU 资源束已随注册创建");
+        // 兜底裁决：无已消费紧凑结果或其产出帧不是恰好上一帧（首帧 /
+        // 读回迟到 / 映射失败 / 跳帧）⇒ 恒等列表全量绘制。剔除只删不可见
+        // 几何 ⇒ 全量帧与剔除帧像素恒等，这是「回读一帧延迟」下的连续性
+        // 兜底（诚实限制 §8.54）。
+        let consumed_valid = self
+            .meshlet_consumed
+            .as_ref()
+            .is_some_and(|c| c.frame + 1 == frame_index);
+        let fallback = !consumed_valid;
+        let (draw_count, draw_parity, triangles) = if fallback {
+            let mut identity: Vec<u32> = Vec::with_capacity(frame.total_clusters as usize);
+            let mut triangles = 0u32;
+            for (i, entry) in frame.entries.iter().enumerate() {
+                let handle = frame.handles[i];
+                if let Some(Some(slot)) = self.meshlet_arena.slots.get(handle as usize) {
+                    triangles += slot.total_triangles;
+                }
+                for local in 0..entry.base_counts[3] {
+                    identity.push(((i as u32) << 16) | local);
+                }
+            }
+            self.gpu
+                .queue
+                .write_buffer(&mg.compact_buf, 0, bytemuck::cast_slice(&identity));
+            (frame.total_clusters, cull_parity, triangles)
+        } else {
+            let consumed = self.meshlet_consumed.as_ref().expect("兜底裁决已排除 None");
+            (
+                consumed.list.len() as u32,
+                ((frame_index + 1) % 2) as usize,
+                consumed.triangles,
+            )
+        };
+        // 本帧实例表（compute 槽位）+ 剔除参数（VP 与绘制同源——含 TAA
+        // 抖动，保证「剔除边界」与「实际可见边界」一致）
+        self.gpu.queue.write_buffer(
+            &mg.instance_tables[cull_parity],
+            0,
+            bytemuck::cast_slice(&frame.entries),
+        );
+        let max_count = frame
+            .entries
+            .iter()
+            .map(|e| e.base_counts[3])
+            .max()
+            .unwrap_or(1);
+        self.gpu.queue.write_buffer(
+            &mg.cull_params_buf,
+            0,
+            bytemuck::bytes_of(&MeshletCullParamsRaw {
+                view_proj: vp.to_cols_array_2d(),
+                eye: [eye.x, eye.y, eye.z, 0.0],
+                counts: [frame.entries.len() as u32, frame.total_clusters, 0, 0],
+            }),
+        );
+        // meshlet 路径 v1 恒用默认材质（句柄 0；单 instanced draw 单材质，
+        // 诚实限制 §8.54）——在 hdr 借用之前预热绑定组
+        self.ensure_material(
+            materials,
+            textures,
+            lightmaps,
+            MaterialHandle(0),
+            NO_LIGHTMAP,
+        );
+        MeshletDrawPlan {
+            draw_count,
+            triangles,
+            draw_parity,
+            cull_parity,
+            cull_blocks: max_count.div_ceil(MESHLET_CULL_WORKGROUP).max(1),
+            dispatch_instances: frame.entries.len() as u32,
+            do_compute: self.meshlet_inflight.is_none(),
         }
     }
 

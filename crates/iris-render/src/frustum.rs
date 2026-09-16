@@ -48,6 +48,16 @@ impl Frustum {
         Self { planes }
     }
 
+    /// 平面只读视图（`[left, right, bottom, top, near, far]`，每项
+    /// `Vec4 = (normal.xyz, d)`，锥内满足 `normal·p + d >= 0`）。
+    ///
+    /// R85 起为剔除谓词的解析单测锚点服务（`meshlet.rs` 的视锥解析解
+    /// 对照直接核对提取出的平面常数；WGSL `meshlet_cull.wgsl` 的提取式
+    /// 与 `from_view_proj` 逐式镜像，同步契约）。
+    pub fn planes(&self) -> &[Vec4; 6] {
+        &self.planes
+    }
+
     /// 「全通过」视锥（R62a 反射探针捕获用）：覆盖以 `center` 为中心、
     /// 半边长 `radius` 的**立方体**的正交视锥（六个平面全部朝外扩到该盒）。
     ///

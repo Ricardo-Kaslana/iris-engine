@@ -1,18 +1,55 @@
-//! 虚拟几何体 V1（R84）：meshlet 簇的运行期表示 + 版本化资产容器（IRML）。
+//! 虚拟几何体 V1+V2（R84/R85）：meshlet 簇的运行期表示 + 版本化资产
+//! 容器（IRML）+ V2 的 GPU compute 剔除谓词。
 //!
 //! meshlet（簇）= 网格三角形的近似凸连通小块（≤ [`MESHLET_CLUSTER_MAX_TRIANGLES`]
 //! 个三角、≤ [`MESHLET_CLUSTER_MAX_VERTICES`] 个簇内顶点），是本仓
-//! 「Nanite 式子集」路线（R84–R87）的基本处理单元。本模块提供三件事：
+//! 「Nanite 式子集」路线（R84–R87）的基本处理单元。本模块提供四件事：
 //!
 //! 1. **运行期表示**：[`MeshletMesh`]（全局顶点 / 全局索引 / 逐簇元数据）
-//!    与 [`MeshletClusterRaw`]（48 B POD，布局为 R85 GPU storage 的前置）；
+//!    与 [`MeshletClusterRaw`]（48 B POD，布局即 R85 GPU storage 的逐字
+//!    排布——`meshlet_cull.wgsl` / `meshlet_draw.wgsl` 以 12×u32 词阵列
+//!    消费，见下文「GPU storage 词布局」）；
 //! 2. **展开**：[`MeshletMesh::expand`] 纯函数——把簇表示还原为既有渲染
 //!    路径可消费的 [`MeshData`](crate::mesh::MeshData)。V1 的正确性锚点：
 //!    顶点重排不改像素（覆盖集与逐角插值不变），同一几何「常规路径 vs
 //!    meshlet 构建后展开路径」渲染逐字节一致（GPU 佐证见
-//!    `tests/meshlet_render.rs`）；
+//!    `tests/meshlet_render.rs`；R85 中继续作为对照锚点与文档兜底路径）；
 //! 3. **资产容器（IRML）**：版本化 + CRC32 的单文件格式，`write_to` /
-//!    `write_file` / `from_bytes` / `open` 与 `iris-engine::pack` 同构。
+//!    `write_file` / `from_bytes` / `open` 与 `iris-engine::pack` 同构；
+//! 4. **V2 剔除（R85）**：组件 [`MeshletInstance`] / 目录
+//!    [`MeshletMeshStore`] 与剔除谓词纯函数（背面锥
+//!    [`cluster_is_backfacing`]、紧凑化扫描镜像 [`chunked_prefix_compact`]、
+//!    顶点 storage 词重排 [`vertex_storage_words`]、网格包围盒
+//!    [`mesh_bounds`]）。GPU 侧 `shaders/meshlet_cull.wgsl`（compute：
+//!    逐簇视锥 + 背面锥判定 → u32 存活标志 → 前缀和 + 稳定紧凑化）与
+//!    `shaders/meshlet_draw.wgsl`（vertex-pull 绘制）是其镜像消费端，
+//!    接线见 `renderer.rs` 的 meshlet 段与 ARCHITECTURE §4.41。
+//!
+//! # GPU storage 词布局（R85 影子契约）
+//!
+//! WGSL storage 地址空间里 `vec3<f32>` 的对齐是 16 B，48 B 的
+//! [`MeshletClusterRaw`] 与 32 B 的 [`Vertex`](crate::mesh::Vertex) 都
+//! **不能**作为 WGSL struct 原样映射。定稿：两个数组都以扁平 u32 词
+//! 消费，字节布局与 CPU 结构**逐字一致**（`bytemuck::cast_slice` 直接
+//! 上传，零重排）：
+//!
+//! - 簇 = 12 词（48 B）：`w0 = vertex_offset`、`w1 = index_offset`、
+//!   `w2 = vertex_count | triangle_count << 8 | reserved << 16`、
+//!   `w3..w5 = cone_axis`（f32 位型）、`w6 = cone_cutoff_cos`、
+//!   `w7..w10 = bounds`、`w11 = error`。WGSL 侧以 `bitcast<f32>` 解码，
+//!   词下标由 `cluster_raw_word_layout`（单测）锚定；
+//! - 顶点 = 2 词（8 B... 即 32 B 中的 2×16 B vec4）：`[px,py,pz,nx]` /
+//!   `[ny,nz,u,v]`——这是唯一需要重排的数组（[`vertex_storage_words`]，
+//!   注册期一次性）；索引 = `array<u32>` 原样透传。
+//!
+//! # 前缀和确定性（R85 定稿要点）
+//!
+//! u32 整数加法**结合精确**（无舍入、无重排序自由）⇒ 无论扫描树形状
+//! （Hillis-Steele / 顺序 / 分段）结果恒等——与浮点扫描的本质区别，也是
+//! 「紧凑化无需原子、无需固定线程调度即会话内逐位确定」的根据。紧凑序
+//! = 全局簇号升序（stable compaction）⇒ 绘制序确定。
+//!
+//! # 全案 MVP 边界（R84–R87 红线修订声明，越界即 bug）
 //!
 //! # 全案 MVP 边界（R84–R87 红线修订声明，越界即 bug）
 //!
@@ -33,10 +70,13 @@
 //!   校验连续性，见 [`MeshletAssetError::Corrupt`]）；
 //! - `cone_axis` / `cone_cutoff_cos`：背面簇剔除边界锥。axis 为簇内三角
 //!   面法线均值的归一化向量；`cone_cutoff_cos = min(axis·n_i)`（截断到
-//!   [-1, 1]）——视线方向与 axis 点积小于 cutoff 时簇整体背面。退化防护：
-//!   簇内无有效面法线（全退化三角）或均值长度 < 1e-6（法线完全对消，
-//!   如立方体六向簇）⇒ 锥退化为全向（axis = [0,0,1]、cutoff = −1，
-//!   **永不剔除**，保守方向）；
+//!   [-1, 1]）。剔除判定（R85 定稿的精确谓词，见
+//!   [`cluster_is_backfacing`] 的推导）：视线方向与轴的夹角越过
+//!   90° + acos(cutoff) 才判整簇背面——R84 头注释里「点积 < cutoff 即
+//!   背面」是松散表述（对近平坦簇会误剔正面），V1 无剔除消费者未暴露，
+//!   R85 以本模块纯函数为准。退化防护：簇内无有效面法线（全退化三角）
+//!   或均值长度 < 1e-6（法线完全对消，如立方体六向簇）⇒ 锥退化为全向
+//!   （axis = [0,0,1]、cutoff = −1，**永不剔除**，保守方向）；
 //! - `bounds`：簇包围球。**xyz = 球心相对网格包围盒的归一化坐标**
 //!   （`(center − bbox_min) / bbox_extent`，退化轴 extent = 0 时除数取
 //!   1.0），**w = 半径（世界单位，米，不归一）**。归一化基（网格包围盒）
@@ -68,6 +108,7 @@ use std::io::Write;
 use std::path::Path;
 
 use glam::Vec3;
+use iris_core::Resource;
 
 use crate::mesh::{MeshData, Vertex};
 
@@ -82,6 +123,79 @@ pub const MESHLET_CONE_FALLBACK_AXIS: [f32; 3] = [0.0, 0.0, 1.0];
 
 /// 背面锥退化时的兜底 cutoff（−1 = 整个方向半球都算正面）。
 pub const MESHLET_CONE_FALLBACK_CUTOFF_COS: f32 = -1.0;
+
+/// 单帧 meshlet 剔除 / 绘制的全局簇容量上限（R85）。
+///
+/// 三处消费者同一常量：IRML 读取（单文件簇数超限 = 构建期拒绝）、渲染器
+/// 注册处（arena 总量超限 = warn + 该网格跳过注册）、GPU storage 缓冲
+/// 尺寸（簇词 16384 × 48 B = 768 KB；存活标志 / 载荷 / 紧凑列表同容量）。
+pub const MAX_MESHLET_CLUSTERS: usize = 16384;
+
+/// 紧凑化 compute pass 的工作组线程数（WGSL `@workgroup_size` 同值）。
+pub const MESHLET_COMPACT_THREADS: u32 = 256;
+
+/// 紧凑化 pass 每线程顺序扫描的 flag 数（段长）。
+///
+/// 线程数 × 段长 = [`MAX_MESHLET_CLUSTERS`]（const 断言锁定）：单工作组
+/// 两遍扫描——每线程先把本段的存活数顺序累加，再对 256 个段总和做
+/// Hillis-Steele 包含式扫描得到段基址，第二遍把存活者写到「段基址 +
+/// 段内游标」的最终槽位。无原子、无跨组传递，紧凑序 = 全局簇号升序。
+pub const MESHLET_COMPACT_CHUNK: u32 = 64;
+
+const _: () = assert!(
+    MESHLET_COMPACT_THREADS as usize * MESHLET_COMPACT_CHUNK as usize == MAX_MESHLET_CLUSTERS,
+    "紧凑化单工作组容量必须恰为簇上限（256 × 64 = 16384）"
+);
+
+/// meshlet 网格句柄（R85），指向 [`MeshletMeshStore`] 中的条目。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, iris_core::Component)]
+pub struct MeshletMeshHandle(pub u32);
+
+/// CPU 侧 meshlet 网格目录（World 资源，R85）。与 [`crate::mesh::MeshStore`]
+/// 同构的句柄注册表：GPU 上传（簇 / 顶点 / 索引 arena）由渲染器按需懒执行。
+#[derive(Default, Resource)]
+pub struct MeshletMeshStore {
+    meshes: Vec<MeshletMesh>,
+}
+
+impl MeshletMeshStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 注册 meshlet 网格；新句柄从 0 开始递增。
+    pub fn add(&mut self, mesh: MeshletMesh) -> MeshletMeshHandle {
+        self.meshes.push(mesh);
+        MeshletMeshHandle(self.meshes.len() as u32 - 1)
+    }
+
+    pub fn get(&self, handle: MeshletMeshHandle) -> Option<&MeshletMesh> {
+        self.meshes.get(handle.0 as usize)
+    }
+
+    /// 已注册 meshlet 网格数。
+    pub fn len(&self) -> usize {
+        self.meshes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.meshes.is_empty()
+    }
+}
+
+/// meshlet 实例组件（R85）：把 [`MeshletMeshHandle`] 指向的簇表示挂上
+/// `GlobalTransform` 实体参与渲染。缺本组件 = 零 dispatch、零回读、
+/// 零绘制（既有像素与命令流逐位不变）。
+///
+/// v1 消费口径（诚实清单见 ARCHITECTURE §8.54）：材质恒用默认材质
+/// （句柄 0——单 instanced draw 单材质，逐实例材质需按材质切段，留
+/// 后续轮）；不投影阴影、不进 scene_depth 副本；间接光只吃
+/// irradiance_map（vertex-pull 管线无 loc14 探针实例属性路径）。
+#[derive(Clone, Copy, Debug, iris_core::Component)]
+pub struct MeshletInstance {
+    /// 簇表示网格（须已注册进 [`MeshletMeshStore`]，未注册 = warn + 跳过）。
+    pub mesh: MeshletMeshHandle,
+}
 
 /// 簇元数据（48 B，POD；布局为 R85 GPU storage 的前置——字段排布即未来
 /// 的 WGSL struct 排布，改一字段必须过 R85 的并行布局看门）。
@@ -228,6 +342,12 @@ impl MeshletMesh {
             u32::from_le_bytes(bytes[12..16].try_into().expect("索引数字段 4 字节")) as usize;
         let cluster_count =
             u32::from_le_bytes(bytes[16..20].try_into().expect("簇数字段 4 字节")) as usize;
+        if cluster_count > MAX_MESHLET_CLUSTERS {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "簇数 {cluster_count} 超出单帧剔除容量上限 {MAX_MESHLET_CLUSTERS}（R85 storage \
+                 与紧凑化缓冲按上限定长）"
+            )));
+        }
         let expected_crc = u32::from_le_bytes(bytes[20..24].try_into().expect("CRC 字段 4 字节"));
 
         let data = &bytes[HEADER_LEN..];
@@ -434,7 +554,7 @@ impl MeshletMesh {
 }
 
 // ---------------------------------------------------------------------------
-// 簇元数据纯函数（构建器与未来 R85/R87 共用；无状态、逐位确定）
+// 簇元数据纯函数（构建器与 R85 剔除共用；无状态、逐位确定）
 // ---------------------------------------------------------------------------
 
 /// 簇包围球：均值球心 + 最大半径。
@@ -515,6 +635,134 @@ pub fn cluster_bounds_normalized(
     );
     let normalized = (center - mesh_bounds_min) / safe_extent;
     [normalized.x, normalized.y, normalized.z, radius]
+}
+
+// ---------------------------------------------------------------------------
+// R85 GPU 剔除谓词（CPU 锚点实现；`shaders/meshlet_cull.wgsl` 逐式镜像，
+// 两侧必须同步修改——与 spot_cone_factor 的同步契约同款纪律）
+// ---------------------------------------------------------------------------
+
+/// 背面簇判定（一线程一簇的布尔谓词，逐簇独立 ⇒ 逐簇布尔稳定）。
+///
+/// 输入 `to_eye` = 簇包围球世界球心 → 相机眼点的方向，`axis` = 世界空间
+/// 锥轴（模型矩阵旋转部分变换后**归一化**）——两者都必须已归一化；
+/// `cutoff_cos` = 簇元数据的 `cone_cutoff_cos`（局部空间口径，随刚体旋转
+/// 不变量）。
+///
+/// 语义推导（R84 模块头「视线方向与 axis 点积小于 cutoff 时整体背面」的
+/// 松散表述在此定稿为可执行的精确判定）：`cutoff = min_i(axis·n_i)` ⇒
+/// 全部簇内面法线与轴的夹角 ≤ θc = acos(cutoff)。视线方向 d 下簇内法线
+/// 的最大前途 = max_i(d·n_i) = cos(max(0, ∠(d, axis) − θc))（球冠上的
+/// 最大点积在 d 与轴所张平面内、靠 d 一侧取得）。**全部背面 ⇔ max ≤ 0
+/// ⇔ ∠(d, axis) ≥ 90° + θc ⇔ d·axis ≤ −sin(θc)**。因此：
+///
+/// - `cutoff ≤ 0`（θc ≥ 90°，含全向退化锥）时条件恒假 ⇒ **永不剔除**
+///   （保守方向，退化防护口径）；
+/// - 阈值取严格小于（相等点判存活）：`d·axis == −sin θc` 时最接近的前途
+///   法线恰好垂直视线（零面积投影），剔除与否像素等价，取保守一侧。
+///
+/// 局部轴经**非均匀缩放**变换后圆形锥不再是圆锥，归一化 + 原 cutoff 的
+/// 组合可能不再严格保守——v1 按均匀 / 近均匀缩放假设使用（诚实限制
+/// §8.54；GPU 像素等价测试用均匀缩放场景）。
+pub fn cluster_is_backfacing(to_eye: Vec3, axis: Vec3, cutoff_cos: f32) -> bool {
+    if cutoff_cos <= 0.0 {
+        return false;
+    }
+    let sin_theta_c = (1.0 - cutoff_cos * cutoff_cos).max(0.0).sqrt();
+    to_eye.dot(axis) < -sin_theta_c
+}
+
+/// 紧凑化扫描的 CPU 逐式镜像（WGSL `main_compact` 同形）：单工作组
+/// [`MESHLET_COMPACT_THREADS`] 线程，每线程顺序扫描本段
+/// （[`MESHLET_COMPACT_CHUNK`] 个 flag），段总和做 Hillis-Steele 包含式
+/// 扫描得段基址，第二遍按「段基址 + 段内游标」输出存活者的全局簇号。
+///
+/// 返回值 = 存活簇号**升序**排列（stable compaction——绘制序确定性的
+/// 根据）。u32 加法结合精确 ⇒ 扫描树形状不影响结果（与浮点扫描的本质
+/// 区别，见模块头）；`flag` 以 `& 1` 钳制消费（与 WGSL 同式——非 0/1
+/// 输入只可能来自越界写，钳制保证不外溢）。
+pub fn chunked_prefix_compact(flags: &[u32]) -> Vec<u32> {
+    assert!(
+        flags.len() <= MAX_MESHLET_CLUSTERS,
+        "flag 数组超出单工作组扫描容量 {MAX_MESHLET_CLUSTERS}"
+    );
+    const THREADS: usize = MESHLET_COMPACT_THREADS as usize;
+    const CHUNK: usize = MESHLET_COMPACT_CHUNK as usize;
+    // 第一遍：逐段顺序累加（段内顺序 = 全局簇号升序的局部切片）
+    let mut totals = [0u32; THREADS];
+    for (t, total) in totals.iter_mut().enumerate() {
+        let base = t * CHUNK;
+        let mut run = 0u32;
+        for k in 0..CHUNK {
+            if base + k < flags.len() {
+                run += flags[base + k] & 1;
+            }
+        }
+        *total = run;
+    }
+    // 第二遍前置：段总和的包含式树形扫描（双缓冲——每步完整读上一步，
+    // 与 WGSL 共享内存 + barrier 的逐步形态同构）
+    let mut incl = totals;
+    let mut next = [0u32; THREADS];
+    let mut d = 1usize;
+    while d < THREADS {
+        for i in 0..THREADS {
+            next[i] = if i >= d {
+                incl[i].wrapping_add(incl[i - d])
+            } else {
+                incl[i]
+            };
+        }
+        std::mem::swap(&mut incl, &mut next);
+        d *= 2;
+    }
+    // 第三遍：段基址（包含式 − 自身段和 = 排他前缀）+ 段内游标写最终槽位
+    let mut out = Vec::with_capacity(incl[THREADS - 1] as usize);
+    for t in 0..THREADS {
+        let mut slot = incl[t] - totals[t];
+        let base = t * CHUNK;
+        for k in 0..CHUNK {
+            let g = base + k;
+            if g < flags.len() && flags[g] & 1 == 1 {
+                out.push(g as u32);
+                slot += 1;
+            }
+        }
+        // 镜像自检：段基址 + 段内游标恰收敛到「包含式前缀」——扫描树数学
+        // 与输出排列自洽（u32 加法精确 ⇒ 树形状无关，见模块头）
+        assert_eq!(slot, incl[t], "段 {t} 的最终槽位应等于其包含式前缀");
+    }
+    out
+}
+
+/// 顶点 → GPU storage 词重排（注册期一次性；`meshlet_draw.wgsl` 的读取
+/// 下标同式镜像）。CPU 顶点 32 B 在 WGSL storage 里没有合法的 struct 映射
+/// （`vec3<f32>` 对齐 16 会撑爆逐字排布），故以 `array<vec4<f32>>` 消费：
+/// 每顶点 2 词 `[px,py,pz,nx]` / `[ny,nz,u,v]`（总字节数与原布局相同，
+/// 仅分组不同）。索引数组无对齐问题，原样 `array<u32>` 透传。
+pub fn vertex_storage_words(vertices: &[Vertex]) -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(vertices.len() * 2);
+    for v in vertices {
+        out.push([v.position[0], v.position[1], v.position[2], v.normal[0]]);
+        out.push([v.normal[1], v.normal[2], v.uv[0], v.uv[1]]);
+    }
+    out
+}
+
+/// 网格包围盒 `(min, extent)`（注册期写进逐实例条目，供剔除端把归一化
+/// 球心反归一化回局部空间）。空网格返回 `None`（该网格不可实例化）。
+pub fn mesh_bounds(vertices: &[Vertex]) -> Option<([f32; 3], [f32; 3])> {
+    let mut iter = vertices.iter().map(|v| v.position);
+    let first = iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for p in iter {
+        for i in 0..3 {
+            min[i] = min[i].min(p[i]);
+            max[i] = max[i].max(p[i]);
+        }
+    }
+    Some((min, [max[0] - min[0], max[1] - min[1], max[2] - min[2]]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,5 +1310,260 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want, "展开三角形集合（含环绕）应与簇定义一致");
+    }
+
+    // ---- R85：剔除谓词与紧凑化（CPU 锚点，WGSL 逐式镜像的对照极）----
+
+    /// 48 B 簇布局的 GPU 词映射锚点（`meshlet_cull.wgsl` /
+    /// `meshlet_draw.wgsl` 以 12×u32 词消费，词下标契约由本测试锁定）。
+    #[test]
+    fn cluster_raw_word_layout_matches_gpu_contract() {
+        let raw = MeshletClusterRaw {
+            vertex_offset: 7,
+            index_offset: 21,
+            vertex_count: 200,
+            triangle_count: 128,
+            reserved: [0; 2],
+            cone_axis: [0.25, -0.5, 0.75],
+            cone_cutoff_cos: 0.125,
+            bounds: [0.1, 0.2, 0.3, 4.5],
+            error: 0.0,
+        };
+        let words: &[u32] = bytemuck::cast_ref::<MeshletClusterRaw, [u32; 12]>(&raw);
+        assert_eq!(words.len(), 12, "48 B = 12 × u32 词");
+        assert_eq!(words[0], 7, "w0 = vertex_offset");
+        assert_eq!(words[1], 21, "w1 = index_offset");
+        assert_eq!(
+            words[2],
+            200 | (128u32 << 8),
+            "w2 = vertex_count 低字节 | triangle_count 次字节"
+        );
+        for (k, expect) in [(3, 0.25f32), (4, -0.5), (5, 0.75)] {
+            assert_eq!(f32::from_bits(words[k]), expect, "w{k} = cone_axis 分量");
+        }
+        assert_eq!(f32::from_bits(words[6]), 0.125, "w6 = cone_cutoff_cos");
+        for (k, expect) in [(7, 0.1f32), (8, 0.2), (9, 0.3), (10, 4.5)] {
+            assert_eq!(f32::from_bits(words[k]), expect, "w{k} = bounds 分量");
+        }
+        assert_eq!(f32::from_bits(words[11]), 0.0, "w11 = error");
+    }
+
+    /// 视锥平面提取与球判定解析解：正交视锥（轴对齐平面）下核对提取出的
+    /// 平面常数，以及「球在锥内 / 相切 / 恰好越界」三态。平面提取
+    /// （Gribb-Hartmann）复用 `Frustum::from_view_proj`（WGSL
+    /// `meshlet_cull.wgsl` 的提取式与其逐式镜像，同步契约），球判定同式
+    /// （所有平面 `dist >= −r` 才存活）。
+    #[test]
+    fn frustum_plane_extraction_and_sphere_analytic() {
+        // 单位正交盒 x,y ∈ [-1,1]、z ∈ [0,1]（identity 视图 ⇒ 平面轴对齐，
+        // 距离全为精确 f32）
+        let proj = glam::camera::rh::proj::directx::orthographic(-1.0, 1.0, -1.0, 1.0, 0.0, 1.0);
+        let frustum = crate::frustum::Frustum::from_view_proj(&proj);
+        // 平面提取解析解（序 = left, right, bottom, top）。正交投影的
+        // w 行 = (0,0,0,1)，left = row3 + row0 = (1,0,0,1)（语义：x ≥ −1），
+        // 其余三面按「法线朝内」对称取反——以提取式逐面核对而非假设符号
+        let expect = [
+            ([1.0f32, 0.0, 0.0], 1.0),
+            ([-1.0, 0.0, 0.0], 1.0),
+            ([0.0, 1.0, 0.0], 1.0),
+            ([0.0, -1.0, 0.0], 1.0),
+        ];
+        for (i, (n, d)) in expect.into_iter().enumerate() {
+            let p = frustum.planes()[i];
+            assert!(
+                (p.x - n[0]).abs() < 1e-6
+                    && (p.y - n[1]).abs() < 1e-6
+                    && (p.z - n[2]).abs() < 1e-6
+                    && (p.w - d).abs() < 1e-6,
+                "平面 #{i} 应为 ({n:?}, {d})，实际 {:?}",
+                (p.x, p.y, p.z, p.w)
+            );
+        }
+        // 球在锥内（余量充足）
+        assert!(frustum.intersects_sphere(Vec3::ZERO, 0.5), "中心球应存活");
+        // 恰在右平面（x = 1）相切：球心 x = 1.5、r = 0.5 ⇒
+        // dist = −1.5 + 1 = −0.5 = −r ⇒ 相切存活（边界归内侧）
+        assert!(
+            frustum.intersects_sphere(Vec3::new(1.5, 0.0, 0.5), 0.5),
+            "与右平面精确相切的球应存活"
+        );
+        // 恰好完全越出右平面：球心 x = 1.6、r = 0.5 ⇒ dist = −0.6 < −0.5
+        assert!(
+            !frustum.intersects_sphere(Vec3::new(1.6, 0.0, 0.5), 0.5),
+            "完全越出右平面的球应剔除"
+        );
+        // 四个轴向平面各验一次相切 / 越界（对称性）
+        for axis in [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y] {
+            let tangent = axis * 1.5 + Vec3::Z * 0.5;
+            assert!(
+                frustum.intersects_sphere(tangent, 0.5),
+                "轴 {axis:?} 平面相切球应存活"
+            );
+            let outside = axis * 1.6 + Vec3::Z * 0.5;
+            assert!(
+                !frustum.intersects_sphere(outside, 0.5),
+                "轴 {axis:?} 外侧球应剔除"
+            );
+        }
+    }
+
+    /// 背面锥符号约定（R85 定稿谓词）：正对存活、背对剔除、阈值角 =
+    /// 90° + acos(cutoff)、退化全向锥永不剔除、相等点判存活。
+    #[test]
+    fn backfacing_cone_sign_convention() {
+        let axis = Vec3::Z;
+        // 平面簇（cutoff ≈ 1，θc ≈ 0）：视线沿 +Z（正对）存活，−Z 背对剔除
+        assert!(!cluster_is_backfacing(Vec3::Z, axis, 1.0 - 1e-6));
+        assert!(cluster_is_backfacing(Vec3::NEG_Z, axis, 1.0 - 1e-6));
+        // 垂直视线（90°）：θc = 0 时阈值恰为 90°，相等点判存活（保守侧）
+        assert!(!cluster_is_backfacing(Vec3::X, axis, 1.0));
+        // θc = 10°（cutoff = cos10°）：阈值角 100° —— 99° 存活、101° 剔除
+        let cutoff = 10.0f32.to_radians().cos();
+        let at99 = 99.0f32.to_radians();
+        let at101 = 101.0f32.to_radians();
+        let dir99 = Vec3::Z * at99.cos() + Vec3::X * at99.sin();
+        let dir101 = Vec3::Z * at101.cos() + Vec3::X * at101.sin();
+        assert!(!cluster_is_backfacing(dir99, axis, cutoff));
+        assert!(cluster_is_backfacing(dir101, axis, cutoff));
+        // 退化全向锥（cutoff ≤ 0）：永不剔除
+        for cutoff in [-1.0f32, 0.0, -0.5] {
+            assert!(
+                !cluster_is_backfacing(Vec3::NEG_Z, axis, cutoff),
+                "cutoff {cutoff} 退化锥必须永不剔除"
+            );
+        }
+        // 阈值等式逐点核对：d·axis == −sin(θc) 判存活（严格小于才剔除）
+        let theta = 20.0f32.to_radians();
+        let cutoff = theta.cos();
+        let edge = Vec3::Z * (90.0f32 + 20.0).to_radians().cos()
+            + Vec3::X * (90.0f32 + 20.0).to_radians().sin();
+        assert!(
+            !cluster_is_backfacing(edge, axis, cutoff),
+            "阈值角 110° 相等点存活"
+        );
+        let beyond =
+            Vec3::Z * (111.0f32).to_radians().cos() + Vec3::X * (111.0f32).to_radians().sin();
+        assert!(
+            cluster_is_backfacing(beyond, axis, cutoff),
+            "111° > 110° 阈值剔除"
+        );
+    }
+
+    /// 紧凑化扫描镜像：与朴素过滤（期望排列）对照——覆盖空输入 / 段边界 /
+    /// 全存活 / 全死亡 / 容量满档，并用无状态哈希流生成伪随机 flag 序列
+    /// （确定性硬文化：splitmix64 + 计数器，禁 rand）。
+    #[test]
+    fn chunked_prefix_compact_matches_naive_reference() {
+        let naive = |flags: &[u32]| -> Vec<u32> {
+            flags
+                .iter()
+                .enumerate()
+                .filter(|&(_, &f)| f & 1 == 1)
+                .map(|(i, _)| i as u32)
+                .collect()
+        };
+        // 手工形态
+        assert_eq!(chunked_prefix_compact(&[]), Vec::<u32>::new(), "空输入");
+        assert_eq!(
+            chunked_prefix_compact(&[0; MAX_MESHLET_CLUSTERS]),
+            Vec::<u32>::new(),
+            "全死"
+        );
+        let all_alive = [1u32; MAX_MESHLET_CLUSTERS];
+        assert_eq!(
+            chunked_prefix_compact(&all_alive),
+            naive(&all_alive),
+            "全存活 = 恒等排列"
+        );
+        // 段边界（63/64/65、线程边界 255/256/257、末尾）
+        for len in [1usize, 63, 64, 65, 255, 256, 257, MAX_MESHLET_CLUSTERS - 1] {
+            let mut flags = vec![0u32; len];
+            for i in (0..len).step_by(3) {
+                flags[i] = 1;
+            }
+            assert_eq!(chunked_prefix_compact(&flags), naive(&flags), "len = {len}");
+        }
+        // 伪随机批量（splitmix64 流）
+        let mut z = 0x243F_6A88_85A3_08D3u64;
+        for round in 0..8 {
+            let len = 1024 * (round + 1);
+            let mut flags = Vec::with_capacity(len);
+            for _ in 0..len {
+                z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                flags.push((z >> 63) as u32);
+            }
+            assert_eq!(
+                chunked_prefix_compact(&flags),
+                naive(&flags),
+                "round {round} 伪随机 flag 序列"
+            );
+        }
+    }
+
+    /// 顶点 storage 词重排往返：解码回 (position, normal, uv) 与原顶点
+    /// 位级一致（WGSL 读取下标契约的 CPU 锚点）。
+    #[test]
+    fn vertex_storage_words_roundtrip_bit_exact() {
+        let vertices: Vec<Vertex> = (0..5).map(sample_vertex).collect();
+        let words = vertex_storage_words(&vertices);
+        assert_eq!(words.len(), vertices.len() * 2);
+        for (i, v) in vertices.iter().enumerate() {
+            let a = words[i * 2];
+            let b = words[i * 2 + 1];
+            assert_eq!(&a[0..3], &v.position[..], "position 逐位");
+            assert_eq!(a[3].to_bits(), v.normal[0].to_bits());
+            assert_eq!(b[0].to_bits(), v.normal[1].to_bits());
+            assert_eq!(b[1].to_bits(), v.normal[2].to_bits());
+            assert_eq!(&b[2..4], &v.uv[..], "uv 逐位");
+        }
+        assert!(vertex_storage_words(&[]).is_empty());
+    }
+
+    /// mesh_bounds：min/extent 解析解 + 空网格 None。
+    #[test]
+    fn mesh_bounds_returns_min_and_extent() {
+        let vertices: Vec<Vertex> = (0..4)
+            .map(|i| {
+                let f = i as f32;
+                Vertex {
+                    position: [f - 1.0, -2.0 * f, 0.5 * f],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [0.0; 2],
+                }
+            })
+            .collect();
+        let (min, extent) = mesh_bounds(&vertices).expect("非空网格有包围盒");
+        assert_eq!(min, [-1.0, -6.0, 0.0]);
+        assert_eq!(extent, [3.0, 6.0, 1.5]);
+        assert!(mesh_bounds(&[]).is_none(), "空网格无包围盒");
+    }
+
+    /// IRML 构建期簇上限拒绝：头部登记超限簇数（数据区尚未读）即拒。
+    #[test]
+    fn container_rejects_cluster_capacity_overflow() {
+        let mesh = sample_mesh();
+        let mut bytes = Vec::new();
+        mesh.write_to(&mut bytes).expect("写出");
+        let mut bloated = bytes.clone();
+        bloated[16..20].copy_from_slice(&((MAX_MESHLET_CLUSTERS + 1) as u32).to_le_bytes());
+        match MeshletMesh::from_bytes(&bloated) {
+            Err(MeshletAssetError::Corrupt(msg)) => {
+                assert!(msg.contains("超出单帧剔除容量上限"), "应报容量超限：{msg}");
+            }
+            other => panic!("超限簇数必须被拒绝，实际 {other:?}"),
+        }
+        // 恰在上限内不被此检查拒绝（该容器数据区不匹配，走后续长度校验）
+        let mut at_cap = bytes;
+        at_cap[16..20].copy_from_slice(&(MAX_MESHLET_CLUSTERS as u32).to_le_bytes());
+        assert!(
+            matches!(
+                MeshletMesh::from_bytes(&at_cap),
+                Err(MeshletAssetError::Corrupt(msg)) if msg.contains("数据区长度不符")
+            ),
+            "上限内的簇数应进入后续校验（长度不符）"
+        );
     }
 }

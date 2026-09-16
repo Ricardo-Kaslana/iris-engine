@@ -5,6 +5,66 @@
 
 ## [Unreleased]
 
+### Added（R85：虚拟几何体 V2——compute 簇剔除 + 前缀和压缩绘制）
+
+路线图 v5 第三梯队 R84–R87 连役 2/4。路线图裁定：wgpu 无 mesh shader、
+WebGPU 无 multi_draw_indirect ⇒ **前缀和压缩绘制**（wasm 兼容）。MVP
+边界延续 R84（无 visbuffer / opaque-only / 单 LOD / 遮挡留 R87）。
+
+- **compute 剔除（`shaders/meshlet_cull.wgsl`，两 entry / 两管线）**：
+  ① `main_cull` 一线程一（实例, 簇）对——包围球视锥判定（Gribb-Hartmann
+  6 平面提取，`frustum.rs` 同式；归一化球心反归一化 → 模型变换 → 半径
+  最大列缩放）+ 背面锥判定；② `main_compact` 单工作组（256 线程 × 每
+  线程顺序扫 64 flag）两遍扫描——u32 前缀和（**整数加法结合精确 ⇒ 扫描
+  树形状无关的确定性**，与浮点扫描的本质区别）+ 按前缀槽位写紧凑列表，
+  **无原子**，紧凑序 = 全局簇号升序（stable compaction ⇒ 绘制序确定）。
+  谓词锚点 = `meshlet.rs` 纯函数（`cluster_is_backfacing` /
+  `chunked_prefix_compact` 逐式镜像单测）。**背面锥谓词定稿修正**：R84
+  头注释「点积 < cutoff 即背面」是松散表述（近平坦簇会误剔正面），R85
+  以精确推导为准——全背 ⇔ 视线角 ≥ 90° + acos(cutoff) ⇔
+  `dot ≤ −sin(cutoff)`（严格小于才剔、退化全向锥永不剔）。
+- **vertex-pull 绘制（`shaders/meshlet_draw.wgsl`）**：无顶点 / 索引
+  缓冲的 instanced draw——`instance_index → 紧凑簇列表 → 簇元数据
+  （12×u32 词 storage，48 B `MeshletClusterRaw` 逐字排布）→ storage 拉
+  顶点 / 索引`。**片元阶段 = standard.wgsl 的 fs_main 本体**（wgpu 跨
+  模块管线阶段）——「PBR 提取共享 vs 逐式复制」以零复制消解，与常规
+  路径同一材质绑定组语义；间接光只吃 irradiance_map（探针 / 光照贴图
+  实例属性路径不在 vertex-pull 管线，§8.54③）。顶点侧与 vs_main 逐式
+  同构（同 `InstanceRaw::from_matrix` 值源）⇒ **跨管线像素等价可达**。
+- **组件与接线**：`MeshletInstance` 组件 + `MeshletMeshStore` 目录 +
+  `MeshletMeshHandle` 句柄（MeshStore 同构注册表）；渲染器侧追加式
+  arena（簇 / 顶点 / 索引，变更时上传、超容量 warn 跳过）、实例表双
+  缓冲、剔除参数 uniform、紧凑列表 / 载荷 / 标志 storage。
+  `MAX_MESHLET_CLUSTERS = 16384` 三处同源（IRML 读取构建期拒绝 + 注册
+  处校验 warn + GPU 缓冲定长）。缺席语义：无 `MeshletInstance` = 零
+  dispatch、零回读、零绘制（既有像素与命令流逐位不变）。绘制在主 pass
+  内不透明段之后；compute pass 编码在主 pass 之后（本帧 draw 消费上帧
+  列表、本帧 compute 覆写在后——同编码器按序）。
+- **回读机制**：staging 双缓冲 + map_async（遮挡 R53 同款协议），本帧
+  读上帧结果（**一帧延迟，§8.54①**）；消费端要求「产出帧 == 恰好上一
+  帧」——首帧 / 迟到 / 映射失败 / 跳帧一律降级**恒等列表全量绘制**
+  （剔除只删不可见几何 ⇒ 兜底帧与剔除帧像素恒等，无视觉跳变；定稿不
+  走 expand 常规管线兜底——避免第二着色路径；expand 保留为对照锚点）。
+  `FrameStats.meshlet_surviving` = 本帧提交的紧凑实例数（剔除有效性
+  可观测）。
+- **测试**：CPU +7（`meshlet` 20 项：+48 B 词布局锚点 / 视锥平面提取与
+  球判定解析解（内 / 切 / 外三态）/ 背面锥符号约定（正对存活 / 背对
+  剔除 / 阈值带 / 退化全向 / 相等点存活）/ 紧凑化扫描镜像（朴素过滤
+  对照 + splitmix64 伪随机批量）/ 顶点词重排位级往返 / mesh_bounds /
+  IRML 簇上限拒绝）；pipeline +1（meshlet 三重接口看门：Globals 前缀 /
+  VertexOutput 逐字段 / InstanceEntry 双侧同序）；GPU 6 项
+  (`tests/meshlet_v2_render.rs`，`GPU_SERIAL`)：三机位（正面 / 侧后 /
+  远距）全量帧 vs 剔除帧逐字节相等（本轮最强断言）/ 紧凑列表严格升序 /
+  surviving 口径 / 缺席语义（有 vs 无 FNV 不同 + 空场景双帧双渲染器
+  逐位）/ 双会话逐字节 / 旋转一帧哈希变化。快照
+  `examples/meshlet_v2_snapshot.rs` → `docs/meshlet_v2.png`（1×2：expand
+  常规路径 | compute 剔除路径；**全帧 FNV 相等**（跨管线像素等价实锤）
+  + 反空洞 + 跨运行逐位 + 目检）。
+- **诚实限制（§8.54）**：回读一帧延迟（快速移动单帧缺簇 / 跨世界切换
+  一帧幽灵）/ meshlet 路径间接光只吃 irradiance_map / 单材质（默认
+  句柄 0）/ 不投影阴影不进 scene_depth / 固定顶点数展开（小簇空转）/
+  非均匀缩放锥保守性弱化 / 16384 簇上限 / 跨适配器剔除边界位翻转可能。
+
 ### Added（R84：虚拟几何体 V1——簇构建 + 资产格式）
 
 路线图 v5 第三梯队 R84–R87 连役 1/4。全案 MVP 边界：**无 visbuffer、

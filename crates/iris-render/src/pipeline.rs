@@ -203,6 +203,27 @@ pub(crate) struct PipelineBundle {
     /// 粒子 v2 拖尾布局（R82，渲染）：binding 0 = DrawParams uniform
     ///（64B，vertex 阶段）、1 = 粒子状态只读 storage（vertex 阶段）。
     pub particle_v2_draw_layout: wgpu::BindGroupLayout,
+    /// meshlet vertex-pull 绘制管线（R85）：顶点 = `meshlet_draw.wgsl`
+    /// vs_main（紧凑簇列表 → storage 拉顶点 / 索引），**片元 =
+    /// standard.wgsl 的 fs_main 本体**（wgpu 跨模块管线阶段——PBR 求值
+    /// 零复制共享，与常规路径像素等价的根据）。光栅状态与不透明主管线
+    /// 一致（Cull Back、REPLACE、深度写、Less）。
+    pub meshlet_pipeline: wgpu::RenderPipeline,
+    /// meshlet 逐簇剔除 compute 管线（R85）：包围球视锥 + 背面锥 →
+    /// flags / payload（一线程一（实例, 簇）对，无簇间交互）。
+    pub meshlet_cull_pipeline: wgpu::ComputePipeline,
+    /// meshlet 稳定紧凑化 compute 管线（R85）：单工作组 256×64 两遍扫描
+    /// ——u32 前缀和 + 按前缀槽位写紧凑列表与存活总数（无原子，紧凑序 =
+    /// 全局簇号升序，绘制序确定）。
+    pub meshlet_compact_pipeline: wgpu::ComputePipeline,
+    /// meshlet draw 组 2 布局（R85，vertex 阶段）：binding 0..4 = 只读
+    /// storage（簇词 / 顶点词 / 索引 / 实例表 / 紧凑列表）。
+    pub meshlet_draw_layout: wgpu::BindGroupLayout,
+    /// meshlet compute 布局（R85）：binding 0 = CullParams uniform（96B）、
+    /// 1 = 簇词只读、2 = 实例表只读、3..6 = flags / payload / compact /
+    /// survive_count read-write storage。main_cull / main_compact 两条
+    /// 管线共用（布局声明是着色器用量的超集，合法）。
+    pub meshlet_cull_layout: wgpu::BindGroupLayout,
     /// 贴花纹理布局：binding 0 = 贴花纹理、1 = 采样器（组 1 按纹理分批
     /// 绑定；tint 在实例数据里逐实例携带，不占绑定组）。
     pub decal_layout: wgpu::BindGroupLayout,
@@ -2335,6 +2356,197 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
     );
 
+    // meshlet 剔除 compute（R85，虚拟几何体 V2）：一条布局服务两个 entry
+    // point——main_cull（一线程一（实例, 簇）对：包围球视锥 + 背面锥，
+    // 写 flags / payload）与 main_compact（单工作组 256×64 两遍扫描：前缀
+    // 和稳定紧凑化，写 compact / 存活总数）。u32 前缀和结合精确 ⇒ 扫描树
+    // 形状无关的会话内确定性（meshlet.rs 模块头）；dispatch 形状由 CPU
+    // 每帧按常量算出（越界线程早退，R82 范式）。
+    let meshlet_cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.meshlet_cull"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/meshlet_cull.wgsl").into()),
+    });
+    let meshlet_cull_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.meshlet_cull"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // flags / payload / compact / survive_count：read-write storage
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let meshlet_cull_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.meshlet.cull.pipeline.layout"),
+            bind_group_layouts: &[Some(&meshlet_cull_layout)],
+            immediate_size: 0,
+        });
+    let meshlet_cull_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("iris.pipeline.meshlet_cull"),
+        layout: Some(&meshlet_cull_pipeline_layout),
+        module: &meshlet_cull_shader,
+        entry_point: Some("main_cull"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let meshlet_compact_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("iris.pipeline.meshlet_compact"),
+            layout: Some(&meshlet_cull_pipeline_layout),
+            module: &meshlet_cull_shader,
+            entry_point: Some("main_compact"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+    // meshlet vertex-pull 绘制管线（R85）：顶点 = meshlet_draw.wgsl
+    // vs_main（紧凑簇列表 → storage 拉顶点 / 索引，无顶点 / 索引缓冲），
+    // **片元 = standard.wgsl 的 fs_main 本体**——wgpu 允许管线两阶段跨
+    // 模块（接口按 location 匹配），PBR 求值零复制共享，与常规路径同一
+    // 材质绑定组语义（像素等价断言的根据，ARCHITECTURE §4.41）。布局 =
+    // [globals, material, meshlet 组 2（5 个只读 storage）]；光栅状态与
+    // 不透明主管线一致（Cull Back + CCW、REPLACE、深度写、Less、MSAA 同
+    // 采样数、HDR 目标）。组 2 布局同时被 draw 管线（vertex 只读）消费。
+    let meshlet_draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.meshlet_draw"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/meshlet_draw.wgsl").into()),
+    });
+    let meshlet_draw_storage_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let meshlet_draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.meshlet_draw"),
+        entries: &[
+            meshlet_draw_storage_entry(0),
+            meshlet_draw_storage_entry(1),
+            meshlet_draw_storage_entry(2),
+            meshlet_draw_storage_entry(3),
+            meshlet_draw_storage_entry(4),
+        ],
+    });
+    let meshlet_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.meshlet.pipeline.layout"),
+        bind_group_layouts: &[
+            Some(&globals_layout),
+            Some(&material_layout),
+            Some(&meshlet_draw_layout),
+        ],
+        immediate_size: 0,
+    });
+    let meshlet_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.meshlet"),
+        layout: Some(&meshlet_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &meshlet_draw_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
     // 贴花（R39）：盒投影代理几何（单位盒 ±Z 端盖，位置顶点）× 逐实例
     // 世界盒矩阵 + 逆矩阵 + tint（144B，DecalInstanceRaw::LAYOUT location
     // 1..=9）。组 0 复用全局布局（着色器只声明 view_proj，精简 Globals，
@@ -2551,6 +2763,9 @@ pub(crate) fn create_pipeline(
         particle_v2_sim_pipeline,
         particle_v2_additive_pipeline,
         particle_v2_alpha_pipeline,
+        meshlet_pipeline,
+        meshlet_cull_pipeline,
+        meshlet_compact_pipeline,
         decal_pipeline,
         fxaa_pipeline,
         taa_pipeline,
@@ -2574,6 +2789,8 @@ pub(crate) fn create_pipeline(
         particle_layout,
         particle_v2_sim_layout,
         particle_v2_draw_layout,
+        meshlet_draw_layout,
+        meshlet_cull_layout,
         decal_layout,
     }
 }
@@ -2632,5 +2849,95 @@ mod tests {
                 find(&standard_body, cursor.1, field),
             );
         }
+    }
+
+    /// **meshlet vertex-pull 管线的三重接口看门（R85）**：
+    /// ① `meshlet_draw.wgsl` 自持的 `Globals` 是 standard 的**完整前缀**
+    ///    （skybox 看门同款——数组长度平移后面所有字段的教训延续）；
+    /// ② 其 `VertexOutput` 必须与 standard.wgsl 的逐字段同名同序（管线
+    ///    顶点 / 片元跨模块按 location 匹配，字段名不参与匹配但漂移会让
+    ///    「逐式同构」的像素等价论证失效）；
+    /// ③ `meshlet_cull.wgsl` 与 `meshlet_draw.wgsl` 的 `InstanceEntry`
+    ///    必须同字段序（176 B 双侧镜像）。
+    #[test]
+    fn meshlet_draw_shader_interfaces_match_standard() {
+        let standard = include_str!("../shaders/standard.wgsl");
+        let draw = include_str!("../shaders/meshlet_draw.wgsl");
+        let cull = include_str!("../shaders/meshlet_cull.wgsl");
+        let body_of = |src: &str, marker: &str| -> String {
+            src.split(marker)
+                .nth(1)
+                .and_then(|s| s.split('}').next())
+                .unwrap_or_else(|| panic!("着色器应声明 {marker}"))
+                .to_string()
+        };
+        // ① Globals 前缀（standard 的全部 11 个字段逐名同序）
+        let globals_fields = [
+            "view_proj",
+            "eye_pos",
+            "light_dir",
+            "light_color",
+            "ambient",
+            "point_count",
+            "point_lights",
+            "shadow_params",
+            "env_params",
+            "inv_view_proj",
+            "point_shadow_params",
+        ];
+        let std_globals = body_of(standard, "struct Globals {");
+        let mesh_globals = body_of(draw, "struct Globals {");
+        let find = |body: &str, from: usize, name: &str| {
+            body[from..]
+                .find(&format!("{name}:"))
+                .map(|i| from + i)
+                .unwrap_or_else(|| panic!("Globals 缺少字段 {name}"))
+        };
+        let mut cursor = (0usize, 0usize);
+        for field in globals_fields {
+            cursor = (
+                find(&mesh_globals, cursor.0, field),
+                find(&std_globals, cursor.1, field),
+            );
+        }
+        // ② VertexOutput 逐字段同序（跨模块片元接口）
+        let vo_fields = ["world_pos", "world_normal", "uv", "tangent", "uv2", "probe"];
+        let std_vo = body_of(standard, "struct VertexOutput {");
+        let mesh_vo = body_of(draw, "struct VertexOutput {");
+        let mut cursor = (0usize, 0usize);
+        for field in vo_fields {
+            cursor = (
+                find(&mesh_vo, cursor.0, field),
+                find(&std_vo, cursor.1, field),
+            );
+        }
+        // ③ InstanceEntry 双侧同字段序（compute / draw 两模块镜像）
+        let entry_fields = [
+            "model0",
+            "model1",
+            "model2",
+            "model3",
+            "normal0",
+            "normal1",
+            "normal2",
+            "base_counts",
+            "frame_base",
+            "bounds_min",
+            "bounds_extent",
+        ];
+        let cull_entry = body_of(cull, "struct InstanceEntry {");
+        let draw_entry = body_of(draw, "struct InstanceEntry {");
+        let mut cursor = (0usize, 0usize);
+        for field in entry_fields {
+            cursor = (
+                find(&cull_entry, cursor.0, field),
+                find(&draw_entry, cursor.1, field),
+            );
+        }
+        // draw 模块不声明 read_write storage（只读 storage 顶点阶段合法）
+        assert!(
+            !draw.contains("read_write"),
+            "meshlet_draw.wgsl 不得声明 read_write storage"
+        );
     }
 }

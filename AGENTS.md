@@ -49,7 +49,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1416 / release 1413**（R84 收官：+13 项 meshlet CPU 单测 + 13 项聚类构建器单测 + 4 项 GPU 等价集成；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1430 / release 1427**（R85 收官：+7 项 meshlet CPU 单测 + 1 项管线接口看门 + 6 项 GPU v2 集成；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -131,7 +131,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1416 / release 1413）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1430 / release 1427）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -149,7 +149,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1416 / release 1413；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1430 / release 1427；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -175,7 +175,11 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
   - 第二梯队（环境底座）**全部收官**：R79 天空 v2+大气+体积雾 ✅、R80 昼夜+风场 ✅、
     R81 平面水体 v1 ✅、R82 粒子 v2（GPU 化+拖尾）✅、R83 GI 逐片元化（探针三阶
     SH + 片端径向权重，§8.40①② 移入实现、③ 维持拒绝）✅
-  - 第三梯队（硬科技）：R84–R87 虚拟几何体 V1–V4（opaque-only MVP，裁定接受）、
+  - 第三梯队（硬科技）：R84 虚拟几何体 V1 ✅（确定性簇构建 + IRML 容器 +
+    展开等价锚点，渲染路径零改动）、R85 虚拟几何体 V2 ✅（compute 簇剔除 +
+    u32 前缀和稳定紧凑化 + vertex-pull 绘制 + 片元阶段 = standard fs_main
+    本体 ⇒ expand 与 compute 路径跨管线 FNV 相等；诚实限制 §8.54）、
+    R86/R87 虚拟几何体 V3/V4（层级 LOD / 分页流送+遮挡整合，待开工）、
     R88/R89 DDGI 动态 GI、R90/R91 毛发、R92 降水、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）
   - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /

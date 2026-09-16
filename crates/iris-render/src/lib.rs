@@ -195,9 +195,12 @@ pub mod prelude {
         LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex, primitives,
     };
     pub use crate::meshlet::{
-        MESHLET_CLUSTER_MAX_TRIANGLES, MESHLET_CLUSTER_MAX_VERTICES, MESHLET_CONE_FALLBACK_AXIS,
-        MESHLET_CONE_FALLBACK_CUTOFF_COS, MeshletAssetError, MeshletClusterRaw, MeshletMesh,
-        cluster_bounding_sphere, cluster_bounds_normalized, cluster_cone,
+        MAX_MESHLET_CLUSTERS, MESHLET_CLUSTER_MAX_TRIANGLES, MESHLET_CLUSTER_MAX_VERTICES,
+        MESHLET_COMPACT_CHUNK, MESHLET_COMPACT_THREADS, MESHLET_CONE_FALLBACK_AXIS,
+        MESHLET_CONE_FALLBACK_CUTOFF_COS, MeshletAssetError, MeshletClusterRaw, MeshletInstance,
+        MeshletMesh, MeshletMeshHandle, MeshletMeshStore, chunked_prefix_compact,
+        cluster_bounding_sphere, cluster_bounds_normalized, cluster_cone, cluster_is_backfacing,
+        mesh_bounds, vertex_storage_words,
     };
     pub use crate::occlusion::OcclusionCulling;
     pub use crate::offscreen::OffscreenRenderer;
