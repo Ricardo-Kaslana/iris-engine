@@ -1158,6 +1158,7 @@ dependencies = [
  "glam",
  "image",
  "iris-core",
+ "iris-engine",
  "iris-platform",
  "log",
  "pollster",

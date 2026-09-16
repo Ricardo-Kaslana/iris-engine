@@ -5,6 +5,61 @@
 
 ## [Unreleased]
 
+### Added（R84：虚拟几何体 V1——簇构建 + 资产格式）
+
+路线图 v5 第三梯队 R84–R87 连役 1/4。全案 MVP 边界：**无 visbuffer、
+opaque-only、无软件光栅回退**；V1 = 运行期表示 + 确定性聚类构建器 +
+IRML 资产容器 + 渲染等价性锚点，**渲染器绘制路径零改动**（compute 剔除
+是 R85 的事，本轮不产生任何剔除收益——元数据就位待消费）。
+
+- **运行期表示（`iris_render::meshlet`）**：`MeshletMesh`（全局顶点 +
+  全局索引 + 逐簇元数据）与 `MeshletClusterRaw`（48 B POD，布局为 R85
+  GPU storage 前置；`reserved: [u8; 2]` 显式占位消除隐式填充满足
+  bytemuck::Pod）。逐簇元数据：`vertex_offset` / `index_offset`（全局
+  缓冲偏移，簇按构建序连续衔接，读侧校验）、边界锥（面法线均值归一 +
+  `cutoff = min(axis·n_i)`；退化 ⇒ 全向锥 [0,0,1] / −1 永不剔除，保守
+  方向）、包围球（xyz 球心相对网格包围盒归一、w 半径世界单位；均值 +
+  最大半径——单遍 / 必然包含 / 逐位确定）、`error` 恒 0.0（R86 简化器
+  启用）。诚实口径：预算常量 256 顶点被 u8 字段物理容量收窄到 255，
+  构建器按 255 卡。
+- **确定性贪心聚类（`iris_engine::meshlet_builder`）**：顶点 → 三角形
+  邻接表上的种子生长——种子 = 未分配三角索引序最小者；候选集
+  `BTreeSet`（升序迭代，确定性硬文化选型）；评分 = 固定字典序全序
+  （共享已用顶点数降序、三角索引升序收尾）；满 128 三角或无可生长候选
+  即封簇。簇内顶点局部重映射（发现序编号），簇间边界顶点不去重（总量
+  换逐簇自包含）。**输入即索引序**（乱序输入不适用种子序保证），同输入
+  两跑输出逐位一致（to_bits 断言）。元数据走 `meshlet` 模块无状态纯
+  函数（`cluster_bounding_sphere` / `cluster_cone` /
+  `cluster_bounds_normalized`，R85/R87 共用）。`is_meshlet_eligible`
+  判定 V1 网格资格（无蒙皮 / 切线 / UV2）。
+- **IRML 资产容器（v1）**：`"IRML"` + version + 三区段计数 + CRC-32
+  （与 `pack::crc32` 同一定义；跨 crate 复制而非共享依赖——反向依赖会
+  成环）+ 数据区（顶点 | 索引 | 簇，全 LE 逐字段编解码）。校验链：魔数
+  → 精确版本 → 长度精确匹配 → CRC → 簇偏移连续性 / 区间 / 簇内局部
+  索引 / 保留位。API 与 Pack 同构（`write_to` / `write_file` /
+  `from_bytes` / `open`）。
+- **展开 API 与渲染等价性锚点**：`MeshletMesh::expand` 纯函数（逐簇
+  局部号 + vertex_offset 还原全局索引）。正确性论证：展开 = 顶点重排 +
+  索引重排，三角形集合（含环绕）与逐角属性值与输入完全一致 ⇒ 不透明
+  几何渲染**逐字节一致**（场景无共面重叠面为前提；失败即真 bug，无
+  阈值豁免）。GPU 佐证 `tests/meshlet_render.rs` 4 项（`GPU_SERIAL`；
+  两台独立渲染器分服务常规 / meshlet 世界——句柄值缓存跨世界串味）：
+  两机位逐字节 / 反空洞（两角度 FNV 必不同）/ 重渲逐字节。
+- **偏离声明**：GltfBuilder 侧导出入口 or 独立 example 二选一，定稿
+  **独立 example** `meshlet_build_example`（GltfBuilder 现场生成测试
+  GLB → `spawn_gltf_instance` 真实解析 → 逐网格簇化 → `.imesh` 写出 →
+  位级往返 + 三角守恒 + 簇上限断言；球 2976 三角 → 24 簇均 124 三角）。
+  pack 集成留 R87 分页流送。仓内既有内容资产全部带蒙皮或 TANGENT
+  （assault_courtyard 为法线贴图写切线），V1 按边界拒收——example
+  自产测试 GLB 的原因。
+- **测试**：CPU 26 项（`meshlet` 13 + `meshlet_builder` 13：48 B 布局
+  契约 / 包围球与锥解析解 / 归一化映射 / 容器往返位级 / 魔数版本 CRC
+  截断与语义损坏拒绝 / 展开守恒 / 两跑逐位 / 覆盖恰一次 / 连通性 BFS /
+  锥朝外 / 立方逐面解析解 / 资格判定 / should_panic×2）；GPU 4 项；
+  快照 `examples/meshlet_snapshot.rs` → `docs/meshlet.png`（2×2：常规 |
+  meshlet × 两机位，同机位 FNV 相等、跨机位不等、跨运行逐位）。
+  诚实限制 §8.53。
+
 ### Added（R83：GI 探针逐片元化——三阶 SH 方向性探针 × 片端径向权重求值）
 
 路线图 v5 第二梯队收官轮（5/5）。`iris-render/irradiance.rs` 新增三阶球谐

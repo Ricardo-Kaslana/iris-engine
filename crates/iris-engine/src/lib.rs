@@ -23,6 +23,7 @@ pub mod daynight;
 pub mod gltf_builder;
 pub mod level;
 pub mod manifest;
+pub mod meshlet_builder;
 pub mod pack;
 pub mod plugin;
 pub mod scene;
@@ -73,6 +74,10 @@ pub mod prelude {
     // 编程式 glTF / GLB 构造器（打磨 IV）：记账归 builder，人只声明
     // 几何 / 层级 / 关键帧；打磨 VI 追加纹理通道声明（material_textured）
     pub use crate::gltf_builder::{AnimChannel, GltfBuilder, GltfMaterialTextures, GltfNodeDesc};
+    // 虚拟几何体 V1（R84）：meshlet 确定性聚类构建器
+    pub use crate::meshlet_builder::{
+        build_meshlets, build_meshlets_from_mesh_data, is_meshlet_eligible,
+    };
     // 平滑追随范式（打磨 IV）：子实体相机 + 帧率无关指数趋近
     pub use crate::camera_rig::{SmoothFollow, update_smooth_follow};
     // 昼夜循环（R80）：相位 → 方向光派生系统（DayNightPlugin 的系统体）

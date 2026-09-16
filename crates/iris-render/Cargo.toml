@@ -24,6 +24,12 @@ serde_json = "1"
 
 [dev-dependencies]
 criterion = { workspace = true }
+# meshlet 渲染等价测试（tests/meshlet_render.rs）与快照示例
+# （examples/meshlet_snapshot.rs）需要构建器做「常规路径 vs meshlet
+# 展开路径」同几何对照。dev 依赖允许与 iris-engine → iris-render 的
+# 正常依赖形成环：cargo 保证普通依赖单向、dev 依赖可回指（与
+# iris-engine dev 依赖 iris-game / iris-arena 同款先例）
+iris-engine = { workspace = true }
 
 # criterion 基准（harness = false：基准自管 main，见 benches/render_cpu.rs）
 [[bench]]

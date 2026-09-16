@@ -104,6 +104,7 @@ pub mod light_bins;
 pub mod lightmap;
 pub mod material;
 pub mod mesh;
+pub mod meshlet;
 pub mod occlusion;
 pub mod offscreen;
 pub mod particles;
@@ -192,6 +193,11 @@ pub mod prelude {
     pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{
         LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex, primitives,
+    };
+    pub use crate::meshlet::{
+        MESHLET_CLUSTER_MAX_TRIANGLES, MESHLET_CLUSTER_MAX_VERTICES, MESHLET_CONE_FALLBACK_AXIS,
+        MESHLET_CONE_FALLBACK_CUTOFF_COS, MeshletAssetError, MeshletClusterRaw, MeshletMesh,
+        cluster_bounding_sphere, cluster_bounds_normalized, cluster_cone,
     };
     pub use crate::occlusion::OcclusionCulling;
     pub use crate::offscreen::OffscreenRenderer;
