@@ -101,6 +101,7 @@ pub mod mesh;
 pub mod occlusion;
 pub mod offscreen;
 pub mod particles;
+pub mod particles_v2;
 pub mod pipeline;
 pub mod post;
 pub mod probe;
@@ -185,6 +186,10 @@ pub mod prelude {
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::particles::{
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
+    };
+    pub use crate::particles_v2::{
+        PARTICLES_V2_DISPATCH, PARTICLES_V2_MAX, PARTICLES_V2_PENDING_CAP, PARTICLES_V2_TRAIL_MAX,
+        PARTICLES_V2_WORKGROUP, ParticleEmitterV2, update_particles_v2,
     };
     pub use crate::post::{
         AO_SLICES, AO_STEPS, AoSettings, BloomSettings, DepthOfFieldSettings, ExposureSettings,

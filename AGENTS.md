@@ -26,6 +26,17 @@ crate 布局（依赖自上而下）：
 - **所有 cargo 命令必须加前缀 `CARGO_HTTP_CHECK_REVOKE=false`**（本机镜像 SSL 吊销检查问题，不加必挂）。
 - `.cargo/config.toml` 已配 `rustc-wrapper = "sccache"`：新机器先 `cargo install sccache`，否则一切 cargo 命令失败。
 - ffmpeg 在 PATH（验收图 BMP/PPM→PNG 转换用）。
+- **链接期环境（Git Bash 特有的两个坑，2026-09-16 实测各烧掉数轮）**：
+  ① **裸 `link.exe` 被 Git Bash 的 GNU `link` 抢占**——`/usr/bin` 排在
+  MSVC bin 目录之前，`link.exe` 解析到 coreutils 的 `link`，症状 =
+  `link: missing operand after '\377\376'` + `link.exe returned an
+  unexpected error`（**不是** LNK 错误码）；② **`LIB` / `INCLUDE` 为空**
+  ⇒ MSVC link 找不到 SDK 库，症状 = `LNK1181: 无法打开输入文件
+  "opengl32.lib"`。修法（可复用脚本
+  `~/.workbuddy-ai/iris_build_env.sh`，`source` 后再跑 cargo）：
+  MSVC bin 目录前置到 PATH + `LIB` 指 `VC/Tools/MSVC/<ver>/lib/x64` 与
+  `Windows Kits/10/Lib/<ver>/{um,ucrt}/x64`。**只 `cargo check` 不触发
+  链接 ⇒ 该坑不显形**，一旦要跑 `build` / `test` / example 就会撞上。
 
 ## 门禁命令序（每轮收官，顺序有讲究——详见 ARCHITECTURE §7.2）
 
@@ -38,7 +49,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1348 / release 1345**（每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1365 / release 1362**（R82 收官：+13 项 v2 CPU 单测 + 4 项 v2 GPU 集成；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -78,7 +89,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ## 测试规约
 
 - 断言用**精确值**（解析解对照、±1e-5 容差写明依据），不写「大于 0」式摆设断言；**有效性断言要可判别**（R53/R60 的指标学教训：指标要在分布高端区分、ROI 避开混淆源）。
-- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿；后续复测发现 debug 同样会挂——shadow_v2_render 两轮自旋 10 分钟零推进，transparent_render 空转 18 分钟、decal_render 直接段错误 0xc0000005——症状谱：**自旋挂死 / 空转死等 / 驱动侧段错误**，同一病灶）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal / post——post_render 13 项曾漏配，iris-exp 控制轮 debug 全量门禁实锤挂死 10 分钟后补齐），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。新写 GPU 套件时直接带上互斥，别等挂了再补。cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。
+- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿；后续复测发现 debug 同样会挂——shadow_v2_render 两轮自旋 10 分钟零推进，transparent_render 空转 18 分钟、decal_render 直接段错误 0xc0000005——症状谱：**自旋挂死 / 空转死等 / 驱动侧段错误**，同一病灶）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal / post / probe——post_render 13 项曾漏配，iris-exp 控制轮 debug 全量门禁实锤挂死 10 分钟后补齐；**probe_render 7 项曾漏配，R82 收官轮 release 全量门禁实锤挂死**（`running 7 tests` 后 CPU 0% 长驻；单独复跑 10.65 s 正常）**后补齐**），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。新写 GPU 套件时直接带上互斥，别等挂了再补。cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。
 - should_panic 测试若依赖 `debug_assert!`，必须 `#[cfg(debug_assertions)]` 门控（R33/R38 各踩过一次 release 假失败）。
 - 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline/edit_headless 四次：R62a 验收 `pid` 同名目录下并行测试线程互删文件；R63 验收 editor 测试只在 pid 后**无调用序计数**——Windows 复用历史运行 pid 时 `create_dir_all` 命中旧目录 ⇒ `loaded = true` / 陈旧产物失配，debug 时序不同侥幸通过、release 才炸；唯一名 = 进程 id + 调用序计数，缺一不可）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试；渲染器按**句柄值**缓存 GPU 资源——同一渲染器上渲染「同句柄不同内容」的多个世界会串味（R53/R62 两次踩到），跨世界对照必须各用独立渲染器。
@@ -120,7 +131,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1348 / release 1345）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1365 / release 1362）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -138,7 +149,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1348 / release 1345；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1365 / release 1362；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65

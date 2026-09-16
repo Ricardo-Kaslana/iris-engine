@@ -313,21 +313,24 @@ impl Plugin for PhysicsPlugin {
 }
 
 /// 粒子插件：在 **PostUpdate** 阶段（层级传播之后）推进所有
-/// [`iris_render::particles::ParticleEmitter`]。
+/// [`iris_render::particles::ParticleEmitter`] 与
+/// [`iris_render::particles_v2::ParticleEmitterV2`]。
 ///
 /// 编排语义：发射原点 = `GlobalTransform` 平移——必须在
 /// [`HierarchyPlugin`] 的传播之后执行才能取到当帧全局位置（用户在
 /// Update 移动发射器，当帧新粒子即从新位置出生）；渲染发生在
 /// PostUpdate 全部结束之后，本帧模拟出的活粒子当帧即成像（调用契约
-/// 见 `iris_render::particles` 模块文档）。注册为**并行系统**：
-/// 访问集写 ParticleEmitter、读 GlobalTransform / Time。
+/// 见 `iris_render::particles` / `particles_v2` 模块文档）。注册为**
+/// 并行系统**：访问集写 ParticleEmitter / ParticleEmitterV2、读
+/// GlobalTransform / Time / Wind（v2 的风采样——R80 接口首个引擎内
+/// 消费点；`Wind` 资源缺席 = 无风）。
 #[derive(Default)]
 pub struct ParticlePlugin;
 
 impl Plugin for ParticlePlugin {
     fn build(&self, app: &mut App) {
         use iris_core::prelude::{Access, GlobalTransform, Stage, Time};
-        use iris_render::prelude::{ParticleEmitter, update_particles};
+        use iris_render::prelude::{ParticleEmitter, update_particles, update_particles_v2};
         app.schedule.add_parallel_system(
             Stage::PostUpdate,
             Access::new()
@@ -335,6 +338,19 @@ impl Plugin for ParticlePlugin {
                 .read::<GlobalTransform>()
                 .read::<Time>(),
             update_particles,
+        );
+        // v2（R82）：与 v1 同层同序——CPU 侧只做发射记账（发射数 /
+        // 种子偏移 / 风采样入队），GPU 模拟由渲染器在 draw 时消费帧
+        // 队列执行。两个系统访问集不相交（v1 写 ParticleEmitter、v2 写
+        // ParticleEmitterV2），可同批并行。
+        app.schedule.add_parallel_system(
+            Stage::PostUpdate,
+            Access::new()
+                .write::<iris_render::prelude::ParticleEmitterV2>()
+                .read::<GlobalTransform>()
+                .read::<Time>()
+                .read::<iris_core::wind::Wind>(),
+            update_particles_v2,
         );
     }
 }

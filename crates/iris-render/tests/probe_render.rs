@@ -15,6 +15,12 @@
 //!    乱序插入探针时选中同一探针（权重裁决与插入序无关）；
 //! 6. **光照贴图协同**（闭合 ARCHITECTURE §8.31④）：挂光照贴图的金属球
 //!    在无探针时没有环境镜面（近黑），有探针时恢复为可见反射。
+//!
+//! **文件内 `GPU_SERIAL` 互斥串行化**：7 项测试全部走 GPU，同文件多测试
+//! 并行共用单适配器会挂死（AGENTS.md 测试规约；R82 收官轮 release 全量
+//! 门禁实测挂死在 `running 7 tests` 后 CPU 0% 长驻——补齐互斥后正常）。
+
+use std::sync::Mutex;
 
 use glam::Vec3;
 use iris_core::hierarchy::propagate_transforms;
@@ -22,6 +28,11 @@ use iris_core::prelude::{Entity, Transform, World};
 use iris_render::prelude::*;
 
 const SIZE: u32 = 256;
+
+/// 文件内 GPU 互斥：同文件多测试并行共用单适配器会挂死（AGENTS.md 测试
+/// 规约——症状谱：自旋挂死 / 空转死等 / 驱动侧段错误）。本文件 7 项测试
+/// 全部走 GPU，**必须**串行化（与 ssr_render.rs::GPU_SERIAL 同款）。
+static GPU_SERIAL: Mutex<()> = Mutex::new(());
 
 /// FNV-1a 64 位全帧哈希（与既有 GPU 测试同款）。
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -172,6 +183,7 @@ fn orientation_world(with_probe: bool, roughness: f32) -> (World, Option<Entity>
 /// 的两个世界——句柄布局相同，故可共用一个渲染器）。
 #[test]
 fn probe_absent_or_unbaked_is_bitwise_identical() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(SIZE, SIZE) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -205,6 +217,7 @@ fn probe_absent_or_unbaked_is_bitwise_identical() {
 /// 反射内容存在的强断言 + 朝向断言（写反立方体面约定即两侧互换）。
 #[test]
 fn probe_reflects_directional_markers_in_mirrored_orientation() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(SIZE, SIZE) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -248,6 +261,7 @@ fn probe_reflects_directional_markers_in_mirrored_orientation() {
 /// 0.9 的被模糊：峰值饱和度下降、带红像素面积上升。
 #[test]
 fn probe_roughness_selects_blurrier_mip() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     // 两个粗糙度是**内容不同**的世界（同句柄布局）⇒ 必须各用一个渲染器：
     // 渲染器按句柄值缓存 GPU 材质，共用会把第一次的材质带给第二次（R53 教训）。
     let render = |roughness: f32| -> Option<Vec<u8>> {
@@ -291,6 +305,7 @@ fn probe_roughness_selects_blurrier_mip() {
 /// 确定性③：探针捕获 + 渲染的两个完整会话逐帧逐位一致。
 #[test]
 fn probe_two_sessions_are_frame_by_frame_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     const FRAMES: u32 = 12;
     let run = || -> Option<Vec<u64>> {
         let mut renderer = OffscreenRenderer::new(SIZE, SIZE)?;
@@ -335,6 +350,7 @@ fn probe_two_sessions_are_frame_by_frame_bitwise() {
 /// 它必须与「两个都烘焙」的画面不同，证明选择确实起了作用。
 #[test]
 fn probe_selection_is_independent_of_insertion_order() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let scene = |first_a: bool, bake: [bool; 2]| -> Option<(Vec<u8>, u32)> {
         let mut renderer = OffscreenRenderer::new(SIZE, SIZE)?;
         let (mut world, _) = orientation_world(false, 0.05);
@@ -536,6 +552,7 @@ fn pixel_distance(a: (f32, f32), b: (u32, u32)) -> f32 {
 /// 解析的「无重定向」位置（两者相距数十像素）。
 #[test]
 fn probe_parallax_matches_analytic_mirror_position() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(SIZE, SIZE) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -704,6 +721,7 @@ fn lightmap_probe_world(with_probe: bool) -> (World, Option<Entity>) {
 /// §8.31④ 的缺口），探针在场时镜面由探针补回（两侧自发光板的反射出现）。
 #[test]
 fn probe_restores_specular_on_lightmapped_entities() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(SIZE, SIZE) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;

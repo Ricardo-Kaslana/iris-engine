@@ -126,6 +126,15 @@ pub(crate) struct PipelineBundle {
     /// 粒子 alpha 管线（标准 alpha 混合 + 深度只测不写，与透明管线参数
     /// 一致；实例按视深降序绘制）。
     pub particle_alpha_pipeline: wgpu::RenderPipeline,
+    /// 粒子 v2 compute 模拟管线（R82，**全仓首个 compute 管线**）：
+    /// 固定池 4096 粒 × 恒定 64 工作组 × 64 线程，按索引有序读写
+    /// storage——会话内逐位确定性的根基（见 particles_v2.rs）。
+    pub particle_v2_sim_pipeline: wgpu::ComputePipeline,
+    /// 粒子 v2 拖尾 additive 管线（R82）：ribbon + 头部 billboard，
+    /// 顶点全由 vertex_index 派生（storage 读数据，无顶点缓冲）。
+    pub particle_v2_additive_pipeline: wgpu::RenderPipeline,
+    /// 粒子 v2 拖尾 alpha 管线（R82）：参数同 additive、标准 alpha 混合。
+    pub particle_v2_alpha_pipeline: wgpu::RenderPipeline,
     /// 贴花管线（R39）：盒投影代理几何（单位盒 ±Z 端盖）× 逐实例世界盒
     /// 矩阵 + 逆矩阵 + tint（144B）。alpha 混合 + 深度 LessEqual 只测不写
     /// （端盖与被贴表面共面，等深必须通过；不污染后续 pass 读取的深度），
@@ -188,6 +197,12 @@ pub(crate) struct PipelineBundle {
     /// 粒子相机布局：binding 0 = billboard 基向量小 uniform
     ///（相机 right / up，视图矩阵第 0 / 1 行，每帧 write_buffer）。
     pub particle_layout: wgpu::BindGroupLayout,
+    /// 粒子 v2 模拟布局（R82，compute）：binding 0 = SimParams uniform
+    ///（96B）、1 = 粒子状态 read-write storage（固定池 4096 × 560B）。
+    pub particle_v2_sim_layout: wgpu::BindGroupLayout,
+    /// 粒子 v2 拖尾布局（R82，渲染）：binding 0 = DrawParams uniform
+    ///（64B，vertex 阶段）、1 = 粒子状态只读 storage（vertex 阶段）。
+    pub particle_v2_draw_layout: wgpu::BindGroupLayout,
     /// 贴花纹理布局：binding 0 = 贴花纹理、1 = 采样器（组 1 按纹理分批
     /// 绑定；tint 在实例数据里逐实例携带，不占绑定组）。
     pub decal_layout: wgpu::BindGroupLayout,
@@ -2135,6 +2150,164 @@ pub(crate) fn create_pipeline(
         wgpu::BlendState::ALPHA_BLENDING,
     );
 
+    // 粒子 v2（R82）——**全仓首个 compute 管线**。模拟管线：组 0 =
+    // SimParams uniform（96B，CPU 每帧 write_buffer：发射数 / 游标 /
+    // dt / 风 / 位姿）+ 粒子状态 read-write storage（固定池 4096 ×
+    // 560B）；恒定 dispatch（池 / 工作组常量算出，不随存活数变）+
+    // 每线程按索引有序读写 = 会话内逐位确定性的根基（跨适配器位级
+    // 不可保，§8.51）。WGSL 无 u64 算术——出生哈希以 u32 肢对模拟
+    // mix64（整数精确，跨适配器恒等）。
+    let particle_v2_sim_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.particle_v2_sim"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/particles_v2_sim.wgsl").into()),
+    });
+    let particle_v2_sim_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("iris.layout.particle_v2_sim"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let particle_v2_sim_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.particle_v2.sim.pipeline.layout"),
+            bind_group_layouts: &[Some(&particle_v2_sim_layout)],
+            immediate_size: 0,
+        });
+    let particle_v2_sim_pipeline =
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("iris.pipeline.particle_v2_sim"),
+            layout: Some(&particle_v2_sim_pipeline_layout),
+            module: &particle_v2_sim_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+    // 粒子 v2 拖尾渲染：ribbon + 头部 billboard，顶点全由 vertex_index
+    // 派生（storage 读数据——无顶点缓冲、无实例缓冲），固定顶点数 =
+    // 池 × trail_length × 6。组 0 复用全局布局（精简 Globals 声明，
+    // particle.wgsl 同款）；组 1 = DrawParams uniform + 只读 storage。
+    // 深度只测不写（Less）、cull None（屏幕空间展宽绕向随相机变化）、
+    // HDR 目标 alpha 混合——两条管线仅混合不同（与 v1 粒子管线同参数，
+    // 渲染进同一粒子 pass 位置）。
+    let particle_v2_draw_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.particle_v2_draw"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/particles_v2_draw.wgsl").into()),
+    });
+    let particle_v2_draw_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("iris.layout.particle_v2_draw"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+    let particle_v2_draw_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.particle_v2.draw.pipeline.layout"),
+            bind_group_layouts: &[Some(&globals_layout), Some(&particle_v2_draw_layout)],
+            immediate_size: 0,
+        });
+    let make_particle_v2_pipeline =
+        |label: &'static str, blend: wgpu::BlendState| -> wgpu::RenderPipeline {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&particle_v2_draw_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &particle_v2_draw_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &particle_v2_draw_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+    let particle_v2_additive_pipeline = make_particle_v2_pipeline(
+        "iris.pipeline.particle_v2_additive",
+        wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        },
+    );
+    let particle_v2_alpha_pipeline = make_particle_v2_pipeline(
+        "iris.pipeline.particle_v2_alpha",
+        wgpu::BlendState::ALPHA_BLENDING,
+    );
+
     // 贴花（R39）：盒投影代理几何（单位盒 ±Z 端盖，位置顶点）× 逐实例
     // 世界盒矩阵 + 逆矩阵 + tint（144B，DecalInstanceRaw::LAYOUT location
     // 1..=9）。组 0 复用全局布局（着色器只声明 view_proj，精简 Globals，
@@ -2348,6 +2521,9 @@ pub(crate) fn create_pipeline(
         rt_blit_pipeline,
         particle_additive_pipeline,
         particle_alpha_pipeline,
+        particle_v2_sim_pipeline,
+        particle_v2_additive_pipeline,
+        particle_v2_alpha_pipeline,
         decal_pipeline,
         fxaa_pipeline,
         taa_pipeline,
@@ -2369,6 +2545,8 @@ pub(crate) fn create_pipeline(
         water_layout,
         ui_layout,
         particle_layout,
+        particle_v2_sim_layout,
+        particle_v2_draw_layout,
         decal_layout,
     }
 }

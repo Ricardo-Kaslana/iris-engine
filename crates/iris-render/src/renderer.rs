@@ -686,6 +686,10 @@ pub struct Renderer {
     particle_camera_buf: wgpu::Buffer,
     /// 粒子相机绑定组（粒子管线的组 1）。
     particle_camera_bg: wgpu::BindGroup,
+    /// 粒子 v2 GPU 池（R82；按实体绑定、销毁不回收，见 ParticleV2Pool）。
+    particle_v2_pools: Vec<ParticleV2Pool>,
+    /// 粒子 v2 收集暂存（跨帧复用）。
+    particle_v2_scratch: Vec<ParticleV2Item>,
     /// 贴花代理几何顶点缓冲（单位盒 ±Z 端盖，初始化时一次性上传；
     /// 字段保持缓冲存活）。
     #[allow(dead_code)]
@@ -1322,6 +1326,52 @@ const _: () = assert!(
     std::mem::size_of::<ParticleCameraRaw>() == 32,
     "ParticleCamera 必须与 WGSL 布局一致"
 );
+
+/// 粒子 v2 单粒子状态步长（560 B）：3 × vec4 元数据 + 32 × vec4 环形
+/// 历史——与 `shaders/particles_v2_sim.wgsl` 的 `SimParticle` 布局对齐
+///（影子契约：改 WGSL 必须同步此常量）。
+const PARTICLES_V2_STRIDE: u64 = 48 + 16 * crate::particles_v2::PARTICLES_V2_TRAIL_MAX as u64;
+
+/// 粒子 v2 GPU 池（R82）：按发射器实体绑定（世代位含于 to_bits，销毁
+/// 重建不撞旧池；销毁后不回收——诚实限制见 particles_v2.rs）。模拟状态
+/// 常驻 storage，发射记账在组件；`bound_cursor` 供 `reset` 检测（游标
+/// 回退 → 全量清零一次）。
+struct ParticleV2Pool {
+    /// 绑定的发射器实体位模式。
+    entity: u64,
+    /// 粒子状态 read-write storage（compute 写、渲染读）。
+    particles_buf: wgpu::Buffer,
+    /// 模拟 uniform（每份待消费帧一个槽位，按需增长跨帧复用——
+    /// write_buffer 与 dispatch 无法在同一 submit 内交错，逐帧槽位
+    /// 保证每份帧参数与对应 dispatch 配对）。
+    sim_uniforms: Vec<wgpu::Buffer>,
+    sim_bgs: Vec<wgpu::BindGroup>,
+    /// 拖尾渲染 uniform（每帧每可见发射器写一份）。
+    draw_params_buf: wgpu::Buffer,
+    draw_bg: wgpu::BindGroup,
+    /// 上次见到的发射器游标（reset 检测基准）。
+    bound_cursor: u32,
+}
+
+/// 粒子 v2 收集项（`draw` 的收集阶段产出；frames = 本帧待消费模拟帧）。
+struct ParticleV2Item {
+    entity: u64,
+    blend: ParticleBlend,
+    /// 存活估计（统计口径；绘制跳过判据）。
+    alive: u32,
+    /// 发射器游标（reset 检测输入）。
+    cursor: u32,
+    /// 钳制后的拖尾历史点数。
+    trail_length: u32,
+    /// 可见性（Visibility 自身 + 祖先级联；隐藏只过滤绘制——模拟照常）。
+    visible: bool,
+    /// 对应池下标（ensure 阶段填）。
+    pool: usize,
+    /// 本帧待消费模拟帧（排水自组件）。
+    frames: Vec<crate::particles_v2::SimParamsRaw>,
+    /// 拖尾渲染 uniform（收集时按相机参数现算）。
+    draw: crate::particles_v2::DrawParamsRaw,
+}
 
 /// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、贴花 pass、
 /// 透明 pass 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17 / §4.20）：UI pass
@@ -2166,6 +2216,57 @@ fn collect_particles(
         total += tmp.len() as u32;
     });
     total
+}
+
+/// 收集全部 [`ParticleEmitterV2`](crate::particles_v2::ParticleEmitterV2)
+/// 的模拟帧与渲染参数（`draw` 的粒子 v2 收集阶段；须在
+/// `update_particles_v2` 之后调用——排水的是当帧记账产出的模拟帧）。
+///
+/// - **帧排水**：每发射器 `take_frames` 排空待消费队列（多次 update 而
+///   未渲染的帧按序补跑；同状态重复渲染 = 空队列 = 不重复步进）。
+/// - **Visibility 过滤**与 v1 同语义（组件缺席 = 可见；自身或任一祖先
+///   `HIDDEN` 跳过**绘制**——模拟照常排水推进，粒子继续老化）。隐藏
+///   发射器 `visible = false` 仍入表。
+/// - **无视锥剔除**（与 v1 的差别，诚实限制）：粒子位置状态在 GPU，
+///   CPU 无逐粒位置，发射器包围球剔除不可做。
+/// - 拖尾渲染 uniform 现场构建（相机投影参数每帧变化，不驻组件）。
+fn collect_particles_v2(
+    world: &iris_core::world::World,
+    proj_y: f32,
+    aspect: f32,
+    out: &mut Vec<ParticleV2Item>,
+) {
+    out.clear();
+    world.query::<(
+        iris_core::prelude::Entity,
+        &GlobalTransform,
+        &crate::particles_v2::ParticleEmitterV2,
+        Option<&Visibility>,
+    )>(|(e, _, emitter, visibility)| {
+        let visible = !(visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e));
+        let trail_length = emitter.trail_length_clamped();
+        out.push(ParticleV2Item {
+            entity: e.to_bits(),
+            blend: emitter.blend,
+            alive: emitter.alive_estimate(),
+            cursor: emitter.spawn_cursor(),
+            trail_length,
+            visible,
+            pool: usize::MAX,
+            frames: emitter.take_frames(),
+            draw: crate::particles_v2::DrawParamsRaw {
+                lifetime_size: [
+                    emitter.particle_lifetime,
+                    emitter.size_start,
+                    emitter.size_end,
+                    emitter.trail_width,
+                ],
+                color_start: emitter.color_start,
+                color_end: emitter.color_end,
+                trail_view: [trail_length as f32, proj_y, aspect, 0.0],
+            },
+        });
+    });
 }
 
 /// 收集全部 [`Decal`] 贴花实例（`draw` 的贴花 pass 数据准备）。
@@ -3216,6 +3317,8 @@ impl Renderer {
             occ_entity_scratch: Vec::new(),
             particle_scratch: Vec::new(),
             particle_alpha_scratch: Vec::new(),
+            particle_v2_pools: Vec::new(),
+            particle_v2_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
                 g: 0.07,
@@ -5492,6 +5595,19 @@ impl Renderer {
         particle_alpha.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let particle_additive_len = particle_instances.len();
         particle_instances.extend(particle_alpha.iter().map(|(_, _, inst)| *inst));
+        // 2c'. 粒子 v2 收集（R82）：排水待消费模拟帧 + 构建拖尾渲染
+        //      uniform + 池对齐（新实体建池 / reset 检测 / uniform 槽位
+        //      按需增长——建池需要 &mut self，必须在 hdr 借用之前，与 4c
+        //      同款纪律）。须在 update_particles_v2 之后（调用契约见
+        //      particles_v2.rs）；组件缺席 = 空表 = 零计算零绘制。
+        let mut particle_v2_items = std::mem::take(&mut self.particle_v2_scratch);
+        collect_particles_v2(
+            world,
+            1.0 / (fov * 0.5).tan(),
+            aspect,
+            &mut particle_v2_items,
+        );
+        self.ensure_particle_v2_pools(&mut particle_v2_items);
         // 2d. 贴花收集（R39）：Visibility 过滤 + 祖先级联 + 变换后 AABB
         //     视锥剔除，随后按纹理句柄排序分批（同纹理连续区间 = 1 draw；
         //     批内实体 bits 并列序——确定性，与收集顺序无关）。无贴花时
@@ -6066,6 +6182,44 @@ impl Renderer {
                 .queue
                 .write_buffer(particle_buf, 0, bytemuck::cast_slice(&particle_instances));
         }
+        // 4c'. 粒子 v2 模拟（R82，全仓首个 compute 管线）：逐份待消费帧
+        // write_buffer 模拟 uniform + compute pass 恒定 dispatch。编码在
+        // 全部 render pass **之前**——同一编码器按序执行，后续渲染 pass
+        // 读到的是本帧模拟后的粒子状态。每份帧一个 uniform 槽位（write
+        // 与 dispatch 无法在同一 submit 内交错，逐槽配对保证帧参数与
+        // dispatch 一一对应）；帧队列空（重复渲染）= 零开销跳过。
+        if !particle_v2_items.is_empty() {
+            for item in &particle_v2_items {
+                let pool = &self.particle_v2_pools[item.pool];
+                for (slot, frame) in item.frames.iter().enumerate() {
+                    self.gpu.queue.write_buffer(
+                        &pool.sim_uniforms[slot],
+                        0,
+                        bytemuck::bytes_of(frame),
+                    );
+                }
+            }
+            let any_dispatch = particle_v2_items.iter().any(|i| !i.frames.is_empty());
+            if any_dispatch {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("iris.pass.particle_v2_sim"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bundle.particle_v2_sim_pipeline);
+                for item in &particle_v2_items {
+                    if item.frames.is_empty() {
+                        continue;
+                    }
+                    let pool = &self.particle_v2_pools[item.pool];
+                    for slot in 0..item.frames.len() {
+                        cpass.set_bind_group(0, &pool.sim_bgs[slot], &[]);
+                        // 恒定 dispatch：池容量 / 工作组大小（常量算出，
+                        // 不随存活数变——会话内逐位确定性的根基）
+                        cpass.dispatch_workgroups(crate::particles_v2::PARTICLES_V2_DISPATCH, 1, 1);
+                    }
+                }
+            }
+        }
         // SSR 参数（R62b）：上帧重投影矩阵（prev_vp = 上帧实际渲染矩阵，
         // 与 MB/TAA 同源）+ 标量。`active = 0` 的帧（首帧启用 / 关→开 /
         // 分辨率变化 / 切镜 / 上帧或本帧无不透明几何——深度副本没跑，
@@ -6588,8 +6742,15 @@ impl Renderer {
         // 3) additive 先画（顺序无关、不排序——加法交换律），alpha 后画
         //    （视深降序整段一次 draw）。无粒子时整个 pass 跳过（零开销）。
         //    实例已在 4c 全量上传，这里只绑定与绘制。
-        if particle_total > 0 {
-            let particle_buf = self.particle_buf.as_ref().expect("粒子实例缓冲已就绪");
+        // 4) 粒子 v2（R82）在同一 pass、v1 之后绘制——pass 位置照旧不动
+        //    （透明之后、泛光之前），R81 水体（更后）不受影响；逐发射器
+        //    一次 draw（固定顶点数 = 池 × trail_length × 6，死粒子 /
+        //    历史不足在顶点着色器零面积退化）。仅 v2 发射器在场时同样
+        //    打开本 pass。
+        let particle_v2_drawable = particle_v2_items.iter().any(|i| i.visible && i.alive > 0);
+        if particle_total > 0 || particle_v2_drawable {
+            // v1 实例缓冲仅在 v1 粒子在场时解包（仅 v2 场景下不分配）
+            let particle_buf = self.particle_buf.as_ref();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.particle"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -6613,26 +6774,59 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &self.globals_bg, &[]);
-            pass.set_bind_group(1, &self.particle_camera_bg, &[]);
-            pass.set_vertex_buffer(0, particle_buf.slice(..));
-            if particle_additive_len > 0 {
-                pass.set_pipeline(&self.bundle.particle_additive_pipeline);
-                pass.draw(0..4, 0..particle_additive_len as u32);
-                draw_calls += 1;
+            if particle_total > 0 {
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pass.set_bind_group(1, &self.particle_camera_bg, &[]);
+                pass.set_vertex_buffer(
+                    0,
+                    particle_buf.expect("v1 粒子在场时实例缓冲已就绪").slice(..),
+                );
+                if particle_additive_len > 0 {
+                    pass.set_pipeline(&self.bundle.particle_additive_pipeline);
+                    pass.draw(0..4, 0..particle_additive_len as u32);
+                    draw_calls += 1;
+                }
+                if particle_instances.len() > particle_additive_len {
+                    pass.set_pipeline(&self.bundle.particle_alpha_pipeline);
+                    pass.draw(
+                        0..4,
+                        particle_additive_len as u32..particle_instances.len() as u32,
+                    );
+                    draw_calls += 1;
+                }
+                instances += particle_total;
+                // 每粒一个 quad = 2 三角形
+                triangles_drawn += 2 * particle_total;
+                particles_drawn = particle_total;
             }
-            if particle_instances.len() > particle_additive_len {
-                pass.set_pipeline(&self.bundle.particle_alpha_pipeline);
+            // 粒子 v2（R82）：逐发射器一次 draw（收集序 = 查询序，确定
+            // 性）；additive / alpha 按各自混合管线。拖尾渲染 uniform 每
+            // 帧现场上传（含相机投影参数）。
+            for item in &particle_v2_items {
+                if !item.visible || item.alive == 0 {
+                    continue;
+                }
+                let pool = &self.particle_v2_pools[item.pool];
+                self.gpu.queue.write_buffer(
+                    &pool.draw_params_buf,
+                    0,
+                    bytemuck::bytes_of(&item.draw),
+                );
+                pass.set_bind_group(0, &self.globals_bg, &[]);
+                pass.set_bind_group(1, &pool.draw_bg, &[]);
+                pass.set_pipeline(match item.blend {
+                    ParticleBlend::Additive => &self.bundle.particle_v2_additive_pipeline,
+                    ParticleBlend::Alpha => &self.bundle.particle_v2_alpha_pipeline,
+                });
                 pass.draw(
-                    0..4,
-                    particle_additive_len as u32..particle_instances.len() as u32,
+                    0..crate::particles_v2::PARTICLES_V2_MAX * item.trail_length * 6,
+                    0..1,
                 );
                 draw_calls += 1;
+                instances += item.alive;
+                triangles_drawn += item.alive * item.trail_length * 2;
+                particles_drawn += item.alive;
             }
-            instances += particle_total;
-            // 每粒一个 quad = 2 三角形
-            triangles_drawn += 2 * particle_total;
-            particles_drawn = particle_total;
         }
         // 主相机场景深度副本 pass（R43）：仅 DOF / MB / TAA / SSR 启用时
         // 编码。把不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件
@@ -7494,6 +7688,7 @@ impl Renderer {
         self.decal_scratch = decal_items;
         self.particle_scratch = particle_instances;
         self.particle_alpha_scratch = particle_alpha;
+        self.particle_v2_scratch = particle_v2_items;
     }
 
     /// 实例缓冲容量复用：足够则零开销返回 `false`；不足时按 2 倍扩容
@@ -7581,6 +7776,112 @@ impl Renderer {
         }));
         self.particle_capacity = capacity;
         log::debug!("粒子实例缓冲扩容至 {capacity} 实例");
+    }
+
+    /// 粒子 v2 池对齐（R82）：逐收集项找 / 建实体对应池，并处理
+    /// `reset` 检测（游标回退 → storage 全量清零一次，~2.3 MB 上传，
+    /// 仅检测到的那帧）。池的模拟 uniform 槽位按本帧待消费帧数增长
+    ///（跨帧复用，不回收）。
+    fn ensure_particle_v2_pools(&mut self, items: &mut [ParticleV2Item]) {
+        for item in items {
+            let idx = match self
+                .particle_v2_pools
+                .iter()
+                .position(|p| p.entity == item.entity)
+            {
+                Some(i) => i,
+                None => {
+                    let pool = self.create_particle_v2_pool(item.entity);
+                    self.particle_v2_pools.push(pool);
+                    self.particle_v2_pools.len() - 1
+                }
+            };
+            // reset 检测：游标回退（v1 语义里池满停发只前进不回退）
+            if item.cursor < self.particle_v2_pools[idx].bound_cursor {
+                let zero = vec![
+                    0u8;
+                    (PARTICLES_V2_STRIDE * crate::particles_v2::PARTICLES_V2_MAX as u64)
+                        as usize
+                ];
+                self.gpu
+                    .queue
+                    .write_buffer(&self.particle_v2_pools[idx].particles_buf, 0, &zero);
+                log::debug!("粒子 v2 池检测到发射器 reset（游标回退），storage 已清零");
+            }
+            self.particle_v2_pools[idx].bound_cursor = item.cursor;
+            // 模拟 uniform 槽位按需增长（每份待消费帧一个槽）
+            let needed = item.frames.len();
+            while self.particle_v2_pools[idx].sim_uniforms.len() < needed {
+                let device = &self.gpu.device;
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.particle_v2.sim_params"),
+                    size: std::mem::size_of::<crate::particles_v2::SimParamsRaw>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("iris.particle_v2.sim.bg"),
+                    layout: &self.bundle.particle_v2_sim_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.particle_v2_pools[idx]
+                                .particles_buf
+                                .as_entire_binding(),
+                        },
+                    ],
+                });
+                let pool = &mut self.particle_v2_pools[idx];
+                pool.sim_uniforms.push(buf);
+                pool.sim_bgs.push(bg);
+            }
+            item.pool = idx;
+        }
+    }
+
+    /// 创建一个粒子 v2 GPU 池（storage 由 wgpu 零初始化 = 全体死粒子，
+    /// 首帧 dispatch 前状态良构）。
+    fn create_particle_v2_pool(&self, entity: u64) -> ParticleV2Pool {
+        let device = &self.gpu.device;
+        let particles_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.particle_v2.pool"),
+            size: PARTICLES_V2_STRIDE * crate::particles_v2::PARTICLES_V2_MAX as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.particle_v2.draw_params"),
+            size: std::mem::size_of::<crate::particles_v2::DrawParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("iris.particle_v2.draw.bg"),
+            layout: &self.bundle.particle_v2_draw_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: draw_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: particles_buf.as_entire_binding(),
+                },
+            ],
+        });
+        ParticleV2Pool {
+            entity,
+            particles_buf,
+            sim_uniforms: Vec::new(),
+            sim_bgs: Vec::new(),
+            draw_params_buf,
+            draw_bg,
+            bound_cursor: 0,
+        }
     }
 
     /// 贴花实例缓冲容量复用（同款模式）：容量足够则零开销，不足时按
