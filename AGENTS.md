@@ -49,7 +49,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1454 / release 1451**（R86 收官：+21 项层级 LOD CPU 单测 + 3 项 GPU LOD 集成；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1480 / release 1477**（R87 收官：+21 项分页流送 / IRML v3 / pack 入口 CPU 单测 + 5 项 GPU 流送与遮挡整合集成；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -89,7 +89,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ## 测试规约
 
 - 断言用**精确值**（解析解对照、±1e-5 容差写明依据），不写「大于 0」式摆设断言；**有效性断言要可判别**（R53/R60 的指标学教训：指标要在分布高端区分、ROI 避开混淆源）。
-- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿；后续复测发现 debug 同样会挂——shadow_v2_render 两轮自旋 10 分钟零推进，transparent_render 空转 18 分钟、decal_render 直接段错误 0xc0000005——症状谱：**自旋挂死 / 空转死等 / 驱动侧段错误**，同一病灶）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal / post / probe——post_render 13 项曾漏配，iris-exp 控制轮 debug 全量门禁实锤挂死 10 分钟后补齐；**probe_render 7 项曾漏配，R82 收官轮 release 全量门禁实锤挂死**（`running 7 tests` 后 CPU 0% 长驻；单独复跑 10.65 s 正常）**后补齐**），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。新写 GPU 套件时直接带上互斥，别等挂了再补。cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。
+- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件并行会挂死**（R62b 实测：同文件 7 项并行共用单适配器，release 下 3 项后其余无限停顿；后续复测发现 debug 同样会挂——shadow_v2_render 两轮自旋 10 分钟零推进，transparent_render 空转 18 分钟、decal_render 直接段错误 0xc0000005——症状谱：**自旋挂死 / 空转死等 / 驱动侧段错误**，同一病灶）：此类套件在文件内加 `static` 互斥锁串行化（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal / post / probe / meshlet / meshlet_v2 / meshlet_lod / meshlet_stream——post_render 13 项曾漏配，iris-exp 控制轮 debug 全量门禁实锤挂死 10 分钟后补齐；**probe_render 7 项曾漏配，R82 收官轮 release 全量门禁实锤挂死**（`running 7 tests` 后 CPU 0% 长驻；单独复跑 10.65 s 正常）**后补齐**；**meshlet_stream_render 的遮挡整合项曾漏配（R87 首稿 4 项只 3 项带锁——未及在标准门禁下复现，作为纪律缺口在验收轮补齐）**），不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠。新写 GPU 套件时直接带上互斥，别等挂了再补。cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。
 - should_panic 测试若依赖 `debug_assert!`，必须 `#[cfg(debug_assertions)]` 门控（R33/R38 各踩过一次 release 假失败）。
 - 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline/edit_headless 四次：R62a 验收 `pid` 同名目录下并行测试线程互删文件；R63 验收 editor 测试只在 pid 后**无调用序计数**——Windows 复用历史运行 pid 时 `create_dir_all` 命中旧目录 ⇒ `loaded = true` / 陈旧产物失配，debug 时序不同侥幸通过、release 才炸；唯一名 = 进程 id + 调用序计数，缺一不可）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试；渲染器按**句柄值**缓存 GPU 资源——同一渲染器上渲染「同句柄不同内容」的多个世界会串味（R53/R62 两次踩到），跨世界对照必须各用独立渲染器。
@@ -131,7 +131,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1454 / release 1451）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1480 / release 1477）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -149,7 +149,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1454 / release 1451；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1480 / release 1477；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -179,7 +179,14 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     展开等价锚点，渲染路径零改动）、R85 虚拟几何体 V2 ✅（compute 簇剔除 +
     u32 前缀和稳定紧凑化 + vertex-pull 绘制 + 片元阶段 = standard fs_main
     本体 ⇒ expand 与 compute 路径跨管线 FNV 相等；诚实限制 §8.54）、
-    R86/R87 虚拟几何体 V3/V4（层级 LOD / 分页流送+遮挡整合，待开工）、
+    R86 虚拟几何体 V3 ✅（层级 LOD：簇 DAG + 屏幕空间误差选择；IRML v2
+    与 v1 双向兼容，选择只换输入集合 ⇒ GPU 管线零改动；诚实限制 §8.55）、
+    R87 虚拟几何体 V4 ✅（分页流送 + 遮挡整合，**连役 4/4 收官**：IRML v3
+    页区段 + 16 簇/页 + GPU 显存驻留状态机（优先级全序、无抖动、乱序请求
+    同队列）+ 驻留感知 LOD 选择（页缺沿 DAG 上取父组、无缝洞）+ R53 实体级
+    遮挡整合（收集期整帧跳过）；页槽 = arena 规范区间 ⇒ 两个 WGSL 零改动；
+    兑现 R84/R85 推迟的 pack 最小入口与路线图 §一红线修订声明；诚实限制
+    §8.56）、
     R88/R89 DDGI 动态 GI、R90/R91 毛发、R92 降水、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）
   - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /
@@ -197,5 +204,5 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
   （Nanite/Lumen 类）」红线解禁收窄：虚拟几何体（本仓体量 Nanite 式子集、opaque-only
   MVP，R84–R87）与 DDGI 动态 GI（R88–R89）立项；visbuffer 全量管线与 Lumen 类全动态
   GI 仍不做。原「大开放世界流式」收窄：开放世界地块流式不做，资产级 meshlet 分页
-  流送随 R87 允许。
+  流送随 R87 允许（**已兑现**：GPU 显存分页，磁盘级异步 IO 仍不做——§8.56①）。
 - 用户会实际运行游戏与编辑器并报 bug（Infiltration 四问题、编辑器试玩落盘）——演示与验收图质量必须真实。

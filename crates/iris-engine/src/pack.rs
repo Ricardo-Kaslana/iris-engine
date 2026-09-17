@@ -61,6 +61,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use iris_render::meshlet::{MeshletAssetError, MeshletMesh};
+
 /// 文件头魔数（"IPAK" = Iris PAcK）。
 const MAGIC: [u8; 4] = *b"IPAK";
 
@@ -417,6 +419,59 @@ fn read_exact_bounded(source: &mut impl Read, buf: &mut [u8]) -> Result<(), Pack
 }
 
 // ---------------------------------------------------------------------------
+// pack × IRML：meshlet 资产的最小读取入口（R87）
+// ---------------------------------------------------------------------------
+
+/// [`PackReader`] 读 meshlet 资产的错误：pack 层（路径不存在 / 条目损坏
+/// / CRC 不符）与 IRML 层（魔数 / 版本 / 结构 / 数据损坏）分开报告，
+/// 调用方可判别「挂载层继续找下一来源」（NotFound）与「资产真的坏
+/// 了」（其余）。
+#[derive(Debug)]
+pub enum MeshletPackError {
+    /// pack 层失败（`read` 的 [`PackError`] 原样透传）。
+    Pack(PackError),
+    /// 条目不是 IRML 容器（魔数不符——路径扩展名只是约定，读取以
+    /// 魔数为准）。
+    NotIrml,
+    /// IRML 容器解析失败（版本 / 结构 / CRC——详见
+    /// [`MeshletAssetError`]）。
+    Irml(MeshletAssetError),
+}
+
+impl fmt::Display for MeshletPackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pack(e) => write!(f, "pack 读取失败：{e}"),
+            Self::NotIrml => write!(f, "pack 条目不是 IRML 容器（魔数不符）"),
+            Self::Irml(e) => write!(f, "IRML 解析失败：{e}"),
+        }
+    }
+}
+
+impl std::error::Error for MeshletPackError {}
+
+/// 从 pack 源读一个 `.imesh`（IRML）条目并解析为
+/// [`MeshletMesh`](iris_render::meshlet::MeshletMesh)（R87 的 pack 集成
+/// 兑现——R84/R85 两次推迟的最小入口：一个函数 + 往返测试；编辑器与
+/// AssetMount 的全接线留后续，见 ARCHITECTURE §4.43）。
+///
+/// 语义 = [`PackReader::read`]（seek + read_exact + CRC 校验，数据区
+/// 不整体进内存——大资产只触碰所读条目）+ [`MeshletMesh::from_bytes`]
+/// （版本矩阵 {1, 2, 3} / 结构校验链）。v1 边界：**一次性读入整条目**
+/// ——流送的分页在 GPU 显存维度（见 `iris_render::meshlet_stream`），
+/// 磁盘级按页异步 IO 不做（诚实限制 §8.56）。
+pub fn read_meshlet<S: Read + Seek>(
+    pack: &PackReader<S>,
+    path: &str,
+) -> Result<MeshletMesh, MeshletPackError> {
+    let bytes = pack.read(path).map_err(MeshletPackError::Pack)?;
+    if bytes.len() < 4 || bytes[0..4] != *b"IRML" {
+        return Err(MeshletPackError::NotIrml);
+    }
+    MeshletMesh::from_bytes(&bytes).map_err(MeshletPackError::Irml)
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
@@ -668,5 +723,44 @@ mod tests {
         // 大条目完整读回：逐字节一致（本测试的 12 MB 读取结果即峰值
         // 内存下界——调用方请求多少、返回多少，无额外复制缓冲暴露）
         assert_eq!(reader.read("big.bin").unwrap(), big);
+    }
+
+    // ---- pack × IRML（R87 最小入口）----
+
+    /// `.imesh` 条目读取往返：构建器产物（带页表 ⇒ v3 容器）写进
+    /// pack → `read_meshlet` 读回逐字段相等（簇 + 页表）；路径不存在
+    /// 报 Pack(NotFound)（挂载层可判别继续找）；非 IRML 条目报
+    /// NotIrml（魔数为准，扩展名只是约定）。
+    #[test]
+    fn read_meshlet_roundtrip_and_error_discrimination() {
+        let mesh = crate::meshlet_builder::build_meshlets_from_mesh_data(
+            &iris_render::mesh::MeshData::cube(),
+        );
+        let mut irml = Vec::new();
+        let written = mesh.write_to(&mut irml).expect("写出 IRML");
+        assert!(written > 0);
+        let pack = build_pack(&[
+            ("models/cube.imesh", irml),
+            ("junk.bin", b"not a mesh".to_vec()),
+        ]);
+        let reader = PackReader::from_source(std::io::Cursor::new(pack)).expect("打开");
+
+        let back = read_meshlet(&reader, "models/cube.imesh").expect("读取 meshlet");
+        assert_eq!(back.clusters, mesh.clusters, "簇元数据逐字段相等");
+        assert_eq!(back.hierarchy.groups, mesh.hierarchy.groups);
+        assert_eq!(back.pages, mesh.pages, "v3 页表往返逐字段相等");
+        assert_eq!(back.vertices.len(), mesh.vertices.len());
+
+        assert!(matches!(
+            read_meshlet(&reader, "models/missing.imesh"),
+            Err(MeshletPackError::Pack(PackError::NotFound(path))) if path == "models/missing.imesh"
+        ));
+        assert!(
+            matches!(
+                read_meshlet(&reader, "junk.bin"),
+                Err(MeshletPackError::NotIrml)
+            ),
+            "魔数不符 = 不是 IRML"
+        );
     }
 }

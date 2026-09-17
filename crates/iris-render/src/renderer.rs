@@ -729,6 +729,20 @@ pub struct Renderer {
     /// 上一收集帧的 run 起点表（与 meshlet_last_handles 同序同生命周期
     /// ——紧凑列表三角形统计的解析输入，R86）。
     meshlet_last_run_starts: Vec<u32>,
+    /// meshlet 页驻留状态机（R87）：`MeshletStreamSettings` 预算在场时
+    /// 惰性创建；None = 全驻留 = R86 行为逐位不变。
+    meshlet_stream: Option<crate::meshlet_stream::ResidencyManager>,
+    /// 上一收集帧的流送请求（全局页号, 页最小屏幕误差）——本帧 tick 的
+    /// 输入（请求一帧延迟：收集在 tick 之后使用本帧驻留状态）。
+    meshlet_stream_requests: Vec<(u32, f32)>,
+    /// 流送 → 非流送迁移标记：驻留期间页可能被逐出 arena，回到非流送
+    /// 路径前必须整库重传（下一次 [`Self::ensure_meshlet_world`] 消费）。
+    meshlet_stream_recover_upload: bool,
+    /// meshlet 实体的遮挡查询条目（R87 遮挡整合——收集期填充，2e 段
+    /// 追加到普通实例条目之后；跨帧复用）。
+    meshlet_occ_aabb_scratch: Vec<AabbInstanceRaw>,
+    /// 与 [`Self::meshlet_occ_aabb_scratch`] 同序的实体位模式表。
+    meshlet_occ_entity_scratch: Vec<u64>,
     /// 贴花代理几何顶点缓冲（单位盒 ±Z 端盖，初始化时一次性上传；
     /// 字段保持缓冲存活）。
     #[allow(dead_code)]
@@ -1512,6 +1526,14 @@ struct MeshletArenaSlot {
     /// 逐簇三角形数（u8 直通 `triangle_count`，含各层父簇）——
     /// `triangles_drawn` 统计按 run 区间精确累加用。
     cluster_triangles: Vec<u8>,
+    /// 页划分表（R87）：驻留裁决 / 逐页上传 / 驻留感知选择的输入；
+    /// `page_base` = 本网格页号的全局基址（注册期累加分配）。
+    pages: std::sync::Arc<crate::meshlet_stream::MeshletPageTable>,
+    page_base: u32,
+    /// 实例 AABB（R87 遮挡整合）：全部簇包围球（归一化球心反归一化 +
+    /// 半径）的联合包围盒（网格局部空间）——注册期一次预计算，查询期
+    /// 过模型矩阵取保守世界盒（与 R53 的 `world_aabb` 同式）。
+    cluster_union: ([f32; 3], [f32; 3]),
 }
 
 /// GPU arena 的 CPU 镜像（增长重建时全量重传的源数据；注册期追加）。
@@ -1616,6 +1638,16 @@ struct MeshletFrame {
     /// 全局簇总数（本帧实例前缀和的尾值 = 全部 run 长度合计；
     /// ≤ [`MAX_MESHLET_CLUSTERS`]）。
     total_clusters: u32,
+    /// 流送请求（R87）：（全局页号, 页最小屏幕误差）——理想集 ∪ 可绘
+    /// 区间的页；draw 段取走作为下一帧驻留 tick 的输入。
+    stream_requests: Vec<(u32, f32)>,
+    /// 遮挡查询条目（R87）：视锥可见的 meshlet 实体世界 AABB（含被
+    /// 遮挡隐藏者——持续重查是恢复可见的唯一路径）。
+    occ_aabbs: Vec<AabbInstanceRaw>,
+    /// 与 `occ_aabbs` 同序的实体位模式表。
+    occ_entities: Vec<u64>,
+    /// 本帧因遮挡隐藏而整帧跳过的 meshlet 实体数（统计口径）。
+    occ_hidden_count: u32,
 }
 
 /// 本帧 LOD 选择参数（R86）：[`MeshletLodSettings`] 启用时由
@@ -2571,9 +2603,9 @@ fn collect_particles_v2(
 ///
 /// 返回被视锥剔除的实例数；收集次序即查询顺序，分批排序由调用方完成
 /// （按纹理句柄排序，同批内实体 bits 并列序——见 `decal.rs` 分批策略）。
-/// 单帧 meshlet 收集（R85；R86 扩展 run 形实例表）：可见
-/// [`MeshletInstance`](crate::meshlet::MeshletInstance) 实体 → GPU 实例
-/// 表条目 + 全局簇号前缀。
+/// 单帧 meshlet 收集（R85；R86 扩展 run 形实例表；R87 扩展流送门控 +
+/// 遮挡查询条目）：可见 [`MeshletInstance`](crate::meshlet::MeshletInstance)
+/// 实体 → GPU 实例表条目 + 全局簇号前缀。
 ///
 /// - **可见性语义与常规路径一致**：`Visibility` 自身 + 祖先级联；实例
 ///   包围球视锥剔除与 `collect_instances` 同式（中心变换 + 半径按最大
@@ -2585,9 +2617,22 @@ fn collect_particles_v2(
 ///   合并成 run，一条 run = 一条实例表条目（簇范围 = run）；选择输出的
 ///   区间在 arena 中连续 ⇒ cull / draw 对 run 的枚举恰为选中簇集合。
 ///   层级缺席 / LOD 关闭 ⇒ 单条全叶 run = R85 恒等表。
+/// - **流送门控（R87）**：`stream_threshold` 在场（= 驻留预算激活）⇒
+///   选择改走 [`select_lod_cluster_ranges_resident`]：选中组页缺时沿
+///   DAG 上取驻留父组，根链全缺 ⇒ 实例整帧跳过；理想集 ∪ 可绘区间的
+///   页记入 `out.stream_requests`（渲染器喂下一帧驻留 tick——本帧粗化、
+///   页流入后细化收敛）。与 LOD 的关系：阈值取 LOD 设置（启用时），
+///   缺席 = 0（全叶理想）；`lod` 在流送分支只供视口参数。
+/// - **遮挡查询条目（R87）**：`occ_collect` 在场时，每个视锥可见实体
+///   的簇联合盒（注册期预计算）过模型矩阵取保守世界盒，追加进
+///   `out.occ_aabbs / occ_entities`——**先于任何跳过路径**（被遮挡
+///   隐藏者也持续重查，是恢复可见的唯一路径）；隐藏实体记入
+///   `occ_hidden_count` 并整帧跳过（不进实例表 = 不进 cull dispatch
+///   输入）。与流送的次序：未驻留实例在选择期已整帧跳过，遮挡路径
+///   不双重处理；遮挡隐藏者不产生流送请求（不为看不见的物体预热页）。
 /// - **容量退化（确定性，按查询序）**：选中 run 数或簇数超出单帧预算
-///   ⇒ 该实例退化为单条全叶 run（像素正确，仅放弃简化收益）；全叶也
-///   装不下 ⇒ 跳过实例 + warn（与 R85 口径一致）。
+///   ⇒ 该实例退化为单条全叶 run（流送帧再做整块驻留门控——页缺则跳
+///   过）；全叶也装不下 ⇒ 跳过实例 + warn（与 R85 口径一致）。
 /// - **确定性**：条目序 = 查询序（存储插入序，全仓既有口径）× run 升序；
 ///   全局簇号 = 实例前缀和 + run 内局部号——剔除端逐簇独立裁决，
 ///   紧凑序 = 本帧枚举序升序（stable）。
@@ -2597,12 +2642,20 @@ fn collect_meshlet_instances(
     frustum: &Frustum,
     slots: &[Option<MeshletArenaSlot>],
     lod: Option<MeshletLodFrameParams>,
+    stream_threshold: Option<f32>,
+    resident_pages: Option<&std::collections::BTreeSet<u32>>,
+    occ_collect: bool,
+    occ_hidden: &std::collections::HashSet<u64>,
     out: &mut MeshletFrame,
 ) {
     out.entries.clear();
     out.handles.clear();
     out.run_starts.clear();
     out.total_clusters = 0;
+    out.stream_requests.clear();
+    out.occ_aabbs.clear();
+    out.occ_entities.clear();
+    out.occ_hidden_count = 0;
     let mut warned_instances = false;
     let mut warned_clusters = false;
     let mut warned_lod_overflow = false;
@@ -2643,10 +2696,62 @@ fn collect_meshlet_instances(
             return;
         }
 
+        // 遮挡查询条目（R87）：先于流送 / 隐藏跳过——持续重查是恢复
+        // 可见的唯一路径；AABB = 簇联合盒（局部）过模型矩阵的保守
+        // 世界盒（R53 world_aabb 同式）。
+        if occ_collect {
+            let (umin, umax) = slot.cluster_union;
+            let (lo, hi) = world_aabb(Vec3::from(umin), Vec3::from(umax), &model);
+            out.occ_aabbs.push(AabbInstanceRaw {
+                min: [lo.x, lo.y, lo.z, 0.0],
+                max: [hi.x, hi.y, hi.z, 0.0],
+            });
+            let bits = e.to_bits();
+            out.occ_entities.push(bits);
+            if occ_hidden.contains(&bits) {
+                out.occ_hidden_count += 1;
+                return; // 被遮挡隐藏：整帧跳过（不进实例表 = 不进 cull dispatch 输入）
+            }
+        }
+
         // 本实例的选中 run 集（默认 = 单条全叶 run = R85 恒等表）。
         let leaf_count = slot.leaf_cluster_count;
         let mut runs: Vec<(u32, u32)> = vec![(0, leaf_count)];
-        if let Some(params) = &lod {
+        if let Some(threshold) = stream_threshold {
+            // 流送门控（R87）：驻留感知选择 + 理想集请求收集。视口参数
+            // 缺席（内部契约破坏，防御式）⇒ 保持全叶恒等表。
+            if let Some(params) = &lod {
+                let empty = crate::meshlet::MeshletHierarchy::default();
+                let hierarchy = slot.hierarchy.as_deref().unwrap_or(&empty);
+                let resident_set = resident_pages.expect("流送激活 ⇒ 驻留集在场");
+                let is_resident = |local: u32| resident_set.contains(&(slot.page_base + local));
+                let eye_local = model.inverse().transform_point3(params.eye);
+                let view = crate::meshlet::MeshletLodView {
+                    bounds_min: min,
+                    bounds_extent: max - min,
+                    eye_local,
+                    error_scale: scale,
+                    screen_height: params.screen_height,
+                    tan_half_fov: params.tan_half_fov,
+                };
+                let sel = crate::meshlet_stream::select_lod_cluster_ranges_resident(
+                    hierarchy,
+                    leaf_count,
+                    &view,
+                    threshold,
+                    &slot.pages,
+                    &is_resident,
+                );
+                for (local, err) in sel.requests {
+                    out.stream_requests.push((slot.page_base + local, err));
+                }
+                if sel.skipped || sel.ranges.is_empty() {
+                    // 根链全缺 ⇒ 实例整帧跳过（理想页已请求，页流入后恢复）
+                    return;
+                }
+                runs = sel.ranges;
+            }
+        } else if let Some(params) = &lod {
             if let Some(hierarchy) = &slot.hierarchy {
                 let eye_local = model.inverse().transform_point3(params.eye);
                 let view = crate::meshlet::MeshletLodView {
@@ -2691,7 +2796,18 @@ fn collect_meshlet_instances(
                 warned_lod_overflow = true;
                 log::warn!("LOD 选中 run 超出单帧实例表 / 簇预算，该实例退化为全叶绘制");
             }
-            runs = vec![(0, leaf_count)];
+            if stream_threshold.is_some() {
+                // 流送帧：全叶 run 也必须过驻留门（页缺 ⇒ 跳过——退化
+                // 不越预算边界，驻留语义优先于绘制收益）。
+                let resident_set = resident_pages.expect("流送激活 ⇒ 驻留集在场");
+                let is_resident = |local: u32| resident_set.contains(&(slot.page_base + local));
+                match crate::meshlet_stream::gate_full_leaf(&slot.pages, leaf_count, &is_resident) {
+                    Some(gated) => runs = gated,
+                    None => return,
+                }
+            } else {
+                runs = vec![(0, leaf_count)];
+            }
         }
 
         let raw = InstanceRaw::from_matrix(model);
@@ -3800,6 +3916,11 @@ impl Renderer {
             meshlet_last_handles: Vec::new(),
             meshlet_frame_scratch: MeshletFrame::default(),
             meshlet_last_run_starts: Vec::new(),
+            meshlet_stream: None,
+            meshlet_stream_requests: Vec::new(),
+            meshlet_stream_recover_upload: false,
+            meshlet_occ_aabb_scratch: Vec::new(),
+            meshlet_occ_entity_scratch: Vec::new(),
             particle_v2_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
@@ -5410,9 +5531,14 @@ impl Renderer {
         // meshlet 注册 + 读回消费（R85）：arena 追加（变更时上传）与上一帧
         // 紧凑结果的非阻塞消费（遮挡同款协议）。资源缺席 / 无实体 = 两者
         // 皆零开销（缺席语义：零 dispatch、零回读、零绘制）。
+        // R87：流送激活裁决在此先行——预算在场 ⇒ 注册跳过整库数据上传
+        //（页数据由驻留 tick 逐页写入）。
+        let meshlet_stream_active = world
+            .try_resource::<crate::meshlet_stream::MeshletStreamSettings>()
+            .is_some_and(|s| s.gpu_byte_budget.is_some());
         let meshlet_store = world.try_resource::<crate::meshlet::MeshletMeshStore>();
         if let Some(store) = meshlet_store.as_deref() {
-            self.ensure_meshlet_world(store);
+            self.ensure_meshlet_world(store, meshlet_stream_active);
         }
         self.consume_meshlet_readback();
         // 暗角 / 景深 / 运动模糊的按需资源（全分辨率中间对 + blit 接入
@@ -6165,33 +6291,110 @@ impl Renderer {
             &mut particle_v2_items,
         );
         self.ensure_particle_v2_pools(&mut particle_v2_items);
-        // 2c''. meshlet 收集 + 帧上传 + 绘制裁决（R85；R86 LOD 选择）：
-        //       实例表条目（含全局簇号前缀；LOD 启用时 = 选中 run 集）与
-        //       兜底裁决（无有效紧凑回读 ⇒ CPU 写恒等列表全量绘制）。
-        //       hdr 不可变借用之前完成全部 &mut 操作（上传 / 默认材质
-        //       预热），计划贯穿主 pass 与 compute 编码。
+        // 2c''. meshlet 收集 + 帧上传 + 绘制裁决（R85；R86 LOD 选择；
+        //       R87 流送门控 + 遮挡查询条目）：实例表条目（含全局簇号
+        //       前缀）与兜底裁决（无有效紧凑回读 ⇒ CPU 写恒等列表全量
+        //       绘制）。hdr 不可变借用之前完成全部 &mut 操作（tick /
+        //       上传 / 默认材质预热），计划贯穿主 pass 与 compute 编码。
         let mut meshlet_plan: Option<MeshletDrawPlan> = None;
+        let mut meshlet_occ_hidden = 0u32;
         if let Some(store) = meshlet_store.as_deref() {
             if !store.is_empty() {
+                // R87 流送激活裁决：设置在场且预算 Some；缺席 / None =
+                // 全驻留 = R86 行为逐位不变（页表仍随注册构建，但不门
+                // 控、不逐页上传）。active → inactive 迁移 ⇒ 驻留状态
+                // 作废 + 下次注册整库重传（页可能已被逐出 arena）。
+                let stream_settings =
+                    world.try_resource::<crate::meshlet_stream::MeshletStreamSettings>();
+                let stream_active = stream_settings
+                    .as_ref()
+                    .is_some_and(|s| s.gpu_byte_budget.is_some());
+                if !stream_active && self.meshlet_stream.is_some() {
+                    self.meshlet_stream = None;
+                    self.meshlet_stream_requests.clear();
+                    self.meshlet_stream_recover_upload = true;
+                }
+                if stream_active && self.meshlet_stream.is_none() {
+                    self.meshlet_stream = Some(crate::meshlet_stream::ResidencyManager::new());
+                }
                 // LOD 设置（R86）：资源缺席 / enabled = false ⇒ 参数不
-                // 组装 = 全叶表（R85 行为逐位不变）。
-                let lod = world
+                // 组装 = 全叶表（R85 行为逐位不变）。流送激活时参数必
+                // 须在场（选择视口）——阈值取 LOD 设置（启用时），否则
+                // 0（全叶理想：选择必下钻到叶组，页缺再逐组回退）。
+                let lod_on = world
                     .try_resource::<crate::meshlet::MeshletLodSettings>()
-                    .filter(|s| s.enabled)
-                    .map(|s| MeshletLodFrameParams {
+                    .filter(|s| s.enabled);
+                let lod = if lod_on.is_some() || stream_active {
+                    Some(MeshletLodFrameParams {
                         eye,
                         screen_height: height.max(1) as f32,
                         tan_half_fov: (fov * 0.5).tan(),
-                        threshold_px: s.threshold_px,
-                    });
+                        threshold_px: lod_on.map(|s| s.threshold_px).unwrap_or(0.0),
+                    })
+                } else {
+                    None
+                };
+                // 驻留 tick（R87）：上一帧收集的请求 → 本帧上传 / 驱逐
+                // 裁决 → write_buffer 落 arena（随本次提交生效，本帧绘
+                // 制即可消费）。请求一帧延迟 = R85 紧凑回读的同款节拍。
+                let residency_ops = {
+                    let page_bytes = {
+                        let arena = &self.meshlet_arena;
+                        move |page: u32| -> u64 {
+                            for slot in arena.slots.iter().flatten() {
+                                let pc = slot.pages.page_count();
+                                if page >= slot.page_base && page < slot.page_base + pc {
+                                    return slot.pages.page_bytes(page - slot.page_base);
+                                }
+                            }
+                            0
+                        }
+                    };
+                    let requests = std::mem::take(&mut self.meshlet_stream_requests);
+                    match (
+                        self.meshlet_stream.as_mut(),
+                        stream_settings.as_ref().and_then(|s| s.gpu_byte_budget),
+                    ) {
+                        (Some(mgr), Some(budget)) => Some(
+                            mgr.tick(
+                                budget,
+                                stream_settings
+                                    .as_ref()
+                                    .map(|s| s.pages_per_frame)
+                                    .unwrap_or(4),
+                                &requests,
+                                &page_bytes,
+                            ),
+                        ),
+                        _ => None,
+                    }
+                };
+                if let Some(ops) = residency_ops.as_ref() {
+                    self.apply_residency_ops(store, ops);
+                }
                 let mut frame = std::mem::take(&mut self.meshlet_frame_scratch);
                 collect_meshlet_instances(
                     world,
                     &frustum,
                     &self.meshlet_arena.slots,
                     lod,
+                    stream_active.then(|| {
+                        world
+                            .try_resource::<crate::meshlet::MeshletLodSettings>()
+                            .filter(|s| s.enabled)
+                            .map(|s| s.threshold_px)
+                            .unwrap_or(0.0)
+                    }),
+                    self.meshlet_stream.as_ref().map(|m| m.resident()),
+                    occlusion_on,
+                    &self.occ_hidden,
                     &mut frame,
                 );
+                // 本帧请求 / 遮挡条目移交（下一帧 tick 与 2e 段的输入）
+                self.meshlet_stream_requests = std::mem::take(&mut frame.stream_requests);
+                self.meshlet_occ_aabb_scratch = std::mem::take(&mut frame.occ_aabbs);
+                self.meshlet_occ_entity_scratch = std::mem::take(&mut frame.occ_entities);
+                meshlet_occ_hidden = frame.occ_hidden_count;
                 if frame.total_clusters > 0 {
                     // 三角形统计的解析表（下一帧消费读回时按此对账）
                     self.meshlet_last_handles.clear();
@@ -6246,14 +6449,19 @@ impl Renderer {
         //     裁决只作用于主 pass 绘制（阴影 / 深度副本保留，保守性论证
         //     见 occlusion.rs），且仅在上一帧查询的新鲜结果上生效。
         //     items 序 = 排序后确定序 ⇒ 查询槽 ↔ 实体映射稳定（确定性）。
+        //     R87：meshlet 实体的簇联合盒条目追加在普通实例之后（收集
+        //     序 = 查询序，映射同样稳定）；4096 上限对合并列表统一封顶，
+        //     尾部不查询恒可见（保守方向）。
         let mut occ_drawn = std::mem::take(&mut self.occ_drawn_scratch);
         let mut occ_aabbs = std::mem::take(&mut self.occ_aabb_scratch);
         let mut occ_entities = std::mem::take(&mut self.occ_entity_scratch);
+        let meshlet_occ_aabbs = std::mem::take(&mut self.meshlet_occ_aabb_scratch);
+        let meshlet_occ_entities = std::mem::take(&mut self.meshlet_occ_entity_scratch);
         occ_drawn.clear();
         occ_aabbs.clear();
         occ_entities.clear();
         let mut occ_filtered = false;
-        if occlusion_on && total > 0 {
+        if occlusion_on && (total > 0 || !meshlet_occ_aabbs.is_empty()) {
             self.ensure_occ_gpu();
             for item in items.iter().take(wgpu::QUERY_SET_MAX_QUERIES as usize) {
                 let Some((min, max)) = mesh_store
@@ -6273,6 +6481,13 @@ impl Renderer {
                 });
                 occ_entities.push(item.entity);
             }
+            for (&aabb, &entity) in meshlet_occ_aabbs.iter().zip(meshlet_occ_entities.iter()) {
+                if occ_aabbs.len() >= wgpu::QUERY_SET_MAX_QUERIES as usize {
+                    break;
+                }
+                occ_aabbs.push(aabb);
+                occ_entities.push(entity);
+            }
             if occ_fresh && !self.occ_hidden.is_empty() {
                 occ_drawn.resize(items.len(), true);
                 let mut culled_now = 0u32;
@@ -6282,6 +6497,9 @@ impl Renderer {
                         culled_now += 1;
                     }
                 }
+                // meshlet 侧的隐藏裁决发生在收集期（occ_hidden 同源——
+                // 本帧 tick 已消费的读回结果），这里只并入统计口径。
+                culled_now += meshlet_occ_hidden;
                 self.stats.culled_instances += culled_now;
                 self.stats.occlusion_culled = culled_now;
                 occ_filtered = true;
@@ -8382,6 +8600,8 @@ impl Renderer {
         self.occ_drawn_scratch = occ_drawn;
         self.occ_aabb_scratch = occ_aabbs;
         self.occ_entity_scratch = occ_entities;
+        self.meshlet_occ_aabb_scratch = meshlet_occ_aabbs;
+        self.meshlet_occ_entity_scratch = meshlet_occ_entities;
         self.decal_scratch = decal_items;
         self.particle_scratch = particle_instances;
         self.particle_alpha_scratch = particle_alpha;
@@ -8717,7 +8937,53 @@ impl Renderer {
     /// 有效；顶点 / 索引容量不足时重建缓冲 + 全量重传（注册期低频）+
     /// 重建绘制绑定组（旧缓冲随重建作废）。全部句柄已登记时零上传零
     /// 开销（每帧调用安全）。
-    fn ensure_meshlet_world(&mut self, store: &crate::meshlet::MeshletMeshStore) {
+    ///
+    /// R87：注册期同时构建页划分表（容器 v3 随附优先，v1/v2 按同参数
+    /// 现算——逐位等价）、页号全局基址与簇 bounds 联合盒（遮挡查询的
+    /// 实例 AABB）。`stream_active` = 流送预算在场：真 ⇒ **跳过整库数
+    /// 据上传**（页数据按驻留裁决逐页 `write_buffer`；缓冲容量照常预
+    /// 留——页槽 = arena 规范区间，VRAM 全量预留是 v1 诚实限制）；假
+    /// ⇒ 整库上传照旧（R86 逐位不变）。流送 → 非流送迁移
+    /// （`meshlet_stream_recover_upload`）在本函数头部整库重传——驻留
+    /// 期间页可能被逐出 arena，非流送路径要求全量有效。
+    fn ensure_meshlet_world(
+        &mut self,
+        store: &crate::meshlet::MeshletMeshStore,
+        stream_active: bool,
+    ) {
+        // R87 迁移重传：先于「无新句柄」早退——迁移帧即使无新网格也补。
+        if self.meshlet_stream_recover_upload {
+            self.meshlet_stream_recover_upload = false;
+            if let Some(mg) = self.meshlet_gpu.as_ref() {
+                for (handle, slot) in self.meshlet_arena.slots.iter().enumerate() {
+                    let Some(slot) = slot else { continue };
+                    let Some(mesh) = store.get(crate::meshlet::MeshletMeshHandle(handle as u32))
+                    else {
+                        continue;
+                    };
+                    self.gpu.queue.write_buffer(
+                        &mg.cluster_words_buf,
+                        slot.cluster_base as u64
+                            * std::mem::size_of::<crate::meshlet::MeshletClusterRaw>() as u64,
+                        bytemuck::cast_slice(&mesh.clusters),
+                    );
+                    let v0 = slot.vertex_base as usize * 2;
+                    let v1 = v0 + mesh.vertices.len() * 2;
+                    self.gpu.queue.write_buffer(
+                        &mg.vertex_buf,
+                        slot.vertex_base as u64 * 32,
+                        bytemuck::cast_slice(&self.meshlet_arena.words[v0..v1]),
+                    );
+                    let i0 = slot.index_base as usize;
+                    let i1 = i0 + mesh.indices.len();
+                    self.gpu.queue.write_buffer(
+                        &mg.index_buf,
+                        slot.index_base as u64 * 4,
+                        bytemuck::cast_slice(&self.meshlet_arena.indices[i0..i1]),
+                    );
+                }
+            }
+        }
         if store.len() <= self.meshlet_arena.slots.len() {
             return; // 无新句柄（句柄只追加，登记数单调追赶目录长度）
         }
@@ -8726,6 +8992,13 @@ impl Renderer {
         let mut new_indices: Vec<u32> = Vec::new();
         let mut new_cluster_bytes: Vec<u8> = Vec::new();
         let mut total_clusters = self.cluster_count();
+        let mut page_base = self
+            .meshlet_arena
+            .slots
+            .iter()
+            .flatten()
+            .map(|s| s.pages.page_count())
+            .sum::<u32>();
         let mut base_vertex = self.meshlet_arena.words.len() as u32 / 2;
         let mut base_index = self.meshlet_arena.indices.len() as u32;
         for handle in self.meshlet_arena.slots.len()..store.len() {
@@ -8761,9 +9034,35 @@ impl Renderer {
             };
             let cluster_triangles: Vec<u8> =
                 mesh.clusters.iter().map(|c| c.triangle_count).collect();
+            // 页表（R87）：容器 v3 随附的划分表优先；v1/v2 / 内存态网格
+            // 按同参数现算（纯派生，与构建期写入逐位等价）。
+            let pages = std::sync::Arc::new(mesh.pages.clone().unwrap_or_else(|| {
+                crate::meshlet_stream::MeshletPageTable::derive(
+                    mesh,
+                    crate::meshlet_stream::MESHLET_PAGE_CLUSTERS,
+                )
+            }));
+            // 簇 bounds 联合（R87 遮挡整合）：全部簇包围球的联合 AABB
+            //（网格局部空间；球心 = 归一化 × extent + min，半径世界单
+            // 位）。min/max 精确无累加舍入，扫描序 = 簇构建序（确定）。
+            let mut umin = Vec3::splat(f32::INFINITY);
+            let mut umax = Vec3::splat(f32::NEG_INFINITY);
+            let min_v = Vec3::from(min);
+            let extent_v = Vec3::from(extent);
+            for c in &mesh.clusters {
+                let center = min_v + Vec3::new(c.bounds[0], c.bounds[1], c.bounds[2]) * extent_v;
+                let r = c.bounds[3];
+                umin = umin.min(center - Vec3::splat(r));
+                umax = umax.max(center + Vec3::splat(r));
+            }
             new_words.extend(crate::meshlet::vertex_storage_words(&mesh.vertices));
             new_indices.extend(mesh.indices.iter().copied());
             new_cluster_bytes.extend_from_slice(bytemuck::cast_slice(&mesh.clusters));
+            // 全局页基址 = 本网格之前累计的页数（先取值后累加——基址指向
+            // 本网格首个页；写反会与后一网格的页号区间重叠，驻留集的
+            // FALSE POSITIVE 让未上传页以全零数据参与绘制）。
+            let slot_page_base = page_base;
+            page_base += pages.page_count();
             new_slots.push(Some(MeshletArenaSlot {
                 vertex_base: base_vertex,
                 index_base: base_index,
@@ -8774,6 +9073,9 @@ impl Renderer {
                 bounds_min: min,
                 bounds_extent: extent,
                 cluster_triangles,
+                page_base: slot_page_base,
+                pages,
+                cluster_union: (umin.to_array(), umax.to_array()),
             }));
             base_vertex += mesh.vertices.len() as u32;
             base_index += mesh.indices.len() as u32;
@@ -8787,7 +9089,10 @@ impl Renderer {
         let words_offset = self.meshlet_arena.words.len() as u64 * 16;
         let index_offset = self.meshlet_arena.indices.len() as u64 * 4;
         // 顶点 / 索引容量检查：不足 = 重建 + 旧数据全量重传 + 重建设计侧
-        // 绑定组（compute 绑定组不引用这两个缓冲，无需重建）
+        // 绑定组（compute 绑定组不引用这两个缓冲，无需重建）。
+        // 流送激活时重建只分配不回传（页数据按驻留逐页上传——全量回传会
+        // 绕过预算）；**已在驻留的页由本函数尾部的重建补传还原**（见那里
+        // 的论证：`tick` 不会重新请求已驻留页，不补传就是静默消失）。
         let needed_words = (self.meshlet_arena.words.len() + new_words.len()) as u64;
         let needed_indices = (self.meshlet_arena.indices.len() + new_indices.len()) as u64;
         let mut rebuilt = false;
@@ -8802,11 +9107,13 @@ impl Renderer {
                     mapped_at_creation: false,
                 });
                 mg.vertex_capacity_words = cap;
-                self.gpu.queue.write_buffer(
-                    &mg.vertex_buf,
-                    0,
-                    bytemuck::cast_slice(&self.meshlet_arena.words),
-                );
+                if !stream_active {
+                    self.gpu.queue.write_buffer(
+                        &mg.vertex_buf,
+                        0,
+                        bytemuck::cast_slice(&self.meshlet_arena.words),
+                    );
+                }
                 rebuilt = true;
             }
             if needed_indices > mg.index_capacity {
@@ -8818,11 +9125,13 @@ impl Renderer {
                     mapped_at_creation: false,
                 });
                 mg.index_capacity = cap;
-                self.gpu.queue.write_buffer(
-                    &mg.index_buf,
-                    0,
-                    bytemuck::cast_slice(&self.meshlet_arena.indices),
-                );
+                if !stream_active {
+                    self.gpu.queue.write_buffer(
+                        &mg.index_buf,
+                        0,
+                        bytemuck::cast_slice(&self.meshlet_arena.indices),
+                    );
+                }
                 rebuilt = true;
             }
         }
@@ -8859,24 +9168,50 @@ impl Renderer {
             });
             mg.draw_bgs = draw_bgs;
         }
-        // 追加上传（write_buffer 偏移均为 4 的倍数——48/16/4 天然满足）
+        // 追加上传（write_buffer 偏移均为 4 的倍数——48/16/4 天然满足）。
+        // 流送激活 = 逐页上传接管（数据落点 = 同一规范区间，页驻留裁决
+        // 通过后的 tick 中写入），此处跳过整库传。
         let mg = self.meshlet_gpu.as_ref().expect("GPU 资源束已创建");
-        self.gpu
-            .queue
-            .write_buffer(&mg.cluster_words_buf, cluster_offset, &new_cluster_bytes);
-        self.gpu.queue.write_buffer(
-            &mg.vertex_buf,
-            words_offset,
-            bytemuck::cast_slice(&new_words),
-        );
-        self.gpu.queue.write_buffer(
-            &mg.index_buf,
-            index_offset,
-            bytemuck::cast_slice(&new_indices),
-        );
+        if !stream_active {
+            self.gpu
+                .queue
+                .write_buffer(&mg.cluster_words_buf, cluster_offset, &new_cluster_bytes);
+            self.gpu.queue.write_buffer(
+                &mg.vertex_buf,
+                words_offset,
+                bytemuck::cast_slice(&new_words),
+            );
+            self.gpu.queue.write_buffer(
+                &mg.index_buf,
+                index_offset,
+                bytemuck::cast_slice(&new_indices),
+            );
+        }
         self.meshlet_arena.slots.extend(new_slots);
         self.meshlet_arena.words.extend(new_words);
         self.meshlet_arena.indices.extend(new_indices);
+        // 流送激活时的**重建补传**（R87）：顶点 / 索引 arena 被重建 ⇒ 新缓冲
+        // 零初始化，而驻留状态机仍认为旧页驻留——`ResidencyManager::tick`
+        // 只对**未驻留**页组队（`resident.contains` 短路），所以「后续请求
+        // 自然补传」不成立：不补传就是「静默消失」（簇元数据在定长缓冲里
+        // 完好 ⇒ cull 照报存活、顶点 / 索引全零 ⇒ 零面积三角、画面空而
+        // 统计不空）。按当前驻留集全量补传，保住「驻留集 ⇒ arena 字节有效」
+        // 这一选择端依赖的不变量。首帧注册时驻留集为空（管理器尚未创建），
+        // 本段天然零开销。
+        if rebuilt && stream_active {
+            let resident: Vec<u32> = self
+                .meshlet_stream
+                .as_ref()
+                .map(|m| m.resident().iter().copied().collect())
+                .unwrap_or_default();
+            if !resident.is_empty() {
+                let ops = crate::meshlet_stream::ResidencyOps {
+                    evict: Vec::new(),
+                    upload: resident,
+                };
+                self.apply_residency_ops(store, &ops);
+            }
+        }
     }
 
     /// 已登记的全局簇总数（arena 占用）。
@@ -8887,6 +9222,99 @@ impl Renderer {
             .flatten()
             .map(|s| s.cluster_count as usize)
             .sum()
+    }
+
+    /// 全局页号 →（网格槽位下标 = 句柄, 网格内局部页号）。
+    fn locate_meshlet_page(&self, page: u32) -> Option<(usize, u32)> {
+        for (si, slot) in self.meshlet_arena.slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            let pc = slot.pages.page_count();
+            if page >= slot.page_base && page < slot.page_base + pc {
+                return Some((si, page - slot.page_base));
+            }
+        }
+        None
+    }
+
+    /// 执行一帧驻留裁决（R87）：先逐 `evict`（页数据清零——非驻留页的
+    /// arena 区间不保留有效数据，预算的字节语义落在真实拷贝上），后传
+    /// `upload`（页数据从 [`crate::meshlet::MeshletMeshStore`] 写进
+    /// arena 的规范区间；簇 / 顶点词 / 索引三段）。页号失配（防御）静
+    /// 默跳过——注册期页基址记账与状态机共享同一来源，正规路径不触。
+    fn apply_residency_ops(
+        &self,
+        store: &crate::meshlet::MeshletMeshStore,
+        ops: &crate::meshlet_stream::ResidencyOps,
+    ) {
+        let Some(mg) = self.meshlet_gpu.as_ref() else {
+            return;
+        };
+        for &page in &ops.evict {
+            let Some((si, local)) = self.locate_meshlet_page(page) else {
+                continue;
+            };
+            let Some(Some(slot)) = self.meshlet_arena.slots.get(si) else {
+                continue;
+            };
+            let (c0, cc) = slot.pages.page_cluster_range(local);
+            let (vs, vc) = slot.pages.page_vertex_range(local);
+            let (is, ic) = slot.pages.page_index_range(local);
+            let zero_c =
+                vec![0u8; cc as usize * std::mem::size_of::<crate::meshlet::MeshletClusterRaw>()];
+            let zero_v = vec![0u8; vc as usize * std::mem::size_of::<crate::mesh::Vertex>()];
+            let zero_i = vec![0u8; ic as usize * 4];
+            self.gpu.queue.write_buffer(
+                &mg.cluster_words_buf,
+                (slot.cluster_base + c0) as u64
+                    * std::mem::size_of::<crate::meshlet::MeshletClusterRaw>() as u64,
+                &zero_c,
+            );
+            self.gpu.queue.write_buffer(
+                &mg.vertex_buf,
+                (slot.vertex_base + vs) as u64 * 32,
+                &zero_v,
+            );
+            self.gpu
+                .queue
+                .write_buffer(&mg.index_buf, (slot.index_base + is) as u64 * 4, &zero_i);
+        }
+        for &page in &ops.upload {
+            let Some((si, local)) = self.locate_meshlet_page(page) else {
+                continue;
+            };
+            let Some(Some(slot)) = self.meshlet_arena.slots.get(si) else {
+                continue;
+            };
+            let Some(mesh) = store.get(crate::meshlet::MeshletMeshHandle(si as u32)) else {
+                continue;
+            };
+            let (c0, cc) = slot.pages.page_cluster_range(local);
+            let (vs, vc) = slot.pages.page_vertex_range(local);
+            let (is, ic) = slot.pages.page_index_range(local);
+            let c0 = c0 as usize;
+            let cc = cc as usize;
+            let vs = vs as usize;
+            let vc = vc as usize;
+            let is = is as usize;
+            let ic = ic as usize;
+            self.gpu.queue.write_buffer(
+                &mg.cluster_words_buf,
+                (slot.cluster_base + c0 as u32) as u64
+                    * std::mem::size_of::<crate::meshlet::MeshletClusterRaw>() as u64,
+                bytemuck::cast_slice(&mesh.clusters[c0..c0 + cc]),
+            );
+            let words = crate::meshlet::vertex_storage_words(&mesh.vertices[vs..vs + vc]);
+            self.gpu.queue.write_buffer(
+                &mg.vertex_buf,
+                (slot.vertex_base + vs as u32) as u64 * 32,
+                bytemuck::cast_slice(&words),
+            );
+            self.gpu.queue.write_buffer(
+                &mg.index_buf,
+                (slot.index_base + is as u32) as u64 * 4,
+                bytemuck::cast_slice(&mesh.indices[is..is + ic]),
+            );
+        }
     }
 
     /// 消费上一帧的 meshlet 紧凑结果读回（遮挡 consume_occlusion_results

@@ -61,8 +61,29 @@
 //! - **单 LOD（R84/R85 口径）**——R86 起层级 LOD 在本文件落地（簇 DAG +
 //!   屏幕空间误差选择，见下节），但簇级 `error` 字段仍恒 0.0：误差记录
 //!   在**组级**（[`MeshletLodGroup`]），簇字段留待 GPU 侧选择启用；
-//! - **非流式加载**：整文件进内存，分页流送是 R87 的事（届时再做 pack
-//!   集成）。
+//! - **非流式加载（R84/R85/R86 口径）→ R87 起收窄为「GPU 显存分页」**：
+//!   IRML 整文件仍先读进内存（磁盘级异步 IO 不做），但页划分（IRML v3
+//!   页区段）+ 驻留状态机 + 驻留感知选择已落地（[`MeshletPageTable`] /
+//!   `meshlet_stream` 模块）——数据在内存的前提下按页上传 / 驱逐 /
+//!   门控绘制；pack 源的最小读取入口随 R87 兑现（`iris_engine::pack`）。
+//!
+//! # R87 分页流送（GPU 显存分页 + 驻留感知选择 + 遮挡整合）
+//!
+//! - **页划分**：固定簇数页（[`crate::meshlet_stream::MESHLET_PAGE_CLUSTERS`]），
+//!   构建期写进 IRML v3 页区段（页数 / 逐页顶点与索引区间 / 逐簇所属
+//!   层级组号，读侧与导出值逐字段核对）；v1/v2 文件照常读取，页表在
+//!   流送激活时按同参数现算（纯派生、逐位等价）；
+//! - **驻留管理**：[`crate::meshlet_stream::MeshletStreamSettings`] 资源
+//!   **缺席 / 预算 `None` = 全驻留 = R86 行为逐位不变**；有预算 ⇒ 页按
+//!   固定全序（粗层优先的偏离定稿见 `meshlet_stream` 模块头）分帧上传、
+//!   预算满时最低优先级让位、本帧请求页受保护（无抖动）；
+//! - **驻留感知选择**：[`crate::meshlet_stream::select_lod_cluster_ranges_resident`]
+//!   ——选中组页缺时沿 DAG 上取驻留父组，根链全缺 ⇒ 实例整帧跳过
+//!   （层级天然提供粗化回退，无缝洞）；
+//! - **遮挡整合（R53 两阶段，实体级）**：`MeshletInstance` 的实例 AABB
+//!   （簇 bounds 联合，注册期预计算）参与遮挡查询，被遮挡实体整帧
+//!   跳过（不进 cull dispatch 输入）；与流送正交——未驻留实例在选择
+//!   期已整帧跳过，遮挡路径不双重处理。逐簇 GPU 遮挡（Hi-Z 类）不做。
 //!
 //! # R86 层级 LOD（簇 DAG + 屏幕空间误差选择）
 //!
@@ -118,9 +139,10 @@
 //! # v1 诚实限制
 //!
 //! 见模块头 MVP 边界；另：容器无压缩（顶点 32 B / 索引 4 B 原样存储，
-//! 压缩随 R87 流送评估）、簇跨簇顶点不去重（meshlet 标准形态：簇间
-//! 边界顶点各簇各存一份，总量换缓存局部性）、CRC32 只防损坏不防篡改
-//! （与 pack 同一立场）。
+//! R87 评估后维持不压缩——页粒度流送下压缩会破坏「页 = 固定字节区间」
+//! 的直接寻址，留格式 v4 评估）、簇跨簇顶点不去重（meshlet 标准形态：
+//! 簇间边界顶点各簇各存一份，总量换缓存局部性）、CRC32 只防损坏不防
+//! 篡改（与 pack 同一立场）。
 
 use std::fmt;
 use std::fs::File;
@@ -131,6 +153,7 @@ use glam::Vec3;
 use iris_core::Resource;
 
 use crate::mesh::{MeshData, Vertex};
+use crate::meshlet_stream::{MESHLET_NO_GROUP, MeshletPageTable};
 
 /// 单簇三角形数上限。
 pub const MESHLET_CLUSTER_MAX_TRIANGLES: usize = 128;
@@ -349,6 +372,10 @@ pub struct MeshletMesh {
     pub clusters: Vec<MeshletClusterRaw>,
     /// 簇 DAG（R86）。空 = 单层：全部簇都是叶簇（R84/R85 语义）。
     pub hierarchy: MeshletHierarchy,
+    /// 页划分表（R87）。`None` = 未划分（v1/v2 容器 / 内存态手搓网格）
+    /// ——写出落 v1/v2 布局，流送激活时按 [`MESHLET_PAGE_CLUSTERS`]
+    /// 现算（与构建期写入逐位等价）。`Some` ⇒ 写出为 v3（页区段持久化）。
+    pub pages: Option<MeshletPageTable>,
 }
 
 impl MeshletMesh {
@@ -392,11 +419,15 @@ impl MeshletMesh {
 
     /// 写出为 IRML 字节流（含头 + CRC），返回总字节数。
     ///
-    /// 版本裁决（R86）：`hierarchy` 为空（单层）⇒ v1 字节布局（与 R84
-    /// 逐字节同构——单层容器零漂移）；带层级 ⇒ v2（36 B 头 + 组区段 +
-    /// 根区段）。「`--no-lod` 单层写出」因此天然落回 v1 布局。
+    /// 版本裁决（R87）：页表在场 ⇒ v3（40 B 头 + v2 区段 + 页区段——
+    /// 构建期页划分的持久化形态）；否则 `hierarchy` 为空（单层）⇒ v1
+    /// 字节布局（与 R84 逐字节同构——单层容器零漂移）；带层级 ⇒ v2
+    ///（36 B 头 + 组区段 + 根区段）。「`--no-lod` 单层写出」因此天然
+    /// 落回 v1 布局。
     pub fn write_to(&self, mut writer: impl Write) -> std::io::Result<u64> {
-        if self.hierarchy.groups.is_empty() {
+        if self.pages.is_some() {
+            self.write_v3(&mut writer)
+        } else if self.hierarchy.groups.is_empty() {
             self.write_v1(&mut writer)
         } else {
             self.write_v2(&mut writer)
@@ -410,9 +441,11 @@ impl MeshletMesh {
 
     /// 从内存字节解析（校验魔数 / 版本 / 长度 / CRC / 索引与簇范围）。
     ///
-    /// 版本矩阵（R86）：v1 = R84 单层布局（照常读取，层级为空 = 全叶）；
-    /// v2 = 层级布局（头 36 B + 组 / 根区段）；其余版本一律拒绝（R84
-    /// 语义——拒读而非误读）。
+    /// 版本矩阵（R87）：v1 = R84 单层布局（照常读取，层级为空 = 全叶，
+    /// 页表 = 无——流送激活时按同参数现算）；v2 = 层级布局（头 36 B +
+    /// 组 / 根区段，页表同 v1 现算）；v3 = v2 + 页区段（构建期页划分
+    /// 持久化，逐字段校验后原样载入）；其余版本一律拒绝（R84 语义——
+    /// 拒读而非误读）。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MeshletAssetError> {
         if bytes.len() < HEADER_LEN {
             return Err(MeshletAssetError::Corrupt(format!(
@@ -427,6 +460,7 @@ impl MeshletMesh {
         match version {
             VERSION_V1 => Self::decode_v1(bytes),
             VERSION => Self::decode_v2(bytes),
+            VERSION_V3 => Self::decode_v3(bytes),
             other => Err(MeshletAssetError::UnsupportedVersion(other)),
         }
     }
@@ -455,15 +489,32 @@ impl MeshletMesh {
             indices,
             clusters,
             hierarchy: MeshletHierarchy::default(),
+            pages: None,
         })
     }
 
     /// v2（R86 层级布局）解码：36 B 头（v1 字段 + 叶簇数 / 组数 / 根数）
     /// + 顶点 | 索引 | 簇 | 组 | 根。
     fn decode_v2(bytes: &[u8]) -> Result<Self, MeshletAssetError> {
-        if bytes.len() < HEADER_LEN_V2 {
+        let (mesh, _cursor) = Self::decode_v2_body(bytes, false)?;
+        Ok(mesh)
+    }
+
+    /// v3（R87 分页布局）解码：40 B 头（v2 头 + 每页簇数，CRC 后移）
+    /// + 顶点 | 索引 | 簇 | 组 | 根 | 页区段。
+    fn decode_v3(bytes: &[u8]) -> Result<Self, MeshletAssetError> {
+        let (mesh, _) = Self::decode_v2_body(bytes, true)?;
+        Ok(mesh)
+    }
+
+    /// v2 / v3 共享主体：头读取（长度按 `v3` 分档）+ 数据区 + 层级区段
+    ///（v3 续读页区段）。返回（网格, 数据区消费游标）。
+    fn decode_v2_body(bytes: &[u8], v3: bool) -> Result<(Self, usize), MeshletAssetError> {
+        let header_len = if v3 { HEADER_LEN_V3 } else { HEADER_LEN_V2 };
+        if bytes.len() < header_len {
             return Err(MeshletAssetError::Corrupt(format!(
-                "v2 文件不足 {HEADER_LEN_V2} B 头部长度（实际 {} B）",
+                "v{} 文件不足 {header_len} B 头部长度（实际 {} B）",
+                if v3 { 3 } else { 2 },
                 bytes.len()
             )));
         }
@@ -476,14 +527,20 @@ impl MeshletMesh {
         let leaf_cluster_count = read_u32(20);
         let group_count = read_u32(24) as usize;
         let root_count = read_u32(28) as usize;
-        let expected_crc = read_u32(32);
+        let clusters_per_page = if v3 { read_u32(32) } else { 0 };
+        let expected_crc = read_u32(if v3 { 36 } else { 32 });
         if group_count > 2 * MAX_MESHLET_CLUSTERS {
             return Err(MeshletAssetError::Corrupt(format!(
                 "组数 {group_count} 超出上限（2 × {MAX_MESHLET_CLUSTERS}）"
             )));
         }
-        let data = &bytes[HEADER_LEN_V2..];
-        let (vertices, indices, clusters, mut cursor) = Self::decode_common(
+        if v3 && clusters_per_page == 0 {
+            return Err(MeshletAssetError::Corrupt(
+                "每页簇数为 0（页划分无意义）".to_string(),
+            ));
+        }
+        let data = &bytes[header_len..];
+        let (vertices, indices, clusters, cursor) = Self::decode_common(
             data,
             vertex_count,
             index_count,
@@ -505,81 +562,10 @@ impl MeshletMesh {
         }
         // 组区段：变长记录（children 数 + children + 定长字段），全程
         // 边界校验；CRC 兜底损坏，「结构合法但语义错位」在此拦死。
-        let mut groups = Vec::with_capacity(group_count);
-        for g in 0..group_count {
-            let read_u32 = |offset: usize| {
-                u32::from_le_bytes(data[offset..offset + 4].try_into().expect("组字段 4 字节"))
-            };
-            let read_f32 = |offset: usize| {
-                f32::from_le_bytes(data[offset..offset + 4].try_into().expect("组字段 4 字节"))
-            };
-            if cursor + 4 > data.len() {
-                return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
-            }
-            let children_len = read_u32(cursor) as usize;
-            cursor += 4;
-            if children_len > group_count {
-                return Err(MeshletAssetError::Corrupt(format!(
-                    "组 #{g} 子组数 {children_len} 超出组总数 {group_count}"
-                )));
-            }
-            if cursor + children_len * 4 + 32 > data.len() {
-                return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
-            }
-            let mut children = Vec::with_capacity(children_len);
-            for slot in 0..children_len {
-                let child = read_u32(cursor + slot * 4);
-                // 「子组号 < 父组号」不变量（构建层序；见 MeshletHierarchy
-                // 文档）——越界引用与回边在此拦死，遍历深度天然有界。
-                if child as usize >= g {
-                    return Err(MeshletAssetError::Corrupt(format!(
-                        "组 #{g} 子组号 {child} 越界（必须 < {g}）"
-                    )));
-                }
-                children.push(child);
-            }
-            cursor += children_len * 4;
-            let cluster_start = read_u32(cursor);
-            let cluster_range = read_u32(cursor + 4);
-            let own_error = read_f32(cursor + 8);
-            let group_error = read_f32(cursor + 12);
-            let bounds = [
-                read_f32(cursor + 16),
-                read_f32(cursor + 20),
-                read_f32(cursor + 24),
-                read_f32(cursor + 28),
-            ];
-            cursor += 32;
-            if cursor + 16 > data.len() {
-                return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
-            }
-            let cone_axis = [read_f32(cursor), read_f32(cursor + 4), read_f32(cursor + 8)];
-            let cone_cutoff_cos = read_f32(cursor + 12);
-            cursor += 16;
-            if cluster_start as usize + cluster_range as usize > cluster_count {
-                return Err(MeshletAssetError::Corrupt(format!(
-                    "组 #{g} 簇范围越界：{} + {} > {cluster_count}",
-                    cluster_start, cluster_range
-                )));
-            }
-            if cluster_range == 0 {
-                return Err(MeshletAssetError::Corrupt(format!(
-                    "组 #{g} 自有簇数为 0（空组没有绘制语义）"
-                )));
-            }
-            groups.push(MeshletLodGroup {
-                children,
-                cluster_start,
-                cluster_count: cluster_range,
-                own_error,
-                group_error,
-                bounds,
-                cone_axis,
-                cone_cutoff_cos,
-            });
-        }
-        // 根区段 + 长度精确闭合（尾随垃圾 = 损坏）。
-        if cursor + root_count * 4 != data.len() {
+        let (groups, mut cursor) = decode_group_section(data, group_count, cluster_total, cursor)?;
+        // 根区段 + 长度闭合：v2 在根区段后精确闭合（尾随垃圾 = 损坏，
+        // 校验先于根解析 = R86 错误优先级）；v3 在页区段后闭合。
+        if !v3 && cursor + root_count * 4 != data.len() {
             return Err(MeshletAssetError::Corrupt(format!(
                 "数据区长度不符：组/根区段消费 {} B，实际 {} B",
                 cursor + root_count * 4,
@@ -603,7 +589,30 @@ impl MeshletMesh {
                 "层级非空但根列表为空（选择无从遍历）".to_string(),
             ));
         }
-        Ok(Self {
+        // v3 页区段：页数 + 逐页（顶点 / 索引）区间 + 逐簇组号——全部
+        // 与簇元数据 / 层级的导出值核对（可导出字段的错位在此拦死）。
+        let pages = if v3 {
+            let table = decode_page_section(
+                data,
+                &mut cursor,
+                &clusters,
+                clusters_per_page,
+                group_count,
+                &groups,
+            )?;
+            Some(table)
+        } else {
+            None
+        };
+        if cursor != data.len() {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "数据区长度不符：{}区段消费 {} B，实际 {} B",
+                if v3 { "组/根/页" } else { "组/根" },
+                cursor,
+                data.len()
+            )));
+        }
+        let mesh = Self {
             vertices,
             indices,
             clusters,
@@ -612,7 +621,9 @@ impl MeshletMesh {
                 roots,
                 leaf_cluster_count,
             },
-        })
+            pages,
+        };
+        Ok((mesh, cursor + header_len))
     }
 
     /// v1 / v2 共享的顶点 | 索引 | 簇区段解码（R84 校验链逐条保留：
@@ -814,8 +825,81 @@ impl MeshletMesh {
             "IRML v2 组数计数字段超出防护上限"
         );
         let mut data = self.encode_data_region();
-        // 组区段：children 数 | children | 簇范围×2 | 误差×2 | bounds×4
-        //         | cone_axis×3 | cutoff（全 LE，与 decode_v2 逐字段对偶）。
+        data.extend_from_slice(&self.encode_hierarchy_region());
+        for &root in &self.hierarchy.roots {
+            data.extend_from_slice(&root.to_le_bytes());
+        }
+        writer.write_all(&MAGIC)?;
+        writer.write_all(&VERSION.to_le_bytes())?;
+        writer.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.indices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.clusters.len() as u32).to_le_bytes())?;
+        writer.write_all(&self.hierarchy.leaf_cluster_count.to_le_bytes())?;
+        writer.write_all(&(self.hierarchy.groups.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.hierarchy.roots.len() as u32).to_le_bytes())?;
+        writer.write_all(&crc32(&data).to_le_bytes())?;
+        writer.write_all(&data)?;
+        Ok(HEADER_LEN_V2 as u64 + data.len() as u64)
+    }
+
+    /// v3 写出（R87 分页布局，40 B 头 + 组区段 + 根区段 + 页区段）。
+    ///
+    /// 叶簇数归一：单层网格（空层级）的叶数写**簇总数**——读侧叶校验
+    /// 要求叶 ∈ [1, 簇总数]，而空层级的字段默认值是 0（R84 遗留）；
+    /// 归一只影响 v3 字节流，运行期 [`MeshletMesh::leaf_count`] 对空
+    /// 层级本就回落簇总数，语义零漂移。
+    fn write_v3(&self, mut writer: impl Write) -> std::io::Result<u64> {
+        let pages = self.pages.as_ref().expect("v3 写出前提：页表在场");
+        assert!(
+            self.hierarchy.groups.len() <= 2 * MAX_MESHLET_CLUSTERS,
+            "IRML v3 组数计数字段超出防护上限"
+        );
+        assert!(
+            pages.cluster_count() as usize == self.clusters.len()
+                && pages.cluster_group().len() == self.clusters.len(),
+            "页表与簇数组不一致（v3 写出前提破坏）"
+        );
+        let mut data = self.encode_data_region();
+        data.extend_from_slice(&self.encode_hierarchy_region());
+        for &root in &self.hierarchy.roots {
+            data.extend_from_slice(&root.to_le_bytes());
+        }
+        // 页区段：页数 + 逐页（顶点 / 索引）区间 + 逐簇组号（全 LE，
+        // 与 decode_v2_body 的页区段解析逐字段对偶）。
+        data.extend_from_slice(&pages.page_count().to_le_bytes());
+        for p in 0..pages.page_count() {
+            let (vs, vc) = pages.page_vertex_range(p);
+            let (is, ic) = pages.page_index_range(p);
+            data.extend_from_slice(&vs.to_le_bytes());
+            data.extend_from_slice(&vc.to_le_bytes());
+            data.extend_from_slice(&is.to_le_bytes());
+            data.extend_from_slice(&ic.to_le_bytes());
+        }
+        for &g in pages.cluster_group() {
+            data.extend_from_slice(&g.to_le_bytes());
+        }
+        let leaf = if self.hierarchy.groups.is_empty() {
+            self.clusters.len() as u32
+        } else {
+            self.hierarchy.leaf_cluster_count
+        };
+        writer.write_all(&MAGIC)?;
+        writer.write_all(&VERSION_V3.to_le_bytes())?;
+        writer.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.indices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.clusters.len() as u32).to_le_bytes())?;
+        writer.write_all(&leaf.to_le_bytes())?;
+        writer.write_all(&(self.hierarchy.groups.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.hierarchy.roots.len() as u32).to_le_bytes())?;
+        writer.write_all(&pages.clusters_per_page().to_le_bytes())?;
+        writer.write_all(&crc32(&data).to_le_bytes())?;
+        writer.write_all(&data)?;
+        Ok(HEADER_LEN_V3 as u64 + data.len() as u64)
+    }
+
+    /// 组区段编码（v2 / v3 共享，逐字节同构）。
+    fn encode_hierarchy_region(&self) -> Vec<u8> {
+        let mut data = Vec::new();
         for g in &self.hierarchy.groups {
             data.extend_from_slice(&(g.children.len() as u32).to_le_bytes());
             for &child in &g.children {
@@ -833,20 +917,7 @@ impl MeshletMesh {
             }
             data.extend_from_slice(&g.cone_cutoff_cos.to_le_bytes());
         }
-        for &root in &self.hierarchy.roots {
-            data.extend_from_slice(&root.to_le_bytes());
-        }
-        writer.write_all(&MAGIC)?;
-        writer.write_all(&VERSION.to_le_bytes())?;
-        writer.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
-        writer.write_all(&(self.indices.len() as u32).to_le_bytes())?;
-        writer.write_all(&(self.clusters.len() as u32).to_le_bytes())?;
-        writer.write_all(&self.hierarchy.leaf_cluster_count.to_le_bytes())?;
-        writer.write_all(&(self.hierarchy.groups.len() as u32).to_le_bytes())?;
-        writer.write_all(&(self.hierarchy.roots.len() as u32).to_le_bytes())?;
-        writer.write_all(&crc32(&data).to_le_bytes())?;
-        writer.write_all(&data)?;
-        Ok(HEADER_LEN_V2 as u64 + data.len() as u64)
+        data
     }
 
     /// 打开磁盘上的 IRML 文件（整文件读入——非流式，见模块头）。
@@ -1247,19 +1318,221 @@ pub fn select_lod_clusters(
 /// 文件头魔数（"IRML" = IRis MeshLet）。
 const MAGIC: [u8; 4] = *b"IRML";
 
-/// 当前格式版本（R86 起为 2 = 层级布局）。reader 按版本分支：v1（R84
-/// 单层布局）照常读取（层级置空 = 全叶），v2 读取组 / 根区段，其余版本
+/// 组区段解码（v2 / v3 共享，与 write 侧 `encode_hierarchy_region`
+/// 逐字段对偶）：children 数 + children + 簇范围 ×2 + 误差 ×2 +
+/// bounds ×4 + cone_axis ×3 + cutoff，全程边界校验；CRC 兜底损坏，
+/// 「结构合法但语义错位」在此拦死。返回（组表, 消费后游标）。
+fn decode_group_section(
+    data: &[u8],
+    group_count: usize,
+    cluster_total: u32,
+    mut cursor: usize,
+) -> Result<(Vec<MeshletLodGroup>, usize), MeshletAssetError> {
+    let mut groups = Vec::with_capacity(group_count);
+    for g in 0..group_count {
+        let read_u32 = |offset: usize| {
+            u32::from_le_bytes(data[offset..offset + 4].try_into().expect("组字段 4 字节"))
+        };
+        let read_f32 = |offset: usize| {
+            f32::from_le_bytes(data[offset..offset + 4].try_into().expect("组字段 4 字节"))
+        };
+        if cursor + 4 > data.len() {
+            return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
+        }
+        let children_len = read_u32(cursor) as usize;
+        cursor += 4;
+        if children_len > group_count {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "组 #{g} 子组数 {children_len} 超出组总数 {group_count}"
+            )));
+        }
+        if cursor + children_len * 4 + 32 > data.len() {
+            return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
+        }
+        let mut children = Vec::with_capacity(children_len);
+        for slot in 0..children_len {
+            let child = read_u32(cursor + slot * 4);
+            // 「子组号 < 父组号」不变量（构建层序；见 MeshletHierarchy
+            // 文档）——越界引用与回边在此拦死，遍历深度天然有界。
+            if child as usize >= g {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "组 #{g} 子组号 {child} 越界（必须 < {g}）"
+                )));
+            }
+            children.push(child);
+        }
+        cursor += children_len * 4;
+        let cluster_start = read_u32(cursor);
+        let cluster_range = read_u32(cursor + 4);
+        let own_error = read_f32(cursor + 8);
+        let group_error = read_f32(cursor + 12);
+        let bounds = [
+            read_f32(cursor + 16),
+            read_f32(cursor + 20),
+            read_f32(cursor + 24),
+            read_f32(cursor + 28),
+        ];
+        cursor += 32;
+        if cursor + 16 > data.len() {
+            return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
+        }
+        let cone_axis = [read_f32(cursor), read_f32(cursor + 4), read_f32(cursor + 8)];
+        let cone_cutoff_cos = read_f32(cursor + 12);
+        cursor += 16;
+        if cluster_start as usize + cluster_range as usize > cluster_total as usize {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "组 #{g} 簇范围越界：{} + {} > {cluster_total}",
+                cluster_start, cluster_range
+            )));
+        }
+        if cluster_range == 0 {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "组 #{g} 自有簇数为 0（空组没有绘制语义）"
+            )));
+        }
+        groups.push(MeshletLodGroup {
+            children,
+            cluster_start,
+            cluster_count: cluster_range,
+            own_error,
+            group_error,
+            bounds,
+            cone_axis,
+            cone_cutoff_cos,
+        });
+    }
+    Ok((groups, cursor))
+}
+
+/// 页区段解码（v3）：页数 + 逐页（顶点 / 索引）区间 + 逐簇组号。全部
+/// 字段与簇元数据 / 层级的**导出值**核对（可导出字段的错位在此拦死）：
+/// 页数必须恰为 `ceil(簇总数 / 每页簇数)`，逐页区间必须与簇拼接序导出
+/// 的区间逐字段一致，逐簇组号必须是哨兵或落在所指组的自有簇范围内。
+/// 解析后游标前移（调用方据此做数据区闭合校验）。
+fn decode_page_section(
+    data: &[u8],
+    cursor: &mut usize,
+    clusters: &[MeshletClusterRaw],
+    clusters_per_page: u32,
+    group_count: usize,
+    groups: &[MeshletLodGroup],
+) -> Result<MeshletPageTable, MeshletAssetError> {
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes(data[offset..offset + 4].try_into().expect("页字段 4 字节"))
+    };
+    let cluster_total = clusters.len() as u32;
+    let expect_pages = cluster_total.div_ceil(clusters_per_page) as usize;
+    if *cursor + 4 > data.len() {
+        return Err(MeshletAssetError::Corrupt("页区段截断".to_string()));
+    }
+    let page_count = read_u32(*cursor) as usize;
+    *cursor += 4;
+    if page_count != expect_pages {
+        return Err(MeshletAssetError::Corrupt(format!(
+            "页数 {page_count} 与簇划分不符（每页 {clusters_per_page} 簇、\
+             簇总数 {cluster_total} ⇒ 期望 {expect_pages} 页）"
+        )));
+    }
+    let mut page_vertex_start = Vec::with_capacity(page_count);
+    let mut page_vertex_count = Vec::with_capacity(page_count);
+    let mut page_index_start = Vec::with_capacity(page_count);
+    let mut page_index_count = Vec::with_capacity(page_count);
+    for p in 0..page_count {
+        if *cursor + 16 > data.len() {
+            return Err(MeshletAssetError::Corrupt(format!("页 #{p} 截断")));
+        }
+        let vs = read_u32(*cursor);
+        let vc = read_u32(*cursor + 4);
+        let is = read_u32(*cursor + 8);
+        let ic = read_u32(*cursor + 12);
+        *cursor += 16;
+        // 与簇元数据导出区间核对（区间衔接性 = 容器不变量的推论）。
+        let c0 = p as u32 * clusters_per_page;
+        let cc = clusters_per_page.min(cluster_total - c0);
+        let first = &clusters[c0 as usize];
+        let last = &clusters[(c0 + cc - 1) as usize];
+        let expect_vs = first.vertex_offset;
+        let expect_vc = last.vertex_offset + last.vertex_count as u32 - first.vertex_offset;
+        let expect_is = first.index_offset;
+        let expect_ic = last.index_offset + last.triangle_count as u32 * 3 - first.index_offset;
+        if vs != expect_vs || vc != expect_vc {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "页 #{p} 顶点区间与簇元数据不符：登记 {vs}+{vc}，导出 \
+                 {expect_vs}+{expect_vc}"
+            )));
+        }
+        if is != expect_is || ic != expect_ic {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "页 #{p} 索引区间与簇元数据不符：登记 {is}+{ic}，导出 \
+                 {expect_is}+{expect_ic}"
+            )));
+        }
+        page_vertex_start.push(vs);
+        page_vertex_count.push(vc);
+        page_index_start.push(is);
+        page_index_count.push(ic);
+    }
+    let mut cluster_group = Vec::with_capacity(clusters.len());
+    for c in 0..clusters.len() {
+        if *cursor + 4 > data.len() {
+            return Err(MeshletAssetError::Corrupt("簇组号区段截断".to_string()));
+        }
+        let g = read_u32(*cursor);
+        *cursor += 4;
+        if g != MESHLET_NO_GROUP {
+            if g as usize >= group_count {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "簇 #{c} 组号 {g} 越界（组总数 {group_count}）"
+                )));
+            }
+            let grp = &groups[g as usize];
+            let in_range =
+                c as u32 >= grp.cluster_start && (c as u32) < grp.cluster_start + grp.cluster_count;
+            if !in_range {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "簇 #{c} 组号 {g} 与组自有簇范围 {}+{} 不符",
+                    grp.cluster_start, grp.cluster_count
+                )));
+            }
+        }
+        cluster_group.push(g);
+    }
+    Ok(MeshletPageTable::from_parts(
+        clusters_per_page,
+        cluster_total,
+        page_vertex_start,
+        page_vertex_count,
+        page_index_start,
+        page_index_count,
+        cluster_group,
+    ))
+}
+
+/// 当前格式版本（R86 起为 2 = 层级布局；R87 起为 3 = 层级 + 页区段，
+/// 见 [`VERSION_V3`]）。reader 按版本分支：v1（R84 单层布局）照常读取
+/// （层级置空 = 全叶），v2 读取组 / 根区段，v3 另读页区段，其余版本
 /// 拒读而非误读（R84 语义——「将来升版时在此加逐版本分支」的落地面）。
 const VERSION: u32 = 2;
 
 /// v1（R84 单层布局）版本号——写出单层容器与读取历史文件共用。
 const VERSION_V1: u32 = 1;
 
+/// v3（R87 分页布局）版本号：v2 全部区段 + 页区段（构建期页划分的
+/// 持久化——页数 / 逐页顶点与索引区间 / 逐簇所属组号）。运行期页表
+/// 本可由簇元数据 + 层级纯导出，持久化的价值 = 划分参数（每页簇数）
+/// 随资产定稿 + 读侧免导出直接校验；v1/v2 文件照常读取，页表在流送
+/// 激活时按 [`crate::meshlet_stream::MESHLET_PAGE_CLUSTERS`] 现算
+///（与构建期写入逐位等价，见 `meshlet_stream` 单测）。
+const VERSION_V3: u32 = 3;
+
 /// v1 文件头固定长度：魔数 4 + 版本 4 + 顶点数 4 + 索引数 4 + 簇数 4 + CRC 4。
 const HEADER_LEN: usize = 24;
 
 /// v2 文件头固定长度：v1 头 + 叶簇数 4 + 组数 4 + 根数 4（CRC 随之后移）。
 const HEADER_LEN_V2: usize = 36;
+
+/// v3 文件头固定长度：v2 头 + 每页簇数 4（CRC 随之后移）。
+const HEADER_LEN_V3: usize = 40;
 
 /// CRC-32（IEEE 802.3，反射多项式 0xEDB88320），与 `iris-engine::pack`
 /// 同一定义（跨 crate 复制而非共享依赖：pack 在 iris-engine，反向依赖
@@ -1321,7 +1594,8 @@ impl fmt::Display for MeshletAssetError {
             Self::UnsupportedVersion(v) => {
                 write!(
                     f,
-                    "IRML 版本 {v} 不受支持（本实现支持版本 {VERSION_V1} 单层与 {VERSION} 层级）"
+                    "IRML 版本 {v} 不受支持（本实现支持版本 {VERSION_V1} 单层、\
+                     {VERSION} 层级与 {VERSION_V3} 分页）"
                 )
             }
             Self::Corrupt(what) => write!(f, "IRML 结构损坏：{what}"),
@@ -1587,8 +1861,9 @@ mod tests {
 
     /// 魔数不符 → BadMagic；版本不符 → UnsupportedVersion（拒绝而不是误读）。
     ///
-    /// R86 起版本矩阵 = {1, 2}（v1 单层照常读取 + v2 层级），版本 2 从
-    /// 拒绝名单移入兼容名单（原名单 [0, 2, 999] 的 2 位由 3 顶替）。
+    /// R87 起版本矩阵 = {1, 2, 3}（v1 单层照常读取 + v2 层级 + v3 分页），
+    /// 版本 3 从拒绝名单移入兼容名单（R86 同款先例：原名单 [0, 3, 999]
+    /// 的 3 位由 4 顶替）。
     #[test]
     fn container_rejects_bad_magic_and_wrong_version() {
         let mesh = sample_mesh();
@@ -1602,7 +1877,7 @@ mod tests {
             Err(MeshletAssetError::BadMagic)
         ));
 
-        for v in [0u32, 3, 999] {
+        for v in [0u32, 4, 999] {
             let mut bad_version = bytes.clone();
             bad_version[4..8].copy_from_slice(&v.to_le_bytes());
             assert!(
@@ -2420,6 +2695,131 @@ mod tests {
         assert!(matches!(
             MeshletMesh::from_bytes(&bytes),
             Err(MeshletAssetError::Corrupt(msg)) if msg.contains("组/根区段消费")
+        ));
+    }
+
+    // ---- R87：IRML v3 容器（页区段）----
+
+    /// v3 往返位级：带页表的层级网格写出版本 3（40 B 头）→ 读回全部
+    /// 字段（含页表 PartialEq）相等；单层网格带页表同样落 v3（叶数
+    /// 归一为簇总数）；二次写出逐字节一致（幂等）。
+    #[test]
+    fn container_v3_roundtrip_bit_exact() {
+        let mut mesh = lod_test_mesh();
+        mesh.pages = Some(crate::meshlet_stream::MeshletPageTable::derive(&mesh, 3));
+        let mut bytes = Vec::new();
+        let total = mesh.write_to(&mut bytes).expect("写出 v3");
+        assert_eq!(total, bytes.len() as u64);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            3,
+            "带页表 ⇒ 版本 3"
+        );
+        // v3 布局 = 头 40 + 数据区 1716 + 组 612 + 根 4 + 页区段
+        //   （页数 4 + 4 页 × 16 B + 逐簇组号 11 × 4 B = 112）
+        assert_eq!(
+            bytes.len(),
+            40 + 1056 + 132 + 528 + 612 + 4 + 112,
+            "v3 总长"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+            3,
+            "头内每页簇数 = 3"
+        );
+
+        let back = MeshletMesh::from_bytes(&bytes).expect("读回 v3");
+        assert_eq!(back.clusters, mesh.clusters);
+        assert_eq!(back.hierarchy.roots, mesh.hierarchy.roots);
+        assert_eq!(
+            back.hierarchy.leaf_cluster_count, mesh.hierarchy.leaf_cluster_count,
+            "层级非空 ⇒ 叶数字段原样"
+        );
+        assert_eq!(back.pages, mesh.pages, "页表逐字段相等（PartialEq 位级）");
+        assert_eq!(back.leaf_count(), mesh.leaf_count());
+
+        // 二次写出幂等（读回的叶数已归一，再写应得同一字节流）
+        let mut bytes2 = Vec::new();
+        back.write_to(&mut bytes2).expect("二次写出");
+        assert_eq!(bytes, bytes2, "v3 往返后写出必须幂等");
+
+        // 单层网格 + 页表 ⇒ 同样 v3，叶数字段归一为簇总数
+        let mut plain = sample_mesh();
+        plain.pages = Some(crate::meshlet_stream::MeshletPageTable::derive(&plain, 16));
+        let mut pb = Vec::new();
+        plain.write_to(&mut pb).expect("单层 v3");
+        assert_eq!(u32::from_le_bytes(pb[4..8].try_into().unwrap()), 3);
+        assert_eq!(
+            u32::from_le_bytes(pb[20..24].try_into().unwrap()),
+            2,
+            "单层叶数归一 = 簇总数"
+        );
+        let pback = MeshletMesh::from_bytes(&pb).expect("读回单层 v3");
+        assert!(pback.hierarchy.groups.is_empty(), "层级仍为空（单层语义）");
+        assert_eq!(pback.leaf_count(), 2, "空层级 leaf_count 回落簇总数");
+        assert_eq!(pback.pages, plain.pages);
+    }
+
+    /// v3 页区段语义校验：页数与划分不符 / 页区间与簇元数据不符 /
+    /// 逐簇组号越界 / 组号与组范围不符，全部 Corrupt 且可判别
+    ///（良构 v3 数据区按偏移改写 + CRC 现算）。
+    #[test]
+    fn container_v3_rejects_invalid_page_section() {
+        // 页区段在数据区内的偏移：顶点+索引+簇 1716 | 组 612 | 根 4。
+        let pages_off = 1716 + 612 + 4;
+        let craft = |patch: &dyn Fn(&mut [u8])| {
+            let mut mesh = lod_test_mesh();
+            mesh.pages = Some(crate::meshlet_stream::MeshletPageTable::derive(&mesh, 3));
+            let mut bytes = Vec::new();
+            mesh.write_to(&mut bytes).expect("写出良构 v3");
+            let mut data = bytes[40..].to_vec();
+            patch(&mut data);
+            let mut out = Vec::new();
+            out.extend_from_slice(&MAGIC);
+            out.extend_from_slice(&3u32.to_le_bytes());
+            out.extend_from_slice(&(mesh.vertices.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(mesh.indices.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(mesh.clusters.len() as u32).to_le_bytes());
+            out.extend_from_slice(&mesh.hierarchy.leaf_cluster_count.to_le_bytes());
+            out.extend_from_slice(&(mesh.hierarchy.groups.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(mesh.hierarchy.roots.len() as u32).to_le_bytes());
+            out.extend_from_slice(&3u32.to_le_bytes()); // 每页簇数
+            out.extend_from_slice(&crc32(&data).to_le_bytes());
+            out.extend_from_slice(&data);
+            out
+        };
+        // ① 页数与划分不符（4 页改为 5 页）
+        let bytes = craft(&mut |data| {
+            data[pages_off..pages_off + 4].copy_from_slice(&5u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("页数")
+        ));
+        // ② 首页顶点区间与簇元数据不符（vertex_start 改 999）
+        let bytes = craft(&mut |data| {
+            data[pages_off + 4..pages_off + 8].copy_from_slice(&999u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("顶点区间与簇元数据不符")
+        ));
+        // ③ 逐簇组号越界（簇 0 组号 99 ≥ 组总数 11）
+        let group_ids_off = pages_off + 4 + 4 * 16;
+        let bytes = craft(&mut |data| {
+            data[group_ids_off..group_ids_off + 4].copy_from_slice(&99u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("组号 99 越界")
+        ));
+        // ④ 组号与组自有簇范围不符（簇 0 指到根组 10——范围 [10, 11)）
+        let bytes = craft(&mut |data| {
+            data[group_ids_off..group_ids_off + 4].copy_from_slice(&10u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("组号 10 与组自有簇范围")
         ));
     }
 }

@@ -79,6 +79,7 @@ use iris_render::meshlet::{
     MESHLET_CLUSTER_MAX_TRIANGLES, MeshletClusterRaw, MeshletHierarchy, MeshletLodGroup,
     MeshletMesh, cluster_bounding_sphere, cluster_bounds_normalized, cluster_cone,
 };
+use iris_render::meshlet_stream::{MESHLET_PAGE_CLUSTERS, MeshletPageTable};
 
 /// V1 支持的网格形态：无蒙皮 / 切线 / 光照贴图 UV（容器只载标准 32 B
 /// 顶点）。不满足时用 [`build_meshlets_from_mesh_data`] 会断言拦截。
@@ -252,6 +253,9 @@ pub fn build_meshlets(vertices: &[Vertex], indices: &[u32]) -> MeshletMesh {
         mesh.clusters.push(cluster);
     }
 
+    // 页划分（R87）：构建期定稿并随产物携带（写出落 IRML v3 页区段；
+    // 渲染器注册期直接消费，v1/v2 旧产物按同参数现算等价）。
+    mesh.pages = Some(MeshletPageTable::derive(&mesh, MESHLET_PAGE_CLUSTERS));
     mesh
 }
 
@@ -832,6 +836,9 @@ pub fn build_meshlet_hierarchy_with_config(
         roots: level_groups,
         leaf_cluster_count: leaf_clusters,
     };
+    // 页划分重导出（R87）：层级构建追加了父簇，build_meshlets 阶段的
+    // 页表已过期——按最终簇布局 + 层级现算（含逐簇所属组号）。
+    mesh.pages = Some(MeshletPageTable::derive(&mesh, MESHLET_PAGE_CLUSTERS));
     mesh
 }
 

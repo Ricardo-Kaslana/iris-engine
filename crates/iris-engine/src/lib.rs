@@ -48,7 +48,7 @@ pub mod prelude {
     // 异步加载骨架（线程 / inline 双后端）
     pub use crate::async_loading::{AssetKind, AssetLoadError, AssetLoader, LoadRequest};
     pub use crate::manifest::{AssetManifest, ManifestEntry, ManifestError};
-    pub use crate::pack::{PackError, PackReader, PackWriter};
+    pub use crate::pack::{MeshletPackError, PackError, PackReader, PackWriter, read_meshlet};
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, CommandsPlugin, DayNightPlugin, DefaultPlugins,
         HierarchyPlugin, InputPlugin, ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin,

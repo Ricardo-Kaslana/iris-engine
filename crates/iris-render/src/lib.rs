@@ -105,6 +105,7 @@ pub mod lightmap;
 pub mod material;
 pub mod mesh;
 pub mod meshlet;
+pub mod meshlet_stream;
 pub mod occlusion;
 pub mod offscreen;
 pub mod particles;
@@ -202,6 +203,10 @@ pub mod prelude {
         MeshletMeshHandle, MeshletMeshStore, chunked_prefix_compact, cluster_bounding_sphere,
         cluster_bounds_normalized, cluster_cone, cluster_is_backfacing, mesh_bounds,
         select_lod_cluster_ranges_in, select_lod_clusters, vertex_storage_words,
+    };
+    pub use crate::meshlet_stream::{
+        MESHLET_NO_GROUP, MESHLET_PAGE_CLUSTERS, MeshletPageTable, MeshletStreamSettings,
+        ResidencyManager, ResidencyOps, ResidencySelection, select_lod_cluster_ranges_resident,
     };
     pub use crate::occlusion::OcclusionCulling;
     pub use crate::offscreen::OffscreenRenderer;
