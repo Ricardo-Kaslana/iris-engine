@@ -1,5 +1,6 @@
-//! DDGI 动态全局光照 v1（R88）：**规则探针网格** + **CPU 光线追踪的时间片
-//! 滚动重照明** + **深度感知混合**（chebyshev 单侧上界权重）。
+//! DDGI 动态全局光照（R88 v1 + R89 v2）：**规则探针网格** + **CPU 光线追踪
+//! 的时间片滚动重照明** + **深度感知混合**（chebyshev 单侧上界权重）+
+//! **覆盖度合成**（env 兜底连续羽化 + ambient 去双计，R89）。
 //!
 //! # 闭合的缺口
 //!
@@ -28,6 +29,13 @@
 //! 3. **深度感知混合**（[`ddgi_depth_weight`] + [`ddgi_blend`]，GPU 侧
 //!    `standard.wgsl::ddgi_irradiance`）：权重 = R83 的径向窗 × chebyshev
 //!    深度项，双剪枝（`radial > 0` 且 `w > 0`）后才做 9 项 SH 点积。
+//! 4. **覆盖度合成**（R89，[`ddgi_coverage`] + [`DDGI_COVER_FADE`]）：逐片元
+//!    的几何覆盖度 `cov = max_i clamp((r_i − d_i)/(r_i·0.25), 0, 1)`——
+//!    ①env ↔ GI 从硬 `select` 换成 `mix(env, gi, cov)`（修 §8.57⑱ 扇贝带：
+//!    影响半径并集的边界从断界变连续羽化）；②ambient 补光行
+//!    `× (1 − cov)`（修 §8.57⑬：`sky_color` 默认取 ambient ⇒ 同源天空底色
+//!    不再双计，按覆盖度分摊）。`cov = 1` 内区逐位等于 R88
+//!    （`mix(x, y, 1.0) = y` 精确恒等）。
 //!
 //! # 深度表的数据形态（决策 5 / 6 / 7）
 //!
@@ -101,10 +109,17 @@
 //! 10. 跨适配器位级不可保。
 //! 11. CPU 单线程内联重照明（未用 R73 分片并行——并行改累加序 ⇒ 需另做
 //!     固定分片归约序论证）。
-//! 12. 与光照贴图 / 反射探针 / SSR 的合成语义未修订（R89）。
-//! 13. `sky_color` 默认取 `DirectionalLight.ambient`，而 ambient 同时是
-//!     `standard.wgsl` 常量补光项的来源 ⇒ 同一旋钮两处消费、天空底色会双计
-//!     （配平手段：显式覆盖 `sky_color` 或调低 ambient）。
+//! 12. 与烘焙光照贴图**互斥是显式裁决**（R89 定稿，原「未修订」）：挂图集
+//!     的实体不发探针标志位 ⇒ 完全吃不到 DDGI；贴图已含 `sky + bounce`
+//!     （与 DDGI 同一份贡献），同一空间两套静态/动态 GI 二选一、相加即
+//!     双计。差值法（贴图静态 + DDGI 动态增量）已裁定拒绝（决策 9）。
+//!     镜面仍走反射探针 → SSR → env 的既有链路；SSR 读的上帧颜色 =
+//!     主解析缓冲帧尾副本（含全部 GI）⇒ SSR × DDGI 一致性天然成立（R89
+//!     锚 `ssr_reflects_ddgi_gi_bitwise`）。
+//! 13. ~~`sky_color` 默认取 ambient ⇒ 天空底色双计~~ **R89 已按覆盖度
+//!     去双计**（ambient 补光行 `× (1 − cov)`，[`DDGI_COVER_FADE`]）。
+//!     残留：`cov` 是几何并集量、不判断可见性 ⇒ 墙外区域 `cov` 仍可能
+//!     为 1（靠深度项在混合权重侧抑制，而深度项是概率上界）。
 //! 14. 无探针持久化（每次启用重新粗填 + 滚动精修）。
 //! 15. 成本随场景三角数线性上浮（`rays_per_face = 16` ⇒ ≈0.83 ms/探针
 //!     @1000 三角基线；默认 k = 2 ⇒ ≈1.7 ms/脏帧）。昼夜循环场景是**持续
@@ -115,15 +130,15 @@
 //! 17. 着色器全表线性扫描（≤ 256 探针，无逐探针空间加速结构，同 R83）：
 //!     径向 × 深度双剪枝使 `w > 0` 才做 9 项 SH 点积，但扫描本身与探针数
 //!     线性。
-//! 18. 探针**不落实体**（纯资源态）⇒ 编辑器里看不见、也不能逐个调；
-//!     R89 的放置入口再议实体化。
-//! 19. **网格覆盖范围外回退 env ⇒ 可见等值线**：`Σw ≤ ε` 的兜底是 env 天空
-//!     常量（见「兜底语义」），而探针影响半径是有限球 ⇒ 越过某条等值线后
-//!     整片切到 env，边界是「半径球面并集」的截面 ⇒ **扇贝形亮带**。验收图
-//!     `docs/ddgi.png` 里天花板与墙交接处那条波浪带就是它（探针层高 1.3 +
-//!     半径 2.4 ⇒ 只够到 y = 3.7，墙顶 y = 4 以上无人接管）。诚实修法：把
-//!     `bounds` 抬到盖住所有会被着色的表面（`bounds = None` 的自动派生只
-//!     外扩 1×spacing，不保证盖住顶面）。
+//! 18. 探针**不落实体**（纯资源态）⇒ 不能逐个调整；R89 的编辑器入口给出
+//!     了网格可视化（`iris-editor` 的 DDGI 叠加层）与参数步进 + 入档，
+//!     但「看得见」不等于「实体化」——逐探针放置 / 删除 / 排除格笔刷仍在
+//!     拒绝清单（§8.58⑥ / §11）。
+//! 19. ~~网格覆盖范围外回退 env ⇒ 可见等值线（扇贝形亮带）~~ **R89 已用
+//!     覆盖度羽化取代硬断界**（[`ddgi_coverage`]：越过 `0.75·r_i` 的等值线
+//!     从「整片切到 env」变成 25% 半径宽的连续过渡）。残留：羽化带宽是
+//!     固定常量 25%，不随探针密度自适应；且 `bounds` 覆盖不到的表面仍然
+//!     只有 env 天空兜底（羽化让过渡平滑，不凭空补光）。
 //!
 //! [`ShProbeRaw`]: crate::irradiance::ShProbeRaw
 //! [`PROBE_AXES`]: crate::irradiance::PROBE_AXES
@@ -220,6 +235,29 @@ const _: () = assert!(
         && DDGI_RAYS_PER_FACE_CHOICES[3] % DDGI_DEPTH_GRID == 0,
     "rays_per_face 的每个档位都必须能被 DDGI_DEPTH_GRID 整除"
 );
+
+/// 覆盖度羽化带的**占比**（R89，`DDGI_COVER_FADE = 0.25` ⇒ 半径最外 25%
+/// 是羽化带，`d ≤ 0.75·r_i` 时覆盖度恒 1）。
+///
+/// 消费点（`standard.wgsl` mode = 2 分支，R89 的两条合法像素修订）：
+/// ①env ↔ GI 从硬 `select` 换成 `mix(env, gi, cov)`——消灭 §8.57⑱ 的
+/// 扇贝形亮带（探针影响半径有限球的并集边界从断界变连续过渡）；
+/// ②ambient 补光行追加 `× (1 − cov)`——`sky_color` 默认取
+/// `DirectionalLight.ambient`（裁定 3）后 ambient 同时是补光项与探针天光
+/// 的来源，`cov > 0` 的像素按覆盖度分摊、不再双计（§8.57⑬）。
+///
+/// **为什么是占比而不是绝对带宽**（决策 6）：无量纲（分子分母同含 `r_i`）
+/// ⇒ 换 spacing 不改羽化带宽；绝对带宽（米）会让粗网格的羽化带吃掉整个
+/// 探针。**为什么不用 `Σw` 归一化**（决策 5）：`Σw` 在网格内部就达不到 1
+/// （单探针半程处窗权 `(1 − 0.25²)²` ≈ 0.88、相邻探针中途更弱），会把
+/// R88 已经正确的像素削弱掉；「到最近探针球面的带内深度」把改动面
+/// 结构性地限制在外壳（内区 `cov ≡ 1` 逐位等于 R88——`mix(x, y, 1.0)`
+/// 是精确恒等）。
+///
+/// WGSL 侧有同名常数（`standard.wgsl` 的 `DDGI_COVER_FADE`），由
+/// `wgsl_ddgi_source_matches_cpu_contract` 源码层看门钉住同值——**两侧
+/// 必须同步修改**。
+pub const DDGI_COVER_FADE: f32 = 0.25;
 
 /// splitmix64 变体（纯整数混洗：无浮点、无 libm、无全局状态 ⇒ 跨运行 /
 /// 跨平台逐位一致，AGENTS.md 的无 RNG 文化；`irradiance.rs` / `particles.rs`
@@ -855,6 +893,50 @@ pub fn ddgi_depth_weight_at(
     ddgi_depth_weight(dist, m[0], m[1])
 }
 
+/// 覆盖度（R89，**WGSL `ddgi_irradiance` 的 cov 出口镜像**）：
+/// `cov = max_i clamp((r_i − d_i) / (r_i × DDGI_COVER_FADE), 0, 1)`。
+///
+/// 「到最近探针球面的带内深度」：球面外 0、深入带内 1，`d ≤ 0.75·r_i` 时
+/// 恒 1。与 Σw 同一遍循环取 `max`（`f32::max` 全序、与迭代序无关——单测
+/// 钉住）。**纯几何量，不判断可见性**（诚实边界，§8.58①）：墙外区域的
+/// `cov` 仍可能为 1，靠深度项在混合权重侧抑制。
+///
+/// 退化入参：`r_i = 0`（退化探针）⇒ 该探针贡献 0（显式 `r > 0` 守卫，
+/// 不做除法 ⇒ 无 NaN，与 WGSL 侧同形）；空表 ⇒ 0。`d_i ≥ r_i` 恰在球面
+/// ⇒ 0（分子非正）；`d_i = 0.75·r_i`（可精确表示时）恰达 1。
+pub fn ddgi_coverage(position: Vec3, positions: &[Vec3], radii: &[f32]) -> f32 {
+    ddgi_coverage_with_fade(position, positions, radii, DDGI_COVER_FADE)
+}
+
+/// [`ddgi_coverage`] 的显式 fade 版本：羽化带占比是参数而不是写死的常数
+/// ——`fade → 0` 的极限自检锚（§9）由此可测：任何 `d_i < r_i` 的探针
+/// 都给满 1、球面外给 0 ⇒ `cov` 退化成「球内指示函数」，混合退回 R88
+/// 的 `Σw > ε` 硬判据形态。生产路径恒走 [`ddgi_coverage`]。
+///
+/// `fade ≤ 0` 或 NaN ⇒ 全部覆盖度 0（无羽化语义可定义 ⇒ 与「探针缺席」
+/// 同义，不 panic——纯函数不校验生产不可能出现的入参）。
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // NaN fade 必须落 0 支（与 ddgi_depth_weight 同款 NaN 极性契约）
+pub fn ddgi_coverage_with_fade(
+    position: Vec3,
+    positions: &[Vec3],
+    radii: &[f32],
+    fade: f32,
+) -> f32 {
+    let mut cov = 0.0f32;
+    if !(fade > 0.0) {
+        return cov;
+    }
+    for (p, r) in positions.iter().zip(radii) {
+        let d = position.distance(*p);
+        // r = 0（退化探针）不做除法 ⇒ 无 NaN（WGSL 侧同形守卫）
+        if *r > 0.0 {
+            let cover = ((*r - d) / (*r * fade)).clamp(0.0, 1.0);
+            cov = cov.max(cover);
+        }
+    }
+    cov
+}
+
 /// 逐片元 DDGI 求值的 **CPU 镜像**（WGSL：`standard.wgsl::ddgi_irradiance`）。
 ///
 /// ```text
@@ -881,6 +963,68 @@ pub fn ddgi_blend(
     grid: u32,
     depth_weight_enabled: bool,
 ) -> Option<Vec3> {
+    ddgi_blend_core(
+        positions,
+        radii,
+        sh,
+        depth,
+        position,
+        normal,
+        grid,
+        depth_weight_enabled,
+    )
+    .gi
+}
+
+/// [`ddgi_blend`] 的 R89 扩展出口：`(GI, cov)`，与 WGSL `ddgi_irradiance`
+/// 的 vec4 出口**逐式同构**——
+///
+/// - `Σw > ε` ⇒ `Some((加权平均 GI, cov))`；
+/// - `Σw ≤ ε`（全部被深度项抑制 / 球外）⇒ `Some((env_irradiance, cov))`
+///   （env 兜底在**本函数内部**完成，cov 照常返回 ⇒ 调用方按 `(1 − cov)`
+///   分摊 ambient 的语义在兜底支同样成立）；
+/// - 空表 / 非有限位置 ⇒ `None`（cov 无定义）。
+///
+/// [`ddgi_blend`] 是本函数的薄壳（`.gi`，Σw ≤ ε 折回 `None`）——R88 的
+/// 既有调用面与测试**零改动**；GI 累加的算术（式序）只有这一份。
+#[allow(clippy::too_many_arguments)] // 签名 = WGSL `ddgi_irradiance` 的入参镜像，不为 lint 合并
+pub fn ddgi_blend_with_cov(
+    positions: &[Vec3],
+    radii: &[f32],
+    sh: &[ShCoeffs],
+    depth: &[[f32; 2]],
+    position: Vec3,
+    normal: Vec3,
+    grid: u32,
+    depth_weight_enabled: bool,
+    env_irradiance: Vec3,
+) -> Option<(Vec3, f32)> {
+    let core = ddgi_blend_core(
+        positions,
+        radii,
+        sh,
+        depth,
+        position,
+        normal,
+        grid,
+        depth_weight_enabled,
+    );
+    core.cov.map(|cov| (core.gi.unwrap_or(env_irradiance), cov))
+}
+
+/// [`ddgi_blend`] / [`ddgi_blend_with_cov`] 的单一算术源：`gi = None` ⇔
+/// `Σw ≤ ε` 或空表 / 非有限位置；`cov = None` ⇔ 空表 / 非有限位置。
+#[allow(clippy::too_many_arguments)] // 签名 = WGSL `ddgi_irradiance` 的入参镜像（ddgi_blend 同款）
+fn ddgi_blend_core(
+    positions: &[Vec3],
+    radii: &[f32],
+    sh: &[ShCoeffs],
+    depth: &[[f32; 2]],
+    position: Vec3,
+    normal: Vec3,
+    grid: u32,
+    depth_weight_enabled: bool,
+) -> BlendCore {
     assert!(
         positions.len() == radii.len()
             && positions.len() == sh.len()
@@ -892,10 +1036,14 @@ pub fn ddgi_blend(
         depth.len()
     );
     if positions.is_empty() || !position.is_finite() {
-        return None;
+        return BlendCore {
+            gi: None,
+            cov: None,
+        };
     }
     let mut acc = Vec3::ZERO;
     let mut wsum = 0.0f32;
+    let mut cov = 0.0f32;
     for (i, p) in positions.iter().enumerate() {
         let delta = position - *p;
         let d = delta.length();
@@ -903,6 +1051,10 @@ pub fn ddgi_blend(
         if radial <= 0.0 {
             continue;
         }
+        // 覆盖度与 Σw 同一遍循环取 max：radial > 0 ⇔ d < r ⇒ 分母 r > 0
+        // 无除零、分子为正；逐探针 clamp 后 max（与 WGSL / ddgi_coverage
+        // 同式同序）；max 全序 ⇒ 与遍历序无关。
+        cov = cov.max(((radii[i] - d) / (radii[i] * DDGI_COVER_FADE)).clamp(0.0, 1.0));
         let w = radial * ddgi_depth_weight_at(depth, i, delta, d, grid, depth_weight_enabled);
         if w > 0.0 {
             acc += sh_eval(&sh[i], normal) * w;
@@ -910,10 +1062,24 @@ pub fn ddgi_blend(
         }
     }
     if wsum > SH_BLEND_EPS {
-        Some((acc / wsum).max(Vec3::ZERO))
+        BlendCore {
+            gi: Some((acc / wsum).max(Vec3::ZERO)),
+            cov: Some(cov),
+        }
     } else {
-        None
+        BlendCore {
+            gi: None,
+            cov: Some(cov),
+        }
     }
+}
+
+/// [`ddgi_blend_core`] 的出口。
+struct BlendCore {
+    /// `None` ⇔ Σw ≤ ε（或空表 / 非有限位置）。
+    gi: Option<Vec3>,
+    /// `None` ⇔ 空表 / 非有限位置（cov 无定义）。
+    cov: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,14 +2572,52 @@ mod tests {
             src.contains("return face * grid * grid + row * grid + col;"),
             "standard.wgsl 的纹素式必须与 CPU 侧 ddgi_depth_texel 同式"
         );
-        // 兜底语义：mode 2 的 Σw ≤ ε 回退 env（决策 11，不回退最近探针）
+        // R89 覆盖度常数：WGSL 与 CPU 同值（羽化带 25%）
+        let cover_key = "const DDGI_COVER_FADE: f32 = ";
+        let cover_at = src
+            .find(cover_key)
+            .unwrap_or_else(|| panic!("standard.wgsl 缺少 DDGI_COVER_FADE"));
+        let cover_literal: f32 = src[cover_at + cover_key.len()..]
+            .split(';')
+            .next()
+            .expect("字面量必须有分号")
+            .trim()
+            .parse()
+            .expect("DDGI_COVER_FADE 必须是 f32 字面量");
+        assert_eq!(
+            cover_literal.to_bits(),
+            DDGI_COVER_FADE.to_bits(),
+            "DDGI_COVER_FADE 两侧必须逐位同值：WGSL {cover_literal} vs CPU {DDGI_COVER_FADE}"
+        );
+        // 覆盖度公式与 CPU 侧同式（逐探针 clamp 后 max，与 Σw 同遍）
         assert!(
-            src.contains("in.probe.w > 0.5 && ddgi.w > 0.5"),
-            "mode 2 必须用 ddgi.w 作有效标志回退 env_irradiance（不回退最近探针）"
+            src.contains("cov = max(cov, clamp((p.pos_radius.w - d)"),
+            "standard.wgsl 的覆盖度必须与 CPU 侧 ddgi_blend_core 同式同序"
+        );
+        // R89 混合语义：mode 2 = mix(env, gi, cov)（cov = 1 时 mix(x,y,1) = y
+        // 精确恒等 ⇒ 内区逐位等于 R88）；env 兜底在 ddgi_irradiance 内部
+        // （Σw ≤ ε ⇒ 返回 (env_fallback, cov)）
+        assert!(
+            src.contains("mix(env_irradiance, ddgi.xyz, ddgi.w)"),
+            "mode 2 必须是覆盖度连续混合 mix(env, gi, cov)（R89，修扇贝带）"
         );
         assert!(
-            src.contains("if (wsum > GI_BLEND_EPS)"),
-            "mode 2 必须沿用 GI_BLEND_EPS（不新立混合下限常数）"
+            src.contains("ddgi_irradiance(in.world_pos, n, env_irradiance)"),
+            "mode 2 必须把 env 兜底值传入 ddgi_irradiance（R89：兜底支返回真 cov）"
+        );
+        assert!(
+            src.contains("return vec4<f32>(env_fallback, cov);"),
+            "Σw ≤ ε 的兜底支必须返回 (env_fallback, cov)（不回退最近探针）"
+        );
+        // ambient 去双计：补光行追加 × (1 − ddgi_cov)（mode ≤ 1 时 cov 恒 0
+        // ⇒ × 1.0 逐位恒等）
+        assert!(
+            src.contains("* globals.ambient.rgb * ao * ao_ss * (1.0 - ddgi_cov)"),
+            "ambient 补光行必须按覆盖度分摊（R89，修 §8.57⑬ 双计）"
+        );
+        assert!(
+            src.contains("var ddgi_cov = 0.0;"),
+            "ddgi_cov 必须在 mode 门之前声明且默认 0（mode ≤ 1 的 × 1.0 恒等前提）"
         );
         // mode 门三支：0 / 1 / 2（R64 与 R83 的语句逐条不动）
         assert!(src.contains("if (gi_params.params.x < 0.5) {"), "mode 0 门");
@@ -2434,10 +2638,243 @@ mod tests {
             src.contains("let radial = gi_probe_weight(d, p.pos_radius.w);"),
             "mode 2 必须复用 R83 的径向窗 gi_probe_weight"
         );
+        // B1：SSR 强度旋钮（flags.y）必须参与命中权重合成（R89 修复死旋钮）
+        assert!(
+            src.contains("* ssr.flags.y, 0.0, 1.0);"),
+            "SSR 命中权重必须乘 ssr.flags.y 并钳 [0,1]（与 post::ssr_blend_weight 同式）"
+        );
     }
 
     // ------------------------------------------------------------------
-    // ⑲ 指纹位组合（稳定 + 敏感 + 不消费的字段不入指纹）
+    // ⑲ 覆盖度（R89）：边界解析解 / 序无关 / fade→0 退化 / mix 恒等
+    // ------------------------------------------------------------------
+
+    /// WGSL `mix(x, y, t)` 的标量语义（e1·(1−t) + e2·e3）的 CPU 复刻，
+    /// 用于「cov = 1 / cov = 0 是精确恒等」的可测声明。
+    fn mix_scalar(x: f32, y: f32, t: f32) -> f32 {
+        x * (1.0 - t) + y * t
+    }
+
+    #[test]
+    fn ddgi_coverage_boundaries_are_analytic() {
+        // r = 4.0、d 的三个解析点：球心 / 0.75r 恰达 1 / 球面恰 0
+        let positions = [Vec3::ZERO];
+        let radii = [4.0f32];
+        assert_eq!(
+            ddgi_coverage(Vec3::ZERO, &positions, &radii),
+            1.0,
+            "球心 cov = 1"
+        );
+        assert_eq!(
+            ddgi_coverage(Vec3::new(3.0, 0.0, 0.0), &positions, &radii),
+            1.0,
+            "d = 0.75r = 3.0 ⇒ (4−3)/(4×0.25) = 1 恰达满覆盖（内区边界）"
+        );
+        let mid = ddgi_coverage(Vec3::new(3.5, 0.0, 0.0), &positions, &radii);
+        assert_eq!(
+            mid.to_bits(),
+            (0.5f32).to_bits(),
+            "d = 3.5 ⇒ (4−3.5)/1 = 0.5（羽化带中点）"
+        );
+        assert_eq!(
+            ddgi_coverage(Vec3::new(4.0, 0.0, 0.0), &positions, &radii),
+            0.0,
+            "d = r 恰在球面 ⇒ 分子 0 ⇒ cov = 0"
+        );
+        assert_eq!(
+            ddgi_coverage(Vec3::new(4.0, 3.0, 0.0), &positions, &radii),
+            0.0,
+            "球外 cov = 0"
+        );
+        // y 方向同一解析解（无轴向偏置）+ 钳上界：d = 2.8 的原始商
+        // (4 − 2.8)/1 = 1.2 > 1 ⇒ clamp 到 1（内区边界的另一侧验证）
+        assert_eq!(
+            ddgi_coverage(Vec3::new(0.0, 2.8, 0.0), &positions, &radii),
+            1.0,
+            "d = 2.8 ⇒ 原始商 1.2 ⇒ 钳 1"
+        );
+        // 退化探针 r = 0：无 NaN、贡献 0
+        let zero = [Vec3::new(1.0, 2.0, 3.0)];
+        let zero_r = [0.0f32];
+        let c = ddgi_coverage(Vec3::new(1.0, 2.0, 3.0), &zero, &zero_r);
+        assert_eq!(c, 0.0, "r = 0 ⇒ 退化探针贡献 0（显式 r > 0 守卫，无除法）");
+        assert!(!c.is_nan(), "退化探针不得产生 NaN");
+        // 空表 ⇒ 0
+        assert_eq!(ddgi_coverage(Vec3::ZERO, &[], &[]), 0.0);
+        // fade → 0 的极限（§9）：任何球内点 → 1、球面及球外 → 0 ⇒ 退化为
+        // 「球内指示函数」= R88 的硬判据形态
+        let tiny = 1.0e-6f32;
+        let cov_fn = |p: Vec3| ddgi_coverage_with_fade(p, &positions, &radii, tiny);
+        assert_eq!(cov_fn(Vec3::new(0.5, 0.0, 0.0)), 1.0, "fade→0：球内 ⇒ 1");
+        assert_eq!(
+            cov_fn(Vec3::new(0.0, 3.999, 0.0)),
+            1.0,
+            "fade→0：贴着球面内侧仍 ⇒ 1"
+        );
+        assert_eq!(cov_fn(Vec3::new(4.0, 0.0, 0.0)), 0.0, "fade→0：球面 ⇒ 0");
+        assert_eq!(cov_fn(Vec3::new(9.0, 0.0, 0.0)), 0.0, "fade→0：球外 ⇒ 0");
+        // fade ≤ 0 / NaN ⇒ 全 0（无羽化语义可定义 ⇒ 与探针缺席同义）
+        assert_eq!(
+            ddgi_coverage_with_fade(Vec3::ZERO, &positions, &radii, 0.0),
+            0.0
+        );
+        assert_eq!(
+            ddgi_coverage_with_fade(Vec3::ZERO, &positions, &radii, f32::NAN),
+            0.0
+        );
+    }
+
+    #[test]
+    fn ddgi_coverage_max_is_order_independent_and_matches_blend() {
+        let positions = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 6.0),
+        ];
+        let radii = [4.0f32, 2.0f32, 8.0f32];
+        let at = Vec3::new(1.2, 0.4, 0.8);
+        let direct = ddgi_coverage(at, &positions, &radii);
+        // 逐探针解析解取 max（与实现不同的计算路径）
+        let mut expected = 0.0f32;
+        for (p, r) in positions.iter().zip(&radii) {
+            let cover = ((r - at.distance(*p)) / (r * DDGI_COVER_FADE)).clamp(0.0, 1.0);
+            expected = expected.max(cover);
+        }
+        assert_eq!(direct.to_bits(), expected.to_bits(), "与逐探针解析解一致");
+        // 序无关：max 全序 ⇒ 任意置换同值（逐位）
+        let mut perm = positions;
+        perm.swap(0, 2);
+        let mut perm_r = radii;
+        perm_r.swap(0, 2);
+        assert_eq!(
+            direct.to_bits(),
+            ddgi_coverage(at, &perm, &perm_r).to_bits(),
+            "多探针取 max 与表序无关"
+        );
+        // 与 ddgi_blend_core 的 cov 出口一致（同一世界数据）
+        let settings = test_settings();
+        let grid = installed_grid(&settings);
+        let probe_positions = grid.positions().to_vec();
+        let probe_radii = grid.radii().to_vec();
+        let sample = Vec3::new(-3.0, 1.5, 2.0);
+        let standalone = ddgi_coverage(sample, &probe_positions, &probe_radii);
+        let (_, cov) = ddgi_blend_with_cov(
+            &probe_positions,
+            &probe_radii,
+            grid.sh(),
+            grid.depth(),
+            sample,
+            Vec3::Y,
+            settings.rays_per_face,
+            true,
+            Vec3::ZERO,
+        )
+        .expect("网格内点 cov 必有定义");
+        assert_eq!(
+            standalone.to_bits(),
+            cov.to_bits(),
+            "独立覆盖度函数与 blend 的 cov 出口必须逐位一致（同一公式的两个入口）"
+        );
+    }
+
+    #[test]
+    fn cov_endpoints_are_exact_identities() {
+        // mix(x, y, 1.0) = y、mix(x, y, 0.0) = x 的逐位证明（WGSL 标量
+        // mix 语义；这是「cov = 1 内区逐位等于 R88」声明的数学根基）
+        let samples = [
+            0.0f32,
+            1.0e-3,
+            0.25,
+            0.5,
+            1.0,
+            7.8125e-3,
+            123.456,
+            4096.0,
+            f32::MIN_POSITIVE,
+        ];
+        let envs = [0.0f32, 0.137, 1.0, 42.0];
+        for &y in &samples {
+            for &x in &envs {
+                assert_eq!(
+                    mix_scalar(x, y, 1.0).to_bits(),
+                    y.to_bits(),
+                    "mix({x}, {y}, 1.0) 必须逐位等于 {y}"
+                );
+                assert_eq!(
+                    mix_scalar(x, y, 0.0).to_bits(),
+                    x.to_bits(),
+                    "mix({x}, {y}, 0.0) 必须逐位等于 {x}"
+                );
+            }
+        }
+        // ambient 行的 `× (1 − ddgi_cov)`：mode ≤ 1（cov = 0）⇒ × 1.0 逐位恒等
+        for &v in &samples {
+            assert_eq!(
+                (v * (1.0f32 - 0.0)).to_bits(),
+                v.to_bits(),
+                "x × (1 − 0) 必须逐位等于 x"
+            );
+        }
+    }
+
+    #[test]
+    fn ddgi_blend_with_cov_fallback_matches_env_semantics() {
+        // 深度项全抑制（对照模式反着用：enabled = true 但把 μ 置 0、σ² 置 0
+        // ⇒ dist > 0 的探针权重全 0）⇒ Σw ≤ ε ⇒ gi = env 兜底、cov 照常返回
+        let settings = test_settings();
+        let grid = installed_grid(&settings);
+        let n = grid.probe_count();
+        let neutral_sh = vec![[[0.0f32; 3]; SH_COEFFS]; n];
+        let mut depth = grid.depth().to_vec();
+        for m in depth.iter_mut() {
+            *m = [0.0, 0.0];
+        }
+        let positions = grid.positions().to_vec();
+        let radii = grid.radii().to_vec();
+        let env = Vec3::new(0.3, 0.5, 0.7);
+        let (gi, cov) = ddgi_blend_with_cov(
+            &positions,
+            &radii,
+            &neutral_sh,
+            &depth,
+            Vec3::new(-3.0, 1.5, 2.0),
+            Vec3::Y,
+            settings.rays_per_face,
+            true,
+            env,
+        )
+        .expect("网格内点必有定义");
+        assert_eq!(
+            gi.to_array().map(|v| v.to_bits()),
+            env.to_array().map(|v| v.to_bits()),
+            "Σw ≤ ε ⇒ gi = env 兜底（与 WGSL ddgi_irradiance 的兜底支同语义）"
+        );
+        let standalone = ddgi_coverage(Vec3::new(-3.0, 1.5, 2.0), &positions, &radii);
+        assert_eq!(
+            cov.to_bits(),
+            standalone.to_bits(),
+            "兜底支的 cov 仍是真实覆盖度（ambient 分摊语义依赖它）"
+        );
+        // R88 薄壳：同输入 ddgi_blend 返回 None（Σw ≤ ε ⇒ 无有效探针），
+        // 与 R88 原语义零漂移
+        assert!(
+            ddgi_blend(
+                &positions,
+                &radii,
+                &neutral_sh,
+                &depth,
+                Vec3::new(-3.0, 1.5, 2.0),
+                Vec3::Y,
+                settings.rays_per_face,
+                true,
+            )
+            .is_none(),
+            "ddgi_blend 的 Σw ≤ ε ⇒ None 契约不变（R88 既有调用面零改动）"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ⑳ 指纹位组合（稳定 + 敏感 + 不消费的字段不入指纹）
     // ------------------------------------------------------------------
 
     #[test]

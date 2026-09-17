@@ -151,9 +151,9 @@ pub mod prelude {
         write_glb,
     };
     pub use crate::bake::{
-        BAKE_RAY_MIN_T, BAKE_SHADOW_BIAS, BVH_LEAF_SIZE, BakeParams, BakeSample, BakeTriangle,
-        BakedLightmap, Bvh, BvhHit, SHADOW_SOFT_SAMPLES, bake_lightmap, bake_points, bake_sample,
-        build_bvh, collect_bake_triangles, cosine_hemisphere, radical_inverse_2,
+        BAKE_RAY_MIN_T, BAKE_SHADOW_BIAS, BVH_LEAF_SIZE, BakeExcluded, BakeParams, BakeSample,
+        BakeTriangle, BakedLightmap, Bvh, BvhHit, SHADOW_SOFT_SAMPLES, bake_lightmap, bake_points,
+        bake_sample, build_bvh, collect_bake_triangles, cosine_hemisphere, radical_inverse_2,
         ray_triangle_intersection, raycast_bvh, uniform_cone,
     };
     pub use crate::bake_uv::{
@@ -168,16 +168,18 @@ pub mod prelude {
         ChainIk, LookIk, solve_fabrik, swing_fraction, update_chain_ik, update_look_ik,
     };
     pub use crate::context::Gpu;
-    // DDGI 动态全局光照 v1（R88）：规则探针网格 + 时间片滚动重照明 + 深度感知混合
+    // DDGI 动态全局光照（R88 v1 + R89 v2）：规则探针网格 + 时间片滚动重照明
+    // + 深度感知混合 + 覆盖度合成
     pub use crate::ddgi::{
-        DDGI_DEPTH_FLOATS, DDGI_DEPTH_GRID, DDGI_DEPTH_PROBE_BYTES, DDGI_DEPTH_TABLE_BYTES,
-        DDGI_DEPTH_TEXELS, DDGI_DEPTH_TEXELS_PER_FACE, DDGI_PREFILL_GRID,
+        DDGI_COVER_FADE, DDGI_DEPTH_FLOATS, DDGI_DEPTH_GRID, DDGI_DEPTH_PROBE_BYTES,
+        DDGI_DEPTH_TABLE_BYTES, DDGI_DEPTH_TEXELS, DDGI_DEPTH_TEXELS_PER_FACE, DDGI_PREFILL_GRID,
         DDGI_RAYS_PER_FACE_CHOICES, DDGI_SIGMA_REL, DDGI_SKY_DEPTH, DdgiGrid, DdgiLayout,
-        DdgiSettings, DdgiStats, advance, axis_points, ddgi_blend, ddgi_depth_face,
-        ddgi_depth_texel, ddgi_depth_weight, ddgi_depth_weight_at, default_bounds,
-        depth_cell_of_ray, depth_hysteresis, depth_moment_finish, grid_fingerprint,
-        layout_positions, neutral_depth_moment, neutral_depth_table, plan_layout, probe_relight,
-        relight_fingerprint, sh_hysteresis, stride_for_capacity, triangles_bounds,
+        DdgiSettings, DdgiStats, advance, axis_points, ddgi_blend, ddgi_blend_with_cov,
+        ddgi_coverage, ddgi_coverage_with_fade, ddgi_depth_face, ddgi_depth_texel,
+        ddgi_depth_weight, ddgi_depth_weight_at, default_bounds, depth_cell_of_ray,
+        depth_hysteresis, depth_moment_finish, grid_fingerprint, layout_positions,
+        neutral_depth_moment, neutral_depth_table, plan_layout, probe_relight, relight_fingerprint,
+        sh_hysteresis, stride_for_capacity, triangles_bounds,
     };
     pub use crate::decal::{Decal, DecalInstanceRaw};
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
@@ -244,8 +246,8 @@ pub mod prelude {
         AO_SLICES, AO_STEPS, AoSettings, BloomSettings, DepthOfFieldSettings, ExposureSettings,
         FxaaSettings, MotionBlurSettings, SkySettings, SsrSettings, TaaSettings, VignetteSettings,
         ao_dither, ao_falloff, ao_sample_sin, ao_slice_occlusion, ao_uv_offset, ao_view_pos,
-        ao_visibility, halton, jitter_projection, resolve_focus_distance, ssr_edge_fade,
-        ssr_roughness_fade, taa_jitter,
+        ao_visibility, halton, jitter_projection, resolve_focus_distance, ssr_blend_weight,
+        ssr_edge_fade, ssr_roughness_fade, taa_jitter,
     };
     pub use crate::probe::{
         MAX_REFLECTION_PROBES, PROBE_CAPTURE_FAR, PROBE_CAPTURE_NEAR, PROBE_DEFAULT_FALLOFF,

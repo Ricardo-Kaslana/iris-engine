@@ -26,17 +26,6 @@ crate 布局（依赖自上而下）：
 - **所有 cargo 命令必须加前缀 `CARGO_HTTP_CHECK_REVOKE=false`**（本机镜像 SSL 吊销检查问题，不加必挂）。
 - `.cargo/config.toml` 已配 `rustc-wrapper = "sccache"`：新机器先 `cargo install sccache`，否则一切 cargo 命令失败。
 - ffmpeg 在 PATH（验收图 BMP/PPM→PNG 转换用）。
-- **链接期环境（Git Bash 特有的两个坑，2026-09-16 实测各烧掉数轮）**：
-  ① **裸 `link.exe` 被 Git Bash 的 GNU `link` 抢占**——`/usr/bin` 排在
-  MSVC bin 目录之前，`link.exe` 解析到 coreutils 的 `link`，症状 =
-  `link: missing operand after '\377\376'` + `link.exe returned an
-  unexpected error`（**不是** LNK 错误码）；② **`LIB` / `INCLUDE` 为空**
-  ⇒ MSVC link 找不到 SDK 库，症状 = `LNK1181: 无法打开输入文件
-  "opengl32.lib"`。修法（可复用脚本
-  `~/.workbuddy-ai/iris_build_env.sh`，`source` 后再跑 cargo）：
-  MSVC bin 目录前置到 PATH + `LIB` 指 `VC/Tools/MSVC/<ver>/lib/x64` 与
-  `Windows Kits/10/Lib/<ver>/{um,ucrt}/x64`。**只 `cargo check` 不触发
-  链接 ⇒ 该坑不显形**，一旦要跑 `build` / `test` / example 就会撞上。
 
 ## 门禁命令序（每轮收官，顺序有讲究——详见 ARCHITECTURE §7.2）
 
@@ -49,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1527 / release 1524**（R88 收官：+34 项 DDGI CPU 解析 / 逐位单测 + 7 项编排单测 + 6 项 GPU 集成；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1546 / release 1543**（R89 收官：+4 项覆盖度 CPU 单测 + 1 项 SSR 合成权重镜像 + 1 项 BakeExcluded 收集排除 + 3 项 level.ddgi 子段 + 5 项编辑器 DDGI headless + 5 项 GPU 锚（R88 六项零改动原值通过）；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -94,6 +83,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 - 测试间**共享文件名会竞态**（并行执行）——临时文件用唯一名或 Once 模式（gltf/hdr/asset_pipeline/edit_headless 四次：R62a 验收 `pid` 同名目录下并行测试线程互删文件；R63 验收 editor 测试只在 pid 后**无调用序计数**——Windows 复用历史运行 pid 时 `create_dir_all` 命中旧目录 ⇒ `loaded = true` / 陈旧产物失配，debug 时序不同侥幸通过、release 才炸；唯一名 = 进程 id + 调用序计数，缺一不可）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试；渲染器按**句柄值**缓存 GPU 资源——同一渲染器上渲染「同句柄不同内容」的多个世界会串味（R53/R62 两次踩到），跨世界对照必须各用独立渲染器。
 - **偶发失败 = 真 bug 信号**（本仓库沉淀的铁律）：Duration 舍入、临时文件竞态、浮点边界（R39 盒面 1e-4 容差）、uv_sphere 极点退化三角（R58b）、u8 关节蒙皮被拒（R59 规范笔误）都是这么抓到的。不重跑通过就放过；归因要查到机制，「Windows/环境问题」是排除项不是首选解释。
+- **每个公开旋钮至少要有一条非默认值断言**（R89 沉淀，B1 的教训）：分量镜像测试会漏掉整条公式的缺项——`SsrSettings::intensity` 上传到着色器后 26 轮零读取，CPU 侧只有 roughness / edge 两个**分量**镜像、合并权重无镜像，任何「默认值路径」的测试都测不到它；非默认值断言（强度 0 ⇒ 与关逐位一致、0.5 ⇒ 线性、2 ⇒ 钳 1）+ 整条公式的合并镜像函数才把旋钮钉住。
 
 ## 已知平台陷阱（改对应子系统前先读）
 
@@ -131,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1527 / release 1524）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1546 / release 1543）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -149,7 +139,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1527 / release 1524；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1546 / release 1543；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -189,7 +179,12 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     §8.56）、
     R88 DDGI 动态 GI v1 ✅（规则探针网格 × 时间片滚动重照明 × chebyshev
     深度感知混合；**闭合 §8.52①**——径向权重不感知遮挡的墙两侧串味；诚实限制
-    §8.57）、R89 DDGI v2、R90/R91 毛发、R92 降水、R93 海洋 v2+水下（CPU 位移图
+    §8.57）、R89 DDGI v2 ✅（**第三梯队 GI 2/2 收官**：合成语义五方裁决
+    （贴图互斥/覆盖度混合/ambient 分摊/捕获零阶/SSR 一致性）× 覆盖度连续化
+    `cov` 修 §8.57⑬⑱ × 编辑器入口（BakeExcluded + 参数步进 + 可视化 +
+    level.ddgi 入档）× Fixed 两条既有 bug（SSR 强度死旋钮 26 轮 / reset_taa
+    漏清时域状态）；诚实限制 §8.58，闭合 frictions ⑬）、R90/R91 毛发、
+    R92 降水、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）
   - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /
     OIT / 贴花 v2 / LOD v2 / 音频 v3 空间化 / 动画压缩 / BC7+KTX2 / 热重载局部 /

@@ -130,14 +130,11 @@ fn main() {
     for _ in 0..30 {
         game.frame();
     }
-    // 定格 = reset_taa + 三连渲：两张定格之间只推进模拟不渲染，跨帧时域
-    // 状态（TAA 历史 / GTAO 上帧深度副本）全是上一张的——reset_taa 清
-    // TAA/SSR 历史但**不清 AO 深度副本**（引擎缺口，frictions 记录），
-    // 故再连渲两帧让 AO（上帧深度 = 本姿势首帧）与 TAA 历史都收敛到
-    // 本姿势，定格图无跨张残影。确定性：固定帧序，跨运行逐位一致。
+    // 定格 = reset_taa + 单帧渲染（R89 起 reset_taa 清一切跨帧时域状态：
+    // TAA 历史混合系数 0 ⇒ 输出 = 当前帧，GTAO 上帧深度记账失效 ⇒ 可见度
+    // 图中性 1.0——旧姿势的残影从根上消灭，不再需要三连渲绕行）。
+    // 确定性：固定帧序，跨运行逐位一致。
     renderer.renderer_mut().reset_taa();
-    renderer.render(&game.app.world);
-    renderer.render(&game.app.world);
     renderer.render(&game.app.world);
     renderer.save_bmp("exp_walk.bmp").expect("写步行帧");
     let stats = renderer.renderer().stats();
@@ -184,8 +181,6 @@ fn main() {
         }
     }
     renderer.renderer_mut().reset_taa();
-    renderer.render(&game.app.world);
-    renderer.render(&game.app.world);
     renderer.render(&game.app.world);
     renderer.save_bmp("exp_jump.bmp").expect("写跳跃帧");
     let stats = renderer.renderer().stats();

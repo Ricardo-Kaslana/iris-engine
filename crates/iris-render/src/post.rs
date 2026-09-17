@@ -289,7 +289,11 @@ pub struct SsrSettings {
     /// 是否启用 SSR（`Default = false` = 关，与「缺席 = 关」语义一致）。
     pub enabled: bool,
     /// 全局强度倍率（≥ 0；1.0 = 物理权重，粗糙度 / Fresnel / 边缘衰减
-    /// 全量生效）。
+    /// 全量生效）。**口径（R89 定稿）**：本项是 SSR **命中权重**的乘数、
+    /// 不是亮度倍率——`> 1` 的部分被钳到 1（合成公式
+    /// `mix(探针/env 镜面, ssr 反射色, w_ssr)` 的混合因子不允许越界），
+    /// `0` ⇒ 与 SSR 关闭逐位一致（零反射）。R62b 起它被上传到
+    /// `ssr.flags.y` 但着色器零读取（26 轮未发现的死旋钮，R89 修复）。
     pub intensity: f32,
     /// 步进最大距离（米）：反射射线的世界空间行程上限。
     pub max_distance: f32,
@@ -345,6 +349,36 @@ pub fn ssr_edge_fade(uv: [f32; 2], margin: f32) -> f32 {
     let fx = (uv[0].min(1.0 - uv[0]) / margin).clamp(0.0, 1.0);
     let fy = (uv[1].min(1.0 - uv[1]) / margin).clamp(0.0, 1.0);
     fx * fy
+}
+
+/// SSR 合成权重（R89 新增，`standard.wgsl` 的 `ssr_march` 命中支 fade
+/// 表达式的**整条公式**镜像）：
+///
+/// ```text
+/// w_ssr = clamp(roughness_fade(r, cutoff) × edge_fade(uv, margin) × intensity, 0, 1)
+/// ```
+///
+/// R62b 的 CPU 镜像只有 roughness / edge 两个**分量**，合并权重没有镜像
+/// 函数 ⇒ 着色器侧漏乘 `intensity`（`SsrSettings::intensity` 上传后 26
+/// 轮零读取）没有 CPU 侧单测能抓到——本函数补上整条公式的钉子，并落实
+/// AGENTS.md 新规约「每个公开旋钮至少一条非默认值断言」。
+///
+/// 与着色器同式同序：先乘两个衰减分量、再乘 intensity（上传侧已钳
+/// `≥ 0`，此处同钳），最后整体钳 [0, 1]——`intensity = 1.0`（默认）时
+/// 乘法与钳制均逐位恒等 ⇒ 全部既有像素不变；`0` ⇒ 恒 0（与 SSR 关闭
+/// 一致）；`> 1` 的部分被钳掉（命中权重、不是亮度倍率）。
+pub fn ssr_blend_weight(
+    roughness: f32,
+    uv: [f32; 2],
+    intensity: f32,
+    floor: f32,
+    cutoff: f32,
+    margin: f32,
+) -> f32 {
+    let fade = ssr_roughness_fade(roughness, floor, cutoff)
+        * ssr_edge_fade(uv, margin)
+        * intensity.max(0.0);
+    fade.clamp(0.0, 1.0)
 }
 
 // ---------- GTAO 环境光遮蔽（R77，资源缺席 = 关 = 逐位不变） ----------
@@ -1551,6 +1585,45 @@ mod tests {
         assert_eq!(ssr_edge_fade([0.5, 0.5], 0.1), 1.0);
         // 带宽外（距边 ≥ margin）恒全量
         assert_eq!(ssr_edge_fade([0.11, 0.5], 0.1), 1.0);
+    }
+
+    /// 合成权重（R89 新镜像，B1 修复的钉子）：默认强度 1.0 逐位等于
+    /// 「两分量之积」（既有像素不变的依据）；强度 0 ⇒ 恒 0（与 SSR 关闭
+    /// 一致）；强度 2 ⇒ 钳到 1（命中权重不是亮度倍率）；中间线性。
+    /// **非默认强度断言是本测试的主体**——分量镜像测试抓不住整条公式的
+    /// 缺项，这正是强度死旋钮藏了 26 轮的结构性原因（AGENTS.md 测试规约
+    /// 「每个公开旋钮至少一条非默认值断言」的出处）。
+    #[test]
+    fn ssr_blend_weight_follows_full_formula_with_nondefault_intensity() {
+        let (floor, cutoff, margin) = (SSR_ROUGH_FLOOR, 0.6f32, 0.1f32);
+        // 全量场景：粗糙度取下限、屏中心 ⇒ 两分量恒 1，权重 = intensity
+        let full =
+            |intensity: f32| ssr_blend_weight(0.2, [0.5, 0.5], intensity, floor, cutoff, margin);
+        assert_eq!(
+            full(1.0).to_bits(),
+            (ssr_roughness_fade(0.2, floor, cutoff) * ssr_edge_fade([0.5, 0.5], margin)).to_bits(),
+            "默认强度 1.0 ⇒ 与「分量之积」逐位一致（既有像素不变的依据）"
+        );
+        assert_eq!(full(0.0), 0.0, "强度 0 ⇒ 恒 0（与 SSR 关闭逐位一致）");
+        assert_eq!(full(2.0), 1.0, "强度 2 ⇒ 钳到 1（命中权重、不是亮度倍率）");
+        assert_eq!(full(-1.0), 0.0, "负强度 ⇒ 上传侧语义（max(0)）⇒ 0");
+        // 中间线性：全量分量下权重 = intensity（钳制前）
+        assert_eq!(full(0.5).to_bits(), (0.5f32).to_bits());
+        // 半量场景：粗糙度取 (floor+cutoff)/2 ⇒ roughness 分量 0.5，
+        // 权重 = 0.5 × intensity（linear 区间不触钳制）
+        let mid_rough = (floor + cutoff) * 0.5;
+        let w = ssr_blend_weight(mid_rough, [0.5, 0.5], 1.0, floor, cutoff, margin);
+        assert_eq!(w.to_bits(), (0.5f32).to_bits(), "半粗糙 ⇒ 半权重");
+        assert_eq!(
+            ssr_blend_weight(mid_rough, [0.5, 0.5], 1.2, floor, cutoff, margin).to_bits(),
+            (0.6f32).to_bits(),
+            "0.5 × 1.2 = 0.6（未触钳制的放行区）"
+        );
+        assert_eq!(
+            ssr_blend_weight(mid_rough, [0.5, 0.5], 3.0, floor, cutoff, margin),
+            1.0,
+            "0.5 × 3.0 = 1.5 ⇒ 钳到 1"
+        );
     }
 
     // ---- GTAO 纯函数（R77，ao.wgsl 同名函数的 CPU 侧锚点） ----

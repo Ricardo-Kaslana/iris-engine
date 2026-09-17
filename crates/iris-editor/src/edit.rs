@@ -181,6 +181,7 @@ use std::path::{Path, PathBuf};
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 use iris_core::physics::ray_box;
+use iris_engine::ddgi::tick_ddgi;
 use iris_engine::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -260,6 +261,40 @@ pub const SUN_INTENSITY_STEP: f32 = 1.1;
 pub const SUN_AMBIENT_STEP: f32 = 1.1;
 /// 方向光偏航 / 俯仰步长（弧度，`J`/`L`/`I`/`K`）。
 pub const SUN_DIR_STEP: f32 = 0.05;
+
+// ---- DDGI 编辑步进（R89，全部是纯算术的确定性档表） ----
+
+/// bounds 平移的轴（`ddgi_bounds_translate` 的轴参数；glam 无轻量 Axis
+/// 枚举可用，自持一份——语义 = 世界坐标轴）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DdgiAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl From<DdgiAxis> for Vec3 {
+    fn from(axis: DdgiAxis) -> Self {
+        match axis {
+            DdgiAxis::X => Vec3::X,
+            DdgiAxis::Y => Vec3::Y,
+            DdgiAxis::Z => Vec3::Z,
+        }
+    }
+}
+
+/// DDGI 间距步进（`,` = ÷、`.` = ×）。
+pub const DDGI_SPACING_STEP: f32 = 1.25;
+/// DDGI 间距下限（米）：低于此值探针数爆炸（由抽稀兜底，但编辑上无意义）。
+pub const DDGI_SPACING_MIN: f32 = 0.25;
+/// DDGI 每帧重照明探针数上限（0 = 冻结表，档内合法值）。
+pub const DDGI_PROBES_PER_FRAME_MAX: usize = 64;
+/// DDGI hysteresis 步进（加法档：从 0 出发乘法档永远出不了 0）。
+pub const DDGI_HYSTERESIS_STEP: f32 = 0.1;
+/// DDGI bounds 平移步长（米）。
+pub const DDGI_BOUNDS_STEP: f32 = 0.5;
+/// DDGI 探针标记球半径（米，可视化叠加层用）。
+pub const DDGI_VIZ_BALL_RADIUS: f32 = 0.16;
 /// 方向光俯仰限位（±89°，防 atan2 在竖直方向退化）。
 pub const SUN_PITCH_LIMIT: f32 = 89.0f32.to_radians();
 
@@ -473,6 +508,14 @@ struct TransientAssets {
     nav_block: MaterialHandle,
     /// 导航域边框（橙线，b 阶段）。
     nav_border: MaterialHandle,
+    /// 探针标记球网格（R89，`uv_sphere` 小球；极点退化三角已由 R58b 修复）。
+    ddgi_ball: MeshHandle,
+    /// 探针状态：脏（待重照明，红）。
+    ddgi_dirty: MaterialHandle,
+    /// 探针状态：粗填（从未精修，琥珀）。
+    ddgi_coarse: MaterialHandle,
+    /// 探针状态：稳态（绿）。
+    ddgi_steady: MaterialHandle,
 }
 
 /// 编辑器状态（World 资源）：选择集 / 摆放类型 / 吸附开关等交互状态 +
@@ -515,6 +558,13 @@ pub struct EditorState {
     nav_viz_on: bool,
     /// Nav 可视化实体（blocked 红片 + 域边框，[`EditorTransient`]）。
     nav_viz: Vec<Entity>,
+    /// DDGI 编辑模式（`X` 循环；默认 [`DdgiEditMode::Inert`] = 既有键位
+    /// 语义零变化）。
+    pub ddgi_edit: DdgiEditMode,
+    /// DDGI 可视化开关（`V` 切换；叠加层 = 探针标记球，三档状态着色）。
+    ddgi_viz_on: bool,
+    /// DDGI 可视化实体（标记球，[`EditorTransient`] + `BakeExcluded`）。
+    ddgi_viz: Vec<Entity>,
     /// 关卡内容网格缓存（同源复用，见模块文档「句柄编号对齐」）。
     content_meshes: Vec<(PrimitiveSection, MeshHandle)>,
     /// 关卡内容材质缓存（同上）。
@@ -547,6 +597,9 @@ impl EditorState {
             redo_stack: Vec::new(),
             nav_viz_on: false,
             nav_viz: Vec::new(),
+            ddgi_edit: DdgiEditMode::Inert,
+            ddgi_viz_on: false,
+            ddgi_viz: Vec::new(),
             content_meshes: Vec::new(),
             content_materials: Vec::new(),
             transient: None,
@@ -636,6 +689,7 @@ pub fn save_level(world: &mut World) -> Result<usize, SceneError> {
     rebuild_grid(world);
     rebuild_gizmo(world);
     rebuild_nav_viz(world);
+    rebuild_ddgi_viz(world);
     match &result {
         Ok(count) => set_status(
             world,
@@ -837,6 +891,9 @@ pub fn place_light_at(world: &mut World, point: Vec3) -> Option<Entity> {
         mesh,
         material,
         Name(name.clone()),
+        // 灯泡网格是编辑器会话内的视觉记号（档里不落 mesh 段 ⇒ 重载后
+        // 无此几何）⇒ 不进 lightmap / 探针 / DDGI 的三角收集（R89）
+        BakeExcluded,
         PointLight {
             color: Vec3::from(LIGHT_COLOR),
             intensity: LIGHT_INTENSITY,
@@ -1385,6 +1442,9 @@ struct EntitySnapshot {
     body: Option<RigidBody>,
     light: Option<PointLight>,
     emitter: Option<ParticleEmitter>,
+    /// R89：`BakeExcluded` 标记（编辑器的灯泡视觉等「内容 + 排除 GI 收集」
+    /// 实体——undo 重建后标记必须复原，否则同一实体在 GI 里时隐时现）。
+    bake_excluded: bool,
 }
 
 /// 可编辑世界的快照（字段集 = R58a 世界 dump 的字段集 + 编辑器句柄缓存）：
@@ -1411,6 +1471,9 @@ struct WorldSnapshot {
     registry_sky: Option<String>,
     /// 方向光资源（光源编辑的恢复载体，位模式级）。
     directional: Option<DirectionalLight>,
+    /// DDGI 设置资源（R89）：`None` = 资源缺席（DDGI 关）。undo 恢复它，
+    /// 否则「第一条步进命令插入默认资源」这一步不可撤销 = 撤销栈谎言。
+    ddgi: Option<DdgiSettings>,
     /// `level` 段快照（写操作不改它，恢复只是复原现场）。
     level: Option<LevelSection>,
     /// 编辑器句柄缓存（「句柄编号对齐」不变量的运行期一半）。
@@ -1436,6 +1499,7 @@ fn capture_snapshot(world: &World) -> Option<WorldSnapshot> {
             body: world.get::<RigidBody>(entity).map(|b| *b),
             light: world.get::<PointLight>(entity).map(|l| *l),
             emitter: world.get::<ParticleEmitter>(entity).map(|e| e.clone()),
+            bake_excluded: world.get::<BakeExcluded>(entity).is_some(),
         });
     }
     let (registry_meshes, registry_materials, registry_gltfs, registry_sky) =
@@ -1472,6 +1536,7 @@ fn capture_snapshot(world: &World) -> Option<WorldSnapshot> {
         directional: world
             .try_resource::<DirectionalLight>()
             .map(|l| (*l).clone()),
+        ddgi: world.try_resource::<DdgiSettings>().map(|s| *s),
         level: world
             .try_resource::<LevelRegistry>()
             .map(|registry| registry.section.clone()),
@@ -1654,12 +1719,22 @@ fn restore_snapshot(world: &mut World, snapshot: &WorldSnapshot) {
         if let Some(emitter) = entry.emitter.clone() {
             world.insert(entity, emitter);
         }
+        if entry.bake_excluded {
+            world.insert(entity, BakeExcluded);
+        }
     }
     // 5) 资源复原（方向光 / level 段快照）
     if let Some(light) = snapshot.directional.clone() {
         world.insert_resource(light);
     } else {
         world.remove_resource::<DirectionalLight>();
+    }
+    // DDGI 设置复原（R89）：Some = 按快照插回，None = 撤掉（启用 DDGI
+    // 这一步本身可撤销）
+    if let Some(settings) = snapshot.ddgi {
+        world.insert_resource(settings);
+    } else {
+        world.remove_resource::<DdgiSettings>();
     }
     if let Some(section) = &snapshot.level {
         world.insert_resource(LevelRegistry {
@@ -1702,6 +1777,32 @@ pub fn light_edit_mode(world: &World) -> LightEditMode {
         Some(_) => LightEditMode::Inert,
         None => LightEditMode::Directional,
     }
+}
+
+/// DDGI 编辑模式（R89，`X` 循环切换）：一个模式对应一组按键语义，
+/// `Inert`（默认）= 编辑器行为与没有 DDGI 入口时逐位相同。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DdgiEditMode {
+    /// DDGI 编辑未激活：全部 DDGI 键回落既有语义。
+    #[default]
+    Inert,
+    /// 网格形态：`,` / `.` = 间距 ÷/×；方向键 / `PgUp` / `PgDn` = bounds
+    /// 平移（X−/X+、Z−/Z+、Y±）。
+    Grid,
+    /// 预算：`,` / `.` = 每帧重照明探针数 −/+；`[` / `]` = 射线档四档循环；
+    /// `;` / `'` = hysteresis −/+。
+    Budget,
+    /// 可视化：`,` / `.` = 重建叠加层（手动刷新，不自动跟随——与 Nav
+    /// 叠加同款立场，模块文档诚实清单第 4 条）。
+    Debug,
+}
+
+/// 当前 DDGI 编辑模式（输入翻译用只读查询；编辑器状态缺席 = `Inert`）。
+pub fn ddgi_edit_mode(world: &World) -> DdgiEditMode {
+    world
+        .try_resource::<EditorState>()
+        .map(|state| state.ddgi_edit)
+        .unwrap_or(DdgiEditMode::Inert)
 }
 
 /// RGB（线性）→ HSV。h ∈ [0, 360)（度）、s / v ∈ [0, 1]。纯函数：
@@ -1915,6 +2016,295 @@ pub fn rotate_light_direction(direction: Vec3, dyaw: f32, dpitch: f32) -> Vec3 {
 }
 
 // ---------------------------------------------------------------------------
+// DDGI 编辑（R89：模式循环 + 五条步进命令 + 可视化）
+// ---------------------------------------------------------------------------
+
+/// `DdgiSettings` 缺席时插入默认资源（「启用 DDGI」是可撤销的一步——
+/// `push_undo` 在本函数之前调用 ⇒ undo 恢复 `ddgi: None` 即撤掉资源）。
+/// 返回是否新插入（状态行提示用）。
+fn ensure_ddgi_settings(world: &mut World) -> bool {
+    if world.contains_resource::<DdgiSettings>() {
+        return false;
+    }
+    world.insert_resource(DdgiSettings::default());
+    true
+}
+
+/// 修改 DDGI 设置的公共尾部（状态行 + HUD + 重建开着的叠加层——参数
+/// 步进改变网格 ⇒ 叠加层随之重建，设计稿 C2 的「步进时重建」）。
+fn ddgi_after_edit(world: &mut World, message: String) {
+    set_status(world, message);
+    refresh_hud(world);
+    rebuild_ddgi_viz(world);
+}
+
+/// `X`：循环切换 DDGI 编辑模式（Inert → Grid → Budget → Debug → Inert）。
+/// 编辑器状态缺席 = no-op（返回 `Inert`）。切换本身不入 undo 栈（它是
+/// 输入路由状态，不是世界内容——与吸附开关 `G` 同款立场）。
+pub fn ddgi_mode_cycle(world: &mut World) -> DdgiEditMode {
+    let Some(mut state) = world.try_resource_mut::<EditorState>() else {
+        return DdgiEditMode::Inert;
+    };
+    state.ddgi_edit = match state.ddgi_edit {
+        DdgiEditMode::Inert => DdgiEditMode::Grid,
+        DdgiEditMode::Grid => DdgiEditMode::Budget,
+        DdgiEditMode::Budget => DdgiEditMode::Debug,
+        DdgiEditMode::Debug => DdgiEditMode::Inert,
+    };
+    let mode = state.ddgi_edit;
+    drop(state);
+    set_status(world, format!("DDGI MODE {mode:?}"));
+    refresh_hud(world);
+    mode
+}
+
+/// DDGI 间距步进（Grid 模式 `,` / `.`）：÷/× [`DDGI_SPACING_STEP`]，
+/// 下限 [`DDGI_SPACING_MIN`]。资源缺席 ⇒ 先插入默认资源（「启用 DDGI」
+/// 入 undo 栈）。返回新间距；无编辑器状态返回 `None`。
+pub fn ddgi_spacing_step(world: &mut World, dir: i32) -> Option<f32> {
+    world.try_resource::<EditorState>()?;
+    push_undo(world);
+    let inserted = ensure_ddgi_settings(world);
+    let mut settings = *world.try_resource::<DdgiSettings>()?;
+    settings.spacing = step_x(
+        settings.spacing,
+        dir as f32,
+        DDGI_SPACING_STEP,
+        DDGI_SPACING_MIN,
+    );
+    settings.validate();
+    let spacing = settings.spacing;
+    world.insert_resource(settings);
+    let hint = if inserted { " (default)" } else { "" };
+    ddgi_after_edit(world, format!("DDGI SPACING {spacing:.3}{hint}"));
+    Some(spacing)
+}
+
+/// DDGI bounds 平移（Grid 模式方向键 / PgUp / PgDn）：沿 `axis` 平移
+/// [`DDGI_BOUNDS_STEP`] × `dir`。`bounds = None`（自动派生）时先物化为
+/// 「静态几何 AABB 外扩 1×spacing」（与引擎 `default_bounds` 同式），
+/// 空几何则 no-op 提示。返回 `(min, max)`；无编辑器状态时返回 `None`。
+pub fn ddgi_bounds_translate(world: &mut World, axis: DdgiAxis, dir: i32) -> Option<(Vec3, Vec3)> {
+    world.try_resource::<EditorState>()?;
+    push_undo(world);
+    let inserted = ensure_ddgi_settings(world);
+    let mut settings = *world.try_resource::<DdgiSettings>()?;
+    let (min, max) = match settings.bounds {
+        Some(pair) => pair,
+        None => {
+            // 物化默认 bounds：与引擎安装路径同源（静态几何 AABB 外扩）
+            let triangles = collect_bake_triangles(world);
+            let Some(derived) = default_bounds(&triangles, settings.spacing) else {
+                set_status(world, "DDGI BOUNDS none (empty geometry)");
+                refresh_hud(world);
+                return None;
+            };
+            derived
+        }
+    };
+    let step = Vec3::from(axis) * (DDGI_BOUNDS_STEP * dir as f32);
+    settings.bounds = Some((min + step, max + step));
+    settings.validate();
+    let pair = settings.bounds.expect("刚写入");
+    world.insert_resource(settings);
+    let hint = if inserted { " (default)" } else { "" };
+    let axis_name = match axis {
+        DdgiAxis::X => "X",
+        DdgiAxis::Y => "Y",
+        DdgiAxis::Z => "Z",
+    };
+    ddgi_after_edit(
+        world,
+        format!(
+            "DDGI BOUNDS {axis_name}{:+.1} ({:.1},{:.1},{:.1})-({:.1},{:.1},{:.1}){hint}",
+            DDGI_BOUNDS_STEP * dir as f32,
+            pair.0.x,
+            pair.0.y,
+            pair.0.z,
+            pair.1.x,
+            pair.1.y,
+            pair.1.z,
+        ),
+    );
+    Some(pair)
+}
+
+/// DDGI 每帧重照明探针数步进（Budget 模式 `,` / `.`）：±1，钳
+/// [0, [`DDGI_PROBES_PER_FRAME_MAX`]]（0 = 冻结表，`DdgiSettings` 的档内
+/// 合法值）。返回新值。
+pub fn ddgi_probes_per_frame_step(world: &mut World, dir: i32) -> Option<usize> {
+    world.try_resource::<EditorState>()?;
+    push_undo(world);
+    let inserted = ensure_ddgi_settings(world);
+    let mut settings = *world.try_resource::<DdgiSettings>()?;
+    let next = settings.probes_per_frame as i64 + dir as i64;
+    settings.probes_per_frame = next.clamp(0, DDGI_PROBES_PER_FRAME_MAX as i64) as usize;
+    settings.validate();
+    let k = settings.probes_per_frame;
+    world.insert_resource(settings);
+    let hint = if inserted { " (default)" } else { "" };
+    ddgi_after_edit(world, format!("DDGI K {k}{hint}"));
+    Some(k)
+}
+
+/// DDGI 射线档循环（Budget 模式 `[` / `]`）：在
+/// [`DDGI_RAYS_PER_FACE_CHOICES`] 四档间循环（`]` 前进、`[` 后退，
+/// 越界回绕）。返回新档。
+pub fn ddgi_rays_face_step(world: &mut World, dir: i32) -> Option<u32> {
+    world.try_resource::<EditorState>()?;
+    push_undo(world);
+    let inserted = ensure_ddgi_settings(world);
+    let mut settings = *world.try_resource::<DdgiSettings>()?;
+    let choices = DDGI_RAYS_PER_FACE_CHOICES;
+    let slot = choices
+        .iter()
+        .position(|&c| c == settings.rays_per_face)
+        .unwrap_or(1); // 未知值（理论上不可能：validate 把关）⇒ 回默认档
+    let len = choices.len() as i64;
+    let next = ((slot as i64 + dir as i64).rem_euclid(len)) as usize;
+    settings.rays_per_face = choices[next];
+    settings.validate();
+    let rays = settings.rays_per_face;
+    world.insert_resource(settings);
+    let hint = if inserted { " (default)" } else { "" };
+    ddgi_after_edit(world, format!("DDGI RAYS {rays}{hint}"));
+    Some(rays)
+}
+
+/// DDGI hysteresis 步进（Budget 模式 `;` / `'`）：±[`DDGI_HYSTERESIS_STEP`]
+/// （加法档：从 0 出发乘法档永远出不了 0），钳 [0, 1]。返回新值。
+pub fn ddgi_hysteresis_step(world: &mut World, dir: i32) -> Option<f32> {
+    world.try_resource::<EditorState>()?;
+    push_undo(world);
+    let inserted = ensure_ddgi_settings(world);
+    let mut settings = *world.try_resource::<DdgiSettings>()?;
+    let next = settings.hysteresis + DDGI_HYSTERESIS_STEP * dir as f32;
+    settings.hysteresis = next.clamp(0.0, 1.0);
+    settings.validate();
+    let hysteresis = settings.hysteresis;
+    world.insert_resource(settings);
+    let hint = if inserted { " (default)" } else { "" };
+    ddgi_after_edit(world, format!("DDGI HYST {hysteresis:.2}{hint}"));
+    Some(hysteresis)
+}
+
+/// `V`：DDGI 可视化开关（叠加层 = 探针标记球，脏红 / 粗填琥珀 / 稳态绿）。
+/// 开 = 按 `DdgiGrid` 当前状态重建（网格未装时先手动 tick 一帧装配——
+/// 编辑命令层的显式动作，不做每帧自动跟随，与 Nav 叠加同款立场）。
+/// 编辑器状态缺席 = no-op（返回 `false`）。
+pub fn ddgi_overlay_toggle(world: &mut World) -> bool {
+    if world.try_resource::<EditorState>().is_none() {
+        return false;
+    }
+    let turning_on = !world
+        .try_resource::<EditorState>()
+        .is_some_and(|state| state.ddgi_viz_on);
+    if turning_on {
+        build_ddgi_viz(world);
+    } else {
+        clear_ddgi_viz(world);
+        set_status(world, "DDGI VIZ off");
+        refresh_hud(world);
+    }
+    turning_on
+}
+
+/// 重建 + 生成 DDGI 叠加层（重复调用安全——先撤旧实体）。
+fn build_ddgi_viz(world: &mut World) {
+    let Some(assets) = transient_assets(world) else {
+        return;
+    };
+    clear_ddgi_viz(world);
+    // 网格未装 / 参数变过 ⇒ 手动 tick 一帧装配（显式编辑动作；tick 是
+    // 纯函数链，headless 可复现）
+    if world.try_resource::<DdgiSettings>().is_some() {
+        tick_ddgi(world);
+    }
+    // 只读阶段：抓探针数据与三档判定（两阶段模式）
+    let balls: Vec<(Vec3, MaterialHandle)> = {
+        let Some(grid) = world.try_resource::<DdgiGrid>() else {
+            return;
+        };
+        if grid.is_empty() {
+            return;
+        }
+        // 粗填判定：从未被精修的探针 = stamp 仍是安装帧（全表最小 stamp）
+        let install_stamp = grid.probe_stamp().iter().copied().min().unwrap_or(0);
+        let dirty = grid.dirty();
+        let stamps = grid.probe_stamp();
+        let material = |index: usize| -> MaterialHandle {
+            if dirty[index] {
+                assets.ddgi_dirty
+            } else if stamps[index] == install_stamp {
+                assets.ddgi_coarse
+            } else {
+                assets.ddgi_steady
+            }
+        };
+        grid.positions()
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, material(i)))
+            .collect()
+    };
+    let mut spawned = Vec::new();
+    for (index, (position, material)) in balls.into_iter().enumerate() {
+        spawned.push(world.spawn((
+            Transform {
+                position,
+                rotation: Quat::IDENTITY,
+                scale: Vec3::splat(DDGI_VIZ_BALL_RADIUS),
+            },
+            assets.ddgi_ball,
+            material,
+            Name(format!("ddgiviz/p{index}")),
+            EditorTransient,
+            BakeExcluded,
+        )));
+    }
+    if let Some(mut state) = world.try_resource_mut::<EditorState>() {
+        state.ddgi_viz_on = true;
+        state.ddgi_viz = spawned;
+    }
+    let summary = world
+        .try_resource::<DdgiGrid>()
+        .map(|grid| {
+            let dirty = grid.dirty().iter().filter(|d| **d).count();
+            format!("{} probes {} dirty", grid.probe_count(), dirty)
+        })
+        .unwrap_or_else(|| "no grid".to_string());
+    set_status(world, format!("DDGI VIZ on {summary}"));
+    refresh_hud(world);
+}
+
+/// 撤掉 DDGI 叠加层实体（`ddgi_viz_on` 标记不动——由 toggle / rebuild 管理）。
+fn clear_ddgi_viz(world: &mut World) {
+    let viz: Vec<Entity> = world
+        .try_resource::<EditorState>()
+        .map(|state| state.ddgi_viz.clone())
+        .unwrap_or_default();
+    for entity in viz {
+        world.despawn(entity);
+    }
+    if let Some(mut state) = world.try_resource_mut::<EditorState>() {
+        state.ddgi_viz.clear();
+    }
+}
+
+/// 按 `ddgi_viz_on` 标记重建可视化（存档 / 烘焙 / 参数步进的瞬态重建路径
+/// 用；没开过 = no-op）。网格未重装时保持旧布局（下一帧引擎 tick 装配后
+/// 再按 `V` / `,` / `.` 刷新——手动重建立场的边界，写进诚实清单）。
+pub fn rebuild_ddgi_viz(world: &mut World) {
+    let on = world
+        .try_resource::<EditorState>()
+        .map(|state| state.ddgi_viz_on)
+        .unwrap_or(false);
+    if on {
+        build_ddgi_viz(world);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 烘焙入口（B 键）
 // ---------------------------------------------------------------------------
 
@@ -1932,6 +2322,9 @@ pub struct BakeReport {
     /// 参数来源：`true` = 档内 `level.bake` 段，`false` = 引擎默认
     /// （产物走默认名，重载不自动挂载——诚实限制第 3 条）。
     pub from_level_section: bool,
+    /// R89：烘焙时 `DdgiGrid` 是否非空（贴图 × DDGI 对同一空间互斥的
+    /// 状态提示——只提示，不做自动裁剪，A1 裁决）。
+    pub ddgi_grid_present: bool,
 }
 
 /// 烘焙当前静态世界并挂载（`B` 键）：档内 `level.bake` 参数（缺席 =
@@ -2083,12 +2476,16 @@ pub fn bake_and_install(world: &mut World) -> Option<BakeReport> {
     // Store 整库恢复把在用的 UV2 副本换掉
     clear_undo_history(world);
     let elapsed_ms = started.elapsed().as_millis();
+    let ddgi_grid_present = world
+        .try_resource::<DdgiGrid>()
+        .is_some_and(|grid| !grid.is_empty());
     let report = BakeReport {
         texels,
         entities: install.entities,
         elapsed_ms,
         artifact: artifact_path,
         from_level_section: from_section,
+        ddgi_grid_present,
     };
     set_status(
         world,
@@ -2100,6 +2497,15 @@ pub fn bake_and_install(world: &mut World) -> Option<BakeReport> {
             file_label(&report.artifact)
         ),
     );
+    if ddgi_grid_present {
+        log::warn!(
+            "本关卡同时挂了 DDGI 网格与烘焙贴图：二者对同一空间互斥（贴图赢，             挂图集实体不吃 DDGI——ARCHITECTURE §4.45 裁决），建议一个关卡一套 GI"
+        );
+        set_status(
+            world,
+            "BAKE NOTE lightmap x DDGI mutual exclusion (lm wins)",
+        );
+    }
     refresh_hud(world);
     Some(report)
 }
@@ -2286,6 +2692,7 @@ fn build_nav_viz(world: &mut World) -> Option<NavReport> {
             assets.nav_block,
             Name(format!("navviz/c{col}r{row}")),
             EditorTransient,
+            BakeExcluded,
         )));
     }
     // 域边框：bounds 四条边（XZ 平面一圈），复用线网格
@@ -2338,6 +2745,7 @@ fn build_nav_viz(world: &mut World) -> Option<NavReport> {
             assets.nav_border,
             Name(format!("navviz/border{index}")),
             EditorTransient,
+            BakeExcluded,
         )));
     }
     if let Some(mut state) = world.try_resource_mut::<EditorState>() {
@@ -2487,6 +2895,30 @@ fn build_transient_assets(world: &mut World) {
         roughness: 0.8,
         ..Default::default()
     });
+    // DDGI 探针标记（R89）：小球网格 + 脏 / 粗填 / 稳态三档自发光材质
+    // （红 / 琥珀 / 绿——与网格红蓝轴、黄色选中框、Nav 红片都可区分；
+    // 三档让 ⌈n/k⌉ 收敛过程肉眼可读）
+    let ddgi_ball = world
+        .resource_mut::<MeshStore>()
+        .add(MeshData::uv_sphere(1.0, 12, 8));
+    let ddgi_dirty = world.resource_mut::<MaterialStore>().add(MaterialDef {
+        base_color: [1.0, 0.16, 0.12, 1.0],
+        emissive: [1.4, 0.10, 0.06, 1.0],
+        roughness: 0.7,
+        ..Default::default()
+    });
+    let ddgi_coarse = world.resource_mut::<MaterialStore>().add(MaterialDef {
+        base_color: [1.0, 0.62, 0.10, 1.0],
+        emissive: [1.2, 0.55, 0.05, 1.0],
+        roughness: 0.7,
+        ..Default::default()
+    });
+    let ddgi_steady = world.resource_mut::<MaterialStore>().add(MaterialDef {
+        base_color: [0.20, 0.85, 0.35, 1.0],
+        emissive: [0.10, 1.1, 0.30, 1.0],
+        roughness: 0.7,
+        ..Default::default()
+    });
     let assets = TransientAssets {
         line_mesh,
         grid,
@@ -2495,14 +2927,18 @@ fn build_transient_assets(world: &mut World) {
         gizmo,
         nav_block,
         nav_border,
+        ddgi_ball,
+        ddgi_dirty,
+        ddgi_coarse,
+        ddgi_steady,
     };
     if let Some(mut state) = world.try_resource_mut::<EditorState>() {
         state.transient = Some(assets);
     }
 }
 
-/// despawn 全部瞬态实体（网格线 + 选中框 + Nav 可视化），句柄缓存保留。
-/// `nav_viz_on` 标记**不清**（存档后按标记重建可视化）。
+/// despawn 全部瞬态实体（网格线 + 选中框 + Nav / DDGI 可视化），句柄缓存
+/// 保留。`nav_viz_on` / `ddgi_viz_on` 标记**不清**（存档后按标记重建）。
 pub fn clear_transient(world: &mut World) {
     let mut doomed = Vec::new();
     world.query::<(Entity, &EditorTransient)>(|(entity, _)| doomed.push(entity));
@@ -2513,6 +2949,7 @@ pub fn clear_transient(world: &mut World) {
         state.grid.clear();
         state.gizmo.clear();
         state.nav_viz.clear();
+        state.ddgi_viz.clear();
     }
 }
 
@@ -2579,6 +3016,7 @@ fn spawn_line(
         material,
         Name(name),
         EditorTransient,
+        BakeExcluded,
     ))
 }
 
@@ -2603,6 +3041,7 @@ pub fn rebuild_gizmo(world: &mut World) {
             assets.gizmo,
             Name(format!("gizmo/{index}")),
             EditorTransient,
+            BakeExcluded,
         )));
     }
     if let Some(mut state) = world.try_resource_mut::<EditorState>() {
@@ -2860,6 +3299,40 @@ pub fn panel_text(world: &World) -> String {
             grid.rows() as f32 * params.cell_size,
         ));
     }
+    // DDGI 摘要（R89）：模式 / 网格状态 / 参数。资源缺席时也显示模式
+    // （Grid 等模式激活但未启用 ⇒ 提示「off (no settings)」）
+    {
+        let ddgi_line = match world.try_resource::<DdgiSettings>() {
+            Some(settings) => {
+                let grid_info = world
+                    .try_resource::<DdgiGrid>()
+                    .map(|grid| {
+                        if grid.is_empty() {
+                            "grid empty".to_string()
+                        } else {
+                            format!(
+                                "{}p {}dirty viz {}",
+                                grid.probe_count(),
+                                grid.dirty().iter().filter(|d| **d).count(),
+                                on_off(state.ddgi_viz_on),
+                            )
+                        }
+                    })
+                    .unwrap_or_else(|| "no grid".to_string());
+                format!(
+                    "DDGI {:?} sp {:.2} k {} rays {} hyst {:.2} | {}",
+                    state.ddgi_edit,
+                    settings.spacing,
+                    settings.probes_per_frame,
+                    settings.rays_per_face,
+                    settings.hysteresis,
+                    grid_info,
+                )
+            }
+            None => format!("DDGI {:?} off (no settings)", state.ddgi_edit),
+        };
+        lines.push(ascii_only(&ddgi_line));
+    }
     match state.selected.and_then(|entity| describe(world, entity)) {
         Some(info) => {
             lines.push(format!("SELECTED {}", ascii_only(&info.name)));
@@ -2909,6 +3382,7 @@ pub fn panel_text(world: &World) -> String {
     lines.push("[ ] light I  -/= range  H hue  K sh".to_string());
     lines.push("no sel: [] sun I  ;' amb  JLIK dir".to_string());
     lines.push("B bake   N nav   F focus   MMB orbit".to_string());
+    lines.push("X ddgi mode  ,/. step  V viz".to_string());
     lines.push("WASD/QE fly  WHEEL zoom  ESC quit".to_string());
     lines.join("\n")
 }

@@ -140,9 +140,10 @@ use iris_core::physics::{Collider, ColliderShape, RigidBody};
 use iris_core::prelude::{Entity, Transform, Vec3, World};
 use iris_core::{Component, Resource};
 use iris_render::prelude::{
-    AtlasEntry, AtlasTriangle, BakeParams, BakeUvParams, BakedLightmap, ChartAxis, Heightmap,
-    LIGHTMAP_DILATE_ITERATIONS, LightmapAtlas, MaterialHandle, MeshHandle, MeshStore,
-    TerrainOptions, build_terrain, generate_hills, install_lightmap,
+    AtlasEntry, AtlasTriangle, BakeParams, BakeUvParams, BakedLightmap, ChartAxis,
+    DDGI_RAYS_PER_FACE_CHOICES, DdgiSettings, Heightmap, LIGHTMAP_DILATE_ITERATIONS, LightmapAtlas,
+    MaterialHandle, MeshHandle, MeshStore, TerrainOptions, build_terrain, generate_hills,
+    install_lightmap,
 };
 use serde::{Deserialize, Serialize};
 
@@ -155,7 +156,7 @@ use crate::scene::{
 // ---------------------------------------------------------------------------
 
 /// `level` 段：全部子段可选（缺席 = 该能力不启用）。序列化顺序 =
-/// 字段声明序（terrain → nav → bake），save 输出确定。
+/// 字段声明序（terrain → nav → bake → ddgi），save 输出确定。
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct LevelSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,12 +165,17 @@ pub struct LevelSection {
     pub nav: Option<NavSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bake: Option<BakeSection>,
+    /// DDGI 网格参数（R89）：缺席 = DDGI 不启用（能力不启用，与 nav/bake
+    /// 同款语义）。加载 → `DdgiSettings` 资源；保存 → 从活动资源回写
+    /// （`save_scene`，照 `DirectionalLight` 的资源回写先例）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ddgi: Option<DdgiSection>,
 }
 
 impl LevelSection {
     /// 全子段缺席（v1 迁移产出的默认段）：save 时整段省略。
     pub fn is_empty(&self) -> bool {
-        self.terrain.is_none() && self.nav.is_none() && self.bake.is_none()
+        self.terrain.is_none() && self.nav.is_none() && self.bake.is_none() && self.ddgi.is_none()
     }
 }
 
@@ -719,6 +725,167 @@ pub(crate) fn apply_bake(
     };
     let baked = parse_lightmap_artifact(&bytes)?;
     attach_lightmap_artifact(world, baked)
+}
+
+// ---------------------------------------------------------------------------
+// ddgi 子段（R89）
+// ---------------------------------------------------------------------------
+
+fn default_ddgi_spacing() -> f32 {
+    DdgiSettings::default().spacing
+}
+fn default_ddgi_probes_per_frame() -> usize {
+    DdgiSettings::default().probes_per_frame
+}
+fn default_ddgi_rays_per_face() -> u32 {
+    DdgiSettings::default().rays_per_face
+}
+fn default_ddgi_hysteresis() -> f32 {
+    DdgiSettings::default().hysteresis
+}
+fn default_ddgi_bounces() -> u32 {
+    DdgiSettings::default().bounces
+}
+
+/// ddgi 子段：DDGI 探针网格的**作者参数**（[`DdgiSettings`] 的序列化投影；
+/// `geometry_generation` 不入档——它是运行期记账，不是作者意图）。逐字段
+/// `#[serde(default = "…")]` 缺省 = 引擎默认；`bounds` 两项都缺席 =
+/// `None`（从静态几何自动派生，与引擎同语义）。**探针表内容（SH / 深度
+/// 矩 / 脏位 / cursor）不入档**（§8.57⑭ 维持：重算成本可控，入档引入
+/// 「表与几何失配」的校验面）。
+///
+/// 加载：[`apply_ddgi`] 段 → `DdgiSettings` 资源（校验失败 = 加载报错，
+/// 与 nav/bake 同口径）。保存：`save_scene` 从**活动资源**回写（资源缺席
+/// ⇒ 不写段 ⇒ DDGI 关）。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DdgiSection {
+    #[serde(default = "default_ddgi_spacing")]
+    pub spacing: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds_min: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds_max: Option<[f32; 3]>,
+    #[serde(default = "default_ddgi_probes_per_frame")]
+    pub probes_per_frame: usize,
+    #[serde(default = "default_ddgi_rays_per_face")]
+    pub rays_per_face: u32,
+    #[serde(default = "default_ddgi_hysteresis")]
+    pub hysteresis: f32,
+    /// 天空辐射率覆盖（缺席 = 取 `DirectionalLight.ambient`，裁定 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sky_color: Option<[f32; 3]>,
+    #[serde(default = "default_ddgi_bounces")]
+    pub bounces: u32,
+}
+
+impl Default for DdgiSection {
+    fn default() -> Self {
+        Self {
+            spacing: default_ddgi_spacing(),
+            bounds_min: None,
+            bounds_max: None,
+            probes_per_frame: default_ddgi_probes_per_frame(),
+            rays_per_face: default_ddgi_rays_per_face(),
+            hysteresis: default_ddgi_hysteresis(),
+            sky_color: None,
+            bounces: default_ddgi_bounces(),
+        }
+    }
+}
+
+impl DdgiSection {
+    /// 转引擎设置（校验 `DdgiSettings::validate` 的全部断言前提——那些
+    /// 断言是 panic 语义，加载路径按 [`SceneError`] 口径前置拦截）。
+    pub fn to_settings(&self) -> Result<DdgiSettings, SceneError> {
+        let bounds = match (self.bounds_min, self.bounds_max) {
+            (None, None) => None,
+            (Some(min), Some(max)) => {
+                if !min.iter().all(|v| v.is_finite()) || !max.iter().all(|v| v.is_finite()) {
+                    return Err(SceneError::OutOfRange(format!(
+                        "level.ddgi bounds 须有限：{min:?} .. {max:?}"
+                    )));
+                }
+                if !(max[0] >= min[0] && max[1] >= min[1] && max[2] >= min[2]) {
+                    return Err(SceneError::OutOfRange(format!(
+                        "level.ddgi bounds 的 max 须逐分量 ≥ min：{min:?} .. {max:?}"
+                    )));
+                }
+                Some((Vec3::from_array(min), Vec3::from_array(max)))
+            }
+            (min, max) => {
+                return Err(SceneError::Missing(format!(
+                    "level.ddgi.bounds_min / bounds_max 必须成对出现（min = {min:?}，max = {max:?}）"
+                )));
+            }
+        };
+        let settings = DdgiSettings {
+            spacing: self.spacing,
+            bounds,
+            probes_per_frame: self.probes_per_frame,
+            rays_per_face: self.rays_per_face,
+            hysteresis: self.hysteresis,
+            sky_color: self.sky_color.map(Vec3::from_array),
+            bounces: self.bounces,
+            geometry_generation: 0,
+        };
+        // 与引擎校验同口径的逐条前置拦截（`DdgiSettings::validate` 是 panic
+        // 语义；加载路径按 SceneError 报告——照 nav/bake 的处置）
+        if !(settings.spacing.is_finite() && settings.spacing > 0.0) {
+            return Err(SceneError::OutOfRange(format!(
+                "level.ddgi.spacing 必须为正有限值，实际 {}",
+                settings.spacing
+            )));
+        }
+        if !DDGI_RAYS_PER_FACE_CHOICES.contains(&settings.rays_per_face) {
+            return Err(SceneError::OutOfRange(format!(
+                "level.ddgi.rays_per_face 只能取 {DDGI_RAYS_PER_FACE_CHOICES:?}，实际 {}",
+                settings.rays_per_face
+            )));
+        }
+        if !settings.hysteresis.is_finite() {
+            return Err(SceneError::OutOfRange(format!(
+                "level.ddgi.hysteresis 须有限，实际 {}",
+                settings.hysteresis
+            )));
+        }
+        if settings.bounces > 1 {
+            return Err(SceneError::OutOfRange(format!(
+                "level.ddgi.bounces v1 支持 0 / 1，实际 {}",
+                settings.bounces
+            )));
+        }
+        if let Some(sky) = settings.sky_color {
+            if !sky.is_finite() {
+                return Err(SceneError::OutOfRange(format!(
+                    "level.ddgi.sky_color 须有限：{sky:?}"
+                )));
+            }
+        }
+        // 理论不可达的兜底（上面穷尽了 validate 的全部断言前提）
+        settings.validate();
+        Ok(settings)
+    }
+
+    /// 从活动资源投影（`save_scene` 的回写侧）。
+    pub fn from_settings(settings: &DdgiSettings) -> Self {
+        Self {
+            spacing: settings.spacing,
+            bounds_min: settings.bounds.map(|(min, _)| min.to_array()),
+            bounds_max: settings.bounds.map(|(_, max)| max.to_array()),
+            probes_per_frame: settings.probes_per_frame,
+            rays_per_face: settings.rays_per_face,
+            hysteresis: settings.hysteresis,
+            sky_color: settings.sky_color.map(|v| v.to_array()),
+            bounces: settings.bounces,
+        }
+    }
+}
+
+/// ddgi 子段应用：段 → `DdgiSettings` 资源（缺席段 = 不插资源 = DDGI 关）。
+pub(crate) fn apply_ddgi(world: &mut World, section: &DdgiSection) -> Result<(), SceneError> {
+    let settings = section.to_settings()?;
+    world.insert_resource(settings);
+    Ok(())
 }
 
 /// 产物挂载：一致性校验 → [`install_lightmap`] → 登记表回补。
@@ -1834,5 +2001,132 @@ mod tests {
         };
         assert_eq!(bits_a, bits_b, "NavGridParams 全字段位模式往返一致");
         assert_eq!(bits_a.2, 0.5f32.to_bits(), "cell_size 解析值");
+    }
+
+    // ------------------------------------------------------------------
+    // R89：ddgi 子段
+    // ------------------------------------------------------------------
+
+    /// `level.ddgi` 段：逐字段 serde 往返逐位（f32 位模式 + bounds 成对
+    /// 缺席 = 自动派生）+ 加载侧段 → 资源 + 保存侧资源 → 段（save_scene）。
+    #[test]
+    fn ddgi_section_roundtrip_is_bitwise() {
+        // 手写段（非默认值覆盖每个字段）
+        let json = r#"{
+            "version": 2,
+            "entities": [],
+            "level": { "ddgi": {
+                "spacing": 2.5,
+                "bounds_min": [-8.0, 0.0, -8.0],
+                "bounds_max": [8.0, 3.5, 8.0],
+                "probes_per_frame": 4,
+                "rays_per_face": 32,
+                "hysteresis": 0.25,
+                "sky_color": [0.1, 0.2, 0.3],
+                "bounces": 0
+            } }
+        }"#;
+        let mut world = World::new();
+        load_str(&mut world, "ddgi_rt.json", json);
+        let settings = world
+            .try_resource::<DdgiSettings>()
+            .expect("ddgi 段 ⇒ DdgiSettings 资源");
+        assert_eq!(settings.spacing.to_bits(), 2.5f32.to_bits());
+        assert_eq!(
+            settings.bounds,
+            Some((Vec3::new(-8.0, 0.0, -8.0), Vec3::new(8.0, 3.5, 8.0)))
+        );
+        assert_eq!(settings.probes_per_frame, 4);
+        assert_eq!(settings.rays_per_face, 32);
+        assert_eq!(settings.hysteresis.to_bits(), 0.25f32.to_bits());
+        assert_eq!(settings.sky_color, Some(Vec3::new(0.1, 0.2, 0.3)));
+        assert_eq!(settings.bounces, 0);
+        // geometry_generation 不入档 ⇒ 恒 0（运行期记账，非作者意图）
+        assert_eq!(settings.geometry_generation, 0);
+
+        // bounds 双缺席 = None（自动派生口径透传）
+        let json_auto = r#"{
+            "version": 2,
+            "entities": [],
+            "level": { "ddgi": { "spacing": 3.0 } }
+        }"#;
+        let mut world = World::new();
+        load_str(&mut world, "ddgi_auto.json", json_auto);
+        let settings = world.try_resource::<DdgiSettings>().expect("在场");
+        assert_eq!(settings.spacing.to_bits(), 3.0f32.to_bits());
+        assert_eq!(settings.bounds, None, "双缺席 = 自动派生");
+        assert_eq!(
+            settings.probes_per_frame,
+            DdgiSettings::default().probes_per_frame,
+            "其余字段缺省 = 引擎默认"
+        );
+    }
+
+    /// `level.ddgi` 段的校验拦截：半 bounds（只有 min）、非法 spacing、
+    /// 非法 rays 档、bounces > 1 → `SceneError`（不 panic）。
+    #[test]
+    fn ddgi_section_validates_before_engine_panics() {
+        let cases = [
+            (r#""ddgi": { "bounds_min": [0,0,0] }"#, "成对"),
+            (r#""ddgi": { "spacing": -1.0 }"#, "正有限"),
+            (r#""ddgi": { "rays_per_face": 24 }"#, "rays_per_face"),
+            (r#""ddgi": { "bounces": 2 }"#, "bounces"),
+        ];
+        for (i, (ddgi_json, expect_msg)) in cases.iter().enumerate() {
+            let json = format!(r#"{{ "version": 2, "entities": [], "level": {{ {ddgi_json} }} }}"#);
+            let mut world = World::new();
+            let path = test_dir().join(format!("ddgi_bad{i}.json"));
+            std::fs::write(&path, json).expect("写关卡文件");
+            let err = load_scene(&mut world, &path).expect_err("必须报错");
+            assert!(
+                err.to_string().contains(expect_msg),
+                "用例 {i}：{err} 应包含 {expect_msg:?}"
+            );
+            assert!(
+                !world.contains_resource::<DdgiSettings>(),
+                "校验失败不插资源"
+            );
+        }
+    }
+
+    /// 保存侧：`DdgiSettings` 资源在场 ⇒ `level.ddgi` 段写出；二次保存
+    /// 逐字节一致（资源 → 段的回写稳定）。无资源 ⇒ 无段（由
+    /// `scene.rs` 与编辑器测试覆盖，此处只钉资源面）。
+    #[test]
+    fn save_writes_ddgi_section_from_live_resource() {
+        let mut world = World::new();
+        world.insert_resource(DdgiSettings {
+            spacing: 3.0,
+            bounds: Some((Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 2.0, 4.0))),
+            probes_per_frame: 5,
+            rays_per_face: 64,
+            hysteresis: 0.5,
+            sky_color: Some(Vec3::new(0.2, 0.2, 0.25)),
+            bounces: 1,
+            geometry_generation: 7,
+        });
+        world.insert_resource(crate::level::LevelRegistry::default());
+        let path = test_dir().join("ddgi_save.json");
+        crate::scene::save_scene(&mut world, &path).expect("保存");
+        let text = std::fs::read_to_string(&path).expect("读");
+        assert!(text.contains("\"ddgi\""), "ddgi 段必须写出：{text}");
+        assert!(!text.contains("geometry_generation"), "运行期记账不入档");
+        // 逐字节重存
+        crate::scene::save_scene(&mut world, &path).expect("重存");
+        let text2 = std::fs::read_to_string(&path).expect("读");
+        assert_eq!(text, text2, "二次保存逐字节一致");
+        // 重载资源复原（geometry_generation 归零是既有语义）
+        let mut reloaded = World::new();
+        load_str(&mut reloaded, "ddgi_save_reload.json", &text);
+        let settings = reloaded.try_resource::<DdgiSettings>().expect("在场");
+        assert_eq!(settings.spacing.to_bits(), 3.0f32.to_bits());
+        assert_eq!(settings.rays_per_face, 64);
+        assert_eq!(settings.probes_per_frame, 5);
+        assert_eq!(settings.hysteresis.to_bits(), 0.5f32.to_bits());
+        assert_eq!(
+            settings.bounds,
+            Some((Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 2.0, 4.0)))
+        );
+        assert_eq!(settings.sky_color, Some(Vec3::new(0.2, 0.2, 0.25)));
     }
 }

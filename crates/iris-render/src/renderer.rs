@@ -2295,14 +2295,23 @@ fn collect_instances(
     };
     // 光照探针集（R64 / R83）：CPU 侧逐实体求值 → 实例载荷（E/π + 标志位）。
     // 资源缺席 / 空集 ⇒ 恒 [0; 4]（着色器 select 取 env 采样值的同一串位）。
-    // **光照贴图优先**：挂图集的实体走 R52c 的逐 texel 分支，CPU 侧就不再发
-    // 标志位（两道保险：着色器那里 select 也是整项替换）。带 SH 的集由
-    // `instance_payload` 内部改走 SH 零阶口径（R83，见 irradiance.rs）。
-    // **DDGI 优先（R88 裁定 2）**：`DdgiGrid` 非空 ⇒ 载荷改取 DDGI 的零阶
-    // 径向混合（与 R83 带 SH 的集**同口径**，见 `DdgiGrid::instance_payload`），
-    // 烘焙探针集被忽略（互斥告警在 draw 的三态裁决段发一次）。这份 xyz 只被
-    // mode = 0 的路径消费（探针捕获 / RT 相机恒 mode 0），主视图在 mode = 2
-    // 时只读它的标志位。
+    // **合成语义裁决 1/5（R89 定稿，原「未修订」）——挂图集实体 × DDGI =
+    // 互斥，贴图赢**：挂图集的实体**不发**探针标志位（下方 `lightmap !=
+    // NO_LIGHTMAP` 早退），DDGI 分支在同一守卫之后 ⇒ 图集实体完全吃不到
+    // DDGI。物理依据：贴图已含 `sky + bounce`（bounce 里带方向光弹射，
+    // bake.rs），与 DDGI 承载同一份间接漫反射贡献，相加即双计。同一空间
+    // 两套静态/动态 GI **二选一**；差值法（贴图静态 + DDGI 动态增量）已
+    // 裁定拒绝（R89 设计决策 9：需要持久化基线表 + 二次重照明对照 +
+    // 负增量钳位 + 「贴图与网格参数严格同源」的脆弱契约，收益可由美术
+    // 流程自行规避——一个关卡一套 GI）。语义权威：ARCHITECTURE §4.45。
+    // 带 SH 的集由 `instance_payload` 内部改走 SH 零阶口径（R83，见
+    // irradiance.rs）。
+    // **合成语义裁决 2/5（R88 裁定 2）——DDGI 优先**：`DdgiGrid` 非空 ⇒
+    // 载荷改取 DDGI 的零阶径向混合（与 R83 带 SH 的集**同口径**，见
+    // `DdgiGrid::instance_payload`），烘焙探针集被忽略（互斥告警在 draw
+    // 的三态裁决段发一次）。这份 xyz 只被 mode = 0 的路径消费（合成语义
+    // 裁决 4/5：探针捕获 / RT 相机恒 mode 0），主视图在 mode = 2 时只读
+    // 它的标志位。
     let ddgi = world.try_resource::<crate::ddgi::DdgiGrid>();
     let probes = world.try_resource::<IrradianceProbeSet>();
     let probe_payload = |position: Vec3, lightmap: u32| -> [f32; 4] {
@@ -4553,6 +4562,25 @@ impl Renderer {
     /// 输出逐位等于当前帧（无历史贡献），再下一帧恢复正常累积。相机
     /// 切镜 / 大幅传送 / 场景整体替换后由宿主调用——切镜阈值检测是
     /// 内容启发式（拒绝清单），决策交给知道切镜时刻的一方。
+    ///
+    /// **语义（R89 起定稿）=「清一切跨帧时域状态，除了探针域」**：
+    /// - `taa_reset_pending`：TAA 历史（R60 原语义）；
+    /// - `ssr_prev_valid`：SSR 上帧颜色/深度副本（R62b 跟随）；
+    /// - `ao_depth_frame`：GTAO 上帧深度副本记账（R89 补齐——iris-exp
+    ///   frictions ⑬ 实锤：切镜后首帧 GTAO 仍按旧场景深度算可见度，旧
+    ///   腿形投出假遮蔽并被 TAA 历史拖尾多帧）。清空后首帧
+    ///   `ao_depth_frame` 与 `occ_frame − 1` 失配 ⇒ GTAO 中性 1.0（输出
+    ///   与 AO 关闭帧逐位一致）、`FrameStats::ao_on == 0`，第二帧起正确；
+    /// - `prev_view_proj`：MB / TAA / SSR 的上帧矩阵（R89 补齐）——消费点
+    ///   是 `unwrap_or(vp_raw)`（首帧语义 = 当前帧矩阵补位 ⇒ 速度恒 0、
+    ///   原色透传），**清空恰是「无历史」语义本身**，与 TAA 重置同款；
+    /// - **故意不清**：`ddgi_upload` / `DdgiGrid` 表内容 / `probe_stamp` /
+    ///   `structure_generation`（探针域状态与镜头无关——镜头切走再切回，
+    ///   探针辐射场仍是同一个物理量；锚测试
+    ///   `reset_taa_does_not_disturb_ddgi` 钉住）。
+    ///
+    /// 不调 reset_taa 的宿主逐位不变；调了但没有 GTAO / SSR 的宿主也逐位
+    /// 不变（`ao_depth_frame` 本就是 None，`ssr_prev_valid` 本就是 false）。
     pub fn reset_taa(&mut self) {
         self.taa_reset_pending = true;
         // SSR 跟随（R62b）：reset_taa 的语义是「宿主宣告切镜」，切镜让
@@ -4561,6 +4589,12 @@ impl Renderer {
         // 之后随帧尾副本恢复。成本是切镜帧的反射回退探针/env 一帧，
         // 收益是杜绝「新场景地板反射旧场景」的一帧闪现。
         self.ssr_prev_valid = false;
+        // GTAO 跟随（R89，frictions ⑬）：上帧深度副本属于旧场景 ⇒ 记账
+        // 失配 ⇒ 首帧可见度图中性 1.0。
+        self.ao_depth_frame = None;
+        // 上帧矩阵（R89）：清空 = 首帧语义（MB 零速度透传），与「无历史」
+        // 等价；下一帧照常保存当前帧矩阵。
+        self.prev_view_proj = None;
     }
 
     /// 切换阴影偏移口径到 **v1 对照模式**（R61，验收 / 归因口）。

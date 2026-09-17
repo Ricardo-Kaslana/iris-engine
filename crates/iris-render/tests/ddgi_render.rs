@@ -1,7 +1,8 @@
-//! 集成测试：DDGI 动态全局光照 v1（R88，`DdgiGrid` 非空 ⇒ binding 18/19 整表
-//! 替换 + binding 20 深度表 + `standard.wgsl` 的 mode = 2 分支）。
+//! 集成测试：DDGI 动态全局光照（R88 v1 + R89 v2，`DdgiGrid` 非空 ⇒
+//! binding 18/19 整表替换 + binding 20 深度表 + `standard.wgsl` 的 mode = 2
+//! 分支）。
 //!
-//! 六条主线（与 ARCHITECTURE §4.44 的验收标准一一对应）：
+//! R88 六条主线（与 ARCHITECTURE §4.44 的验收标准一一对应）：
 //! 1. **缺席 = 逐位不变（红线①）**：无 `DdgiGrid` / 空 `DdgiGrid` /
 //!    有 `DdgiSettings` 但网格空 三者渲染 **逐字节相等**；且 R83 烘焙探针集
 //!    在场时「空 DDGI 网格」与「无 DDGI 网格」逐字节相等（裁定 2 的缺席支：
@@ -19,6 +20,20 @@
 //!    `to_bits` 序列双断言；
 //! 6. **昼夜联动（R80）**：`DirectionalLight` 阶跃 ⇒ 全表 SH 的 L0 在
 //!    `⌈n/k⌉` 帧内单调跟随到位。
+//!
+//! R89 追加（合成语义定稿 + 两个既有 bug 的锚，§4.45 / §8.58）：
+//! 7. **cov = 1 内区 ≈ R88**：全画面都在探针内区（`d ≤ 0.75·r`）的场景，
+//!    DDGI 开帧与 R88 代码的差异 = **全帧恰 1 字节 ±1 LSB**（编译期噪声，
+//!    R63 同款归因；语义等价由 CPU 镜像 `mix(·,·,1.0)` 恒等单测 +
+//!    DDGI-off 全帧逐位共同背书）——本测试锁定 R89 语义修订后的新基线；
+//! 8. **DDGI × 光照贴图互斥（A1 裁决）**：全场景挂图集 + ambient = 0
+//!    （隔离 A3 的无条件 ambient 衰减）⇒ DDGI 开 / 关逐位一致；
+//! 9. **SSR × DDGI（A5）**：SSR 命中色随 DDGI 表内容变化（帧尾副本含
+//!    全部 GI）；`reset_taa` 不触碰探针域状态（故意不清）；
+//! 10. **SSR 强度旋钮（B1 修复）**：`intensity = 0` 帧 ≡ SSR 关闭帧逐位、
+//!     `intensity = 2` 在全量权重区被钳到与 1.0 逐位一致；
+//! 11. **`reset_taa` 清 GTAO 上帧深度（B2 修复）**：reset 后首帧
+//!     `ao_on == 0` 且像素 ≡ AO 关闭帧（残影消灭）。
 //!
 //! 环境无 GPU 适配器时优雅跳过（打印提示，测试仍算通过）。
 //! 本套件文件内 `GPU_SERIAL` 互斥串行化（`ssr_render.rs` 同款纪律——同文件
@@ -898,4 +913,524 @@ fn daynight_change_is_followed_within_convergence_window() {
         target > before * 1.5,
         "正午的 L0 必须显著高于黄昏：{target} vs {before}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ⑦ R89 · cov = 1 内区 ≈ R88（语义修订的归因锚）
+// ---------------------------------------------------------------------------
+
+/// 4×3×4 m 封闭小房（南墙留窗），太阳从窗外照入 ⇒ 室内有真实的一次反弹。
+/// `ambient = 0`：A3（ambient × (1 − cov)）在此场景**恰好逐位中性**，
+/// 剩下的唯一变量是 A2 的覆盖度混合。
+fn cov1_world() -> World {
+    let mut world = World::new();
+    world.insert_resource(MeshStore::new());
+    world.insert_resource(MaterialStore::new());
+    world.insert_resource(TextureStore::new());
+    world.insert_resource(Camera {
+        eye: Vec3::new(2.0, 1.6, 3.4),
+        target: Vec3::new(2.0, 1.1, 0.6),
+        fov_y_radians: 70.0f32.to_radians(),
+        ..Camera::default()
+    });
+    world.insert_resource(DirectionalLight {
+        direction: Vec3::new(-0.25, -0.9, 0.45).normalize(),
+        color: Vec3::new(1.0, 0.95, 0.88),
+        intensity: 5.0,
+        ambient: Vec3::ZERO,
+        shadows: true,
+        ..DirectionalLight::default()
+    });
+    world.insert_resource(BloomSettings::disabled());
+
+    let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(4.0));
+    let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
+    let floor_mat = world
+        .resource_mut::<MaterialStore>()
+        .add(rough(0.78, 0.76, 0.72));
+    let wall_mat = world
+        .resource_mut::<MaterialStore>()
+        .add(rough(0.62, 0.6, 0.58));
+    world.spawn((
+        scaled(Vec3::new(2.0, 0.0, 2.0), Vec3::ONE),
+        plane,
+        floor_mat,
+    ));
+    world.spawn((
+        scaled(Vec3::new(0.0, 1.5, 2.0), Vec3::new(0.2, 3.0, 4.2)),
+        cube,
+        wall_mat,
+    ));
+    world.spawn((
+        scaled(Vec3::new(2.0, 1.5, 4.0), Vec3::new(4.2, 3.0, 0.2)),
+        cube,
+        wall_mat,
+    ));
+    world.spawn((
+        scaled(Vec3::new(4.0, 1.5, 2.0), Vec3::new(0.2, 3.0, 4.2)),
+        cube,
+        wall_mat,
+    ));
+    // 南墙 z=0：两段 + 窗台 + 窗楣（窗 = x ∈ (1.5, 2.5)、y ∈ (0.5, 2.0)）
+    for x in [0.75f32, 3.25] {
+        world.spawn((
+            scaled(Vec3::new(x, 1.5, 0.0), Vec3::new(1.5, 3.0, 0.2)),
+            cube,
+            wall_mat,
+        ));
+    }
+    world.spawn((
+        scaled(Vec3::new(2.0, 0.25, 0.0), Vec3::new(1.1, 0.5, 0.2)),
+        cube,
+        wall_mat,
+    ));
+    world.spawn((
+        scaled(Vec3::new(2.0, 2.5, 0.0), Vec3::new(1.1, 1.0, 0.2)),
+        cube,
+        wall_mat,
+    ));
+    world.spawn((
+        scaled(Vec3::new(2.0, 3.15, 2.0), Vec3::new(4.2, 0.3, 4.2)),
+        cube,
+        wall_mat,
+    ));
+    propagate_transforms(&mut world);
+    world
+}
+
+/// 全画面 cov = 1 的网格：bounds (0,0,0)-(4,3.5,4)、spacing 1.0 ⇒ 4×3×4 =
+/// 48 探针（格心 x/z ∈ {0.5,1.5,2.5,3.5}、y ∈ {0.5,1.5,2.5}）、radius 1.5
+/// ⇒ cov = 1 内区 = d ≤ 1.125 ≥ 任意表面点到格心的最大距离 0.866（半格
+/// 对角；bounds min y = 0 保证最低探针层贴地 0.5 m）。
+fn cov1_settings() -> DdgiSettings {
+    DdgiSettings {
+        spacing: 1.0,
+        bounds: Some((Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 3.5, 4.0))),
+        probes_per_frame: usize::MAX,
+        rays_per_face: 8,
+        ..DdgiSettings::default()
+    }
+}
+
+/// R89 锚（⑦）：全画面 cov = 1、ambient = 0 的场景——A2
+/// （`mix(env, gi, cov)`）在 cov = 1 处是**精确恒等**（CPU 镜像单测
+/// `cov_endpoints_are_exact_identities` 钉住数学），A3 在 ambient = 0 处
+/// 恰好中性 ⇒ 语义上逐位等于 R88。实测差异 = **全帧 196,608 字节中恰
+/// 1 字节 ±1 LSB**（R63 同款编译期副作用：mode 2 分支的增量代码改变
+/// GPU 编译器的 FMA / 公共子表达式决策，一个暗部量化临界像素翻位）——
+/// 语义等价但哈希不可逐位锁 R88 原值，故锁定 R89 修订后的新基线
+/// （R88 原值 0x7353e0ce27f6a7c6，diff 归因见 R89 CHANGELOG）。
+/// DDGI-off 对照组**不受 fs_main 增量影响、与 R88 逐位一致** ⇒ 锁 R88
+/// 原值（改动面没外溢到缺席路径的直接证据）。
+#[test]
+fn cov1_interior_matches_r88_within_single_lsb_compiler_noise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    if !has_gpu() {
+        return;
+    }
+    const R89_COV1_ON: u64 = 0x1df3_e381_0bb4_1fe3;
+    const R88_COV1_OFF: u64 = 0x6e3e_b0bc_9131_b077;
+
+    let off = cov1_world();
+    let px_off = render(&off);
+    assert_eq!(
+        fnv1a(&px_off),
+        R88_COV1_OFF,
+        "DDGI 缺席帧必须与 R88 代码逐位一致（fs_main 的 R89 增量不得外溢到缺席路径）"
+    );
+
+    let mut on = cov1_world();
+    let settings = cov1_settings();
+    let params = bake_params(&on, &settings);
+    let mut grid = DdgiGrid::new();
+    grid.install(&settings, &params, collect_bake_triangles(&on));
+    on.insert_resource(grid);
+    tick(&on, &settings);
+    let px_on = render(&on);
+    assert_eq!(
+        fnv1a(&px_on),
+        R89_COV1_ON,
+        "cov = 1 内区帧必须锁定 R89 基线（= R88 语义 + 1 字节编译期噪声；实得 {:#018x}）",
+        fnv1a(&px_on)
+    );
+    assert_ne!(
+        fnv1a(&px_on),
+        fnv1a(&px_off),
+        "cov1 场景关 / 开必须可判别（DDGI 活着，否则本锚是恒等假通过）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑧ R89 · DDGI × 光照贴图 = 互斥（A1 裁决）
+// ---------------------------------------------------------------------------
+
+/// A1：全场景挂图集 + `ambient = 0`（隔离 A3 的无条件 ambient 衰减——
+/// 该衰减按设计作用于所有 `cov > 0` 像素、含图集实体）⇒ DDGI 开 / 关
+/// **逐位一致**：图集实体不发探针标志位（`renderer.rs` 的 `probe_payload`
+/// 裁决）⇒ 完全吃不到 DDGI；贴图已含 `sky + bounce`、相加即双计。
+/// 末尾对照：撤掉一个实体的图集绑定后同场景立即变得可判别
+/// （证明 DDGI 在本场景确实活着、mode = 2 在跑——非恒等假通过）。
+#[test]
+fn ddgi_does_not_touch_lightmapped_entities_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    if !has_gpu() {
+        return;
+    }
+    const SIZE: u32 = 256;
+    let build = |with_ddgi: bool| -> (World, iris_core::prelude::Entity) {
+        // lightmap_render.rs 的室内盒场景（地板 + 两墙 + 遮挡柱，全部参与
+        // 烘焙 ⇒ 全部挂图集），ambient 压到 0
+        let mut world = World::new();
+        world.insert_resource(MeshStore::new());
+        world.insert_resource(MaterialStore::new());
+        world.insert_resource(TextureStore::new());
+        world.insert_resource(Camera {
+            eye: Vec3::new(3.4, 2.2, 3.8),
+            target: Vec3::new(-1.2, 0.6, -2.0),
+            ..Camera::default()
+        });
+        world.insert_resource(DirectionalLight {
+            direction: Vec3::new(-0.55, -1.0, 0.3).normalize(),
+            color: Vec3::new(1.0, 0.95, 0.85),
+            intensity: 2.2,
+            ambient: Vec3::ZERO,
+            ..DirectionalLight::default()
+        });
+        world.insert_resource(BloomSettings::disabled());
+        let floor_mesh = world.resource_mut::<MeshStore>().add(MeshData::plane(10.0));
+        let wall_mesh = world.resource_mut::<MeshStore>().add(MeshData::plane(10.0));
+        let column_mesh = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let mut mats = world.resource_mut::<MaterialStore>();
+        let floor_mat = mats.add(MaterialDef::solid(0.8, 0.78, 0.72, 1.0));
+        let wall_mat = mats.add(MaterialDef::solid(0.55, 0.6, 0.7, 1.0));
+        let column_mat = mats.add(MaterialDef::solid(0.9, 0.35, 0.2, 1.0));
+        drop(mats);
+        world.spawn((Transform::IDENTITY, floor_mesh, floor_mat));
+        world.spawn((
+            Transform {
+                position: Vec3::new(0.0, 2.0, -5.0),
+                rotation: Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                scale: Vec3::new(1.0, 1.0, 0.4),
+            },
+            wall_mesh,
+            wall_mat,
+        ));
+        world.spawn((
+            Transform {
+                position: Vec3::new(-5.0, 2.0, 0.0),
+                rotation: Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2),
+                scale: Vec3::new(0.4, 1.0, 1.0),
+            },
+            wall_mesh,
+            wall_mat,
+        ));
+        let column = world.spawn((
+            Transform {
+                position: Vec3::new(1.5, 1.0, 0.0),
+                scale: Vec3::new(0.6, 2.0, 0.6),
+                ..Transform::IDENTITY
+            },
+            column_mesh,
+            column_mat,
+        ));
+        propagate_transforms(&mut world);
+        // 烘焙 + 挂载（图集含 sky + bounce ⇒ 与 DDGI 同一份贡献）
+        let baked = bake_lightmap(
+            &world,
+            &BakeParams {
+                light_dir: Vec3::new(-0.55, -1.0, 0.3),
+                light_color: Vec3::new(1.0, 0.95, 0.85) * 2.2,
+                sky_color: Vec3::new(0.12, 0.15, 0.22),
+                shadow_softness: 0.08,
+                sky_samples: 16,
+                bounces: 1,
+            },
+            &BakeUvParams {
+                texels_per_meter: 4.0,
+                atlas_size: 128,
+            },
+        );
+        install_lightmap(&mut world, baked);
+        if with_ddgi {
+            let settings = DdgiSettings {
+                spacing: 2.5,
+                bounds: Some((Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 2.5, 5.0))),
+                probes_per_frame: usize::MAX,
+                rays_per_face: 8,
+                ..DdgiSettings::default()
+            };
+            let params = bake_params(&world, &settings);
+            let mut grid = DdgiGrid::new();
+            grid.install(&settings, &params, collect_bake_triangles(&world));
+            world.insert_resource(grid);
+            tick(&world, &settings);
+        }
+        (world, column)
+    };
+
+    let (off_world, _) = build(false);
+    let (on_world, column) = build(true);
+    let px_off = {
+        let mut renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+        renderer.render(&off_world);
+        renderer.read_pixels()
+    };
+    let px_on = {
+        let mut renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+        renderer.render(&on_world);
+        renderer.read_pixels()
+    };
+    assert_eq!(
+        px_off, px_on,
+        "全场景挂图集 + ambient = 0 ⇒ DDGI 开 / 关必须逐位一致\
+         （图集实体不发探针标志位 ⇒ 吃不到 DDGI；A1 互斥裁决）"
+    );
+
+    // 非恒等对照：撤掉柱子的图集绑定 ⇒ 它的实体标志位恢复 ⇒ mode 2 立即可判别
+    let mut exposed = on_world;
+    exposed.remove_component::<LightmapBinding>(column);
+    let mut renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+    renderer.render(&exposed);
+    assert_ne!(
+        fnv1a(&renderer.read_pixels()),
+        fnv1a(&px_on),
+        "撤图集绑定的实体必须立刻吃到 DDGI（证明互斥的另一半：未挂图集 = 探针接管）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑨ R89 · SSR × DDGI（A5）+ 强度旋钮（B1）
+// ---------------------------------------------------------------------------
+
+/// A5 + B1：①`intensity = 0` 帧 ≡ SSR 关闭帧逐位（修复的正确性：零强度
+/// = 零反射）；②`intensity = 2` 在全量权重区被钳到 1 ⇒ 与 1.0 逐位一致
+/// （命中权重、不是亮度倍率）；③SSR 命中色随 DDGI 表内容变化（帧尾副本
+/// 含全部 GI ⇒ 一致性天然成立，A5 裁决）。相机压低看向光滑地板
+/// （roughness 0.15 < `SSR_ROUGH_FLOOR` ⇒ 粗糙度全量权重），反射里是带
+/// GI 的墙面。帧序：首帧 ssr_prev_valid = false（跳过）、第 2 帧起步进
+/// ⇒ 每跑渲 3 帧取末帧。
+#[test]
+fn ssr_reflects_ddgi_and_intensity_knob_is_live() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    if !has_gpu() {
+        return;
+    }
+    const SIZE: u32 = 256;
+    let build = |intensity: f32, enabled: bool, converged: bool| -> World {
+        let mut world = cov1_world();
+        world.insert_resource(Camera {
+            eye: Vec3::new(2.0, 0.7, 3.3),
+            target: Vec3::new(2.0, 0.25, 1.0),
+            fov_y_radians: 70.0f32.to_radians(),
+            ..Camera::default()
+        });
+        // 地板换光滑材质：floor_mat 在 cov1_world 先于 wall_mat 创建 ⇒
+        // 句柄 1 = 地板材质；两阶段（收集 → 写回，AGENTS.md 规约）
+        let smooth = world.resource_mut::<MaterialStore>().add({
+            let mut def = MaterialDef::solid(0.78, 0.76, 0.72, 1.0);
+            def.roughness = 0.15;
+            def.metallic = 0.0;
+            def
+        });
+        let mut retarget: Vec<iris_core::prelude::Entity> = Vec::new();
+        world.query::<(iris_core::prelude::Entity, &MaterialHandle)>(|(e, h)| {
+            if h.0 == 1 {
+                retarget.push(e);
+            }
+        });
+        for e in retarget {
+            world.insert(e, smooth);
+        }
+        world.insert_resource(SsrSettings {
+            enabled,
+            intensity,
+            ..SsrSettings::default()
+        });
+        let settings = cov1_settings();
+        let params = bake_params(&world, &settings);
+        let mut grid = DdgiGrid::new();
+        grid.install(&settings, &params, collect_bake_triangles(&world));
+        world.insert_resource(grid);
+        if converged {
+            tick(&world, &settings);
+        } // 否则 = 安装帧粗填表（GI 明显不同的另一个表态）
+        world
+    };
+    let render3 = |world: &World| -> Vec<u8> {
+        let mut renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+        for _ in 0..3 {
+            renderer.render(world);
+        }
+        renderer.read_pixels()
+    };
+
+    let off = render3(&build(1.0, false, true));
+    let zero = render3(&build(0.0, true, true));
+    assert_eq!(
+        off, zero,
+        "intensity = 0 的 SSR 帧 ≡ SSR 关闭帧逐位（B1 修复：零强度 = 零反射）"
+    );
+    let one = render3(&build(1.0, true, true));
+    // 非默认强度可判别（AGENTS.md「每个公开旋钮至少一条非默认值断言」）：
+    // intensity 0.5 在命中点 edge_fade < 1 的区域把权重减半 ⇒ 像素可判别。
+    // （`> 1` 的钳到 1 是纯标量性质，解析断言在 CPU 镜像
+    // `post.rs::ssr_blend_weight_follows_full_formula_with_nondefault_intensity`
+    // ——GPU 帧级断言在边缘衰减区无法构造「全量权重」前提。）
+    let half = render3(&build(0.5, true, true));
+    assert_ne!(
+        one, half,
+        "intensity 0.5 的 SSR 帧必须与 1.0 可判别（B1 修复：强度旋钮真实生效）"
+    );
+    assert_ne!(
+        off, one,
+        "SSR 开启（光滑地板反射 GI 墙面）必须与关闭可判别（否则 ③ 无信号）"
+    );
+    let coarse = render3(&build(1.0, true, false));
+    assert_ne!(
+        coarse, one,
+        "SSR 命中色必须随 DDGI 表变化（上帧颜色副本含全部 GI ⇒ A5 一致性）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ⑩ R89 · reset_taa 与时域状态（A5 / B2）
+// ---------------------------------------------------------------------------
+
+/// A5 / B2 的 DDGI 半：`reset_taa()` 是「清一切跨帧时域状态」，探针域是
+/// **故意不清**的那一类——表内容 / `probe_stamp` / `structure_generation` /
+/// `dirty` / cursor 在 reset 前后逐位不变，reset 后稳态帧像素不变
+/// （`ddgi_upload` 记账不被扰动 ⇒ 无全量重传行为差异）。
+#[test]
+fn reset_taa_does_not_disturb_ddgi() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    if !has_gpu() {
+        return;
+    }
+    let mut world = cov1_world();
+    let settings = cov1_settings();
+    let params = bake_params(&world, &settings);
+    let mut grid = DdgiGrid::new();
+    grid.install(&settings, &params, collect_bake_triangles(&world));
+    world.insert_resource(grid);
+    tick(&world, &settings);
+
+    let mut renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+    renderer.render(&world);
+    renderer.render(&world);
+    let px_before = renderer.read_pixels();
+
+    let snapshot = |world: &World| -> Vec<u64> {
+        let grid = world.try_resource::<DdgiGrid>().expect("网格在场");
+        let mut out = Vec::new();
+        for c in grid.sh() {
+            for v in c {
+                for f in v {
+                    out.push(u64::from(f.to_bits()));
+                }
+            }
+        }
+        for m in grid.depth() {
+            out.push(u64::from(m[0].to_bits()));
+            out.push(u64::from(m[1].to_bits()));
+        }
+        for s in grid.probe_stamp() {
+            out.push(*s);
+        }
+        out.push(grid.structure_generation());
+        out.push(grid.grid_fp());
+        out.push(grid.geometry_generation());
+        out.push(grid.cursor() as u64);
+        for d in grid.dirty() {
+            out.push(u64::from(*d));
+        }
+        out
+    };
+    let before = snapshot(&world);
+    renderer.renderer_mut().reset_taa();
+    let after = snapshot(&world);
+    assert_eq!(
+        before, after,
+        "reset_taa 不得触碰探针域状态（表 / stamp / generation / dirty / cursor 逐位不变）"
+    );
+    renderer.render(&world);
+    assert_eq!(
+        fnv1a(&renderer.read_pixels()),
+        fnv1a(&px_before),
+        "reset 后的稳态帧必须与 reset 前逐位一致（ddgi_upload 记账未被扰动）"
+    );
+}
+
+/// B2 的 GTAO 半（iris-exp frictions ⑬ 的修复锚）：AO 开启的世界渲染 2 帧
+/// （ao_on 序列 0 → 1）⇒ `reset_taa()` ⇒ 首帧 `ao_on == 0` 且**像素 ≡
+/// AO 关闭帧**（旧场景深度副本被宣告失效，切镜残影消灭）⇒ 再一帧 ao_on
+/// 恢复 1。对照组：不调 reset 的世界连续 3 帧 ao_on 序列恒 [0, 1, 1]
+/// （默认路径零影响）。
+#[test]
+fn reset_taa_clears_gtao_depth_history() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    if !has_gpu() {
+        return;
+    }
+    const SIZE: u32 = 256;
+    let ao_settings = AoSettings {
+        enabled: true,
+        radius: 0.9,
+        ..AoSettings::default()
+    };
+    let build = |ao: bool| -> World {
+        let mut world = cov1_world();
+        if ao {
+            world.insert_resource(ao_settings);
+        }
+        world
+    };
+    let ao_world = build(true);
+    let mut renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+    renderer.render(&ao_world);
+    renderer.render(&ao_world);
+    assert_eq!(
+        renderer.renderer().stats().ao_on,
+        1,
+        "前提：第二帧起 AO 激活（上帧深度副本已就位）"
+    );
+    let px_ao_steady = renderer.read_pixels();
+
+    let off_world = build(false);
+    let mut off_renderer = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+    off_renderer.render(&off_world);
+    let px_ao_disabled = off_renderer.read_pixels();
+
+    renderer.renderer_mut().reset_taa();
+    renderer.render(&ao_world);
+    assert_eq!(
+        renderer.renderer().stats().ao_on,
+        0,
+        "reset_taa 后首帧 ao_on 必须 = 0（ao_depth_frame 记账被宣告失效）"
+    );
+    let px_after_reset = renderer.read_pixels();
+    assert_eq!(
+        px_after_reset, px_ao_disabled,
+        "reset 后首帧像素必须 ≡ AO 关闭帧（可见度图中性 1.0，GTAO 残影消灭）"
+    );
+    renderer.render(&ao_world);
+    assert_eq!(renderer.renderer().stats().ao_on, 1, "第二帧起 AO 恢复");
+    // 静止场景的正确性质：reset 后系统回到与 reset 前**逐位相同**的稳态
+    // （恢复帧的「新」上帧深度 = 同一静止场景 ⇒ 可见度图一致）——同时是
+    // 「重置不引入永久损伤」的确定性断言。（「内容换新」的可观测形态需要
+    // 运动场景，由 ao_render.rs 的确定性运动套件覆盖，此处不重复。）
+    renderer.render(&ao_world);
+    assert_eq!(
+        fnv1a(&renderer.read_pixels()),
+        fnv1a(&px_ao_steady),
+        "reset 后的稳态帧必须回到与 reset 前逐位一致的稳态（重置无永久损伤）"
+    );
+
+    let steady = build(true);
+    let mut renderer2 = OffscreenRenderer::new(SIZE, SIZE).expect("离屏渲染器");
+    let mut seq = Vec::new();
+    for _ in 0..3 {
+        renderer2.render(&steady);
+        seq.push(renderer2.renderer().stats().ao_on);
+    }
+    assert_eq!(seq, vec![0, 1, 1], "不调 reset 的宿主不受影响");
 }

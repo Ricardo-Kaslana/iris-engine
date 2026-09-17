@@ -134,7 +134,9 @@
 //! let count = save_scene(&mut world, "assets/arena_out.json")?;
 //! ```
 
-use crate::level::{LevelRegistry, LevelSection, apply_bake, apply_nav, apply_terrain};
+use crate::level::{
+    DdgiSection, LevelRegistry, LevelSection, apply_bake, apply_ddgi, apply_nav, apply_terrain,
+};
 use crate::vfs::AssetMount;
 use iris_core::name::Name;
 use iris_core::physics::{BodyType, Collider, ColliderShape, RigidBody};
@@ -145,9 +147,9 @@ use iris_render::asset::{
     spawn_gltf_instance_from_bytes,
 };
 use iris_render::prelude::{
-    AlphaMode, CpuTexture, DirectionalLight, GrassTextures, MaterialDef, MaterialHandle,
-    MaterialStore, MeshData, MeshHandle, MeshStore, ParticleBlend, ParticleEmitter, PointLight,
-    SkySource, SkySourceKind, TextureHandle, TextureStore, Visibility, grass_textures,
+    AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, MaterialDef,
+    MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, ParticleBlend, ParticleEmitter,
+    PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore, Visibility, grass_textures,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1357,6 +1359,9 @@ fn load_scene_bytes(
     if let Some(bake) = &level.bake {
         apply_bake(world, &sub, bake)?;
     }
+    if let Some(ddgi) = &level.ddgi {
+        apply_ddgi(world, ddgi)?;
+    }
     // 登记加载时快照：save 回写 version / level 段的依据（语义见
     // crate::level 模块文档「诚实清单」）
     world.insert_resource(LevelRegistry { section: level });
@@ -1618,11 +1623,18 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     let has_environment =
         environment.directional_light.is_some() || environment.sky_source.is_some();
 
-    // level 段：加载时快照原样回写（空段省略）
-    let level = world
+    // level 段：加载时快照原样回写（空段省略）；`ddgi` 子段是例外——
+    // 从**活动资源**回写（R89，照 `DirectionalLight` 的资源回写先例）：
+    // 编辑器步进命令改的是活动资源，快照语义会让 Ctrl+S 静默丢参数。
+    // 资源缺席 ⇒ 不写段 ⇒ DDGI 关（能力不启用）。
+    let mut level = world
         .try_resource::<LevelRegistry>()
         .map(|registry| registry.section.clone())
-        .filter(|section| !section.is_empty());
+        .unwrap_or_default();
+    if let Some(settings) = world.try_resource::<DdgiSettings>() {
+        level.ddgi = Some(DdgiSection::from_settings(&settings));
+    }
+    let level = (!level.is_empty()).then_some(level);
 
     let count = sections.len();
     let doc = SceneDoc {

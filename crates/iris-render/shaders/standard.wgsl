@@ -774,7 +774,14 @@ fn ssr_march(world_pos: vec3<f32>, dir: vec3<f32>, roughness: f32) -> vec4<f32> 
     }
     if (hit) {
         let color = textureSampleLevel(ssr_prev_color, env_sampler, hit_uv, 0.0).rgb;
-        let fade = ssr_roughness_fade(roughness, ssr.flags.z) * ssr_edge_fade(hit_uv, ssr.flags.w);
+        // 强度旋钮（R89 修复）：flags.y（SsrSettings::intensity，上传侧已
+        // 钳 ≥ 0）是**命中权重**的乘数、不是亮度倍率——R62b 起它被上传但
+        // 从未参与合成（26 轮未发现的死旋钮）。乘后钳 [0, 1]：强度 0 ⇒ 与
+        // SSR 关逐位一致（零反射）、> 1 被钳到 1（防过冲把 spec_refl_w
+        // 反号甩出去）。默认 1.0 时 fade ∈ [0,1] ⇒ ×1.0 与 clamp 均逐位
+        // 恒等 ⇒ 全部既有像素不变。CPU 镜像：post::ssr_blend_weight。
+        let fade = clamp(ssr_roughness_fade(roughness, ssr.flags.z)
+            * ssr_edge_fade(hit_uv, ssr.flags.w) * ssr.flags.y, 0.0, 1.0);
         result = vec4<f32>(color, fade);
     }
     return result;
@@ -1025,6 +1032,11 @@ fn gi_sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // 每探针的深度纹素数（6 面 × 8²；= Rust 侧 ddgi::DDGI_DEPTH_TEXELS）
 const DDGI_DEPTH_TEXELS: u32 = 384u;
 
+// 覆盖度羽化带占比（R89；= Rust 侧 ddgi::DDGI_COVER_FADE，同值看门在
+// ddgi.rs::wgsl_ddgi_source_matches_cpu_contract）。半径最外 25% 是羽化带：
+// cov = clamp((r − d) / (r × FADE), 0, 1)，d ≤ 0.75·r 恒 1、球面外恒 0。
+const DDGI_COVER_FADE: f32 = 0.25;
+
 // 方向 → cube 面下标（CPU 镜像：ddgi::ddgi_depth_face）。主轴 = |x|,|y|,|z|
 // 最大者，**并列取 PROBE_AXES 序低者**（严格 > 扫描 ⇒ x → y → z 优先）；
 // 符号决定 ±（comp < 0 ⇒ 负面，NaN 落正面支——与 CPU 侧同式同极性）。
@@ -1127,18 +1139,24 @@ fn ddgi_depth_weight(probe: u32, delta: vec3<f32>, dist: f32, grid: u32,
     return sigma2 / (sigma2 + excess * excess);
 }
 
-// 逐片元 DDGI 求值（CPU 镜像：ddgi::ddgi_blend）：固定序循环全部探针 →
-// **径向窗 × chebyshev 深度项**双剪枝 → 加权平均。固定循环序 = 固定累加序
-// ⇒ 会话内逐位确定。径向窗 gi_probe_weight 与 SH 求值 gi_sh_eval 都是 R83
-// 的原函数**零改动**（只新增深度项这一层）。
+// 逐片元 DDGI 求值（CPU 镜像：ddgi::ddgi_blend_with_cov）：固定序循环全部
+// 探针 → **径向窗 × chebyshev 深度项**双剪枝 → 加权平均 + 覆盖度取 max
+// （与 Σw 同一遍循环，R89）。固定循环序 = 固定累加序 ⇒ 会话内逐位确定。
+// 径向窗 gi_probe_weight 与 SH 求值 gi_sh_eval 都是 R83 的原函数**零改动**
+// （只新增深度项与覆盖度两层）。
 //
-// 返回 vec4：xyz = E/π（钳 ≥ 0）、w = 有效标志（1 = 有有效探针）。
+// 返回 vec4：xyz = E/π（钳 ≥ 0；Σw ≤ ε 时 = env_fallback，见下）、
+// w = **覆盖度 cov**（R89：几何量，与「是否有效」解耦——R88 的 w 是有效
+// 标志，R89 起混合语义见调用方 mode 2 分支）。
 //
-// **兜底语义对 R83 的显式偏离**：mode 1 的 `Σw ≤ ε ⇒ 回退最近探针` 在
-// mode 2 **改为回退 env_irradiance**（w = 0 由调用方 select）。理由：回退
-// 最近探针会**绕过深度项** ⇒ 墙后片元吃到墙另一侧探针的辐照 = 正是本轮要
-// 消灭的漏光。
-fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+// **兜底语义（R88 决策 11 + R89 扩展）**：mode 1 的 `Σw ≤ ε ⇒ 回退最近
+// 探针` 在 mode 2 **回退 env_fallback**（天空兜底）。理由：回退最近探针
+// 会**绕过深度项** ⇒ 墙后片元吃到墙另一侧探针的辐照 = 正是本轮要消灭的
+// 漏光。R89 起 env 兜底在本函数**内部**完成（env_fallback 入参）：兜底支
+// 仍返回真实 cov ⇒ 调用方的 ambient `× (1 − cov)` 分摊在兜底支同样成立，
+// 且 mix(env, env, cov) 在 cov = 1 时逐位等于 env（与 R88 的标志位回退
+// 同值）。
+fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>, env_fallback: vec3<f32>) -> vec4<f32> {
     let count = u32(gi_params.params.y);
     if (count == 0u) {
         // mode = 2 恒有 ≥ 1 探针（CPU 侧裁决），此支只为参数错配兜底
@@ -1148,12 +1166,17 @@ fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
     let enabled = gi_params.params.w;
     var acc = vec3<f32>(0.0);
     var wsum = 0.0;
+    var cov = 0.0;
     for (var i = 0u; i < count; i = i + 1u) {
         let p = gi_probes[i];
         let d = distance(world_pos, p.pos_radius.xyz);
         // 第一道剪枝：R83 的径向窗（1 − (d/r)²)²，d ≥ r ⇒ 0
         let radial = gi_probe_weight(d, p.pos_radius.w);
         if (radial > 0.0) {
+            // 覆盖度（R89）：带内深度取 max，与 Σw 同一遍循环。
+            // radial > 0 ⇒ d < r ⇒ 分母 r > 0 无除零、分子为正。
+            cov = max(cov, clamp((p.pos_radius.w - d)
+                / (p.pos_radius.w * DDGI_COVER_FADE), 0.0, 1.0));
             // 第二道剪枝：chebyshev 深度项（墙后 ⇒ 趋 0）
             let delta = world_pos - p.pos_radius.xyz;
             let w = radial * ddgi_depth_weight(i, delta, d, grid, enabled);
@@ -1164,9 +1187,11 @@ fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
         }
     }
     if (wsum > GI_BLEND_EPS) {
-        return vec4<f32>(max(acc / wsum, vec3<f32>(0.0)), 1.0);
+        return vec4<f32>(max(acc / wsum, vec3<f32>(0.0)), cov);
     }
-    return vec4<f32>(0.0);
+    // Σw ≤ ε：env 兜底 + cov 照常返回（羽化带内被深度抑制的像素按 cov
+    // 分摊 ambient 的语义与有效支一致）
+    return vec4<f32>(env_fallback, cov);
 }
 
 @fragment
@@ -1277,11 +1302,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 载荷支，**执行的语句与 R82 逐条相同**（同一个 select、同一串位）；
     // mode = 1 ⇒ GI 探针项由 R83 的逐片元 SH 求值替代（空间梯度 + 方向性），
     // **语句与 R83 逐条相同**；
-    // mode = 2（R88）⇒ 逐片元 SH 求值再乘 chebyshev 深度项（遮挡感知），
-    // Σw ≤ ε 时**回退 env_irradiance 而不是最近探针**（回退最近探针会绕过
-    // 深度项 ⇒ 把要消灭的漏光从后门放回来，见 ddgi_irradiance 头注释）。
+    // mode = 2（R88 / R89）⇒ 逐片元 SH 求值再乘 chebyshev 深度项（遮挡感
+    // 知）。R89 起混合语义 = **覆盖度连续混合**（修 §8.57⑱ 扇贝带）：
+    // `mix(env, gi, cov)` 把 R88 的硬 select（`Σw > ε` 处的整片切换）变成
+    // 探针半径最外 25% 的连续过渡；cov = 1 时 `mix(x, y, 1.0) = y` 是精确
+    // 恒等 ⇒ 内区像素逐位等于 R88。Σw ≤ ε 的兜底仍是 env（回退最近探针
+    // 会绕过深度项 ⇒ 把要消灭的漏光从后门放回来），R89 起兜底在
+    // ddgi_irradiance 内部完成（见其头注释）。
+    // `ddgi_cov` 在 mode ≤ 1 分支恒 0（ambient 行的 `× (1 − ddgi_cov)` =
+    // `× 1.0`，f32 对任何有限值逐位恒等——R77 ao_ss 哑纹素 1.0 同款形态）。
     // 三支都只替换 `in.probe.w > 0.5` 的实体：天空 irradiance_map 兜底与
     // R52c 的 lightmap `select` 混合语义**零触碰**（正交，见 §4.39）。
+    var ddgi_cov = 0.0;
     var irradiance = env_irradiance;
     if (gi_params.params.x < 0.5) {
         irradiance = select(env_irradiance, in.probe.rgb, in.probe.w > 0.5);
@@ -1289,8 +1321,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         irradiance = select(env_irradiance,
                             gi_sh_irradiance(in.world_pos, n), in.probe.w > 0.5);
     } else {
-        let ddgi = ddgi_irradiance(in.world_pos, n);
-        irradiance = select(env_irradiance, ddgi.xyz, in.probe.w > 0.5 && ddgi.w > 0.5);
+        let ddgi = ddgi_irradiance(in.world_pos, n, env_irradiance);
+        ddgi_cov = ddgi.w;
+        irradiance = select(env_irradiance, mix(env_irradiance, ddgi.xyz, ddgi.w),
+                            in.probe.w > 0.5);
     }
     let nov = max(dot(n, v), 0.0);
     let f_amb = fresnel_schlick_roughness(nov, f0, roughness);
@@ -1393,10 +1427,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ao_dims = vec2<f32>(textureDimensions(ao_visibility_tex)) * 2.0;
     let ao_ss = textureSampleLevel(ao_visibility_tex, env_sampler,
                                    in.clip_position.xy / ao_dims, 0.0).r;
-    // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）
+    // 美术补光：方向光资源上的常量环境项（与 IBL 叠加）。R89 起 ambient
+    // 追加 `× (1 − ddgi_cov)`（修 §8.57⑬：`sky_color` 默认取 ambient ⇒
+    // DDGI 在场的像素按覆盖度分摊、不再双计同一份天空底色；mode ≤ 1 时
+    // ddgi_cov 恒 0 ⇒ `× 1.0` 逐位恒等，R77 ao_ss 同款无分支形态）。
     let f_env = mix(vec3<f32>(material.surface.z), albedo, 0.5);
     color = color + ibl_final * ao_ss
-          + mix(albedo, f_env, metallic) * globals.ambient.rgb * ao * ao_ss
+          + mix(albedo, f_env, metallic) * globals.ambient.rgb * ao * ao_ss * (1.0 - ddgi_cov)
           + material.emissive.rgb;
 
     return vec4<f32>(color, base.a);

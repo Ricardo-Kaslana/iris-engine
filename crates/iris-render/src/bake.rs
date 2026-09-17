@@ -91,6 +91,26 @@ use crate::mesh::{MeshHandle, MeshStore};
 use crate::skin::Skin;
 use crate::visibility::Visibility;
 
+/// 烘焙排除标记（R89）：挂了本组件的实体，其几何**不进入**
+/// [`collect_bake_triangles`] 的三角收集——该收集是光照贴图烘焙 / 辐照
+/// 探针 / DDGI **三个消费者共用**的世界封装（BVH 挡光 + `bounds = None`
+/// 时的 AABB 派生都吃它），排除语义三处同时生效。
+///
+/// **缺席语义（API 的一部分）= 收录**：不带本组件的实体与 R52a 以来逐位
+/// 一致 ⇒ 既有场景的全部烘焙 / 探针 / DDGI 输出零变化。
+///
+/// 典型用户是**编辑器叠加层**（网格线 / 选中框 / Nav blocked 红片 /
+/// DDGI 探针标记球）：它们是普通渲染实体（走主 pass），但正铺在被烘焙 /
+/// 被探针照明的空间里——不排除会自我污染 GI（blocked 红片挡光）并撑大
+/// `bounds = None` 的自动派生范围。这是显式**声明式**排除：不做几何类型
+/// 自动判定（透明 / 粒子 / 贴花仍进收集，与 R52a 同立场，§8.58⑨）。
+///
+/// 形态与 [`IrradianceProbe`](crate::irradiance::IrradianceProbe) 同款
+/// marker：单元结构体、无字段、`EditorTransient` 之类的编辑器标记可以
+/// 与它共存。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, iris_core::Component)]
+pub struct BakeExcluded;
+
 /// BVH 叶内最大三角形数（中值分割到该规模即停）。4 是摊销甜点：再小则节点
 /// 数组与遍历栈占比上升，再大则剪枝收益下降。
 pub const BVH_LEAF_SIZE: usize = 4;
@@ -806,13 +826,18 @@ pub fn bake_points(bvh: &Bvh, points: &[(Vec3, Vec3)], params: &BakeParams) -> V
 ///
 /// 收录条件（全部满足）：有 [`MeshHandle`] + 有 [`GlobalTransform`] +
 /// **静态**（无 [`RigidBody`]——组件缺席 = 静态；或有 [`Collider`] 且
-/// `is_static` 且 `body_type != Kinematic`）+ 非蒙皮 + 未隐藏。
+/// `is_static` 且 `body_type != Kinematic`）+ 非蒙皮 + 未隐藏 +
+/// **无 [`BakeExcluded`] 标记**（R89，缺席 = 收录 ⇒ 既有场景逐位不变）。
 ///
 /// - **动态 / 运动学体排除**：烘焙结果绑定在固定位置，会动的几何（升降台、
 ///   弹簧门）烘进去就是错位阴影；`Collider::is_static` 是「不移动」的显式
 ///   声明，故带 Dynamic 刚体但标静态碰撞体的实体仍收录（与物理侧
 ///   [`effective_static`](iris_core::physics::effective_static) 同口径）；
 /// - **蒙皮排除**：姿态每帧由骨骼驱动，绑定姿态烘焙没有意义（v1 限制）；
+/// - **`BakeExcluded` 排除（R89）**：编辑器叠加层等「可视但非场景内容」
+///   的实体在收集阶段即出局（查询元组已满 7 项 ⇒ 在阶段二用
+///   `world.get` 逐实体判定——顺序不变，只是多一路 skip，输出序 =
+///   收录实体的查询序，确定性不受影响）；
 /// - 只认 `MeshHandle` ⇒ `LodMesh` / `LodMesh3` 几何（R51 地形 chunk）暂不
 ///   参与，见模块文档；
 /// - 无 `GlobalTransform` 的实体自然落选：层级同步未跑过的实体没有确定世界
@@ -829,7 +854,9 @@ pub fn bake_points(bvh: &Bvh, points: &[(Vec3, Vec3)], params: &BakeParams) -> V
 /// 故同世界两次收集 + 两次 [`build_bvh`] 逐位一致。
 pub fn collect_bake_triangles(world: &World) -> Vec<BakeTriangle> {
     // 两阶段（收集 → 处理）：查询闭包内不再借任何存储，见 AGENTS.md 系统规约。
-    // 查询元组上限是 7（iris_core::query），故材质句柄留到阶段二逐实体取。
+    // 查询元组上限是 7（iris_core::query），故材质句柄留到阶段二逐实体取；
+    // BakeExcluded（R89）同理在阶段二判定（元组无空位，且世界级点查与
+    // 收集语义等价）。
     let mut sources: Vec<(Entity, GlobalTransform, MeshHandle)> = Vec::new();
     world.query::<(
         Entity,
@@ -862,6 +889,11 @@ pub fn collect_bake_triangles(world: &World) -> Vec<BakeTriangle> {
     let materials = world.try_resource::<MaterialStore>();
     let mut out = Vec::new();
     for (entity, global, mesh) in sources {
+        // R89：编辑器叠加层等标记实体不进 lightmap / 探针 / DDGI 共用的
+        // 三角收集（缺席 = 收录，既有场景逐位不变）
+        if world.get::<BakeExcluded>(entity).is_some() {
+            continue;
+        }
         let Some(data) = mesh_store.get(mesh) else {
             continue; // 悬垂网格句柄：与渲染器同语义（不可见即不可挡光）
         };
@@ -1882,6 +1914,42 @@ mod tests {
         assert_eq!(triangles.len(), 4);
         // cube 句柄没被任何实体引用 ⇒ 三角总数里不含它（顺带钉住口径）
         let _ = cube;
+    }
+
+    /// R89：`BakeExcluded` 标记实体不进收集（编辑器叠加层语义）——
+    /// 同世界带 / 不带标记 ⇒ 三角集差异可判别；缺席 = 收录（既有场景
+    /// 逐位不变的收集面保证）。
+    #[test]
+    fn bake_excluded_marker_removes_geometry_from_collection() {
+        let mut world = bake_world();
+        let plane = world.resource_mut::<MeshStore>().add(MeshData::plane(2.0));
+        let material = world
+            .resource_mut::<MaterialStore>()
+            .add(MaterialDef::solid(0.5, 0.5, 0.5, 1.0));
+        let decor = world.spawn((
+            GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, 0.0)),
+            plane,
+            material,
+        ));
+        // 编辑器叠加层的形态：普通渲染实体（可见、静态、带网格）+ 排除标记
+        let overlay = world.spawn((
+            GlobalTransform::from_transform(Transform::from_xyz(4.0, 0.0, 0.0)),
+            plane,
+            material,
+            BakeExcluded,
+        ));
+        let with = collect_bake_triangles(&world);
+        assert_eq!(
+            count_of(&with, decor),
+            2,
+            "未标记实体照常收录（缺席 = 收录）"
+        );
+        assert_eq!(with.len(), 2, "标记实体整体出局（2 三角的 plane）");
+        // 撤标记 ⇒ 同一实体回到收集（差异可判别，不是「查不到」式假通过）
+        world.remove_component::<BakeExcluded>(overlay);
+        let without = collect_bake_triangles(&world);
+        assert_eq!(without.len(), 4, "撤标记后两个实体都收录（2 + 2 三角）");
+        assert_eq!(count_of(&without, overlay), 2);
     }
 
     /// 变换应用：旋转后的顶点 / 法线解析值、非均匀缩放的法线矩阵口径

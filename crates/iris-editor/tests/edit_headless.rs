@@ -24,17 +24,20 @@
 use std::path::PathBuf;
 
 use glam::Vec3;
+use iris_core::hierarchy::propagate_transforms;
 use iris_editor::edit::{
-    self, DEFAULT_SNAP, EditorState, EditorTransient, GIZMO_EDGE_COUNT, GRID_EXTENT, GRID_STEP,
-    HUD_NAME, LIGHT_INTENSITY_STEP, LIGHT_RANGE_STEP, MATERIAL_PRESETS, PlaceKind, ascii_only,
-    bake_and_install, begin_drag, clear_transient, cycle_kind, cycle_preset, delete_selected,
-    describe, drag_to, duplicate_selected, editable_entities, end_drag, focus_selected,
-    light_edit_mode, light_hue_step, light_intensity_step, light_range_step, light_shadow_toggle,
-    nav_blocked_count, nav_bounds_from_statics, nudge_selected, open_level, orbit_camera,
-    panel_text, pick, place_at, place_from_ray, placement_point, rebuild_grid, rebuild_nav, redo,
-    redo_depth, save_level, scale_selected, screen_ray_at, select, snap_value, sun_ambient_step,
-    sun_direction_step, toggle_collider, toggle_nav_viz, toggle_snap, undo, undo_depth,
-    update_gizmo, world_aabb_of,
+    self, DEFAULT_SNAP, DdgiEditMode, EditorState, EditorTransient, GIZMO_EDGE_COUNT, GRID_EXTENT,
+    GRID_STEP, HUD_NAME, LIGHT_INTENSITY_STEP, LIGHT_RANGE_STEP, MATERIAL_PRESETS, PlaceKind,
+    ascii_only, bake_and_install, begin_drag, clear_transient, cycle_kind, cycle_preset,
+    ddgi_bounds_translate, ddgi_edit_mode, ddgi_hysteresis_step, ddgi_mode_cycle,
+    ddgi_overlay_toggle, ddgi_probes_per_frame_step, ddgi_rays_face_step, ddgi_spacing_step,
+    delete_selected, describe, drag_to, duplicate_selected, editable_entities, end_drag,
+    focus_selected, light_edit_mode, light_hue_step, light_intensity_step, light_range_step,
+    light_shadow_toggle, nav_blocked_count, nav_bounds_from_statics, nudge_selected, open_level,
+    orbit_camera, panel_text, pick, place_at, place_from_ray, placement_point, rebuild_grid,
+    rebuild_nav, redo, redo_depth, save_level, scale_selected, screen_ray_at, select, snap_value,
+    sun_ambient_step, sun_direction_step, toggle_collider, toggle_nav_viz, toggle_snap, undo,
+    undo_depth, update_gizmo, world_aabb_of,
 };
 use iris_engine::prelude::*;
 
@@ -234,6 +237,22 @@ fn dump_world_with(world: &World, entities: &[Entity]) -> String {
             bits(light.ambient.z),
             light.shadows,
             bits(light.shadow_range),
+        ));
+    }
+    if let Some(settings) = world.try_resource::<DdgiSettings>() {
+        out.push_str(&format!(
+            "ddgi spacing {} k {} rays {} hyst {} bounds {:?} sky {:?}\n",
+            bits(settings.spacing),
+            settings.probes_per_frame,
+            settings.rays_per_face,
+            bits(settings.hysteresis),
+            settings.bounds.map(|(min, max)| (
+                [bits(min.x), bits(min.y), bits(min.z)],
+                [bits(max.x), bits(max.y), bits(max.z)]
+            )),
+            settings
+                .sky_color
+                .map(|v| [bits(v.x), bits(v.y), bits(v.z)]),
         ));
     }
     if let Some(level) = world.try_resource::<LevelRegistry>() {
@@ -2084,4 +2103,283 @@ fn orbit_camera_and_focus_selected() {
     assert_eq!(world.resource::<Camera>().eye, eye_before, "eye 不动");
     select(&mut world, None);
     assert_eq!(focus_selected(&mut world), None, "无选中 = no-op");
+}
+
+// ---------------------------------------------------------------------------
+// R89：DDGI 编辑入口（命令层 + 可视化 + 入档）
+// ---------------------------------------------------------------------------
+
+/// DDGI 步进命令：全部入 undo 栈（含「启用 DDGI」这一步本身），逐步 undo
+/// 的 dump 与该步编辑前逐字符一致（`ddgi` 资源行在 dump 里逐字符对照）。
+#[test]
+fn ddgi_edits_undo_bit_exact() {
+    let dir = temp_dir("ddgiedit");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("ddgi.level.json")).expect("新建");
+    // 摆放前的世界基线（undo 栈底快照的对照：Store 缓存 / 方向光在位，
+    // 只是无可编辑实体与 DDGI 资源）
+    let d_initial = dump_world_sorted(&world);
+    place_with(
+        &mut world,
+        PlaceKind::Cube,
+        0,
+        false,
+        Vec3::new(2.0, 0.0, 2.0),
+    );
+    propagate_transforms(&mut world);
+    assert_eq!(ddgi_edit_mode(&world), DdgiEditMode::Inert);
+    assert!(
+        !world.contains_resource::<DdgiSettings>(),
+        "新建世界无 DdgiSettings（缺席 = DDGI 关）"
+    );
+
+    // `X` 循环到 Grid（模式切换是输入路由状态，不入 undo 栈）
+    assert_eq!(ddgi_mode_cycle(&mut world), DdgiEditMode::Grid);
+
+    // `,`：资源缺席 ⇒ 插入默认资源 + spacing ÷1.25（2.0 → 1.6）
+    let spacing = ddgi_spacing_step(&mut world, -1).expect("命令层不做模式门");
+    assert_eq!(
+        spacing.to_bits(),
+        (2.0f32 / 1.25).to_bits(),
+        "默认 2.0 ÷ 1.25 = 1.6"
+    );
+    assert!(
+        world.contains_resource::<DdgiSettings>(),
+        "第一条命令 = 启用"
+    );
+    let d_enable = dump_world_sorted(&world);
+    // `.`：×1.25（1.6 → 2.0）
+    let spacing2 = ddgi_spacing_step(&mut world, 1).expect("命令层不做模式门");
+    assert_eq!(spacing2.to_bits(), 2.0f32.to_bits());
+    let d_spacing = dump_world_sorted(&world);
+    // bounds 物化 + 平移（`,.` 系列之外的命令形态）
+    let pair =
+        ddgi_bounds_translate(&mut world, edit::DdgiAxis::Y, 1).expect("有几何 ⇒ 物化 + 平移成功");
+    assert!(pair.1.y > pair.0.y, "平移不改变 span：{pair:?}");
+    let d_bounds = dump_world_sorted(&world);
+    // 预算组：k / rays / hysteresis
+    let k = ddgi_probes_per_frame_step(&mut world, 1).expect("k 步进");
+    assert_eq!(k, 3, "默认 k = 2 + 1");
+    let d_k = dump_world_sorted(&world);
+    let rays = ddgi_rays_face_step(&mut world, 1).expect("射线档");
+    assert_eq!(rays, 32, "默认 16 → 下一档 32");
+    let d_rays = dump_world_sorted(&world);
+    let hyst = ddgi_hysteresis_step(&mut world, 1).expect("hysteresis");
+    assert_eq!(hyst.to_bits(), (0.1f32).to_bits(), "默认 0 + 0.1");
+    assert_eq!(undo_depth(&world), 7, "摆放 + 六步 DDGI 编辑 = 七个快照");
+
+    // 逐步 undo：恢复的是「该步之前」的快照（快照序 = 编辑序）
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_rays,
+        "undo hysteresis ⇒ rays 后"
+    );
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d_k, "undo rays ⇒ k 后");
+    assert!(undo(&mut world));
+    assert_eq!(dump_world_sorted(&world), d_bounds, "undo k ⇒ bounds 后");
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_spacing,
+        "undo bounds ⇒ ×1.25 后"
+    );
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_enable,
+        "undo ×1.25 ⇒ 启用后（spacing = 1.6）"
+    );
+    assert!(undo(&mut world));
+    assert!(
+        !world.contains_resource::<DdgiSettings>(),
+        "undo ÷1.25 ⇒ 撤掉「启用 DDGI」（启用本身可撤销——撤销栈谎言反例的钉子）"
+    );
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_initial,
+        "undo 摆放 ⇒ 回到摆放前的世界（摆放在启用之前，栈深 7 全部对账）"
+    );
+}
+
+/// 模式裁决 + 无 `EditorState` ⇒ no-op 契约（`commands_are_inert_…` 的
+/// DDGI 面）：只读查询返回 `Inert`、写操作全 no-op、toggle 返回 `false`。
+#[test]
+fn ddgi_commands_are_inert_without_editor_state() {
+    let mut world = World::new();
+    assert_eq!(ddgi_edit_mode(&world), DdgiEditMode::Inert);
+    assert_eq!(ddgi_mode_cycle(&mut world), DdgiEditMode::Inert);
+    assert_eq!(ddgi_spacing_step(&mut world, 1), None);
+    assert_eq!(
+        ddgi_bounds_translate(&mut world, edit::DdgiAxis::X, 1),
+        None
+    );
+    assert_eq!(ddgi_probes_per_frame_step(&mut world, 1), None);
+    assert_eq!(ddgi_rays_face_step(&mut world, 1), None);
+    assert_eq!(ddgi_hysteresis_step(&mut world, 1), None);
+    assert!(!ddgi_overlay_toggle(&mut world), "toggle 无状态 = false");
+    assert!(
+        !world.contains_resource::<DdgiSettings>(),
+        "no-op 不插入资源"
+    );
+}
+
+/// 参数步进 ⇒ `grid_fingerprint` 变 ⇒ 引擎 `tick_ddgi` 重规划网格：
+/// `structure_generation` 前进 + 全表重填（probe_stamp 全部刷新）——
+/// 编辑器零额外接线的重规划语义（设计稿 C1）钉在这里。
+#[test]
+fn ddgi_spacing_step_replans_the_grid() {
+    let dir = temp_dir("ddgiplan");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("ddgiplan.level.json")).expect("新建");
+    place_with(
+        &mut world,
+        PlaceKind::Cube,
+        0,
+        false,
+        Vec3::new(2.0, 0.0, 2.0),
+    );
+    propagate_transforms(&mut world);
+    ddgi_mode_cycle(&mut world);
+    ddgi_spacing_step(&mut world, 1).expect("启用（默认 2.0 × 1.25 = 2.5）");
+    // headless 世界无 DdgiPlugin ⇒ 手动插空网格（同上）
+    world.insert_resource(DdgiGrid::new());
+    iris_engine::ddgi::tick_ddgi(&world);
+    let (gen0, stamps0, probes) = world
+        .try_resource::<DdgiGrid>()
+        .map(|g| {
+            (
+                g.structure_generation(),
+                g.probe_stamp().to_vec(),
+                g.probe_count(),
+            )
+        })
+        .unwrap();
+    assert!(gen0 >= 1, "首帧装配 ⇒ 结构版本 ≥ 1");
+    assert!(probes > 0, "立方体在 ⇒ 网格非空");
+
+    // spacing 变 ⇒ fingerprint 变 ⇒ 下一帧 tick 重建
+    ddgi_spacing_step(&mut world, 1).expect("×1.25");
+    iris_engine::ddgi::tick_ddgi(&world);
+    let (gen1, stamps1) = world
+        .try_resource::<DdgiGrid>()
+        .map(|g| (g.structure_generation(), g.probe_stamp().to_vec()))
+        .unwrap();
+    assert_eq!(
+        gen1,
+        gen0 + 1,
+        "spacing 变 ⇒ structure_generation 前进（渲染器全量上传的触发键）"
+    );
+    assert_ne!(stamps0, stamps1, "重建 ⇒ 全表重填（stamp 刷新到新 tick）");
+}
+
+/// DDGI 叠加层：不入档（`transient_visuals_never_reach_the_file` 同款）+
+/// `BakeExcluded` 让叠加层不进 GI 三角收集（桶 C0 的编辑器面）+ `level.ddgi`
+/// 段照常落盘（参数与视觉是两回事）。
+#[test]
+fn ddgi_overlay_never_reaches_the_file_nor_the_bake() {
+    let dir = temp_dir("ddgiviz");
+    let path = dir.join("ddgiviz.level.json");
+    let mut world = World::new();
+    open_level(&mut world, &path).expect("新建");
+    place_with(
+        &mut world,
+        PlaceKind::Cube,
+        0,
+        false,
+        Vec3::new(2.0, 0.0, 2.0),
+    );
+    propagate_transforms(&mut world);
+    ddgi_mode_cycle(&mut world);
+    ddgi_spacing_step(&mut world, 1).expect("启用");
+    // headless 世界无 DdgiPlugin ⇒ 手动插空网格（DdgiPlugin 只做这件事）
+    world.insert_resource(DdgiGrid::new());
+    assert!(ddgi_overlay_toggle(&mut world), "开叠加层");
+    let balls = world
+        .try_resource::<DdgiGrid>()
+        .map(|grid| grid.probe_count())
+        .unwrap();
+    assert!(balls > 0, "有几何 ⇒ 有探针 ⇒ 有标记球");
+    // 每探针一个标记球（按名计数——query 无返回值，手数）
+    let mut viz_named = 0usize;
+    world.query::<&Name>(|name| {
+        if name.0.starts_with("ddgiviz/") {
+            viz_named += 1;
+        }
+    });
+    assert_eq!(viz_named, balls, "每探针一个标记球");
+
+    // 收集排除：叠加层在位的静态几何收集 == 叠加层撤除后（探针球不进 BVH）
+    let tri_with_viz = collect_bake_triangles(&world).len();
+    assert_eq!(save_level(&mut world).expect("保存"), 1, "只有立方体入档");
+    let mut reloaded = World::new();
+    open_level(&mut reloaded, &path).expect("重载");
+    propagate_transforms(&mut reloaded);
+    let mut reloaded_viz = 0usize;
+    reloaded.query::<&Name>(|name| {
+        if name.0.starts_with("ddgiviz/") {
+            reloaded_viz += 1;
+        }
+    });
+    assert_eq!(reloaded_viz, 0, "叠加层不入档（重载后无 ddgiviz 实体）");
+    let tri_after = collect_bake_triangles(&reloaded).len();
+    assert_eq!(
+        tri_with_viz, tri_after,
+        "叠加层在位的收集 == 无叠加层的收集（BakeExcluded 生效：{tri_with_viz} vs {tri_after}）"
+    );
+    // DDGI 参数段照常入档（参数与视觉是两回事）
+    let text = std::fs::read_to_string(&path).expect("读档");
+    assert!(text.contains("\"ddgi\""), "level.ddgi 段必须落盘");
+}
+
+/// `level.ddgi` 段端到端：步进参数 → 保存 → 重载 ⇒ `DdgiSettings` 资源
+/// 复原（位模式级）；无 DDGI 的档保存两次逐字节一致且不含 ddgi 段。
+#[test]
+fn ddgi_section_survives_editor_roundtrip() {
+    let dir = temp_dir("ddgirt");
+    let path = dir.join("ddgirt.level.json");
+    let mut world = World::new();
+    open_level(&mut world, &path).expect("新建");
+    save_level(&mut world).expect("保存无 DDGI 档");
+    let text0 = std::fs::read_to_string(&path).expect("读");
+    assert!(
+        !text0.contains("\"ddgi\""),
+        "无 DdgiSettings ⇒ 不写 ddgi 段（缺席 = 能力不启用）"
+    );
+    save_level(&mut world).expect("二次保存");
+    let text1 = std::fs::read_to_string(&path).expect("读");
+    assert_eq!(text0, text1, "无 DDGI ⇒ 二次保存逐字节一致（既有口径复核）");
+
+    // 步进出非默认参数 ⇒ 保存 ⇒ 重载复原
+    ddgi_mode_cycle(&mut world);
+    // 第一条步进命令既「启用」又「步进」：默认 2.0 × 1.25 = 2.5
+    let spacing = ddgi_spacing_step(&mut world, 1).expect("启用 + 步进");
+    assert_eq!(
+        spacing.to_bits(),
+        (2.0f32 * 1.25).to_bits(),
+        "2.0 × 1.25 = 2.5"
+    );
+    let k = ddgi_probes_per_frame_step(&mut world, 1).expect("k = 3");
+    assert_eq!(k, 3);
+    save_level(&mut world).expect("保存带 DDGI 档");
+    let text2 = std::fs::read_to_string(&path).expect("读");
+    let mut reloaded = World::new();
+    open_level(&mut reloaded, &path).expect("重载");
+    {
+        let settings = reloaded
+            .try_resource::<DdgiSettings>()
+            .expect("ddgi 段 ⇒ 资源在场");
+        assert_eq!(
+            settings.spacing.to_bits(),
+            spacing.to_bits(),
+            "spacing 位模式"
+        );
+        assert_eq!(settings.probes_per_frame, k, "k 复原");
+    }
+    // 重存逐字节（往返稳定）
+    save_level(&mut reloaded).expect("重存");
+    let text3 = std::fs::read_to_string(&path).expect("读");
+    assert_eq!(text2, text3, "带 DDGI 档的重存逐字节一致（往返稳定）");
 }

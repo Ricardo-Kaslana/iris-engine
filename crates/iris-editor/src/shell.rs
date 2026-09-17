@@ -25,6 +25,12 @@
 //! | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
 //! | `B` | 烘焙当前静态世界并挂载（产物 IRISLMAP 落盘） |
 //! | `N` | NavGrid 可视化开关（每次开都重建） |
+//! | `X` | DDGI 编辑模式循环（Inert → Grid → Budget → Debug；Inert = 既有键位语义零变化） |
+//! | `V` | DDGI 可视化开关（探针标记球，脏红 / 粗填琥珀 / 稳态绿） |
+//! | `,` / `.` | DDGI 主参数 − / +（Grid = 间距 ÷/×；Budget = 每帧探针数；Debug = 重建叠加层） |
+//! | 方向键 / PgUp / PgDn（Grid 模式） | DDGI bounds 平移（X∓ / Z± / Y±，0.5 m）——替代微移 / 缩放 |
+//! | `[` / `]`（Budget 模式） | DDGI 射线档四档循环——替代光强 |
+//! | `;` / `'`（Budget 模式） | DDGI hysteresis −/+——替代环境光 |
 //! | `[` / `]` | 光强 − / +（选中点光：点光强度；未选中：方向光强度，×/÷） |
 //! | `-` / `=` | 点光范围 −0.5 / +0.5 m（选中点光时） |
 //! | `H` | 点光色相 +30°（HSV，饱和度 / 明度保持） |
@@ -249,6 +255,16 @@ struct FrameInput {
     key_j: bool,
     key_l: bool,
     key_i: bool,
+    /// `X`：DDGI 编辑模式循环。
+    ddgi_cycle: bool,
+    /// `V`：DDGI 可视化开关。
+    ddgi_overlay: bool,
+    /// `,` / `.`：DDGI 主参数 − / +（语义随 DDGI 模式）。
+    ddgi_primary_down: bool,
+    ddgi_primary_up: bool,
+    /// Grid 模式的 bounds 平移键（方向键 = X∓ / Z±、PgUp / PgDn = Y±）。
+    /// 与微移同一组键，但换算成 (轴, 方向)；`None` = 本帧无平移键。
+    ddgi_bounds_key: Option<(edit::DdgiAxis, i32)>,
 }
 
 /// Update 2：输入翻译 → 命令层。编辑器状态缺席（Startup 未跑）则 no-op。
@@ -333,6 +349,25 @@ fn read_input(world: &World) -> FrameInput {
         key_j: input.key_pressed(KeyCode::KeyJ),
         key_l: input.key_pressed(KeyCode::KeyL),
         key_i: input.key_pressed(KeyCode::KeyI),
+        ddgi_cycle: input.key_pressed(KeyCode::KeyX),
+        ddgi_overlay: input.key_pressed(KeyCode::KeyV),
+        ddgi_primary_down: input.key_pressed(KeyCode::Comma),
+        ddgi_primary_up: input.key_pressed(KeyCode::Period),
+        ddgi_bounds_key: if input.key_pressed(KeyCode::ArrowLeft) {
+            Some((edit::DdgiAxis::X, -1))
+        } else if input.key_pressed(KeyCode::ArrowRight) {
+            Some((edit::DdgiAxis::X, 1))
+        } else if input.key_pressed(KeyCode::ArrowUp) {
+            Some((edit::DdgiAxis::Z, -1))
+        } else if input.key_pressed(KeyCode::ArrowDown) {
+            Some((edit::DdgiAxis::Z, 1))
+        } else if input.key_pressed(KeyCode::PageUp) {
+            Some((edit::DdgiAxis::Y, 1))
+        } else if input.key_pressed(KeyCode::PageDown) {
+            Some((edit::DdgiAxis::Y, -1))
+        } else {
+            None
+        },
     }
 }
 
@@ -356,13 +391,68 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
     if frame.delete {
         edit::delete_selected(world);
     }
+    // DDGI 编辑路由（R89）：模式在本帧开头读取（X 切换对下一帧生效）。
+    // Grid / Budget 模式消费方向键 / PgUp·PgDn / `[` `]` / `;` `'`——
+    // 这些键的既有语义（微移 / 缩放 / 光强 / 环境光）被模式门拦截；
+    // Inert 模式下全部回落既有语义（零变化）。
+    let ddgi_mode = edit::ddgi_edit_mode(world);
+    if frame.ddgi_cycle {
+        edit::ddgi_mode_cycle(world);
+    }
+    if frame.ddgi_overlay {
+        edit::ddgi_overlay_toggle(world);
+    }
+    match ddgi_mode {
+        edit::DdgiEditMode::Grid => {
+            if frame.ddgi_primary_down {
+                edit::ddgi_spacing_step(world, -1);
+            }
+            if frame.ddgi_primary_up {
+                edit::ddgi_spacing_step(world, 1);
+            }
+            // 方向键 / PgUp·PgDn → bounds 平移（拦截微移 / 缩放，见下方
+            // nudge / scale 块的守卫）
+            if let Some((axis, dir)) = frame.ddgi_bounds_key {
+                edit::ddgi_bounds_translate(world, axis, dir);
+            }
+        }
+        edit::DdgiEditMode::Budget => {
+            if frame.ddgi_primary_down {
+                edit::ddgi_probes_per_frame_step(world, -1);
+            }
+            if frame.ddgi_primary_up {
+                edit::ddgi_probes_per_frame_step(world, 1);
+            }
+            if frame.intensity_up {
+                edit::ddgi_rays_face_step(world, 1);
+            }
+            if frame.intensity_down {
+                edit::ddgi_rays_face_step(world, -1);
+            }
+            if frame.ambient_up {
+                edit::ddgi_hysteresis_step(world, 1);
+            }
+            if frame.ambient_down {
+                edit::ddgi_hysteresis_step(world, -1);
+            }
+        }
+        edit::DdgiEditMode::Debug => {
+            // `,` / `.` = 手动重建叠加层（刷新三档状态色）
+            if frame.ddgi_primary_down || frame.ddgi_primary_up {
+                edit::rebuild_ddgi_viz(world);
+            }
+        }
+        edit::DdgiEditMode::Inert => {}
+    }
+
     // 光源热键：模式裁决在命令层（[ ] 两模式共用；K / L 双语义键按模式
-    // 路由——语义见 edit 模块文档「光源参数编辑」）
+    // 路由——语义见 edit 模块文档「光源参数编辑」）。DDGI Budget 模式
+    // 消费 `[` `]` `;` `'`（上方已路由），此处跳过。
     let light_mode = edit::light_edit_mode(world);
-    if frame.intensity_up {
+    if frame.intensity_up && ddgi_mode != edit::DdgiEditMode::Budget {
         edit::light_intensity_step(world, 1.0);
     }
-    if frame.intensity_down {
+    if frame.intensity_down && ddgi_mode != edit::DdgiEditMode::Budget {
         edit::light_intensity_step(world, -1.0);
     }
     if frame.range_up {
@@ -393,10 +483,10 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
             if frame.key_l {
                 edit::sun_direction_step(world, edit::SUN_DIR_STEP, 0.0);
             }
-            if frame.ambient_up {
+            if frame.ambient_up && ddgi_mode != edit::DdgiEditMode::Budget {
                 edit::sun_ambient_step(world, 1.0);
             }
-            if frame.ambient_down {
+            if frame.ambient_down && ddgi_mode != edit::DdgiEditMode::Budget {
                 edit::sun_ambient_step(world, -1.0);
             }
         }
@@ -425,11 +515,16 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
     if frame.left_released {
         edit::end_drag(world);
     }
+    // Grid 模式下方向键 / PgUp·PgDn 已被 DDGI bounds 平移消费（上方）
     if let Some((axis, amount)) = frame.nudge {
-        edit::nudge_selected(world, axis, amount);
+        if ddgi_mode != edit::DdgiEditMode::Grid {
+            edit::nudge_selected(world, axis, amount);
+        }
     }
     if let Some(factor) = frame.scale {
-        edit::scale_selected(world, factor);
+        if ddgi_mode != edit::DdgiEditMode::Grid {
+            edit::scale_selected(world, factor);
+        }
     }
     if frame.cycle_kind {
         edit::cycle_kind(world);

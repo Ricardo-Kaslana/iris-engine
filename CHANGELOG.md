@@ -5,6 +5,136 @@
 
 ## [Unreleased]
 
+### Added（R89：DDGI v2——合成语义五方定稿 × 覆盖度连续化 × 编辑器入口）
+
+路线图 v5 第三梯队「全局光照」2/2（R88 DDGI v1 的收官轮）。开工前设计
+定稿（4 项用户裁定 + 15 项决策及理由）留档在 `docs/ddgi_v2_design.md`；
+语义权威 = ARCHITECTURE §4.45 与 §8.58。
+
+- **合成语义五方裁决（§8.57⑫ 移入实现）**：①× 烘焙光照贴图 = **互斥，
+  贴图赢**（挂图集实体不发探针标志位 ⇒ 完全吃不到 DDGI；贴图已含
+  `sky + bounce`、相加即双计；**差值法裁定拒绝**——需要持久化基线表 +
+  二次重照明对照 + 负增量钳位 + 「贴图与网格参数严格同源」的脆弱契约，
+  收益可由美术流程自行规避）；编辑器烘焙在 `DdgiGrid` 非空时发状态提示
+  （`BakeReport::ddgi_grid_present`，只提示不裁剪）。②× env 兜底 =
+  覆盖度连续混合（见下）。③× ambient 补光 = 按覆盖度分摊（见下）。
+  ④× 反射探针捕获 = 恒 mode 0、吃 `instance_payload` 的零阶载荷（R88
+  事实的显式裁决 + 锚；反射里的间接漫反射无方向性、无遮挡感知——低频
+  量）。⑤× SSR = 零代码改动的一致性（上帧颜色副本含全部 GI ⇒ 命中色
+  天然跟随 DDGI 表；锚钉住）。
+- **覆盖度连续化（一次修掉 §8.57⑬ ambient 双计 + §8.57⑱ 扇贝带）**：
+  逐片元几何覆盖度 `cov = max_i clamp((r_i − d_i) / (r_i × 0.25), 0, 1)`
+  （内区 `d ≤ 0.75·r` 恒 1、半径最外 25% 羽化带），与 `Σw` 同遍固定序取
+  `max`；①env ↔ GI 从硬 `select` 换 `mix(env, gi, cov)`（半径球面并集的
+  断界 → 连续过渡）；②ambient 行追加 `× (1 − cov)`（同源天空底色不再
+  双计）。**逐位口径**：`cov = 1` ⇒ `mix(x, y, 1) = y` 精确恒等（内区 =
+  R88）；`cov = 0` ⇒ `× 1.0` 恒等（mode ≤ 1 与 DDGI-off 零变化）。CPU
+  镜像 `ddgi_coverage` / `ddgi_coverage_with_fade`（fade→0 退化锚）/
+  `ddgi_blend_with_cov`；`ddgi_blend` 原签名薄壳保留（既有调用零改动）；
+  WGSL 源码层看门扩展到 `DDGI_COVER_FADE` 与两处消费点形态。
+  **像素修订声明**：R89 修订了 DDGI 在场场景的像素（外壳羽化 + ambient
+  分摊两处，台账见设计稿 §8.2）——R88 的 `docs/ddgi.png` 四面板断言
+  原样复跑全过（对比度因去双计反而增强），cov=1 全等场景与 R88 代码的
+  实测差异 = 全帧恰 **1 字节 ±1 LSB**（R63 同款编译期副作用，归因报告
+  见下偏离声明）。
+- **编辑器 DDGI 入口（四步顺序不可倒）**：**C0** 新 marker 组件
+  **`BakeExcluded`**（`iris_render::bake`，缺席 = 收录 ⇒ 既有场景逐位
+  不变）——编辑器叠加层此前会进 GI 共用三角收集（挡光 + 撑大
+  `default_bounds`）；`collect_bake_triangles` 查询元组已满 7 项 ⇒ 在
+  既有两阶段收集的阶段二逐实体判定（零重构）。**C1** 命令层直抄光源
+  编辑四步模板：`DdgiEditMode{Inert, Grid, Budget, Debug}`（`X` 循环，
+  默认 Inert = 既有键位零变化）+ 间距 / bounds 平移（`None` 时按引擎
+  同式物化）/ 每帧探针数 / 射线四档 / hysteresis 五条步进命令 +
+  `V` 叠加开关；`WorldSnapshot` 增 `ddgi` 字段（**「启用 DDGI」本身是
+  可撤销的一步**）；资源缺席时第一条命令插入默认资源。**明确不做数值
+  输入面板**（既有拒绝：牵连 §8.33② 评审）。**C2** 可视化 = 探针标记球
+  走主 pass（零新 pass / 零新 binding），脏红 / 稳态绿状态着色
+  （`dirty()` + `probe_stamp()` 只读零成本），`EditorTransient` +
+  `BakeExcluded` 双标记；维持「手动重建、不自动刷新」立场。
+  **C3** 入档 = `LevelSection.ddgi: Option<DdgiSection>`（逐字段
+  serde 默认 + 整段缺席省略，**`SCENE_FORMAT_VERSION` 不 bump**——
+  nav/bake/字段级三处先例）；`geometry_generation` 不入档；加载段 →
+  资源（校验前置拦截为 `SceneError`），保存从活动资源回写（照
+  `DirectionalLight` 先例）；**探针表持久化维持拒绝**（§8.57⑭）。
+- **GPU/CPU 测试**：`tests/ddgi_render.rs` 6 → 11 项（R88 六项原值零
+  改动通过 + R89 五项：cov=1 内区新基线 + DDGI-off 对照 R88 原值、图集
+  互斥、SSR 强度旋钮 + 反射随表变、reset_taa 不扰 DDGI、reset_taa 清
+  GTAO）；CPU 单测覆盖 `ddgi_coverage` 边界解析解（球心 1 / `d = r` 恰
+  0 / `d = 0.75r` 恰 1 / `r = 0` 无 NaN / max 序无关）/ mix 端点恒等 /
+  fade→0 退化 / 兜底支 env 语义 / 编辑器步进 undo 逐字符复原 /
+  `DdgiSection` 逐字段往返逐字节 + 无段档逐字节不变 + 参数步进 ⇒
+  `structure_generation` 前进。验收图：`docs/ddgi.png` 重生成（R88 四
+  面板断言原样全过）+ **新** `docs/ddgi_v2.png`（关 | 羽化 | 漏光 |
+  ambient 去双计：GI 表经 `sky_color` 锁同后，ambient 拉高 40× 而内区
+  ROI **逐位不动**、球外可判别——A3 的锐利像素证据）+ **新**
+  `docs/ddgi_editor.png`（编辑器叠加层收敛前沿 + HUD 状态行）。
+
+### Fixed（R89）
+
+- **SSR 强度旋钮从未生效（R62b 引入，26 轮未发现）**：
+  `SsrSettings::intensity` 被上传到 `ssr.flags.y` 后着色器**零读取点**
+  （模块文档的合成公式多了「强度」项）。修复：SSR 命中权重
+  `clamp(roughness_fade × edge_fade × intensity, 0, 1)`——强度 0 ⇒ 与
+  SSR 关闭逐位一致（零反射），> 1 被钳到 1（**本项是命中权重、不是亮度
+  倍率**，口径写进字段文档）。配套新增合并权重镜像
+  `post::ssr_blend_weight` + 非默认强度断言（此前只有 roughness / edge
+  两个分量镜像、整条公式无镜像 = bug 藏住的结构性原因；AGENTS.md 测试
+  规约随之新增「每个公开旋钮至少一条非默认值断言」）。**既有像素零
+  变化的依据**：全仓每一处 `SsrSettings` 构造都走 `..Default::default()`
+  ⇒ `intensity` 恒 1.0 ⇒ 乘法与钳制均逐位恒等。
+- **`reset_taa` 漏清跨帧时域状态（iris-exp frictions ⑬）**：切镜后首帧
+  GTAO 仍按**旧场景深度**算可见度（旧物体形状投出假遮蔽并被 TAA 吸收
+  拖尾多帧）。修复：`reset_taa` 语义定稿为「清一切跨帧时域状态，除了
+  探针域」——补清 `ao_depth_frame`（GTAO 上帧深度记账 ⇒ 切镜首帧可见
+  度图中性 1.0、`FrameStats::ao_on == 0`、第二帧起正确）与
+  `prev_view_proj`（消费点 `unwrap_or(vp_raw)` 的首帧语义 = 零速度透传，
+  等价「无历史」）。**DDGI 表 / `probe_stamp` / `structure_generation`
+  是故意不清的那一类**（探针域状态与镜头无关，锚
+  `reset_taa_does_not_disturb_ddgi` 钉住）。不调 `reset_taa` 的宿主逐位
+  不变；iris-exp 的「连渲三帧」绕行已撤除（`exp_snapshot` 回到
+  `reset_taa()` + 单帧定格）。
+
+### 偏离声明（R89，全部有依据）
+
+1. **mode 2 的 env 兜底从「调用方 select」改为 `ddgi_irradiance` 内部
+   完成**（env 值作参数传入、`Σw ≤ ε` 返回 `(env_fallback, cov)`）——
+   覆盖度混合要求兜底支仍返回真实 `cov`（ambient 分摊语义在兜底支同样
+   成立），且 cov=1 的兜底像素与 R88 的 env 回退逐位同值。
+2. **ambient 补光行在 DDGI 在场时被 `cov` 衰减**（含挂图集实体）——对
+   R52c/R63「ambient 是独立美术补光预算、探针不接管」的**部分推翻**：
+   裁定 3 让 `sky_color` 与 ambient 同源后「不接管」不再自洽（双计）。
+   新口径 = 「ambient 与 DDGI 天光项同源 ⇒ 按覆盖度分摊」。影响与理由
+   显式记录于本条与 §4.45，未并入 Added 含糊带过。
+3. **`collect_bake_triangles` 未扩查询元组**（设计稿预案为扩项或两阶段
+   重构）——既有的两阶段收集已天然提供落点：`BakeExcluded` 判定放在
+   阶段二循环首行（`world.get` 逐实体点查），查询元组 7 项不动、输出
+   序 = 收录实体的查询序 ⇒ **R52a/R64 既有逐位口径零影响**（无标记
+   世界输出逐位不变，单测钉住带/不带标记的差异可判别）。
+4. **SSR 权重公式补强度项**是修复而非改义，但它动的是既有已发布特性的
+   像素路径——按 §8.2 台账程序声明：全仓 `intensity` 恒 1.0 ⇒ 既有
+   `docs/ssr.png` 与 SSR 基线逐位不变（乘法与钳制对 1.0 与 [0,1] 值均
+   精确恒等）；非默认值的有效性由新镜像单测与 GPU 锚承担。
+5. **`reset_taa` 语义从「清 TAA + SSR」扩到「清一切跨帧时域状态」**，
+   且 DDGI 是**故意不清**的那一类（探针域与镜头无关）——`prev_view_proj`
+   的清理在实现期核实为等价（唯一消费点 `unwrap_or(vp_raw)` = 首帧零
+   速度语义）后才落。`occ_frame` / `meshlet_frame` 等帧号记账不属
+   「历史」（自愈型新鲜度机制），不在清理面。
+6. **编辑器 DDGI 入口不含数值输入面板、不含探针实体化**——尊重
+   `edit.rs` 既有拒绝（`LevelRegistry` 语义变更需单独评审）；路线图
+   字面「探针放置入口」实交付为「参数步进 + 可视化 + 入档」三件套
+   （不能逐个放 / 删探针），「排除格」笔刷列为后续候选。
+7. **cov=1 全等锚的口径**：GPU 锚锁定的是 R89 修订后的新基线
+   （cov=1 场景、ambient=0），与 R88 代码的实测差异 = 全帧 196,608 字节
+   中恰 1 字节 ±1 LSB——mode 2 分支的增量代码改变 GPU 编译器 FMA /
+   公共子表达式决策所致（R63 教训同款：**语义等价不保证编译期逐位**）。
+   语义等价性由「CPU 镜像 mix 端点恒等单测 + DDGI-off 对照组与 R88
+   逐位一致 + 差异占比 0.0005%」三重背书；R88 原值（0x7353e0ce27f6a7c6）
+   与 R89 新基线一并记录在测试注释与归因日志。
+8. **编辑器可视化三档着色的「粗填琥珀档」在当前状态机下为空集**（安装
+   帧全表标脏、精修即绿，「非脏且 stamp == 安装帧」恒不成立）——判定
+   保留（数据面完备、未来状态机演进即用），验收图实际呈现红 / 绿收敛
+   前沿。
+
 ### Added（R88：DDGI 动态全局光照 v1——规则探针网格 × 时间片滚动重照明 × 深度感知混合）
 
 路线图 v5 第三梯队「全局光照」1/2（R88 DDGI v1 → R89 DDGI v2）。**闭合
