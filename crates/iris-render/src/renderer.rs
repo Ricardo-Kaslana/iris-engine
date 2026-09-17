@@ -726,6 +726,9 @@ pub struct Renderer {
     meshlet_last_handles: Vec<u32>,
     /// meshlet 收集暂存（跨帧复用）。
     meshlet_frame_scratch: MeshletFrame,
+    /// 上一收集帧的 run 起点表（与 meshlet_last_handles 同序同生命周期
+    /// ——紧凑列表三角形统计的解析输入，R86）。
+    meshlet_last_run_starts: Vec<u32>,
     /// 贴花代理几何顶点缓冲（单位盒 ±Z 端盖，初始化时一次性上传；
     /// 字段保持缓冲存活）。
     #[allow(dead_code)]
@@ -1495,15 +1498,20 @@ struct MeshletArenaSlot {
     vertex_base: u32,
     index_base: u32,
     cluster_base: u32,
+    /// 全部簇数（含层级各层的父簇——arena 排布记账用；帧实例表的簇范围
+    /// 由 [`Self::leaf_cluster_count`] 与 LOD 选择决定）。
     cluster_count: u32,
+    /// 叶簇数（R86：全叶表 / 容量核算的簇范围 = [cluster_base,
+    /// cluster_base + 本值)）。
+    leaf_cluster_count: u32,
+    /// 簇 DAG（R86；None = 单层网格——全簇即叶，选择不可用）。
+    hierarchy: Option<std::sync::Arc<crate::meshlet::MeshletHierarchy>>,
     /// 网格包围盒（min, extent）——剔除端球心反归一化基。
     bounds_min: [f32; 3],
     bounds_extent: [f32; 3],
-    /// 逐簇三角形数（u8 直通 `triangle_count`）——`triangles_drawn`
-    /// 统计按紧凑列表精确累加用。
+    /// 逐簇三角形数（u8 直通 `triangle_count`，含各层父簇）——
+    /// `triangles_drawn` 统计按 run 区间精确累加用。
     cluster_triangles: Vec<u8>,
-    /// Σ cluster_triangles（该网格全部三角形数）。
-    total_triangles: u32,
 }
 
 /// GPU arena 的 CPU 镜像（增长重建时全量重传的源数据；注册期追加）。
@@ -1596,12 +1604,31 @@ struct MeshletDrawPlan {
 /// 单帧 meshlet 收集结果（跨帧复用 scratch）。
 #[derive(Default)]
 struct MeshletFrame {
-    /// 实例表条目（查询序 = 实例槽序；确定性截断见 collect 文档）。
+    /// 实例表条目（查询序 = 实例槽序；R86 起一个可见实例可拆多条
+    /// 「run」条目——每条对应一段选中簇的连续区间；容量截断见 collect
+    /// 文档）。
     entries: Vec<MeshletInstanceEntryRaw>,
     /// 实例槽 → mesh 句柄（与 entries 同序；三角形统计解析用）。
     handles: Vec<u32>,
-    /// 全局簇总数（实例前缀和的尾值；≤ [`MAX_MESHLET_CLUSTERS`]）。
+    /// 实例槽 → 本条目的网格局部簇起点（run 起点；与 entries 同序——
+    /// 紧凑列表的 `(实例槽, run 内局部号)` 由此还原网格局部簇号）。
+    run_starts: Vec<u32>,
+    /// 全局簇总数（本帧实例前缀和的尾值 = 全部 run 长度合计；
+    /// ≤ [`MAX_MESHLET_CLUSTERS`]）。
     total_clusters: u32,
+}
+
+/// 本帧 LOD 选择参数（R86）：[`MeshletLodSettings`] 启用时由
+/// render_frame 组装；None = 全叶表（R85 行为逐位不变）。
+struct MeshletLodFrameParams {
+    /// 相机眼点（世界空间）。
+    eye: Vec3,
+    /// 渲染目标高度（像素）。
+    screen_height: f32,
+    /// tan(垂直半视场角)。
+    tan_half_fov: f32,
+    /// 选中阈值（屏幕像素；来自 `MeshletLodSettings.threshold_px`）。
+    threshold_px: f32,
 }
 
 /// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、贴花 pass、
@@ -2544,28 +2571,41 @@ fn collect_particles_v2(
 ///
 /// 返回被视锥剔除的实例数；收集次序即查询顺序，分批排序由调用方完成
 /// （按纹理句柄排序，同批内实体 bits 并列序——见 `decal.rs` 分批策略）。
-/// 单帧 meshlet 收集（R85）：可见 [`MeshletInstance`](crate::meshlet::MeshletInstance)
-/// 实体 → GPU 实例表条目 + 全局簇号前缀。
+/// 单帧 meshlet 收集（R85；R86 扩展 run 形实例表）：可见
+/// [`MeshletInstance`](crate::meshlet::MeshletInstance) 实体 → GPU 实例
+/// 表条目 + 全局簇号前缀。
 ///
 /// - **可见性语义与常规路径一致**：`Visibility` 自身 + 祖先级联；实例
 ///   包围球视锥剔除与 `collect_instances` 同式（中心变换 + 半径按最大
 ///   列缩放保守放大）。整实例出视锥 ⇒ 该实例全部簇都不进本帧枚举
 ///   （剔除端与全量端都看不到它的像素——绘制对齐的前提）。
-/// - **确定性**：条目序 = 查询序（存储插入序，全仓既有口径）；容量截断
-///   按查询序保留前缀（实例表容量 / 单帧簇容量）+ warn。全局簇号 = 实例
-///   前缀和 + 簇局部号——同一网格被多实例引用时簇身份按（实例, 局部号）
-///   枚举，剔除端逐对独立裁决。
+/// - **LOD 选择（R86）**：`lod` 在场且实例网格带层级 ⇒ 逐实例跑
+///   [`select_lod_cluster_ranges_in`]（眼点经模型逆变换到网格局部、
+///   误差按最大轴缩放放大——与剔除端半径口径一致），选中簇区间升序
+///   合并成 run，一条 run = 一条实例表条目（簇范围 = run）；选择输出的
+///   区间在 arena 中连续 ⇒ cull / draw 对 run 的枚举恰为选中簇集合。
+///   层级缺席 / LOD 关闭 ⇒ 单条全叶 run = R85 恒等表。
+/// - **容量退化（确定性，按查询序）**：选中 run 数或簇数超出单帧预算
+///   ⇒ 该实例退化为单条全叶 run（像素正确，仅放弃简化收益）；全叶也
+///   装不下 ⇒ 跳过实例 + warn（与 R85 口径一致）。
+/// - **确定性**：条目序 = 查询序（存储插入序，全仓既有口径）× run 升序；
+///   全局簇号 = 实例前缀和 + run 内局部号——剔除端逐簇独立裁决，
+///   紧凑序 = 本帧枚举序升序（stable）。
+#[allow(clippy::too_many_arguments)]
 fn collect_meshlet_instances(
     world: &iris_core::world::World,
     frustum: &Frustum,
     slots: &[Option<MeshletArenaSlot>],
+    lod: Option<MeshletLodFrameParams>,
     out: &mut MeshletFrame,
 ) {
     out.entries.clear();
     out.handles.clear();
+    out.run_starts.clear();
     out.total_clusters = 0;
     let mut warned_instances = false;
     let mut warned_clusters = false;
+    let mut warned_lod_overflow = false;
     world.query::<(
         iris_core::prelude::Entity,
         &GlobalTransform,
@@ -2586,18 +2626,6 @@ fn collect_meshlet_instances(
             }
             return;
         }
-        if out.total_clusters as usize + slot.cluster_count as usize
-            > crate::meshlet::MAX_MESHLET_CLUSTERS
-        {
-            if !warned_clusters {
-                warned_clusters = true;
-                log::warn!(
-                    "meshlet 簇总数超过单帧剔除容量 {}，多余的实例已跳过",
-                    crate::meshlet::MAX_MESHLET_CLUSTERS
-                );
-            }
-            return;
-        }
         let model = gt.matrix();
         // 实例包围球视锥剔除（与 collect_instances 同式）
         let min = Vec3::from(slot.bounds_min);
@@ -2614,32 +2642,87 @@ fn collect_meshlet_instances(
         if !frustum.intersects_sphere(center_world, radius_local * scale) {
             return;
         }
+
+        // 本实例的选中 run 集（默认 = 单条全叶 run = R85 恒等表）。
+        let leaf_count = slot.leaf_cluster_count;
+        let mut runs: Vec<(u32, u32)> = vec![(0, leaf_count)];
+        if let Some(params) = &lod {
+            if let Some(hierarchy) = &slot.hierarchy {
+                let eye_local = model.inverse().transform_point3(params.eye);
+                let view = crate::meshlet::MeshletLodView {
+                    bounds_min: min,
+                    bounds_extent: max - min,
+                    eye_local,
+                    error_scale: scale,
+                    screen_height: params.screen_height,
+                    tan_half_fov: params.tan_half_fov,
+                };
+                let selected = crate::meshlet::select_lod_cluster_ranges_in(
+                    hierarchy,
+                    leaf_count,
+                    &view,
+                    params.threshold_px,
+                );
+                if !selected.is_empty() {
+                    runs = selected;
+                }
+            }
+        }
+        // 容量退化：选中集超预算 ⇒ 全叶 run；全叶也超 ⇒ 跳过实例。
+        let selected_total: u32 = runs.iter().map(|&(_, n)| n).sum();
+        if out.total_clusters as usize + selected_total as usize
+            > crate::meshlet::MAX_MESHLET_CLUSTERS
+            || out.entries.len() + runs.len() > MAX_MESHLET_INSTANCES
+        {
+            let fits_leaf = out.total_clusters as usize + leaf_count as usize
+                <= crate::meshlet::MAX_MESHLET_CLUSTERS
+                && out.entries.len() < MAX_MESHLET_INSTANCES;
+            if !fits_leaf {
+                if !warned_clusters {
+                    warned_clusters = true;
+                    log::warn!(
+                        "meshlet 簇总数超过单帧剔除容量 {}，多余的实例已跳过",
+                        crate::meshlet::MAX_MESHLET_CLUSTERS
+                    );
+                }
+                return;
+            }
+            if !warned_lod_overflow {
+                warned_lod_overflow = true;
+                log::warn!("LOD 选中 run 超出单帧实例表 / 簇预算，该实例退化为全叶绘制");
+            }
+            runs = vec![(0, leaf_count)];
+        }
+
         let raw = InstanceRaw::from_matrix(model);
-        out.entries.push(MeshletInstanceEntryRaw {
-            model: raw.model,
-            normal: raw.normal,
-            base_counts: [
-                slot.vertex_base,
-                slot.index_base,
-                slot.cluster_base,
-                slot.cluster_count,
-            ],
-            frame_base: [out.total_clusters, 0, 0, 0],
-            bounds_min: [
-                slot.bounds_min[0],
-                slot.bounds_min[1],
-                slot.bounds_min[2],
-                0.0,
-            ],
-            bounds_extent: [
-                slot.bounds_extent[0],
-                slot.bounds_extent[1],
-                slot.bounds_extent[2],
-                0.0,
-            ],
-        });
-        out.handles.push(mi.mesh.0);
-        out.total_clusters += slot.cluster_count;
+        for &(run_start, run_len) in &runs {
+            out.entries.push(MeshletInstanceEntryRaw {
+                model: raw.model,
+                normal: raw.normal,
+                base_counts: [
+                    slot.vertex_base,
+                    slot.index_base,
+                    slot.cluster_base + run_start,
+                    run_len,
+                ],
+                frame_base: [out.total_clusters, 0, 0, 0],
+                bounds_min: [
+                    slot.bounds_min[0],
+                    slot.bounds_min[1],
+                    slot.bounds_min[2],
+                    0.0,
+                ],
+                bounds_extent: [
+                    slot.bounds_extent[0],
+                    slot.bounds_extent[1],
+                    slot.bounds_extent[2],
+                    0.0,
+                ],
+            });
+            out.handles.push(mi.mesh.0);
+            out.run_starts.push(run_start);
+            out.total_clusters += run_len;
+        }
     });
 }
 
@@ -3716,6 +3799,7 @@ impl Renderer {
             meshlet_frame: 0,
             meshlet_last_handles: Vec::new(),
             meshlet_frame_scratch: MeshletFrame::default(),
+            meshlet_last_run_starts: Vec::new(),
             particle_v2_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
@@ -6081,19 +6165,40 @@ impl Renderer {
             &mut particle_v2_items,
         );
         self.ensure_particle_v2_pools(&mut particle_v2_items);
-        // 2c''. meshlet 收集 + 帧上传 + 绘制裁决（R85）：实例表条目（含
-        //       全局簇号前缀）与兜底裁决（无有效紧凑回读 ⇒ CPU 写恒等
-        //       列表全量绘制）。hdr 不可变借用之前完成全部 &mut 操作
-        //       （上传 / 默认材质预热），计划贯穿主 pass 与 compute 编码。
+        // 2c''. meshlet 收集 + 帧上传 + 绘制裁决（R85；R86 LOD 选择）：
+        //       实例表条目（含全局簇号前缀；LOD 启用时 = 选中 run 集）与
+        //       兜底裁决（无有效紧凑回读 ⇒ CPU 写恒等列表全量绘制）。
+        //       hdr 不可变借用之前完成全部 &mut 操作（上传 / 默认材质
+        //       预热），计划贯穿主 pass 与 compute 编码。
         let mut meshlet_plan: Option<MeshletDrawPlan> = None;
         if let Some(store) = meshlet_store.as_deref() {
             if !store.is_empty() {
+                // LOD 设置（R86）：资源缺席 / enabled = false ⇒ 参数不
+                // 组装 = 全叶表（R85 行为逐位不变）。
+                let lod = world
+                    .try_resource::<crate::meshlet::MeshletLodSettings>()
+                    .filter(|s| s.enabled)
+                    .map(|s| MeshletLodFrameParams {
+                        eye,
+                        screen_height: height.max(1) as f32,
+                        tan_half_fov: (fov * 0.5).tan(),
+                        threshold_px: s.threshold_px,
+                    });
                 let mut frame = std::mem::take(&mut self.meshlet_frame_scratch);
-                collect_meshlet_instances(world, &frustum, &self.meshlet_arena.slots, &mut frame);
+                collect_meshlet_instances(
+                    world,
+                    &frustum,
+                    &self.meshlet_arena.slots,
+                    lod,
+                    &mut frame,
+                );
                 if frame.total_clusters > 0 {
                     // 三角形统计的解析表（下一帧消费读回时按此对账）
                     self.meshlet_last_handles.clear();
                     self.meshlet_last_handles.extend_from_slice(&frame.handles);
+                    self.meshlet_last_run_starts.clear();
+                    self.meshlet_last_run_starts
+                        .extend_from_slice(&frame.run_starts);
                     let plan = self.prepare_meshlet_frame(
                         &frame,
                         &material_store,
@@ -8647,9 +8752,15 @@ impl Renderer {
                 new_slots.push(None);
                 continue;
             };
+            // R86：叶簇界定全叶表范围；层级 Arc 随槽登记（选择输入）。
+            let leaf_cluster_count = mesh.leaf_count();
+            let hierarchy = if mesh.hierarchy.groups.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::new(mesh.hierarchy.clone()))
+            };
             let cluster_triangles: Vec<u8> =
                 mesh.clusters.iter().map(|c| c.triangle_count).collect();
-            let total_triangles = cluster_triangles.iter().map(|&t| t as u32).sum();
             new_words.extend(crate::meshlet::vertex_storage_words(&mesh.vertices));
             new_indices.extend(mesh.indices.iter().copied());
             new_cluster_bytes.extend_from_slice(bytemuck::cast_slice(&mesh.clusters));
@@ -8658,10 +8769,11 @@ impl Renderer {
                 index_base: base_index,
                 cluster_base: total_clusters as u32,
                 cluster_count: mesh.clusters.len() as u32,
+                leaf_cluster_count,
+                hierarchy,
                 bounds_min: min,
                 bounds_extent: extent,
                 cluster_triangles,
-                total_triangles,
             }));
             base_vertex += mesh.vertices.len() as u32;
             base_index += mesh.indices.len() as u32;
@@ -8819,18 +8931,24 @@ impl Renderer {
             words.to_vec()
         };
         mg.staging[inflight.parity].unmap();
-        // 三角形精确统计（handles = 产出该列表那一帧的实例表；防御式
-        // 越界跳过——正规路径下 compute 产物必然良构）
+        // 三角形精确统计（handles / run_starts = 产出该列表那一帧的实例
+        // 表；run 内局部号经 run 起点还原网格局部簇号——R86 run 形实例
+        // 表口径。防御式越界跳过：正规路径下 compute 产物必然良构）
         let handles = std::mem::take(&mut self.meshlet_last_handles);
+        let run_starts = std::mem::take(&mut self.meshlet_last_run_starts);
         let mut triangles = 0u32;
         for &e in &list {
             let inst = (e >> 16) as usize;
             let local = (e & 0xFFFF) as usize;
-            if let Some(Some(slot)) = handles
-                .get(inst)
-                .and_then(|h| self.meshlet_arena.slots.get(*h as usize))
+            let handle = handles.get(inst).copied();
+            let run_start = run_starts.get(inst).copied().unwrap_or(0);
+            if let Some(Some(slot)) = handle.and_then(|h| self.meshlet_arena.slots.get(h as usize))
             {
-                triangles += slot.cluster_triangles.get(local).copied().unwrap_or(0) as u32;
+                triangles += slot
+                    .cluster_triangles
+                    .get(run_start as usize + local)
+                    .copied()
+                    .unwrap_or(0) as u32;
             }
         }
         self.meshlet_consumed = Some(MeshletConsumed {
@@ -8870,10 +8988,19 @@ impl Renderer {
             let mut triangles = 0u32;
             for (i, entry) in frame.entries.iter().enumerate() {
                 let handle = frame.handles[i];
+                let run_start = frame.run_starts[i];
+                let run_len = entry.base_counts[3];
                 if let Some(Some(slot)) = self.meshlet_arena.slots.get(handle as usize) {
-                    triangles += slot.total_triangles;
+                    // run 区间三角形精确累加（防御式 get——畸形层级
+                    // 数据走统计缺失而非 panic；正规路径区间必在界内）
+                    let range = run_start as usize..(run_start + run_len) as usize;
+                    triangles += slot
+                        .cluster_triangles
+                        .get(range)
+                        .map(|slice| slice.iter().map(|&t| t as u32).sum::<u32>())
+                        .unwrap_or(0);
                 }
-                for local in 0..entry.base_counts[3] {
+                for local in 0..run_len {
                     identity.push(((i as u32) << 16) | local);
                 }
             }

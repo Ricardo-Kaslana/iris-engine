@@ -5,6 +5,65 @@
 
 ## [Unreleased]
 
+### Added（R86：虚拟几何体 V3——层级 LOD：簇 DAG + 屏幕空间误差选择）
+
+路线图 v5 第三梯队 R84–R87 连役 3/4。「单 LOD」边界解除：层级进容器
+与 CPU 选择，R85 的 GPU cull / compact / draw 管线**零改动**（只换输
+入集合）。MVP 边界延续（无 visbuffer / opaque-only；遮挡留 R87）。
+
+- **简化器 = 体素网格顶点聚类（Rossignac）**（`iris_engine::meshlet_builder`::
+  `simplify_by_vertex_clustering`，纯函数）：选型裁定——QEM 边坍缩质
+  量更高但堆序 / 半边结构的确定性成本过高；顶点聚类对三角汤天然友好、
+  简化 = 空间网格函数 ⇒ **逐位确定免费**（质量折衷诚实入档 §8.55①）。
+  可合并格收敛首见代表并吸附格心、单顶点格原位保留、**边界顶点永不
+  合并**（组间接缝防线的根据）、塌缩 / 零面积剔除 + 规范序去重；误差
+  = cell × √3/2（格对角半长 = 位移上界），未合并诚实归零。
+- **层级构建（自底向上簇 DAG）**（`build_meshlet_hierarchy[_with_config]`
+  / `build_meshlet_hierarchy_from_mesh_data`）：Level 0 = R84 叶簇（每
+  簇一组）；每轮连续贪心分块（≤ 8 组一块、尾块借用、块恒 ≥ 2）→ 块内
+  几何按位去重合并 → 简化（cell = 叶簇包围球半径均值 × 2^level，三角
+  未达一半时 ≤ 4 次倍增）→ **复用 R84 聚类**产出父组自有簇（叶簇在
+  前、父簇按层追加 ⇒ 组范围连续 + 子组号 < 父组号）→ group_error =
+  max(own, children) 沿 DAG 单调。停止：单组 / 三角 < 128 / 层数上限
+  8。**块间共享顶点 = 边界集**（contested 判定）锁定。收尾按整网格包
+  围盒统一归一全部簇 / 组 bounds（渲染器注册口径）。
+- **IRML v2**：头 36 B（+ 叶簇数 / 组数 / 根数）+ 组区段（children /
+  簇范围 / 误差 / bounds / cone）+ 根区段；CRC 覆盖整个数据区。版本
+  矩阵 {1, 2}：**v1 文件照常读取**（层级空 = 全叶；单层 `write_to`
+  保持 v1 字节布局 = R84 零漂移——`--no-lod` 单层写出语义天然落回），
+  其余版本拒读。v2 读侧校验：叶数 / 子组号 < 父号 / 簇范围 / 根越界 /
+  区段长度闭合。**偏离声明**：R84 时代「版本 2 必拒」断言随 bump 调整
+  （2 进兼容名单，[0, 3, 999] 仍拒）——「bump v2」与「v1 照常读取」
+  两规格共同要求下的必然后果。
+- **逐帧选择（CPU 纯函数）**（`select_lod_cluster_ranges_in` /
+  `select_lod_clusters` + `MeshletLodSettings { threshold_px, enabled }`
+  资源）：组屏幕误差 = `group_error × error_scale × (screen_h × 0.5) /
+  (dist × tan_half_fov)` ≤ 阈值 ⇒ 选中本组簇范围、停止下钻；叶组恒选
+  自身 ⇒ threshold 0 恒全叶。选择是逐组布尔 ⇒ 输出集合与遍历无关；
+  输出 = 选中簇区间升序 + 相邻合并（= 绘制紧凑序）。**资源缺席 /
+  enabled=false = 全叶表 = R85 行为逐位不变**。
+- **渲染器接线（只换输入集合）**：选中区间 = 帧实例表 **run 形条目**
+  （簇范围 = run 起点 + 长度；区间在 arena 连续 ⇒ cull / compact /
+  draw / 双缓冲 / 读回协议零改动）；紧凑序 = 选中集升序（绘制序确定）。
+  容量退化确定性：run / 簇超预算 ⇒ 实例级退化全叶（像素正确）→ 全叶
+  也超 ⇒ 跳过实例 + warn。三角形统计经 run 起点表还原网格局部簇号。
+- **测试**：CPU +21（`meshlet` +9：选择解析解三档阈值 + 恰等边界（≤
+  语义）/ 距离单调 / 非对称区间升序 / threshold 0 全叶 / 极大阈值选中
+  根 / 空层级恒等表 / IRML v2 往返位级 + v1 兼容读取 + v2 语义校验四
+  连；`meshlet_builder` +12：简化器两跑逐位 / 减面 + 误差公式 + 无合
+  并归零 / 边界锁定位级原样 + 格心吸附 / 规范序去重 / should_panic ×2
+  / 层级两跑逐位 / DAG 良构 + 误差单调 + 叶覆盖 / 层数上限两档 / 构建
+  × 选择联动（threshold 0 全叶 + 大阈值根）/ 空输入 / 分块形状）；
+  GPU +3（`tests/meshlet_lod_render.rs`，
+  `GPU_SERIAL`）：**τ→全叶等价**（threshold 0 层级 mesh vs R85 全叶路
+  径逐字节——本轮最强断言）/ 距离单调（近 54 > 中 18 > 远 8 簇 + 物
+  体不消失 + 像素流变化）/ 双会话逐字节 + 阈值变化换哈希。既有
+  R84/R85 测试（含 GPU 10 项）零改动全过。快照
+  `examples/meshlet_lod_snapshot.rs` → `docs/meshlet_lod.png`（1×3：近
+  叶簇细 | 中 L1 过渡 | 远根簇粗；选中数标注于 example 输出；跨运行
+  逐位 + 目检：远处无裂缝碎面、近处细节不丢、无消失闪面）。诚实限制
+  §8.55。
+
 ### Added（R85：虚拟几何体 V2——compute 簇剔除 + 前缀和压缩绘制）
 
 路线图 v5 第三梯队 R84–R87 连役 2/4。路线图裁定：wgpu 无 mesh shader、

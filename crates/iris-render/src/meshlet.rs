@@ -58,10 +58,30 @@
 //! - **opaque-only**：透明 / 蒙皮 / 带切线 / 带光照贴图 UV 的网格不适用
 //!   （容器只载 32 B 标准顶点）；
 //! - **无软件光栅回退**；
-//! - **单 LOD**：簇的 `error` 字段恒 0.0（量化编码就位，R86 简化器启用），
-//!   无簇 DAG / 无层级；
+//! - **单 LOD（R84/R85 口径）**——R86 起层级 LOD 在本文件落地（簇 DAG +
+//!   屏幕空间误差选择，见下节），但簇级 `error` 字段仍恒 0.0：误差记录
+//!   在**组级**（[`MeshletLodGroup`]），簇字段留待 GPU 侧选择启用；
 //! - **非流式加载**：整文件进内存，分页流送是 R87 的事（届时再做 pack
 //!   集成）。
+//!
+//! # R86 层级 LOD（簇 DAG + 屏幕空间误差选择）
+//!
+//! - **簇 DAG**（[`MeshletHierarchy`]）：构建期自底向上——叶簇按固定
+//!   贪心归并成组、组内几何经体素网格顶点聚类简化（Rossignac；简化器
+//!   本体在 `iris_engine::meshlet_builder`，选型理由见其模块文档）后
+//!   重新聚类为父组的自有簇，逐组记录 children / 簇范围 / 误差 /
+//!   bounds / cone。`group_error = max(own, 所有 children)` 沿 DAG 向上
+//!   单调增。v1 容器 / `--no-lod` 产物 = 空层级 = 单层（全簇即叶）。
+//! - **逐帧选择**（[`select_lod_clusters`]）：从根按固定序遍历，组的
+//!   屏幕空间误差 = `group_error × error_scale × (screen_h × 0.5) /
+//!   (dist × tan_half_fov)` ≤ `threshold_px` ⇒ 选中本组簇范围、停止
+//!   下钻；否则下钻 children（叶组恒选自身）。选择是**逐组布尔** ⇒ 与
+//!   遍历实现无关；输出 = 选中簇号升序（相邻区间合并）。选择在 CPU
+//!   （GPU 选择留后续轮），产物 = 帧实例表的 run 形条目——R85 的
+//!   cull / compact / draw 管线零改动，只换输入集合。
+//! - **缺席语义**：[`MeshletLodSettings`] 资源缺席 / `enabled = false`
+//!   = 全叶表 = R85 行为逐位不变；`threshold_px = 0`（或负）恒细化到
+//!   叶 = 同一列表。
 //!
 //! # 簇元数据口径（R85 GPU 剔除 / R87 分页的前置契约）
 //!
@@ -258,25 +278,92 @@ impl Default for MeshletClusterRaw {
     }
 }
 
-/// meshlet 网格：全局顶点 + 全局索引 + 逐簇元数据。
+/// 层级 LOD 的一个组（R86）：DAG 节点 = 一段自有簇范围 + 子组索引 +
+/// 屏幕空间误差选择的全部输入。
+///
+/// 构建口径（`iris_engine::meshlet_builder`）：`own_error` = 本组简化时
+/// 实际使用的体素 cell × √3/2（格对角半长 = 合并位移上界）；
+/// `group_error = max(own_error, 所有 children 的 group_error)` 沿 DAG
+/// 向上单调增——父组误差不低于任何子组，选择的「误差单调 ⇒ 距离单调
+/// ⇒ 粗细单调」性质的根据。`bounds` / cone 与簇元数据同口径（xyz =
+/// 球心相对网格包围盒归一、w = 半径世界单位；锥 = 自有几何面法线均值）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshletLodGroup {
+    /// 子组索引（升序；叶组 = 空）。子组号恒小于父组号（构建序——低层
+    /// 先建），容器读侧校验，遍历深度天然有界。
+    pub children: Vec<u32>,
+    /// 本组自有簇在全局簇数组的连续范围 `[cluster_start, cluster_start +
+    /// cluster_count)`（叶组 = 单个叶簇；父组 = 简化几何的重聚类产物）。
+    pub cluster_start: u32,
+    /// 自有簇数（≥ 1——空组没有绘制语义，构建期不产生）。
+    pub cluster_count: u32,
+    /// 本组简化引入的误差（相对 children 几何的位移上界，世界单位）。
+    pub own_error: f32,
+    /// 组误差 = max(own, 所有 children 的 group_error)——选择的标量。
+    pub group_error: f32,
+    /// 自有几何包围球：xyz = 球心（相对网格包围盒归一）、w = 半径（米）。
+    pub bounds: [f32; 4],
+    /// 自有几何边界锥轴（归一化；口径同 [`MeshletClusterRaw::cone_axis`]，
+    /// R86 CPU 选择不消费，随容器持久化供后续 GPU 选择）。
+    pub cone_axis: [f32; 3],
+    /// 自有几何边界锥 cutoff（同上——持久化字段，CPU 选择不消费）。
+    pub cone_cutoff_cos: f32,
+}
+
+/// 簇 DAG（R86）：组数组 + 根索引 + 叶簇数。
+///
+/// 空（groups 为空）= 单层 = 全部簇都是叶簇（v1 容器 / `--no-lod`），
+/// 此时选择恒等于「全叶表」。组在 `groups` 中按**构建层序**排列：低层
+/// 组在前、父组追加在后 ⇒ 「子组号 < 父组号」是容器读侧校验的不变量
+/// （遍历无需访问集合、深度天然有界）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeshletHierarchy {
+    /// 全部组（构建层序；见类型文档的「子组号 < 父组号」不变量）。
+    pub groups: Vec<MeshletLodGroup>,
+    /// 根组索引（升序）。单根 = 递归到单组收敛；多根 = 提前停在三角数
+    /// 阈值 / 层数上限——选择从根按升序遍历。
+    pub roots: Vec<u32>,
+    /// 叶簇数（叶层 = 全局簇号 `[0, 本值)`；全叶表的簇范围）。
+    pub leaf_cluster_count: u32,
+}
+
+/// meshlet 网格：全局顶点 + 全局索引 + 逐簇元数据（+ R86 层级 DAG）。
 ///
 /// - 顶点与既有网格同格式（[`Vertex`]，32 B：position / normal / uv），
 ///   材质与光照路径零改动复用；**簇间边界顶点不去重**（各簇各存一份，
 ///   索引为簇内局部号）；
 /// - 簇数据在两个全局缓冲里都按簇连续、按簇构建序排布
 ///   （`vertex_offset` / `index_offset` 严格递增衔接）——容器读侧校验
-///   此不变量。
+///   此不变量；
+/// - **层级布局（R86）**：叶簇占据簇号 `[0, leaf_count)`；每层父组的
+///   自有簇（简化几何重聚类产物）按构建序**追加**在更低层之后 ⇒ 每个
+///   组的簇范围连续、选择输出的区间合并后仍连续。`hierarchy` 为空 =
+///   单层（v1 容器 / `--no-lod`），全簇即叶。
 #[derive(Clone, Debug, Default)]
 pub struct MeshletMesh {
     /// 全局顶点缓冲（簇拼接序；同位置顶点可能跨簇重复）。
     pub vertices: Vec<Vertex>,
     /// 全局索引缓冲（簇拼接序；值 = 簇内局部顶点号 0..vertex_count）。
     pub indices: Vec<u32>,
-    /// 逐簇元数据（按簇构建序）。
+    /// 逐簇元数据（按簇构建序；叶簇在前，父组自有簇按层追加）。
     pub clusters: Vec<MeshletClusterRaw>,
+    /// 簇 DAG（R86）。空 = 单层：全部簇都是叶簇（R84/R85 语义）。
+    pub hierarchy: MeshletHierarchy,
 }
 
 impl MeshletMesh {
+    /// 叶簇数（单层 = 全部簇数；层级 = DAG 登记的叶层数量）。
+    ///
+    /// 渲染器「全叶表」（LOD 缺席 / 关闭）以此为簇范围——v1 容器与 R85
+    /// 行为逐位一致的根据。
+    pub fn leaf_count(&self) -> u32 {
+        if self.hierarchy.groups.is_empty() {
+            self.clusters.len() as u32
+        } else {
+            self.hierarchy.leaf_cluster_count
+        }
+    }
+
     /// 展开为既有渲染路径可消费的 [`MeshData`]（纯函数）。
     ///
     /// 索引翻译：全局索引缓冲存的是**簇内局部顶点号**，展开 = 逐簇加上
@@ -304,16 +391,16 @@ impl MeshletMesh {
     }
 
     /// 写出为 IRML 字节流（含头 + CRC），返回总字节数。
+    ///
+    /// 版本裁决（R86）：`hierarchy` 为空（单层）⇒ v1 字节布局（与 R84
+    /// 逐字节同构——单层容器零漂移）；带层级 ⇒ v2（36 B 头 + 组区段 +
+    /// 根区段）。「`--no-lod` 单层写出」因此天然落回 v1 布局。
     pub fn write_to(&self, mut writer: impl Write) -> std::io::Result<u64> {
-        let data = self.encode_data_region();
-        writer.write_all(&MAGIC)?;
-        writer.write_all(&VERSION.to_le_bytes())?;
-        writer.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
-        writer.write_all(&(self.indices.len() as u32).to_le_bytes())?;
-        writer.write_all(&(self.clusters.len() as u32).to_le_bytes())?;
-        writer.write_all(&crc32(&data).to_le_bytes())?;
-        writer.write_all(&data)?;
-        Ok(HEADER_LEN as u64 + data.len() as u64)
+        if self.hierarchy.groups.is_empty() {
+            self.write_v1(&mut writer)
+        } else {
+            self.write_v2(&mut writer)
+        }
     }
 
     /// 便捷：写出为磁盘文件，返回总字节数。
@@ -322,6 +409,10 @@ impl MeshletMesh {
     }
 
     /// 从内存字节解析（校验魔数 / 版本 / 长度 / CRC / 索引与簇范围）。
+    ///
+    /// 版本矩阵（R86）：v1 = R84 单层布局（照常读取，层级为空 = 全叶）；
+    /// v2 = 层级布局（头 36 B + 组 / 根区段）；其余版本一律拒绝（R84
+    /// 语义——拒读而非误读）。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MeshletAssetError> {
         if bytes.len() < HEADER_LEN {
             return Err(MeshletAssetError::Corrupt(format!(
@@ -333,31 +424,232 @@ impl MeshletMesh {
             return Err(MeshletAssetError::BadMagic);
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("版本字段 4 字节"));
-        if version != VERSION {
-            return Err(MeshletAssetError::UnsupportedVersion(version));
+        match version {
+            VERSION_V1 => Self::decode_v1(bytes),
+            VERSION => Self::decode_v2(bytes),
+            other => Err(MeshletAssetError::UnsupportedVersion(other)),
         }
+    }
+
+    /// v1（R84 单层布局）解码：24 B 头 + 顶点 | 索引 | 簇。层级置空 =
+    /// 单层（全簇即叶，[`MeshletMesh::leaf_count`] 回落簇总数）。
+    fn decode_v1(bytes: &[u8]) -> Result<Self, MeshletAssetError> {
         let vertex_count =
             u32::from_le_bytes(bytes[8..12].try_into().expect("顶点数字段 4 字节")) as usize;
         let index_count =
             u32::from_le_bytes(bytes[12..16].try_into().expect("索引数字段 4 字节")) as usize;
         let cluster_count =
             u32::from_le_bytes(bytes[16..20].try_into().expect("簇数字段 4 字节")) as usize;
+        let expected_crc = u32::from_le_bytes(bytes[20..24].try_into().expect("CRC 字段 4 字节"));
+        let data = &bytes[HEADER_LEN..];
+        let (vertices, indices, clusters, _) = Self::decode_common(
+            data,
+            vertex_count,
+            index_count,
+            cluster_count,
+            expected_crc,
+            true,
+        )?;
+        Ok(Self {
+            vertices,
+            indices,
+            clusters,
+            hierarchy: MeshletHierarchy::default(),
+        })
+    }
+
+    /// v2（R86 层级布局）解码：36 B 头（v1 字段 + 叶簇数 / 组数 / 根数）
+    /// + 顶点 | 索引 | 簇 | 组 | 根。
+    fn decode_v2(bytes: &[u8]) -> Result<Self, MeshletAssetError> {
+        if bytes.len() < HEADER_LEN_V2 {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "v2 文件不足 {HEADER_LEN_V2} B 头部长度（实际 {} B）",
+                bytes.len()
+            )));
+        }
+        let read_u32 = |offset: usize| {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("头字段 4 字节"))
+        };
+        let vertex_count = read_u32(8) as usize;
+        let index_count = read_u32(12) as usize;
+        let cluster_count = read_u32(16) as usize;
+        let leaf_cluster_count = read_u32(20);
+        let group_count = read_u32(24) as usize;
+        let root_count = read_u32(28) as usize;
+        let expected_crc = read_u32(32);
+        if group_count > 2 * MAX_MESHLET_CLUSTERS {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "组数 {group_count} 超出上限（2 × {MAX_MESHLET_CLUSTERS}）"
+            )));
+        }
+        let data = &bytes[HEADER_LEN_V2..];
+        let (vertices, indices, clusters, mut cursor) = Self::decode_common(
+            data,
+            vertex_count,
+            index_count,
+            cluster_count,
+            expected_crc,
+            false,
+        )?;
+        // 叶簇数校验：叶层是全叶表的簇范围，必须落在簇数组内。
+        let cluster_total = clusters.len() as u32;
+        let leaf_ok = if cluster_total == 0 {
+            leaf_cluster_count == 0
+        } else {
+            (1..=cluster_total).contains(&leaf_cluster_count)
+        };
+        if !leaf_ok {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "叶簇数 {leaf_cluster_count} 越界（簇总数 {cluster_total}）"
+            )));
+        }
+        // 组区段：变长记录（children 数 + children + 定长字段），全程
+        // 边界校验；CRC 兜底损坏，「结构合法但语义错位」在此拦死。
+        let mut groups = Vec::with_capacity(group_count);
+        for g in 0..group_count {
+            let read_u32 = |offset: usize| {
+                u32::from_le_bytes(data[offset..offset + 4].try_into().expect("组字段 4 字节"))
+            };
+            let read_f32 = |offset: usize| {
+                f32::from_le_bytes(data[offset..offset + 4].try_into().expect("组字段 4 字节"))
+            };
+            if cursor + 4 > data.len() {
+                return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
+            }
+            let children_len = read_u32(cursor) as usize;
+            cursor += 4;
+            if children_len > group_count {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "组 #{g} 子组数 {children_len} 超出组总数 {group_count}"
+                )));
+            }
+            if cursor + children_len * 4 + 32 > data.len() {
+                return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
+            }
+            let mut children = Vec::with_capacity(children_len);
+            for slot in 0..children_len {
+                let child = read_u32(cursor + slot * 4);
+                // 「子组号 < 父组号」不变量（构建层序；见 MeshletHierarchy
+                // 文档）——越界引用与回边在此拦死，遍历深度天然有界。
+                if child as usize >= g {
+                    return Err(MeshletAssetError::Corrupt(format!(
+                        "组 #{g} 子组号 {child} 越界（必须 < {g}）"
+                    )));
+                }
+                children.push(child);
+            }
+            cursor += children_len * 4;
+            let cluster_start = read_u32(cursor);
+            let cluster_range = read_u32(cursor + 4);
+            let own_error = read_f32(cursor + 8);
+            let group_error = read_f32(cursor + 12);
+            let bounds = [
+                read_f32(cursor + 16),
+                read_f32(cursor + 20),
+                read_f32(cursor + 24),
+                read_f32(cursor + 28),
+            ];
+            cursor += 32;
+            if cursor + 16 > data.len() {
+                return Err(MeshletAssetError::Corrupt(format!("组 #{g} 截断")));
+            }
+            let cone_axis = [read_f32(cursor), read_f32(cursor + 4), read_f32(cursor + 8)];
+            let cone_cutoff_cos = read_f32(cursor + 12);
+            cursor += 16;
+            if cluster_start as usize + cluster_range as usize > cluster_count {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "组 #{g} 簇范围越界：{} + {} > {cluster_count}",
+                    cluster_start, cluster_range
+                )));
+            }
+            if cluster_range == 0 {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "组 #{g} 自有簇数为 0（空组没有绘制语义）"
+                )));
+            }
+            groups.push(MeshletLodGroup {
+                children,
+                cluster_start,
+                cluster_count: cluster_range,
+                own_error,
+                group_error,
+                bounds,
+                cone_axis,
+                cone_cutoff_cos,
+            });
+        }
+        // 根区段 + 长度精确闭合（尾随垃圾 = 损坏）。
+        if cursor + root_count * 4 != data.len() {
+            return Err(MeshletAssetError::Corrupt(format!(
+                "数据区长度不符：组/根区段消费 {} B，实际 {} B",
+                cursor + root_count * 4,
+                data.len()
+            )));
+        }
+        let mut roots = Vec::with_capacity(root_count);
+        for r in 0..root_count {
+            let root =
+                u32::from_le_bytes(data[cursor..cursor + 4].try_into().expect("根字段 4 字节"));
+            cursor += 4;
+            if root as usize >= group_count {
+                return Err(MeshletAssetError::Corrupt(format!(
+                    "根 #{r} 组号 {root} 越界（组总数 {group_count}）"
+                )));
+            }
+            roots.push(root);
+        }
+        if !groups.is_empty() && roots.is_empty() {
+            return Err(MeshletAssetError::Corrupt(
+                "层级非空但根列表为空（选择无从遍历）".to_string(),
+            ));
+        }
+        Ok(Self {
+            vertices,
+            indices,
+            clusters,
+            hierarchy: MeshletHierarchy {
+                groups,
+                roots,
+                leaf_cluster_count,
+            },
+        })
+    }
+
+    /// v1 / v2 共享的顶点 | 索引 | 簇区段解码（R84 校验链逐条保留：
+    /// 长度精确 → CRC → 簇上限 → 偏移连续 / 越界 / 局部索引 / 保留位）。
+    /// 返回三区段 + 消费后的游标（v2 从此续读组 / 根）。`exact_len` =
+    /// v1（数据区在簇区段后精确闭合；长度检查先于 CRC，R84 错误优先
+    /// 级）；v2 传 false（组 / 根区段变长，CRC 覆盖整个数据区，尾部闭
+    /// 合由 decode_v2 解析后校验）。
+    #[allow(clippy::type_complexity)] // 区段三元组 + 游标——一次性解码产物
+    fn decode_common(
+        data: &[u8],
+        vertex_count: usize,
+        index_count: usize,
+        cluster_count: usize,
+        expected_crc: u32,
+        exact_len: bool,
+    ) -> Result<(Vec<Vertex>, Vec<u32>, Vec<MeshletClusterRaw>, usize), MeshletAssetError> {
         if cluster_count > MAX_MESHLET_CLUSTERS {
             return Err(MeshletAssetError::Corrupt(format!(
                 "簇数 {cluster_count} 超出单帧剔除容量上限 {MAX_MESHLET_CLUSTERS}（R85 storage \
                  与紧凑化缓冲按上限定长）"
             )));
         }
-        let expected_crc = u32::from_le_bytes(bytes[20..24].try_into().expect("CRC 字段 4 字节"));
 
-        let data = &bytes[HEADER_LEN..];
         let expect_len = vertex_count * std::mem::size_of::<Vertex>()
             + index_count * std::mem::size_of::<u32>()
             + cluster_count * std::mem::size_of::<MeshletClusterRaw>();
-        if data.len() != expect_len {
+        let length_bad = if exact_len {
+            data.len() != expect_len
+        } else {
+            data.len() < expect_len
+        };
+        if length_bad {
             return Err(MeshletAssetError::Corrupt(format!(
-                "数据区长度不符：期望 {expect_len} B（顶点 {vertex_count} × 32 + 索引 \
+                "数据区长度不符：期望 {}{expect_len} B（顶点 {vertex_count} × 32 + 索引 \
                  {index_count} × 4 + 簇 {cluster_count} × 48），实际 {} B",
+                if exact_len { "" } else { "≥ " },
                 data.len()
             )));
         }
@@ -499,14 +791,65 @@ impl MeshletMesh {
             clusters.push(cluster);
         }
 
-        Ok(Self {
-            vertices,
-            indices,
-            clusters,
-        })
+        Ok((vertices, indices, clusters, cursor))
     }
 
-    /// 打开磁盘上的 IRML 文件（整文件读入——v1 非流式，见模块头）。
+    /// v1 写出（R84 单层布局，24 B 头）——与 R84 逐字节同构。
+    fn write_v1(&self, mut writer: impl Write) -> std::io::Result<u64> {
+        let data = self.encode_data_region();
+        writer.write_all(&MAGIC)?;
+        writer.write_all(&VERSION_V1.to_le_bytes())?;
+        writer.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.indices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.clusters.len() as u32).to_le_bytes())?;
+        writer.write_all(&crc32(&data).to_le_bytes())?;
+        writer.write_all(&data)?;
+        Ok(HEADER_LEN as u64 + data.len() as u64)
+    }
+
+    /// v2 写出（R86 层级布局，36 B 头 + 组区段 + 根区段）。
+    fn write_v2(&self, mut writer: impl Write) -> std::io::Result<u64> {
+        assert!(
+            self.hierarchy.groups.len() <= 2 * MAX_MESHLET_CLUSTERS,
+            "IRML v2 组数计数字段超出防护上限"
+        );
+        let mut data = self.encode_data_region();
+        // 组区段：children 数 | children | 簇范围×2 | 误差×2 | bounds×4
+        //         | cone_axis×3 | cutoff（全 LE，与 decode_v2 逐字段对偶）。
+        for g in &self.hierarchy.groups {
+            data.extend_from_slice(&(g.children.len() as u32).to_le_bytes());
+            for &child in &g.children {
+                data.extend_from_slice(&child.to_le_bytes());
+            }
+            data.extend_from_slice(&g.cluster_start.to_le_bytes());
+            data.extend_from_slice(&g.cluster_count.to_le_bytes());
+            data.extend_from_slice(&g.own_error.to_le_bytes());
+            data.extend_from_slice(&g.group_error.to_le_bytes());
+            for slot in g.bounds {
+                data.extend_from_slice(&slot.to_le_bytes());
+            }
+            for slot in g.cone_axis {
+                data.extend_from_slice(&slot.to_le_bytes());
+            }
+            data.extend_from_slice(&g.cone_cutoff_cos.to_le_bytes());
+        }
+        for &root in &self.hierarchy.roots {
+            data.extend_from_slice(&root.to_le_bytes());
+        }
+        writer.write_all(&MAGIC)?;
+        writer.write_all(&VERSION.to_le_bytes())?;
+        writer.write_all(&(self.vertices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.indices.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.clusters.len() as u32).to_le_bytes())?;
+        writer.write_all(&self.hierarchy.leaf_cluster_count.to_le_bytes())?;
+        writer.write_all(&(self.hierarchy.groups.len() as u32).to_le_bytes())?;
+        writer.write_all(&(self.hierarchy.roots.len() as u32).to_le_bytes())?;
+        writer.write_all(&crc32(&data).to_le_bytes())?;
+        writer.write_all(&data)?;
+        Ok(HEADER_LEN_V2 as u64 + data.len() as u64)
+    }
+
+    /// 打开磁盘上的 IRML 文件（整文件读入——非流式，见模块头）。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MeshletAssetError> {
         let bytes = std::fs::read(path)?;
         Self::from_bytes(&bytes)
@@ -766,18 +1109,157 @@ pub fn mesh_bounds(vertices: &[Vertex]) -> Option<([f32; 3], [f32; 3])> {
 }
 
 // ---------------------------------------------------------------------------
+// R86 层级 LOD：逐帧选择（CPU 纯函数）与设置资源
+// ---------------------------------------------------------------------------
+
+/// 层级 LOD 设置（R86，World 资源）。
+///
+/// **缺席语义**：资源缺席 / [`Self::enabled`] = false ⇒ 渲染器按「全叶
+/// 表」组装帧实例表 = R85 行为逐位不变。启用后 `threshold_px` 为选中
+/// 阈值（屏幕空间像素）：组的屏幕误差 ≤ 阈值 ⇒ 选中本组（停止下钻），
+/// 否则下钻 children；叶组恒选自身 ⇒ `threshold_px = 0`（或负）恒细化
+/// 到叶 = 全叶列表。
+#[derive(Clone, Copy, Debug, iris_core::Resource)]
+pub struct MeshletLodSettings {
+    /// 选中阈值（屏幕空间像素）。
+    pub threshold_px: f32,
+    /// 是否启用层级选择（false = 全叶 = R85 行为）。
+    pub enabled: bool,
+}
+
+impl Default for MeshletLodSettings {
+    fn default() -> Self {
+        Self {
+            threshold_px: 2.0,
+            enabled: false,
+        }
+    }
+}
+
+/// 一次选择的视口 / 实例参数（[`select_lod_cluster_ranges_in`] 输入）。
+///
+/// 选择在**网格局部空间**做：眼点由调用方经模型逆矩阵变换为
+/// `eye_local`，组球心按「归一化球心 × 网格 extent + min」反归一化（与
+/// GPU 剔除端 `meshlet_cull.wgsl` 的球心口径逐式一致）；非均匀缩放的
+/// 误差放大用 `error_scale`（模型最大轴缩放——与剔除端半径放大同口径，
+/// 保守方向）。
+#[derive(Clone, Copy, Debug)]
+pub struct MeshletLodView {
+    /// 网格包围盒 min（簇 / 组球心归一化基）。
+    pub bounds_min: Vec3,
+    /// 网格包围盒 extent（退化轴 = 0，与剔除端同式：分量乘积归零）。
+    pub bounds_extent: Vec3,
+    /// 相机眼点（网格局部空间）。
+    pub eye_local: Vec3,
+    /// 实例最大轴缩放（误差放大，与剔除半径口径一致）。
+    pub error_scale: f32,
+    /// 渲染目标高度（像素）——屏幕误差的换算基准。
+    pub screen_height: f32,
+    /// tan(垂直半视场角)——屏幕误差的换算基准。
+    pub tan_half_fov: f32,
+}
+
+/// 层级选择的区间形态：从根遍历 + 升序规范化，返回选中簇的**连续区间**
+/// 列表（`[(start, count)]`，升序、互不相连、不相邻——相邻已合并）。
+///
+/// 区间形态是渲染器帧实例表（run 形条目）的直接输入：一个区间 = 一条
+/// 实例表条目的簇范围，R85 cull / compact / draw 管线零改动消费。
+pub fn select_lod_cluster_ranges_in(
+    hierarchy: &MeshletHierarchy,
+    total_clusters: u32,
+    view: &MeshletLodView,
+    threshold_px: f32,
+) -> Vec<(u32, u32)> {
+    // 空层级 = 单层 = 全簇即叶（v1 容器 / --no-lod 的恒等表）。
+    if hierarchy.groups.is_empty() {
+        return if total_clusters > 0 {
+            vec![(0, total_clusters)]
+        } else {
+            Vec::new()
+        };
+    }
+    let groups = &hierarchy.groups;
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    // 显式栈 DFS：根升序、子组升序访问（入栈反序弹出）。栈深度受 DAG
+    // 高度约束（读侧校验「子组号 < 父组号」⇒ 天然有界），不用递归。
+    let mut stack: Vec<u32> = hierarchy.roots.iter().rev().copied().collect();
+    while let Some(gi) = stack.pop() {
+        let Some(g) = groups.get(gi as usize) else {
+            continue; // 内存态手搓层级防御式跳过（容器读侧已拦越界）
+        };
+        if g.children.is_empty() {
+            // 叶组：恒选自身（误差为 0 也无需判定——它是绘制精度的下界）。
+            ranges.push((g.cluster_start, g.cluster_count));
+            continue;
+        }
+        // 球心反归一化（与 meshlet_cull.wgsl 同式：min + n × extent），
+        // 屏幕误差 = 组误差 × 缩放 × (H/2) / (dist × tan_half)。
+        let center =
+            view.bounds_min + Vec3::new(g.bounds[0], g.bounds[1], g.bounds[2]) * view.bounds_extent;
+        let dist = (center - view.eye_local).length().max(1e-6);
+        let screen_error = g.group_error * view.error_scale * (view.screen_height * 0.5)
+            / (dist * view.tan_half_fov);
+        if screen_error <= threshold_px {
+            ranges.push((g.cluster_start, g.cluster_count));
+        } else {
+            for &child in g.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    // 升序规范化：选择是逐组布尔 ⇒ 输出**集合**与遍历序无关；按簇起点
+    // 升序排序（u32 全序，sort_unstable_by_key 无并列歧义）后合并相邻
+    // 区间 ⇒ 输出序 = 绘制紧凑序（升序），两跑逐位一致。
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for &(start, count) in &ranges {
+        match merged.last_mut() {
+            Some(last) if last.0 + last.1 == start => last.1 += count,
+            _ => merged.push((start, count)),
+        }
+    }
+    merged
+}
+
+/// 层级选择的展开形态（规格签名）：返回选中的簇号**升序**列表。
+/// 空层级 = 单层 = `[0, clusters.len())` 恒等列表（= R85 全叶路径）。
+pub fn select_lod_clusters(
+    mesh: &MeshletMesh,
+    view: &MeshletLodView,
+    threshold_px: f32,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    for (start, count) in select_lod_cluster_ranges_in(
+        &mesh.hierarchy,
+        mesh.clusters.len() as u32,
+        view,
+        threshold_px,
+    ) {
+        out.extend(start..start + count);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // IRML 容器：魔数 / 版本 / CRC32（与 pack.rs 同一 IEEE 802.3 定义）
 // ---------------------------------------------------------------------------
 
 /// 文件头魔数（"IRML" = IRis MeshLet）。
 const MAGIC: [u8; 4] = *b"IRML";
 
-/// 当前格式版本。reader 拒读一切非当前版本（v1 无历史版本可向后兼容；
-/// 将来升版时在此加逐版本分支，旧 reader 拒读而非误读）。
-const VERSION: u32 = 1;
+/// 当前格式版本（R86 起为 2 = 层级布局）。reader 按版本分支：v1（R84
+/// 单层布局）照常读取（层级置空 = 全叶），v2 读取组 / 根区段，其余版本
+/// 拒读而非误读（R84 语义——「将来升版时在此加逐版本分支」的落地面）。
+const VERSION: u32 = 2;
 
-/// 文件头固定长度：魔数 4 + 版本 4 + 顶点数 4 + 索引数 4 + 簇数 4 + CRC 4。
+/// v1（R84 单层布局）版本号——写出单层容器与读取历史文件共用。
+const VERSION_V1: u32 = 1;
+
+/// v1 文件头固定长度：魔数 4 + 版本 4 + 顶点数 4 + 索引数 4 + 簇数 4 + CRC 4。
 const HEADER_LEN: usize = 24;
+
+/// v2 文件头固定长度：v1 头 + 叶簇数 4 + 组数 4 + 根数 4（CRC 随之后移）。
+const HEADER_LEN_V2: usize = 36;
 
 /// CRC-32（IEEE 802.3，反射多项式 0xEDB88320），与 `iris-engine::pack`
 /// 同一定义（跨 crate 复制而非共享依赖：pack 在 iris-engine，反向依赖
@@ -837,7 +1319,10 @@ impl fmt::Display for MeshletAssetError {
             Self::Io(e) => write!(f, "IO 错误：{e}"),
             Self::BadMagic => write!(f, "不是 IRML 文件（魔数不符，期望 \"IRML\"）"),
             Self::UnsupportedVersion(v) => {
-                write!(f, "IRML 版本 {v} 不受支持（本实现支持版本 {VERSION}）")
+                write!(
+                    f,
+                    "IRML 版本 {v} 不受支持（本实现支持版本 {VERSION_V1} 单层与 {VERSION} 层级）"
+                )
             }
             Self::Corrupt(what) => write!(f, "IRML 结构损坏：{what}"),
             Self::ChecksumMismatch { expected, actual } => write!(
@@ -1101,6 +1586,9 @@ mod tests {
     }
 
     /// 魔数不符 → BadMagic；版本不符 → UnsupportedVersion（拒绝而不是误读）。
+    ///
+    /// R86 起版本矩阵 = {1, 2}（v1 单层照常读取 + v2 层级），版本 2 从
+    /// 拒绝名单移入兼容名单（原名单 [0, 2, 999] 的 2 位由 3 顶替）。
     #[test]
     fn container_rejects_bad_magic_and_wrong_version() {
         let mesh = sample_mesh();
@@ -1114,7 +1602,7 @@ mod tests {
             Err(MeshletAssetError::BadMagic)
         ));
 
-        for v in [0u32, 2, 999] {
+        for v in [0u32, 3, 999] {
             let mut bad_version = bytes.clone();
             bad_version[4..8].copy_from_slice(&v.to_le_bytes());
             assert!(
@@ -1201,8 +1689,10 @@ mod tests {
             data.extend_from_slice(&cluster.error.to_le_bytes());
 
             let mut bytes = Vec::new();
+            // 手工拼 legacy v1 布局（R86 起 VERSION 常量 = 2，此处按 v1
+            // 字节格式现拼——被测校验链在 v1 分支内）。
             bytes.extend_from_slice(&MAGIC);
-            bytes.extend_from_slice(&VERSION.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
             bytes.extend_from_slice(&3u32.to_le_bytes());
             bytes.extend_from_slice(&(indices.len() as u32).to_le_bytes());
             bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -1565,5 +2055,371 @@ mod tests {
             ),
             "上限内的簇数应进入后续校验（长度不符）"
         );
+    }
+
+    // ---- R86：层级 LOD 选择（解析解 + 单调性 + 恒等表）----
+
+    /// 手搓一棵最小 DAG：8 个叶组（各占叶簇 i）、2 个中层组（自有簇
+    /// 8/9）与 1 个根（自有簇 10）。几何数据不参与选择，簇元数据填最小
+    /// 占位；组球心按「bbox min = 0 / extent = 8」的归一化口径摆放（叶
+    /// i 球心世界 x = i + 0.5；中层 A/B 球心 2.5 / 6.5；根 4.5）。
+    fn lod_test_mesh() -> MeshletMesh {
+        let mut mesh = MeshletMesh::default();
+        // 11 个占位簇（每簇 1 三角 3 顶点，偏移连续——选择不消费但保持
+        // 良构）
+        for i in 0..11u32 {
+            mesh.vertices.push(Vertex {
+                position: [i as f32, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+            });
+            mesh.vertices.push(Vertex {
+                position: [i as f32 + 1.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+            });
+            mesh.vertices.push(Vertex {
+                position: [i as f32 + 0.5, 1.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+            });
+            mesh.indices.extend_from_slice(&[0, 1, 2]);
+            mesh.clusters.push(MeshletClusterRaw {
+                vertex_offset: i * 3,
+                index_offset: i * 3,
+                vertex_count: 3,
+                triangle_count: 1,
+                bounds: [(i as f32 + 0.5) / 8.0, 0.5, 0.5, 0.2],
+                error: 0.0,
+                ..MeshletClusterRaw::default()
+            });
+        }
+        let group = |children: Vec<u32>, start: u32, own: f32, group_err: f32, cx: f32, r: f32| {
+            MeshletLodGroup {
+                children,
+                cluster_start: start,
+                cluster_count: 1,
+                own_error: own,
+                group_error: group_err,
+                // 球心摆在 x 轴上（y/z 归一化 0 = 世界 0）——dist 解析式
+                // 不含杂项偏移
+                bounds: [cx / 8.0, 0.0, 0.0, r],
+                cone_axis: [0.0, 0.0, 1.0],
+                cone_cutoff_cos: 1.0,
+            }
+        };
+        // 组 0..7 = 叶组（簇 i）；组 8 = A（叶 0-3，簇 8）；组 9 = B（叶
+        // 4-7，簇 9）；组 10 = 根（A/B，簇 10）。组误差沿 DAG 单调：叶 0
+        // < 中层 1.0 < 根 2.0。
+        mesh.hierarchy.groups = vec![
+            group(Vec::new(), 0, 0.0, 0.0, 0.5, 0.2),
+            group(Vec::new(), 1, 0.0, 0.0, 1.5, 0.2),
+            group(Vec::new(), 2, 0.0, 0.0, 2.5, 0.2),
+            group(Vec::new(), 3, 0.0, 0.0, 3.5, 0.2),
+            group(Vec::new(), 4, 0.0, 0.0, 4.5, 0.2),
+            group(Vec::new(), 5, 0.0, 0.0, 5.5, 0.2),
+            group(Vec::new(), 6, 0.0, 0.0, 6.5, 0.2),
+            group(Vec::new(), 7, 0.0, 0.0, 7.5, 0.2),
+            group(vec![0, 1, 2, 3], 8, 1.0, 1.0, 2.5, 2.0),
+            group(vec![4, 5, 6, 7], 9, 1.0, 1.0, 6.5, 2.0),
+            group(vec![8, 9], 10, 2.0, 2.0, 4.5, 4.0),
+        ];
+        mesh.hierarchy.roots = vec![10];
+        mesh.hierarchy.leaf_cluster_count = 8;
+        mesh
+    }
+
+    /// 选择视口：眼点 (4.5, 0, dist)、H = 200 px、tan_half = 0.5、单位
+    /// 缩放、bbox [0,8]×[0,1]×[0,1]。屏幕误差解析式（error_scale = 1）：
+    /// err_px(g) = group_error × 100 / (dist × 0.5) = group_error × 200 / dist。
+    fn lod_view(dist: f32) -> MeshletLodView {
+        MeshletLodView {
+            bounds_min: Vec3::new(0.0, 0.0, 0.0),
+            bounds_extent: Vec3::new(8.0, 1.0, 1.0),
+            eye_local: Vec3::new(4.5, 0.0, dist),
+            error_scale: 1.0,
+            screen_height: 200.0,
+            tan_half_fov: 0.5,
+        }
+    }
+
+    /// threshold = 0 恒细化到叶：输出 = 全叶列表 = R85 恒等表（升序）。
+    #[test]
+    fn lod_selection_threshold_zero_returns_all_leaves() {
+        let mesh = lod_test_mesh();
+        let selected = select_lod_clusters(&mesh, &lod_view(100.0), 0.0);
+        assert_eq!(
+            selected,
+            (0..8).collect::<Vec<u32>>(),
+            "threshold 0 必须下钻到全部叶簇（= R85 全叶列表）"
+        );
+        // 负阈值同语义（误差 ≥ 0 恒大于负阈值 ⇒ 恒下钻）
+        let selected_neg = select_lod_clusters(&mesh, &lod_view(100.0), -1.0);
+        assert_eq!(selected_neg, selected, "负阈值与 0 同为全叶");
+    }
+
+    /// threshold 极大：根的屏幕误差必过阈 ⇒ 只选根的自有簇。
+    #[test]
+    fn lod_selection_huge_threshold_selects_root_only() {
+        let mesh = lod_test_mesh();
+        let selected = select_lod_clusters(&mesh, &lod_view(100.0), 1.0e9);
+        assert_eq!(selected, vec![10u32], "根误差必过阈 ⇒ 仅根自有簇");
+    }
+
+    /// 解析解（按 lod_view 的 err_px 公式逐档精确判定）：
+    /// dist = 100 ⇒ 根 err_px = 2×200/100 = 4.0、中层 = 200/√(100²+2²) ≈ 2.0。
+    /// threshold 4.0（恰等）：根选中（相等点判选中，f32 精确整除）；
+    /// threshold 3.0：根下钻、A/B 选中 ⇒ 输出 = 自有簇 8/9（升序）；
+    /// threshold 1.0：全下钻到叶 ⇒ 输出 = 全叶。
+    #[test]
+    fn lod_selection_analytic_thresholds_and_ascending_output() {
+        let mesh = lod_test_mesh();
+        // 恰等边界：4.0 ≤ 4.0 ⇒ 根选中（阈值语义 = ≤）
+        assert_eq!(
+            select_lod_clusters(&mesh, &lod_view(100.0), 4.0),
+            vec![10u32],
+            "屏幕误差恰等于阈值判选中（≤ 语义）"
+        );
+        // 中档：根下钻、A/B 双双选中（各自的自有簇 8 / 9，叶不再出现）
+        let mid = select_lod_clusters(&mesh, &lod_view(100.0), 3.0);
+        assert_eq!(
+            mid,
+            vec![8u32, 9],
+            "A/B 选中 = 自有簇 8/9（叶组不下钻不出现）；输出必须升序"
+        );
+        // 低档：全下钻
+        assert_eq!(
+            select_lod_clusters(&mesh, &lod_view(100.0), 1.0),
+            (0..8).collect::<Vec<u32>>(),
+            "threshold 1.0 下中层（≈2.0）也不过阈 ⇒ 全叶"
+        );
+    }
+
+    /// 距离单调：threshold 固定，眼点拉近 ⇒ 选择变细（根/中层不过阈），
+    /// 拉远 ⇒ 变粗（中层/根选中）。解析锚点：dist = 100 时中层 ≈ 2.0
+    /// （过阈 2.0）；dist = 50 时中层 = 200/√(50²+2²) ≈ 4.0（不过阈）。
+    #[test]
+    fn lod_selection_distance_monotonic() {
+        let mesh = lod_test_mesh();
+        let far = select_lod_cluster_ranges_in(&mesh.hierarchy, 11, &lod_view(100.0), 2.0);
+        assert_eq!(
+            far,
+            vec![(8, 2)],
+            "远距：双中层选中，两簇范围相邻 ⇒ 合并为单条 run"
+        );
+        let near = select_lod_cluster_ranges_in(&mesh.hierarchy, 11, &lod_view(50.0), 2.0);
+        assert_eq!(near, vec![(0, 8)], "近距：全下钻到叶（单条合并 run）");
+        assert!(
+            far[0].1 < near[0].1,
+            "远距选择的簇数不得多于近距（远 {} vs 近 {}）",
+            far[0].1,
+            near[0].1
+        );
+    }
+
+    /// 区间升序规范化 + 非对称选择：眼点对齐 A（x = 2.5, z = 30）⇒
+    /// errA = 100/15 ≈ 6.667（不过阈，下钻到叶 0-3）、errB =
+    /// 100/(√916×0.5) ≈ 6.608（过阈，选中自有簇 9）。threshold 6.63 居中
+    /// ⇒ 输出 = 两个**不相邻**区间 [(0,4), (9,1)]（簇 4..9 是空档），
+    /// 展开后升序。
+    #[test]
+    fn lod_selection_asymmetric_ranges_sorted() {
+        let mesh = lod_test_mesh();
+        let mut view = lod_view(30.0);
+        view.eye_local = Vec3::new(2.5, 0.0, 30.0);
+        let ranges = select_lod_cluster_ranges_in(&mesh.hierarchy, 11, &view, 6.63);
+        assert_eq!(
+            ranges,
+            vec![(0, 4), (9, 1)],
+            "A 下钻到叶（区间 (0,4)）、B 选中自有簇（区间 (9,1)）——升序、不相邻"
+        );
+        let selected = select_lod_clusters(&mesh, &view, 6.63);
+        assert_eq!(selected, vec![0u32, 1, 2, 3, 9], "展开形态升序");
+    }
+
+    /// 空层级（v1 容器 / 手搓单层网格）= 恒等表：`select_lod_clusters`
+    /// 返回全部簇号升序（R85 全叶路径的 CPU 锚点）。
+    #[test]
+    fn lod_selection_empty_hierarchy_identity() {
+        let mesh = sample_mesh(); // 2 簇、无层级
+        let selected = select_lod_clusters(&mesh, &lod_view(100.0), 1.0e9);
+        assert_eq!(
+            selected,
+            vec![0u32, 1],
+            "空层级恒等表：阈值不影响输出（单层 = 全簇即叶）"
+        );
+        assert_eq!(mesh.leaf_count(), 2, "v1 网格叶数 = 簇总数");
+    }
+
+    // ---- R86：IRML v2 容器 ----
+
+    /// v2 往返位级：层级网格 write（v2 布局：36 B 头）→ read 逐字段
+    /// 相等（组 children / 范围 / 误差 / bounds / cone + 根 + 叶数，f32
+    /// 位级比较）；单层网格 write 仍为 v1 布局（24 B 头）。
+    #[test]
+    fn container_v2_roundtrip_bit_exact_and_v1_layout_unchanged() {
+        let mut mesh = lod_test_mesh();
+        // 给误差 / bounds 填非平凡位型（负数 / 非整值——抓编解码错位）
+        mesh.hierarchy.groups[8].own_error = -0.375;
+        mesh.hierarchy.groups[8].group_error = 1.125;
+        mesh.hierarchy.groups[10].bounds = [0.5125, 0.4, 0.6, 4.25];
+
+        let mut bytes = Vec::new();
+        let total = mesh.write_to(&mut bytes).expect("写出 v2");
+        assert_eq!(total, bytes.len() as u64, "返回值 = 实际字节数");
+        // v2 布局 = 头 36 + 顶点 33×32 + 索引 33×4 + 簇 11×48
+        //   + 组（8 叶组 × 52 + 2 中层组 × 68 + 根 60 = 612）+ 根 1×4
+        assert_eq!(bytes.len(), 36 + 1056 + 132 + 528 + 612 + 4, "v2 总长");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            2,
+            "版本 = 2"
+        );
+
+        let back = MeshletMesh::from_bytes(&bytes).expect("读回 v2");
+        assert_eq!(
+            back.hierarchy.leaf_cluster_count, mesh.hierarchy.leaf_cluster_count,
+            "叶簇数逐位"
+        );
+        assert_eq!(back.hierarchy.roots, mesh.hierarchy.roots, "根列表");
+        assert_eq!(
+            back.hierarchy.groups.len(),
+            mesh.hierarchy.groups.len(),
+            "组数"
+        );
+        for (a, b) in back
+            .hierarchy
+            .groups
+            .iter()
+            .zip(mesh.hierarchy.groups.iter())
+        {
+            assert_eq!(a.children, b.children, "children");
+            assert_eq!(a.cluster_start, b.cluster_start, "簇起点");
+            assert_eq!(a.cluster_count, b.cluster_count, "簇数");
+            assert_eq!(
+                a.own_error.to_bits(),
+                b.own_error.to_bits(),
+                "own_error 位级"
+            );
+            assert_eq!(
+                a.group_error.to_bits(),
+                b.group_error.to_bits(),
+                "group_error 位级"
+            );
+            for (x, y) in a.bounds.iter().zip(b.bounds.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "组 bounds 位级");
+            }
+            for (x, y) in a.cone_axis.iter().zip(b.cone_axis.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "组锥轴位级");
+            }
+            assert_eq!(
+                a.cone_cutoff_cos.to_bits(),
+                b.cone_cutoff_cos.to_bits(),
+                "组锥 cutoff 位级"
+            );
+        }
+        assert_eq!(back.clusters, mesh.clusters, "簇元数据不受 v2 区段影响");
+
+        // 单层网格仍走 v1 布局（R84 字节格式零漂移）
+        let plain = sample_mesh();
+        let mut v1_bytes = Vec::new();
+        plain.write_to(&mut v1_bytes).expect("写出 v1");
+        assert_eq!(
+            u32::from_le_bytes(v1_bytes[4..8].try_into().unwrap()),
+            1,
+            "单层容器版本 = 1"
+        );
+        assert_eq!(v1_bytes.len(), 24 + 7 * 32 + 9 * 4 + 2 * 48, "v1 头长 24 B");
+        let back_v1 = MeshletMesh::from_bytes(&v1_bytes).expect("读回 v1");
+        assert!(
+            back_v1.hierarchy.groups.is_empty(),
+            "v1 容器层级为空（单层 = 全叶）"
+        );
+        assert_eq!(back_v1.leaf_count(), 2, "v1 叶数 = 簇总数");
+    }
+
+    /// v1 容器照常读取（R86 版本矩阵的兼容面）：R84 时代字节流 → 单层
+    /// 网格（层级空、全簇即叶、展开三角形集合不变）。
+    #[test]
+    fn container_v1_file_still_reads_single_layer() {
+        // R84 布局的字节流 = 单层网格 write_to 产物（版本字段 1）
+        let mesh = sample_mesh();
+        let mut bytes = Vec::new();
+        mesh.write_to(&mut bytes).expect("写出");
+        let back = MeshletMesh::from_bytes(&bytes).expect("v1 容器必须照常读取");
+        assert!(back.hierarchy.groups.is_empty() && back.hierarchy.roots.is_empty());
+        assert_eq!(back.clusters, mesh.clusters);
+        assert_eq!(back.indices, mesh.indices);
+        let expanded = back.expand();
+        assert_eq!(expanded.indices.len(), 9, "展开不受层级字段影响");
+    }
+
+    /// v2 语义校验：子组号越界 / 组簇范围越界 / 根越界 / 截断，全部
+    /// Corrupt 且可判别（良构 v2 数据区按偏移改写 + CRC 现算）。
+    #[test]
+    fn container_v2_rejects_semantically_invalid_hierarchy() {
+        // 数据区布局：顶点（33×32）| 索引（33×4）| 簇区段 11×48 | 组区段
+        // （8 叶组各 52、中层 2 组各 68、根 60）| 根区段 4。
+        let common_section = 33 * 32 + 33 * 4;
+        let cluster_section = 11 * 48;
+        let leaf_groups = 8 * 52;
+        let mid_groups = 2 * 68;
+        let root_group_off = common_section + cluster_section + leaf_groups + mid_groups;
+        let roots_off = root_group_off + 60;
+        let craft = |patch: &dyn Fn(&mut [u8])| {
+            let mesh = lod_test_mesh();
+            let mut bytes = Vec::new();
+            mesh.write_to(&mut bytes).expect("写出良构 v2");
+            let mut data = bytes[36..].to_vec();
+            patch(&mut data);
+            let mut out = Vec::new();
+            out.extend_from_slice(&MAGIC);
+            out.extend_from_slice(&2u32.to_le_bytes());
+            out.extend_from_slice(&(mesh.vertices.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(mesh.indices.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(mesh.clusters.len() as u32).to_le_bytes());
+            out.extend_from_slice(&mesh.hierarchy.leaf_cluster_count.to_le_bytes());
+            out.extend_from_slice(&(mesh.hierarchy.groups.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(mesh.hierarchy.roots.len() as u32).to_le_bytes());
+            out.extend_from_slice(&crc32(&data).to_le_bytes());
+            out.extend_from_slice(&data);
+            out
+        };
+        // ① 子组号越界（根的 children 首项改成 10 ≥ 父序号 10）
+        let bytes = craft(&mut |data| {
+            let off = root_group_off + 4;
+            data[off..off + 4].copy_from_slice(&10u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("子组号")
+        ));
+        // ② 组簇范围越界（根 cluster_start = 100 > 簇总数 11）
+        let bytes = craft(&mut |data| {
+            let off = root_group_off + 4 + 8;
+            data[off..off + 4].copy_from_slice(&100u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("簇范围越界")
+        ));
+        // ③ 根越界（roots[0] = 99 ≥ 组总数 11）
+        let bytes = craft(&mut |data| {
+            data[roots_off..roots_off + 4].copy_from_slice(&99u32.to_le_bytes());
+        });
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("根 #0 组号")
+        ));
+        // ④ 区段长度闭合：头部谎报 root_count = 2（头不受 CRC 保护，
+        // 头布局：魔数/版本/顶点/索引/簇/叶/组/根 = 0/4/8/12/16/20/24/28）
+        // ⇒ 组 / 根区段消费长度与数据区不符。单纯截断会被整区段 CRC 先
+        // 拦（ChecksumMismatch），闭合校验在此单独覆盖。
+        let mut bytes = craft(&mut |_| {});
+        bytes[28..32].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            MeshletMesh::from_bytes(&bytes),
+            Err(MeshletAssetError::Corrupt(msg)) if msg.contains("组/根区段消费")
+        ));
     }
 }

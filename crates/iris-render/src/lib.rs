@@ -197,10 +197,11 @@ pub mod prelude {
     pub use crate::meshlet::{
         MAX_MESHLET_CLUSTERS, MESHLET_CLUSTER_MAX_TRIANGLES, MESHLET_CLUSTER_MAX_VERTICES,
         MESHLET_COMPACT_CHUNK, MESHLET_COMPACT_THREADS, MESHLET_CONE_FALLBACK_AXIS,
-        MESHLET_CONE_FALLBACK_CUTOFF_COS, MeshletAssetError, MeshletClusterRaw, MeshletInstance,
-        MeshletMesh, MeshletMeshHandle, MeshletMeshStore, chunked_prefix_compact,
-        cluster_bounding_sphere, cluster_bounds_normalized, cluster_cone, cluster_is_backfacing,
-        mesh_bounds, vertex_storage_words,
+        MESHLET_CONE_FALLBACK_CUTOFF_COS, MeshletAssetError, MeshletClusterRaw, MeshletHierarchy,
+        MeshletInstance, MeshletLodGroup, MeshletLodSettings, MeshletLodView, MeshletMesh,
+        MeshletMeshHandle, MeshletMeshStore, chunked_prefix_compact, cluster_bounding_sphere,
+        cluster_bounds_normalized, cluster_cone, cluster_is_backfacing, mesh_bounds,
+        select_lod_cluster_ranges_in, select_lod_clusters, vertex_storage_words,
     };
     pub use crate::occlusion::OcclusionCulling;
     pub use crate::offscreen::OffscreenRenderer;
