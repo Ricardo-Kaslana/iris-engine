@@ -483,6 +483,24 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // DDGI 深度表（R88，同一扩容先例的延续）：
+            // 20 = read-only storage `array<f32>`（256 × 6 × 8² × 2 × 4 B =
+            // 768 KiB 定长，**惰性创建**——首个 mode = 2 帧才分配）。
+            // 缺席 / mode ≤ 1 / 捕获 / RT = 4 B 全零哑缓冲（mode 2 分支死码，
+            // 永不读），skybox.wgsl 的并行布局不受影响。片元阶段只读 storage
+            // 缓冲计数 = **4**（16/17/18/20），恰在 WebGPU 默认的
+            // maxStorageBuffersPerShaderStage = 4 之内（下一轮再加 storage
+            // 必须先申请特性或改用纹理）。
+            wgpu::BindGroupLayoutEntry {
+                binding: 20,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 

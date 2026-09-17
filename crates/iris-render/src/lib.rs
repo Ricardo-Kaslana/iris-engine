@@ -77,6 +77,17 @@
 //!   走 mode = 1（binding 18/19，片端径向权重 × 9 项点积逐片元求值——空间
 //!   梯度 + 方向性）；不带 SH ⇒ mode = 0，v1 逐实体路径**逐位不变**。
 //!   见 ARCHITECTURE §4.39 / §8.52 与 `tests/gi_sh_render.rs`。
+//! - DDGI 动态全局光照 v1（R88，`ddgi` 模块）：**规则探针网格**（纯资源态，
+//!   不落实体；超容量走确定性抽稀而非按序截断 ⇒ 覆盖范围不变）+ **CPU 光线
+//!   追踪的时间片滚动重照明**（复用 R52a 的 BVH，每帧只重照明 k 个脏探针，
+//!   收敛 `⌈n/k⌉` 帧；稳态零 CPU 零上传）+ **深度感知混合**（每探针 6×8²
+//!   方向深度两阶矩 (μ, σ²) × chebyshev 单侧上界权重，**闭合 §8.52①** 的
+//!   「隔墙串味」）。SH 投影与深度矩**同一批射线** ⇒ 深度项零额外光线成本；
+//!   σ² 在 CPU 用 f64 求差后钳下限（f32 会灾难性抵消）⇒ 着色器零减法。
+//!   binding 20 = 768 KiB 深度表（惰性创建）+ binding 19 的 mode 扩到 2；
+//!   R83 / R64 的 mode 0/1 分支**语句逐条不动**。`DdgiSettings` 缺席 ⇒
+//!   一个 `write_buffer` 都不发、既有 FNV 基线原值通过。
+//!   见 ARCHITECTURE §4.44 / §8.57 与 `tests/ddgi_render.rs`。
 //! - 平面水体 v1（R81，`water` 模块）：`WaterSurface` 组件声明世界空间
 //!   水平面（多实体确定性选择键取首盏），Gerstner 4 波顶点位移（解析
 //!   法线，CPU 纯函数与 WGSL 逐式镜像）+ 反射 / 折射半分辨率捕获
@@ -91,6 +102,7 @@ pub mod bake_uv;
 pub mod camera;
 pub mod chain_ik;
 pub mod context;
+pub mod ddgi;
 pub mod decal;
 pub mod environment;
 pub mod fog;
@@ -156,6 +168,17 @@ pub mod prelude {
         ChainIk, LookIk, solve_fabrik, swing_fraction, update_chain_ik, update_look_ik,
     };
     pub use crate::context::Gpu;
+    // DDGI 动态全局光照 v1（R88）：规则探针网格 + 时间片滚动重照明 + 深度感知混合
+    pub use crate::ddgi::{
+        DDGI_DEPTH_FLOATS, DDGI_DEPTH_GRID, DDGI_DEPTH_PROBE_BYTES, DDGI_DEPTH_TABLE_BYTES,
+        DDGI_DEPTH_TEXELS, DDGI_DEPTH_TEXELS_PER_FACE, DDGI_PREFILL_GRID,
+        DDGI_RAYS_PER_FACE_CHOICES, DDGI_SIGMA_REL, DDGI_SKY_DEPTH, DdgiGrid, DdgiLayout,
+        DdgiSettings, DdgiStats, advance, axis_points, ddgi_blend, ddgi_depth_face,
+        ddgi_depth_texel, ddgi_depth_weight, ddgi_depth_weight_at, default_bounds,
+        depth_cell_of_ray, depth_hysteresis, depth_moment_finish, grid_fingerprint,
+        layout_positions, neutral_depth_moment, neutral_depth_table, plan_layout, probe_relight,
+        relight_fingerprint, sh_hysteresis, stride_for_capacity, triangles_bounds,
+    };
     pub use crate::decal::{Decal, DecalInstanceRaw};
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::fog::{
@@ -172,8 +195,8 @@ pub mod prelude {
         SH_Y1, SH_Y2A, SH_Y2B, SH_Y2C, ShCoeffs, ShProbeRaw, TetraStats, TetraValidation,
         Tetrahedralization, bake_irradiance_probes, bake_irradiance_probes_sh, cube_face_direction,
         cube_texel_solid_angle, derive_probe_radii, install_irradiance_probes,
-        probe_influence_weight, probe_sh_coefficients, probe_sh_radiance, project_probe_sh,
-        sh_basis, sh_blend, sh_blend_l0, sh_dc, sh_eval, sh_lambert_convolve,
+        probe_influence_weight, probe_ray_radiance_depth, probe_sh_coefficients, probe_sh_radiance,
+        project_probe_sh, sh_basis, sh_blend, sh_blend_l0, sh_dc, sh_eval, sh_lambert_convolve,
     };
     pub use crate::light::{
         CascadeFit, DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY,

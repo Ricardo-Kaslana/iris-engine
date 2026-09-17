@@ -441,6 +441,61 @@ impl Plugin for DayNightPlugin {
     }
 }
 
+/// DDGI 动态全局光照插件（R88）：Startup 插入空的 [`DdgiGrid`] 资源，
+/// Update 注册 [`crate::ddgi::tick_ddgi`] 并行系统（时间片滚动重照明）。
+///
+/// **注册序**：必须在 [`DayNightPlugin`] **之后**——昼夜系统当帧写进
+/// `DirectionalLight` 的方向 / 色温 / 强度 / 环境光，当帧就被 DDGI 的重照明
+/// 口径消费（`sky_color` 默认取 `ambient`，裁定 3 的 R80 免费联动）。
+///
+/// **资源缺席语义**：[`DdgiSettings`] 未注册 = 系统空转一次资源查询即过，
+/// 渲染器维持 R83 的 mode 裁决（0 / 1），**既有像素逐位不变**（一个
+/// `write_buffer` 都不发）。已包含在 [`DefaultPlugins`] 中；自建 App 时手动添加。
+///
+/// [`DdgiGrid`]: iris_render::ddgi::DdgiGrid
+/// [`DdgiSettings`]: iris_render::ddgi::DdgiSettings
+#[derive(Default)]
+pub struct DdgiPlugin;
+
+impl Plugin for DdgiPlugin {
+    fn build(&self, app: &mut App) {
+        use iris_core::prelude::{Access, Stage};
+        use iris_core::prelude::{Collider, GlobalTransform, RigidBody};
+        use iris_render::ddgi::{DdgiGrid, DdgiSettings};
+        use iris_render::light::DirectionalLight;
+        use iris_render::material::{MaterialHandle, MaterialStore};
+        use iris_render::mesh::MeshHandle;
+        use iris_render::skin::Skin;
+        use iris_render::visibility::Visibility;
+        // Startup 插入空网格：`&World` 的系统无法注册新资源类型
+        //（`insert_resource` 要 `&mut World`），故落在这里而不是系统体
+        if !app.world.contains_resource::<DdgiGrid>() {
+            app.world.insert_resource(DdgiGrid::new());
+        }
+        // 访问集：只写 DdgiGrid，其余全读。几何收集（`collect_bake_triangles`）
+        // 读的组件类型逐一声明 ⇒ 调度器把它排在层级传播之后（GlobalTransform
+        // 当帧就位），与 DayNight 的 DirectionalLight 写入不冲突（一读一写
+        // 同一类型 ⇒ 分批串行，注册序即执行序）。
+        app.schedule.add_parallel_system(
+            Stage::Update,
+            Access::new()
+                .write::<DdgiGrid>()
+                .read::<DdgiSettings>()
+                .read::<DirectionalLight>()
+                .read::<GlobalTransform>()
+                .read::<MeshHandle>()
+                .read::<MaterialHandle>()
+                .read::<RigidBody>()
+                .read::<Collider>()
+                .read::<Skin>()
+                .read::<Visibility>()
+                .read::<MeshStore>()
+                .read::<MaterialStore>(),
+            crate::ddgi::tick_ddgi,
+        );
+    }
+}
+
 /// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 +
 /// 粒子 + 空间音频 + UI + 命令队列。
 ///
@@ -483,6 +538,9 @@ impl Plugin for DefaultPlugins {
         // 昼夜循环（R80）：默认方向光就位后注册派生系统（缺席 cycle =
         // 零触碰，见 DayNightPlugin 文档）
         DayNightPlugin.build(app);
+        // DDGI 动态全局光照（R88）：**必须在昼夜之后**——昼夜当帧写的方向光
+        // 当帧被重照明口径消费（缺席 DdgiSettings = 零触碰，见 DdgiPlugin 文档）
+        DdgiPlugin.build(app);
         AudioPlugin.build(app);
         AnimationPlugin.build(app);
         // 演出时间线（R47）：动画之后、物理之前（编排理由见 TimelinePlugin

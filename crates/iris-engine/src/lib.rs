@@ -20,6 +20,7 @@ pub mod async_loading;
 pub mod audio;
 pub mod camera_rig;
 pub mod daynight;
+pub mod ddgi;
 pub mod gltf_builder;
 pub mod level;
 pub mod manifest;
@@ -50,7 +51,7 @@ pub mod prelude {
     pub use crate::manifest::{AssetManifest, ManifestEntry, ManifestError};
     pub use crate::pack::{MeshletPackError, PackError, PackReader, PackWriter, read_meshlet};
     pub use crate::plugin::{
-        AnimationPlugin, AudioPlugin, CommandsPlugin, DayNightPlugin, DefaultPlugins,
+        AnimationPlugin, AudioPlugin, CommandsPlugin, DayNightPlugin, DdgiPlugin, DefaultPlugins,
         HierarchyPlugin, InputPlugin, ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin,
         SpatialPlugin, TimePlugin, TimelinePlugin, Viewport, WindowPlugin,
     };
@@ -82,6 +83,11 @@ pub mod prelude {
     pub use crate::camera_rig::{SmoothFollow, update_smooth_follow};
     // 昼夜循环（R80）：相位 → 方向光派生系统（DayNightPlugin 的系统体）
     pub use crate::daynight::update_day_night;
+    // DDGI 动态全局光照（R88）：时间片滚动重照明的系统体 + 口径组装 +
+    // 测试 / 快照用的同步收敛入口（DDGI 的类型与常量随
+    // `iris_render::prelude::*` 一并可用——R74 的 prelude 缺口摩擦 §8.26⑧
+    // 不重演）
+    pub use crate::ddgi::{converge_ddgi, ddgi_bake_params, tick_ddgi};
     // 空间音频 v1（听者 / 声源组件与每帧同步系统）
     pub use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
     // 演出时间线（R47）：轨道数据 + 采样纯函数 + 播放器与托管入口

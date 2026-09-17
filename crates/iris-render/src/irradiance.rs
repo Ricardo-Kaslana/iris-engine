@@ -2079,18 +2079,50 @@ pub fn cube_texel_solid_angle(u0: f64, u1: f64, v0: f64, v1: f64) -> f64 {
 ///
 /// 直接光复用 [`direct_irradiance`](crate::bake::direct_irradiance)（不复制
 /// 公式），命中法线同样翻向射线来向（薄板背面照实受光）。
+///
+/// **R88 改薄壳（偏离声明）**：函数体搬进 [`probe_ray_radiance_depth`]，本函数
+/// 只取其 `.0`。理由是辐射率口径必须有**单一事实源**——DDGI 的重照明器要
+/// 逐式复用同一份「天空 / 一次反弹」三项口径并额外带出命中深度，复制一份
+/// 公式会让两条路径在后续修订中悄悄漂移。看门有两道：①R83 既有测试原值
+/// 通过；②`ddgi` 的跨模块等价锚点（`rays_per_face = SH_CUBE_GRID` 时
+/// [`probe_sh_coefficients`] 与 DDGI 重照明的 SH 表逐位相等）。
 pub fn probe_sh_radiance(
     bvh: &crate::bake::Bvh,
     position: Vec3,
     dir: Vec3,
     params: &BakeParams,
 ) -> Vec3 {
+    probe_ray_radiance_depth(bvh, position, dir, params).0
+}
+
+/// 沿单条方向的**间接辐射率 L + 命中深度 t**（DDGI 的方向样本，R88）。
+///
+/// 辐射率口径与 [`probe_sh_radiance`] 完全同源（后者是本函数的薄壳）；
+/// 深度是 DDGI 深度感知混合的输入，口径如下：
+///
+/// - 未命中 ⇒ 深度 = [`DDGI_SKY_DEPTH`](crate::ddgi::DDGI_SKY_DEPTH)（10 km
+///   **有限**哨兵；不用 `f32::INFINITY` —— 无穷进矩累加会污染 Σt / Σt²，
+///   且 `E[t²] − μ²` 直接变 NaN）；
+/// - 命中 ⇒ 深度 = `hit.t + BAKE_SHADOW_BIAS`：`raycast_bvh` 的 `t` 是从
+///   **偏移后的射线原点**起算的，加回偏移量才与「从探针位置起算」的
+///   着色器侧 `d = distance(x, p)` 同原点（少这一项 = 系统性低估 2 mm，
+///   在 σ² 的相对下限钳之下不可见，但口径必须对齐）。
+///
+/// `bounces = 0` 且命中 ⇒ 辐射率 0（与 [`probe_sh_radiance`] 一致：被挡方向
+/// 既无天空也无反弹），深度**照实返回**（遮挡事实与反弹开关无关）。
+pub fn probe_ray_radiance_depth(
+    bvh: &crate::bake::Bvh,
+    position: Vec3,
+    dir: Vec3,
+    params: &BakeParams,
+) -> (Vec3, f32) {
     let origin = position + dir * crate::bake::BAKE_SHADOW_BIAS;
     match crate::bake::raycast_bvh(bvh, origin, dir, f32::INFINITY) {
-        None => params.sky_color,
+        None => (params.sky_color, crate::ddgi::DDGI_SKY_DEPTH),
         Some(hit) => {
+            let depth = hit.t + crate::bake::BAKE_SHADOW_BIAS;
             if params.bounces == 0 {
-                return Vec3::ZERO;
+                return (Vec3::ZERO, depth);
             }
             let hit_point = origin + dir * hit.t;
             let m = if hit.normal.dot(-dir) >= 0.0 {
@@ -2101,7 +2133,7 @@ pub fn probe_sh_radiance(
             let albedo = bvh.triangle(hit.triangle).albedo;
             let incident = crate::bake::direct_irradiance(bvh, hit_point, m, params, false)
                 + params.sky_color * std::f32::consts::PI;
-            albedo * incident * std::f32::consts::FRAC_1_PI
+            (albedo * incident * std::f32::consts::FRAC_1_PI, depth)
         }
     }
 }

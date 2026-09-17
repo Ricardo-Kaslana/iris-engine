@@ -222,15 +222,22 @@ struct LightBinsParams {
 @group(0) @binding(16) var<storage, read> binned_lights: array<BinnedLight>;
 @group(0) @binding(17) var<storage, read> bins_tiles: array<u32>;
 
-// GI 探针三阶 SH（R83，排在分箱 binding 17 之后、不扩 Globals 前缀——
-// skybox.wgsl 的并行布局陷阱不触碰）。两路资源：
+// GI 探针三阶 SH（R83）+ DDGI 深度表（R88，排在分箱 binding 17 之后、不扩
+// Globals 前缀——skybox.wgsl 的并行布局陷阱不触碰）。三路资源：
 //   18 = 探针表 read-only storage：GiProbe 定长数组（容量 256 = Rust 侧
 //        MAX_IRRADIANCE_PROBES，与 irradiance::ShProbeRaw 逐字段对齐，
-//        10×vec4 = 160 B/探针）。
+//        10×vec4 = 160 B/探针）。R88 的 mode = 2 复用同一张表（DDGI 在场 ⇒
+//        整表替换，与 R83 烘焙探针集互斥）。
 //   19 = 16B 小参数 uniform：params.x = mode（0 = 关——缺席 / 无 SH 探针集 /
 //        捕获 / RT 绑全零哑缓冲，逐片元分支死码，loc14 逐实体路径逐位不变；
-//        1 = 逐片元 SH 求值替代 GI 探针项），params.y = 探针数（循环上界），
-//        zw 保留。
+//        1 = R83 逐片元 SH 求值替代 GI 探针项；2 = R88 DDGI 深度感知混合），
+//        params.y = 探针数（循环上界），params.z = DDGI 深度网格边长
+//        （R88，= ddgi::DDGI_DEPTH_GRID = 8；mode ≤ 1 时不消费），
+//        params.w = DDGI 深度项开关（R88，1 = 生产路径；0 = 对照模式，见
+//        Renderer::set_ddgi_depth_weight_enabled，仅供验收图与归因测试）。
+//   20 = DDGI 深度表 read-only storage：`array<f32>` **标量数组**（R88）。
+//        片元阶段只读 storage 计数 = 4（16/17/18/20），恰在 WebGPU 默认的
+//        maxStorageBuffersPerShaderStage = 4 之内。
 // 系数存的是 **E/π 直读**值（Lambert 带通已在 CPU 侧卷积进系数，见
 // irradiance.rs 的 sh_lambert_convolve）⇒ 求值是 9 项纯点积，与
 // irradiance_map 采样值 / loc14 载荷同口径。
@@ -243,12 +250,13 @@ struct GiProbe {
 
 // 16B 参数块（与 Rust 侧 GiShParamsRaw 逐字段对齐）
 struct GiShParams {
-    // x: mode（0/1）, y: 探针数, zw: 保留
+    // x: mode（0/1/2）, y: 探针数, z: DDGI 深度网格边长, w: DDGI 深度项开关
     params: vec4<f32>,
 };
 
 @group(0) @binding(18) var<storage, read> gi_probes: array<GiProbe>;
 @group(0) @binding(19) var<uniform> gi_params: GiShParams;
+@group(0) @binding(20) var<storage, read> gi_depth: array<f32>;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -1001,6 +1009,166 @@ fn gi_sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return max(gi, vec3<f32>(0.0));
 }
 
+// ---- DDGI 深度感知混合（R88）----
+//
+// 每探针的深度表存 **cube 面参数化**的两阶矩（6 面 × 8² 纹素 × (μ, σ²)），
+// 与 SH 投影同批射线 ⇒ 零额外光线成本。索引式（CPU 侧
+// ddgi::DDGI_DEPTH_TEXELS 同值，看门单测 ddgi.rs::wgsl_ddgi_source_matches_cpu_contract）：
+//
+//   索引 = (probe × DDGI_DEPTH_TEXELS + texel) × 2 + moment
+//   texel = face × grid² + row × grid + col        （grid = gi_params.params.z）
+//   moment: 0 = μ（平均可见深度，米）、1 = σ²（方差，米²，CPU 侧已钳下限）
+//
+// 用 `array<f32>` **标量数组**而不是 vec4 打包：WGSL 无动态 swizzle ⇒ vec4
+// 取值要 3 次 select，正是 irradiance.rs 里 ShProbeRaw 偏离声明记录过的坑。
+
+// 每探针的深度纹素数（6 面 × 8²；= Rust 侧 ddgi::DDGI_DEPTH_TEXELS）
+const DDGI_DEPTH_TEXELS: u32 = 384u;
+
+// 方向 → cube 面下标（CPU 镜像：ddgi::ddgi_depth_face）。主轴 = |x|,|y|,|z|
+// 最大者，**并列取 PROBE_AXES 序低者**（严格 > 扫描 ⇒ x → y → z 优先）；
+// 符号决定 ±（comp < 0 ⇒ 负面，NaN 落正面支——与 CPU 侧同式同极性）。
+fn ddgi_depth_face(dir: vec3<f32>) -> u32 {
+    let ax = abs(dir.x);
+    let ay = abs(dir.y);
+    let az = abs(dir.z);
+    var axis = 0u;
+    var m = ax;
+    if (ay > m) {
+        axis = 1u;
+        m = ay;
+    }
+    if (az > m) {
+        axis = 2u;
+        m = az;
+    }
+    var comp = dir.x;
+    if (axis == 1u) {
+        comp = dir.y;
+    }
+    if (axis == 2u) {
+        comp = dir.z;
+    }
+    if (comp < 0.0) {
+        return axis * 2u + 1u;
+    }
+    return axis * 2u;
+}
+
+// 方向 → 深度纹素下标（CPU 镜像：ddgi::ddgi_depth_texel，**同式同序**）。
+// 局部轴约定同 irradiance.rs 的 cube_face_direction：±X 面 (u→y, v→z)、
+// ±Y 面 (u→x, v→z)、±Z 面 (u→x, v→y)。只用分量的**比值与符号** ⇒ 传单位
+// 方向或 delta/dist 同结果。nearest-texel，无双线性插值（诚实限制）。
+// NaN ⇒ row/col 落 0 支（`floor(c) >= 0.0` 对 NaN 恒假，与 CPU 的
+// `!(cell >= 0.0)` 同义），调用方已用 dist > 0 把它挡在外面。
+fn ddgi_depth_texel(dir: vec3<f32>, grid: u32) -> u32 {
+    let face = ddgi_depth_face(dir);
+    let axis = face / 2u;
+    var main = abs(dir.x);
+    if (axis == 1u) {
+        main = abs(dir.y);
+    }
+    if (axis == 2u) {
+        main = abs(dir.z);
+    }
+    var au = dir.y;
+    var av = dir.z;
+    if (face >= 2u && face <= 3u) {
+        au = dir.x;
+        av = dir.z;
+    }
+    if (face >= 4u) {
+        au = dir.x;
+        av = dir.y;
+    }
+    let g = f32(grid);
+    let cu = floor((au / main + 1.0) * 0.5 * g);
+    let cv = floor((av / main + 1.0) * 0.5 * g);
+    var col = 0u;
+    var row = 0u;
+    if (cu >= 0.0) {
+        col = u32(min(cu, g - 1.0));
+    }
+    if (cv >= 0.0) {
+        row = u32(min(cv, g - 1.0));
+    }
+    return face * grid * grid + row * grid + col;
+}
+
+// chebyshev 单侧上界权重（CPU 镜像：ddgi::ddgi_depth_weight_at +
+// ddgi::ddgi_depth_weight，含两道取值中性的守卫）。
+//
+//   dist ≤ μ ⇒ 1                                 （着色点在探针可见范围内）
+//   dist > μ ⇒ σ² / (σ² + (dist − μ)²)           （「真实深度 ≥ dist」的概率上界）
+//
+// 墙后片元的 dist 远超该方向的 μ ⇒ 权重趋 0，这就是 §8.52① 串味的解药。
+// σ² 已在 CPU 侧钳过下限（ddgi::DDGI_SIGMA_REL）⇒ 着色器零减法、零钳位。
+// enabled = 0 是对照模式（Renderer::set_ddgi_depth_weight_enabled），恒 1。
+fn ddgi_depth_weight(probe: u32, delta: vec3<f32>, dist: f32, grid: u32,
+                     enabled: f32) -> f32 {
+    if (!(enabled > 0.5)) {
+        return 1.0;
+    }
+    // dist = 0 ⇒ 着色点即探针位置（delta 退化成零向量、归一化得 NaN），
+    // 「无遮挡证据」是唯一正确语义；同时挡住 NaN 进查表（径向窗对 NaN
+    // 距离已给 0 ⇒ 乘积恒 0，本支取值不影响结果）
+    if (!(dist > 0.0)) {
+        return 1.0;
+    }
+    let texel = ddgi_depth_texel(delta / dist, grid);
+    let base = (probe * DDGI_DEPTH_TEXELS + texel) * 2u;
+    let mu = gi_depth[base];
+    // !(dist > mu) 而不是 dist <= mu：NaN 同样落进「无遮挡证据」支（保守：不抑制）
+    if (!(dist > mu)) {
+        return 1.0;
+    }
+    let sigma2 = gi_depth[base + 1u];
+    let excess = dist - mu;
+    return sigma2 / (sigma2 + excess * excess);
+}
+
+// 逐片元 DDGI 求值（CPU 镜像：ddgi::ddgi_blend）：固定序循环全部探针 →
+// **径向窗 × chebyshev 深度项**双剪枝 → 加权平均。固定循环序 = 固定累加序
+// ⇒ 会话内逐位确定。径向窗 gi_probe_weight 与 SH 求值 gi_sh_eval 都是 R83
+// 的原函数**零改动**（只新增深度项这一层）。
+//
+// 返回 vec4：xyz = E/π（钳 ≥ 0）、w = 有效标志（1 = 有有效探针）。
+//
+// **兜底语义对 R83 的显式偏离**：mode 1 的 `Σw ≤ ε ⇒ 回退最近探针` 在
+// mode 2 **改为回退 env_irradiance**（w = 0 由调用方 select）。理由：回退
+// 最近探针会**绕过深度项** ⇒ 墙后片元吃到墙另一侧探针的辐照 = 正是本轮要
+// 消灭的漏光。
+fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    let count = u32(gi_params.params.y);
+    if (count == 0u) {
+        // mode = 2 恒有 ≥ 1 探针（CPU 侧裁决），此支只为参数错配兜底
+        return vec4<f32>(0.0);
+    }
+    let grid = u32(gi_params.params.z);
+    let enabled = gi_params.params.w;
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let p = gi_probes[i];
+        let d = distance(world_pos, p.pos_radius.xyz);
+        // 第一道剪枝：R83 的径向窗（1 − (d/r)²)²，d ≥ r ⇒ 0
+        let radial = gi_probe_weight(d, p.pos_radius.w);
+        if (radial > 0.0) {
+            // 第二道剪枝：chebyshev 深度项（墙后 ⇒ 趋 0）
+            let delta = world_pos - p.pos_radius.xyz;
+            let w = radial * ddgi_depth_weight(i, delta, d, grid, enabled);
+            if (w > 0.0) {
+                acc = acc + gi_sh_eval(p, n) * w;
+                wsum = wsum + w;
+            }
+        }
+    }
+    if (wsum > GI_BLEND_EPS) {
+        return vec4<f32>(max(acc / wsum, vec3<f32>(0.0)), 1.0);
+    }
+    return vec4<f32>(0.0);
+}
+
 @fragment
 // 注：VertexOutput 的 @builtin(position)（字段名 clip_position 沿用顶点
 // 侧语义）作为片元入口输入时，WGSL 规定其值为**帧缓冲像素坐标**——
@@ -1104,18 +1272,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 而不是浮点恒等式）。探针缺席 / 空集 / 实体挂光照贴图（CPU 侧直接不发
     // 标志位）⇒ 走原全局 env 路径，全部既有 FNV 基线原值通过。
     let env_irradiance = textureSampleLevel(irradiance_map, env_sampler, n, 0.0).rgb;
-    // ---- GI 探针 SH（R83）：mode 均匀门（R78 分箱同款形态）----
+    // ---- GI 探针 SH（R83）/ DDGI（R88）：mode 均匀门三支（R78 分箱同款形态）----
     // mode = 0（探针集缺席 / 无 SH / 捕获 / RT）⇒ 走 R64 的 loc14 逐实体
     // 载荷支，**执行的语句与 R82 逐条相同**（同一个 select、同一串位）；
-    // mode = 1 ⇒ GI 探针项由逐片元 SH 求值替代（空间梯度 + 方向性）。
-    // 两支都只替换 `in.probe.w > 0.5` 的实体：天空 irradiance_map 兜底与
+    // mode = 1 ⇒ GI 探针项由 R83 的逐片元 SH 求值替代（空间梯度 + 方向性），
+    // **语句与 R83 逐条相同**；
+    // mode = 2（R88）⇒ 逐片元 SH 求值再乘 chebyshev 深度项（遮挡感知），
+    // Σw ≤ ε 时**回退 env_irradiance 而不是最近探针**（回退最近探针会绕过
+    // 深度项 ⇒ 把要消灭的漏光从后门放回来，见 ddgi_irradiance 头注释）。
+    // 三支都只替换 `in.probe.w > 0.5` 的实体：天空 irradiance_map 兜底与
     // R52c 的 lightmap `select` 混合语义**零触碰**（正交，见 §4.39）。
     var irradiance = env_irradiance;
     if (gi_params.params.x < 0.5) {
         irradiance = select(env_irradiance, in.probe.rgb, in.probe.w > 0.5);
-    } else {
+    } else if (gi_params.params.x < 1.5) {
         irradiance = select(env_irradiance,
                             gi_sh_irradiance(in.world_pos, n), in.probe.w > 0.5);
+    } else {
+        let ddgi = ddgi_irradiance(in.world_pos, n);
+        irradiance = select(env_irradiance, ddgi.xyz, in.probe.w > 0.5 && ddgi.w > 0.5);
     }
     let nov = max(dot(n, v), 0.0);
     let f_amb = fresnel_schlick_roughness(nov, f0, roughness);

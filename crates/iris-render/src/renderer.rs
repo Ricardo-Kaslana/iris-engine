@@ -137,15 +137,25 @@ const _: () = assert!(
     "LightBinsParams 必须与 WGSL 布局一致（2×vec4 = 32 B）"
 );
 
-/// 与 WGSL `GiShParams` 结构对齐（16 字节，POD）——GI 探针三阶 SH（R83）的
-/// 小参数块。刻意与探针表（binding 18）分开：mode 是**逐帧裁决**的均匀门，
-/// 探针表是烘焙产物（mode = 1 帧才写），分开两个缓冲让「关闭帧零 write_buffer」
-/// 与 R78 分箱同纪律。
+/// 与 WGSL `GiShParams` 结构对齐（16 字节，POD）——GI 探针三阶 SH（R83）+
+/// DDGI（R88）的小参数块。刻意与探针表（binding 18）分开：mode 是**逐帧
+/// 裁决**的均匀门，探针表是烘焙 / 重照明产物（mode ≥ 1 帧才写），分开两个
+/// 缓冲让「关闭帧零 write_buffer」与 R78 分箱同纪律。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GiShParamsRaw {
     /// x = mode（0 = 关——逐片元分支死码，loc14 逐实体路径逐位不变；
-    /// 1 = 逐片元 SH 求值），y = 探针数（着色器循环上界），zw = 保留。
+    /// 1 = R83 逐片元 SH 求值；2 = R88 DDGI 深度感知混合），
+    /// y = 探针数（着色器循环上界），
+    /// z = [`DDGI_DEPTH_GRID`](crate::ddgi::DDGI_DEPTH_GRID)（R88，= 8；
+    /// mode ≤ 1 时不消费，恒写 0），
+    /// w = DDGI 深度项开关（R88，1 = 生产路径；0 = 对照模式，见
+    /// [`Renderer::set_ddgi_depth_weight_enabled`]）。
+    ///
+    /// **偏离声明**：设计稿 §7.1 写的是「w = 保留 0」（理由是 σ² 已在 CPU
+    /// 钳过、着色器不需要 `DDGI_SIGMA_REL`）——那条理由成立，但 §7.4 要求的
+    /// 对照模式开关必须有落脚处，`w` 是唯一空位（照 `probe_params.count.w`
+    /// 承载视差开关的先例）。
     params: [f32; 4],
 }
 
@@ -667,6 +677,20 @@ pub struct Renderer {
     /// GI 探针三阶 SH（R83）常驻资源：哑资源恒在（mode = 0 分支死码），
     /// 真缓冲按帧写（mode = 1），`bind_real` 决定 binding 18/19 指向。
     gi_sh: GiShGpu,
+    /// DDGI 深度表（R88）常驻资源：4 B 哑缓冲恒在，768 KiB 真表**惰性创建**
+    /// （首个 mode = 2 帧），`bind_real` 决定 binding 20 指向。
+    ddgi: DdgiGpu,
+    /// DDGI 增量上传的跨帧记账（见 [`DdgiUploadState`]）。
+    ddgi_upload: DdgiUploadState,
+    /// DDGI 深度项**对照模式**（R88，验收 / 归因专用）：`false` 时参数块的
+    /// w 分量置 0 ⇒ 着色器的 chebyshev 深度项恒 1，同一二进制内复现「只有
+    /// R83 径向窗」的混合行为，供 `docs/ddgi.png` 的漏光对照面板与
+    /// 「深度项确实抑制了串味」的归因测试（`tests/ddgi_render.rs`）。
+    /// 生产路径恒 `true`（照 `legacy_probe_no_parallax` 先例）。
+    ddgi_depth_weight: bool,
+    /// 「DDGI 与 R83 烘焙探针集同时在场」的告警是否已发过（裁定 2 要求
+    /// warn **一次**，不是每帧刷屏）。
+    ddgi_mutex_warned: bool,
     /// scene_depth pass 最近一次运行的帧号（R77，`occ_frame` 口径）：
     /// GTAO 读的是「上一帧」深度——本帧编号恰好等于该值 + 1 才允许编码
     /// AO pass，否则可见度图清成中性 1.0（首帧启用 / 上帧无几何 / 深度
@@ -1032,6 +1056,42 @@ struct GiShGpu {
     /// 绑定裁决：`true` = binding 18/19 指向真实缓冲（本帧逐片元 SH 生效）。
     /// draw 逐帧设置，globals 绑定组重建时消费。
     bind_real: bool,
+}
+
+/// DDGI 深度表（R88）的常驻 GPU 资源。globals 布局的 binding 20 恒需合法
+/// 绑定：**4 B 全零哑缓冲始终存在**（mode ≤ 1 / 捕获 / RT 帧绑定——mode 2
+/// 分支死码永不读），真实的 768 KiB 深度表**惰性创建**（首个 mode = 2 帧；
+/// 照 `AoGpu` 的半分辨率可见度图 / `OccGpu` 的查询集先例——缺席路径零分配
+/// 大资源、零 write_buffer）。
+struct DdgiGpu {
+    /// 深度表 storage（[`DDGI_DEPTH_TABLE_BYTES`] = 768 KiB 定长）。
+    /// `None` = 从未启用（哑缓冲占位）。
+    ///
+    /// [`DDGI_DEPTH_TABLE_BYTES`]: crate::ddgi::DDGI_DEPTH_TABLE_BYTES
+    depth_buf: Option<wgpu::Buffer>,
+    /// 4 B 全零哑缓冲（关闭 / 捕获 / RT 帧绑定——永不读）。
+    off_depth_buf: wgpu::Buffer,
+    /// 绑定裁决：`true` = binding 20 指向真实深度表（本帧 mode = 2）。
+    /// draw 逐帧设置，globals 绑定组重建时消费。
+    bind_real: bool,
+}
+
+/// DDGI 增量上传的跨帧记账（R88）。
+///
+/// **偏离声明**：R83 的探针表是「每帧重传」（`upload_gi_probes` 的文档：
+/// 烘焙产物、无 generation 字段可比）。DDGI 偏离成**增量上传**，理由三条：
+/// ①数据量 19×（40 KiB → 768 KiB）；②DDGI **有** dirty / cursor 变更记账
+/// （`DdgiGrid::probe_stamp`），不需要靠重传规避比对成本；③与 README 既有
+/// 「实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段」同纪律。
+/// 默认参数下增量 ≈ 6.3 KiB/脏帧（SH 2 × 160 B + 深度 2 × 3072 B）、
+/// 稳态 **0 B**。
+struct DdgiUploadState {
+    /// 已同步的网格结构版本（不等 ⇒ 全量上传 + 重同步 `stamps`）。
+    structure: u64,
+    /// 逐探针「已上传的重照明戳」（与 `DdgiGrid::probe_stamp` 比对）。
+    stamps: Vec<u64>,
+    /// 已写的 16B 参数（`None` = 从未写过 ⇒ 首个 mode = 2 帧必写）。
+    params: Option<[u32; 4]>,
 }
 
 /// 遮挡查询的常驻 GPU 资源（R53，首次启用时惰性创建，见
@@ -1730,6 +1790,12 @@ pub struct FrameStats {
     /// 数**（读回迟到 / 首帧无上一帧结果 ⇒ 恒等列表全量绘制，像素与剔除
     /// 帧恒等——剔除只删不可见几何）；无 meshlet 实体 = 0。
     pub meshlet_surviving: u32,
+    /// 本帧 DDGI 重照明的探针数（R88，观测字段，**不进任何排序键**）：
+    /// 取自 [`DdgiGrid::stats`](crate::ddgi::DdgiGrid::stats) 的 `last_updated`。
+    /// 0 = 稳态（无脏探针 ⇒ tick 立即 return，CPU 与上传成本双零）或 DDGI
+    /// 缺席；`k`（= `DdgiSettings::probes_per_frame`）= 滚动窗口满载。
+    /// 收敛进度可由「连续非零帧数 × k」对账（= `⌈n_dirty / k⌉`）。
+    pub ddgi_updated: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -1793,14 +1859,19 @@ pub fn diff_changed_ranges(
 /// 19 = 16B 参数）：主视图按 `gi_sh.bind_real` 在真 / 哑之间裁决，捕获面与
 /// RT 相机恒传哑资源（mode = 0 ⇒ 逐片元 SH 分支死码，与「捕获不渲染锥光与
 /// 第 9+ 盏点光」同一立场——见 §8.47③ / §8.52）。
+/// R88 追加第三路（binding 20 = DDGI 深度表 storage）：按 `ddgi.bind_real`
+/// 裁决，捕获面 / RT 相机同样恒传哑缓冲（mode = 0，§8.52⑦ 同款立场）。
 #[derive(Clone, Copy)]
 struct ProbeGlobalsResources<'a> {
     params_buf: &'a wgpu::Buffer,
     cube_view: &'a wgpu::TextureView,
     /// GI 探针表 storage（binding 18）。
     gi_probes: &'a wgpu::Buffer,
-    /// GI 探针参数 uniform（binding 19）：主相机 mode=1 走真缓冲，其余哑零。
+    /// GI 探针参数 uniform（binding 19）：主相机 mode ≥ 1 走真缓冲，其余哑零。
     gi_params: &'a wgpu::Buffer,
+    /// DDGI 深度表 storage（binding 20，R88）：主相机 mode = 2 走真表，
+    /// 其余（mode ≤ 1 / 捕获 / RT）走 4 B 全零哑缓冲。
+    gi_depth: &'a wgpu::Buffer,
 }
 
 /// 全局绑定组里的两张阴影贴图视图：方向光级联数组（binding 1）与点光
@@ -1958,7 +2029,7 @@ fn build_globals_bind_group(
                 binding: 17,
                 resource: screen.bins_tiles.as_entire_binding(),
             },
-            // GI 探针三阶 SH（R83）：探针表 + 16B 参数（主相机 mode=1 走真
+            // GI 探针三阶 SH（R83）：探针表 + 16B 参数（主相机 mode ≥ 1 走真
             // 缓冲；捕获 / RT / 无 SH 探针集帧走全零哑缓冲——mode = 0 使着色器
             // 逐片元分支死码，loc14 逐实体路径逐位不变）
             wgpu::BindGroupEntry {
@@ -1968,6 +2039,12 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 19,
                 resource: probe.gi_params.as_entire_binding(),
+            },
+            // DDGI 深度表（R88）：主相机 mode = 2 走 768 KiB 真表（惰性创建），
+            // 其余走 4 B 全零哑缓冲（mode ≤ 1 ⇒ ddgi_irradiance 分支死码）
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: probe.gi_depth.as_entire_binding(),
             },
         ],
     })
@@ -2157,6 +2234,9 @@ fn skin_world_aabb(
 /// 不带 SH 的集 = v1 的四面体重心插值（逐实体）；**带 SH 的集（R83）**载荷
 /// 改由 SH 的零阶项按径向权重给出，且这份 xyz 只被 mode = 0 的路径（探针
 /// 捕获 / RT 相机）消费——主视图在 mode = 1 时逐片元重新求值，只读标志位。
+/// **DDGI（R88）在场时优先**：`DdgiGrid` 非空 ⇒ 载荷改取 DDGI 的零阶径向
+/// 混合（同口径），烘焙探针集被忽略（互斥，裁定 2）；主视图走 mode = 2 的
+/// 逐片元深度感知混合，同样只读标志位。
 /// 求值点选择的完整论证见 [`crate::irradiance`] 模块文档。
 /// **光照贴图解析（R52c）**：挂 [`LightmapBinding`] 的实体取其图集句柄，
 /// 但只在三个条件齐备时生效——世界有 [`LightmapStore`] 资源、句柄在目录内、
@@ -2218,10 +2298,19 @@ fn collect_instances(
     // **光照贴图优先**：挂图集的实体走 R52c 的逐 texel 分支，CPU 侧就不再发
     // 标志位（两道保险：着色器那里 select 也是整项替换）。带 SH 的集由
     // `instance_payload` 内部改走 SH 零阶口径（R83，见 irradiance.rs）。
+    // **DDGI 优先（R88 裁定 2）**：`DdgiGrid` 非空 ⇒ 载荷改取 DDGI 的零阶
+    // 径向混合（与 R83 带 SH 的集**同口径**，见 `DdgiGrid::instance_payload`），
+    // 烘焙探针集被忽略（互斥告警在 draw 的三态裁决段发一次）。这份 xyz 只被
+    // mode = 0 的路径消费（探针捕获 / RT 相机恒 mode 0），主视图在 mode = 2
+    // 时只读它的标志位。
+    let ddgi = world.try_resource::<crate::ddgi::DdgiGrid>();
     let probes = world.try_resource::<IrradianceProbeSet>();
     let probe_payload = |position: Vec3, lightmap: u32| -> [f32; 4] {
         if lightmap != NO_LIGHTMAP {
             return [0.0; 4];
+        }
+        if let Some(grid) = ddgi.as_deref().filter(|grid| !grid.is_empty()) {
+            return grid.instance_payload(position);
         }
         match probes.as_deref() {
             Some(set) => set.instance_payload(position),
@@ -3370,6 +3459,18 @@ impl Renderer {
             ),
             bind_real: false,
         };
+        // DDGI 深度表常驻资源（R88）：4 B 全零哑缓冲恒在（binding 20 的布局
+        // 占位——mode ≤ 1 / 捕获 / RT 帧绑定，着色器 mode 2 分支死码永不读）；
+        // 768 KiB 真表**惰性创建**（首个 mode = 2 帧，见 `ensure_ddgi_gpu`）。
+        let ddgi = DdgiGpu {
+            depth_buf: None,
+            off_depth_buf: make_bins_buf(
+                "iris.ddgi.depth_off",
+                4,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ),
+            bind_real: false,
+        };
         // 主视图绑定组初建时的屏幕空间资源（SSR 三路 + AO + 分箱三路）：
         // 参数走**活跃**缓冲（此后由 draw 逐帧管理），颜色 / 深度 / AO /
         // 分箱此时只有哑资源（prev_color / scene_depth / ao target 均未
@@ -3414,6 +3515,7 @@ impl Renderer {
                     cube_view: &probe_dummy_view,
                     gi_probes: &gi_sh.off_probes_buf,
                     gi_params: &gi_sh.off_params_buf,
+                    gi_depth: &ddgi.off_depth_buf,
                 },
                 ScreenSpaceGlobalsResources {
                     params_buf: &ssr.off_params_buf,
@@ -3733,6 +3835,7 @@ impl Renderer {
                 cube_view: &probe_cube_view,
                 gi_probes: &gi_sh.off_probes_buf,
                 gi_params: &gi_sh.off_params_buf,
+                gi_depth: &ddgi.off_depth_buf,
             },
             ssr_main_res,
         );
@@ -3863,6 +3966,14 @@ impl Renderer {
             ao,
             light_bins,
             gi_sh,
+            ddgi,
+            ddgi_upload: DdgiUploadState {
+                structure: u64::MAX,
+                stamps: Vec::new(),
+                params: None,
+            },
+            ddgi_depth_weight: true,
+            ddgi_mutex_warned: false,
             ao_depth_frame: None,
             water: None,
             water_size: (0, 0),
@@ -3965,20 +4076,27 @@ impl Renderer {
         );
     }
 
-    /// 探针资源（R62a 反射两路 + R83 GI SH 两路）的「主相机」形态：反射
-    /// 参数 / cubemap 数组视图恒为活跃资源，GI 两路按 `gi_sh.bind_real`
-    /// 裁决（探针集不带 SH 的帧绑哑零缓冲 ⇒ mode = 0）。
+    /// 探针资源（R62a 反射两路 + R83 GI SH 两路 + R88 DDGI 深度表一路）的
+    /// 「主相机」形态：反射参数 / cubemap 数组视图恒为活跃资源，GI 两路按
+    /// `gi_sh.bind_real` 裁决（mode = 0 帧绑哑零缓冲），深度表按
+    /// `ddgi.bind_real` 裁决（mode ≠ 2 帧绑 4 B 哑缓冲——即使真表已创建，
+    /// 陈旧内容也不得被采样）。
     fn probe_globals_resources(&self) -> ProbeGlobalsResources<'_> {
         let (gi_probes, gi_params) = if self.gi_sh.bind_real {
             (&self.gi_sh.probes_buf, &self.gi_sh.params_buf)
         } else {
             (&self.gi_sh.off_probes_buf, &self.gi_sh.off_params_buf)
         };
+        let gi_depth = match self.ddgi.bind_real.then_some(self.ddgi.depth_buf.as_ref()) {
+            Some(Some(buf)) => buf,
+            _ => &self.ddgi.off_depth_buf,
+        };
         ProbeGlobalsResources {
             params_buf: &self.probe_params_buf,
             cube_view: &self.probe_cube_view,
             gi_probes,
             gi_params,
+            gi_depth,
         }
     }
 
@@ -4097,11 +4215,16 @@ impl Renderer {
     /// 满载 256 探针 = 40 KiB/帧（分箱帧最多写 1 MiB tile 索引，同一量级）。
     /// 只写**用到的前缀**（`count × 160 B`）：着色器循环上界 = 参数 y，尾部
     /// 陈旧数据永不被读（与灯表 `cast_slice(lights)` 同口径）。
-    fn upload_gi_probes(&self, set: &IrradianceProbeSet) {
+    ///
+    /// `&mut self`（R88）：mode = 1 与 mode = 2 **共用 binding 19 的参数缓冲**，
+    /// 本函数每帧覆写它 ⇒ 必须让 DDGI 的「已写参数」记账失效，否则 DDGI 回归
+    /// 时会以为参数还在而跳过写入（`upload_ddgi` 只在位模式变化时写）。
+    fn upload_gi_probes(&mut self, set: &IrradianceProbeSet) {
         let probes = set.gpu_probes();
         if probes.is_empty() {
             return; // mode = 1 的裁决前提就是非空 SH 表；防御性早退不写缓冲
         }
+        self.ddgi_upload.params = None;
         self.gpu
             .queue
             .write_buffer(&self.gi_sh.probes_buf, 0, bytemuck::cast_slice(&probes));
@@ -4111,6 +4234,98 @@ impl Renderer {
         self.gpu
             .queue
             .write_buffer(&self.gi_sh.params_buf, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// DDGI 768 KiB 深度表的惰性创建（R88，首个 mode = 2 帧调用；照
+    /// `ensure_occ_gpu` / AO 半分辨率可见度图的先例——缺席路径零分配大资源）。
+    fn ensure_ddgi_gpu(&mut self) {
+        if self.ddgi.depth_buf.is_some() {
+            return;
+        }
+        self.ddgi.depth_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.ddgi.depth"),
+            size: crate::ddgi::DDGI_DEPTH_TABLE_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        // 新建的表对渲染器而言是「全零」⇒ 记账必须失效，否则首个 mode = 2
+        // 帧会以为已经同步过而跳过全量上传
+        self.ddgi_upload.structure = u64::MAX;
+        self.ddgi_upload.stamps.clear();
+        self.ddgi_upload.params = None;
+    }
+
+    /// DDGI 表上传（R88，mode = 2 的 draw 每帧调用）：**增量**写本帧重照明
+    /// 的 k 个探针段（SH 的 `k × 160 B` + 深度的 `k × 3072 B`）；网格结构
+    /// 变化 / 首次启用 ⇒ 全量写。策略与偏离理由见 [`DdgiUploadState`]。
+    ///
+    /// 16B 参数只在**内容变化**时写（mode / 探针数 / 深度网格 / 深度项开关
+    /// 四元的位模式比对）——稳态帧一个 `write_buffer` 都不发。
+    fn upload_ddgi(&mut self, grid: &crate::ddgi::DdgiGrid) {
+        let n = grid.probe_count();
+        if n == 0 {
+            return; // mode = 2 的裁决前提就是非空网格；防御性早退不写缓冲
+        }
+        let Some(depth_buf) = self.ddgi.depth_buf.as_ref() else {
+            return; // ensure_ddgi_gpu 已在裁决段先行调用；此支只为借用检查兜底
+        };
+        let structure = grid.structure_generation();
+        if self.ddgi_upload.structure != structure || self.ddgi_upload.stamps.len() != n {
+            // 全量：网格结构变化 / 首次启用 / 绑定组重建后
+            self.gpu.queue.write_buffer(
+                &self.gi_sh.probes_buf,
+                0,
+                bytemuck::cast_slice(&grid.gpu_probes()),
+            );
+            self.gpu
+                .queue
+                .write_buffer(depth_buf, 0, bytemuck::cast_slice(grid.depth_floats()));
+            self.ddgi_upload.structure = structure;
+            self.ddgi_upload.stamps = grid.probe_stamp().to_vec();
+        } else {
+            // 增量：只写戳变化的探针段（偏移与长度都是 4 的倍数 ⇒ 满足
+            // wgpu 的 COPY_BUFFER_ALIGNMENT）
+            let stamps = grid.probe_stamp();
+            // `probe_stamp().len() ≡ probe_count()`（install 里 `vec![tick; n]`，
+            // 单测钉住）⇒ enumerate 与 `0..n` 等价
+            for (i, &stamp) in stamps.iter().enumerate() {
+                if self.ddgi_upload.stamps[i] == stamp {
+                    continue;
+                }
+                self.ddgi_upload.stamps[i] = stamp;
+                let raw = grid.probe_raw(i);
+                self.gpu.queue.write_buffer(
+                    &self.gi_sh.probes_buf,
+                    (i * std::mem::size_of::<ShProbeRaw>()) as u64,
+                    bytemuck::bytes_of(&raw),
+                );
+                self.gpu.queue.write_buffer(
+                    depth_buf,
+                    i as u64 * crate::ddgi::DDGI_DEPTH_PROBE_BYTES,
+                    bytemuck::cast_slice(grid.depth_segment(i)),
+                );
+            }
+        }
+        let params = GiShParamsRaw {
+            params: [
+                2.0,
+                n as f32,
+                crate::ddgi::DDGI_DEPTH_GRID as f32,
+                if self.ddgi_depth_weight { 1.0 } else { 0.0 },
+            ],
+        };
+        let bits = [
+            params.params[0].to_bits(),
+            params.params[1].to_bits(),
+            params.params[2].to_bits(),
+            params.params[3].to_bits(),
+        ];
+        if self.ddgi_upload.params != Some(bits) {
+            self.ddgi_upload.params = Some(bits);
+            self.gpu
+                .queue
+                .write_buffer(&self.gi_sh.params_buf, 0, bytemuck::bytes_of(&params));
+        }
     }
 
     /// 环境源失效检查：`SkySource` 资源的 generation 与缓存不同（资源缺席
@@ -4374,6 +4589,21 @@ impl Renderer {
     /// 不改变探针的捕获 / 预滤波 / 选择裁决，只改采样方向的重定向。
     pub fn set_legacy_probe_parallax(&mut self, legacy: bool) {
         self.legacy_probe_no_parallax = legacy;
+    }
+
+    /// DDGI 深度项的**对照模式**（R88，验收 / 归因专用）：`false` = 关闭
+    /// chebyshev 深度权重（着色器侧恒 1）⇒ 混合退回「只有 R83 径向窗」的
+    /// 形态，同一二进制内复现 §8.52① 的墙两侧串味，供 `docs/ddgi.png` 的
+    /// 漏光对照面板与「深度项确实抑制了漏光」的归因测试
+    /// （`tests/ddgi_render.rs`）。生产路径恒 `true`（默认）；本开关不改变
+    /// 重照明 / 深度表的**内容**（CPU 侧照算照传），只改片元的权重口径 ⇒
+    /// 两侧的差异只能来自深度项。
+    ///
+    /// 照 [`Self::set_legacy_probe_parallax`] / [`Self::set_legacy_shadow_bias`]
+    /// 先例：不是运行时诊断可视化，只在两个口径之间切换；参数块的 w 分量
+    /// 变化由 `upload_ddgi` 的位模式比对自动补写。
+    pub fn set_ddgi_depth_weight_enabled(&mut self, enabled: bool) {
+        self.ddgi_depth_weight = enabled;
     }
 
     /// 该实体的反射探针是否已烘焙（观测口径，GPU 测试用）。
@@ -5147,6 +5377,7 @@ impl Renderer {
                     cube_view: &self.probe_dummy_view,
                     gi_probes: &self.gi_sh.off_probes_buf,
                     gi_params: &self.gi_sh.off_params_buf,
+                    gi_depth: &self.ddgi.off_depth_buf,
                 },
                 ScreenSpaceGlobalsResources {
                     params_buf: &self.ssr.off_params_buf,
@@ -6018,18 +6249,45 @@ impl Renderer {
         let bins_on = bins_force || light_bins_enabled(point_total, spot_total);
         let bins_bind_changed = self.light_bins.bind_real != bins_on;
         self.light_bins.bind_real = bins_on;
-        // GI 探针 SH 裁决（R83）：探针集**带 SH** ⇒ mode = 1（逐片元求值），
-        // 资源缺席 / 空集 / 无 SH ⇒ mode = 0（loc14 逐实体路径逐位不变）。
-        // 没有独立开关资源：SH 是烘焙期的显式选择（`bake_irradiance_probes_sh`），
-        // 「烘了就用」与 R64「装了探针集就用」同一心智模型。绑定指向变化时
-        // 重建全局绑定组（bins / AO 的 bind_real 同款）。
+        // GI **三态**裁决（R83 / R88）：DDGI 网格非空 ⇒ mode = 2（逐片元 SH
+        // × chebyshev 深度项），并**整表替换** binding 18/19 + 忽略 R83 的
+        // 烘焙探针集（裁定 2：两份间接漫反射叠加会双重计入天空与色溢）；
+        // DDGI 缺席 ⇒ R83 现规则原样（探针集**带 SH** ⇒ mode = 1，资源缺席 /
+        // 空集 / 无 SH ⇒ mode = 0，loc14 逐实体路径逐位不变）。
+        // 没有独立开关资源：SH 是烘焙期的显式选择、DDGI 是 `DdgiSettings`
+        // 的在场与否，「装了就用」与 R64 同一心智模型。绑定指向变化时重建
+        // 全局绑定组（bins / AO 的 bind_real 同款）。
+        let ddgi_grid = world.try_resource::<crate::ddgi::DdgiGrid>();
+        let ddgi_on = ddgi_grid.as_deref().is_some_and(|grid| !grid.is_empty());
         let gi_set = world.try_resource::<IrradianceProbeSet>();
-        let gi_on = gi_set.as_deref().is_some_and(|set| set.has_sh());
+        let baked_on = gi_set.as_deref().is_some_and(|set| set.has_sh());
+        if ddgi_on && baked_on && !self.ddgi_mutex_warned {
+            log::warn!(
+                "世界同时存在 DDGI 网格（{} 探针）与 R83 烘焙探针集（带 SH）——\
+                 两者互斥，本轮以 DDGI 为准（整表替换 binding 18/19），烘焙探针集被忽略。\
+                 理由：两份间接漫反射叠加会双重计入天空与色溢",
+                ddgi_grid.as_deref().map_or(0, |g| g.probe_count())
+            );
+            self.ddgi_mutex_warned = true;
+        }
+        let gi_on = ddgi_on || baked_on;
         let gi_bind_changed = self.gi_sh.bind_real != gi_on;
         self.gi_sh.bind_real = gi_on;
-        if bins_bind_changed || gi_bind_changed {
+        // 768 KiB 真表的惰性创建必须在 `ddgi.bind_real` 翻转**之前**：
+        // `rebuild_globals_bind_group` 会按它裁决 binding 20 的指向
+        if ddgi_on {
+            self.ensure_ddgi_gpu();
+        }
+        let ddgi_bind_changed = self.ddgi.bind_real != ddgi_on;
+        self.ddgi.bind_real = ddgi_on;
+        if bins_bind_changed || gi_bind_changed || ddgi_bind_changed {
             self.rebuild_globals_bind_group();
         }
+        // DDGI 观测（不进任何排序键）：本帧重照明的探针数
+        self.stats.ddgi_updated = ddgi_grid
+            .as_deref()
+            .map(|grid| grid.stats().last_updated)
+            .unwrap_or(0);
         // 反射探针（R62a）：收集「挂了组件**且已烘焙**（登记表命中）」的
         // 探针，按（相机到影响域距离升序, 实体位模式升序）取预算内一批，
         // 再按实体位模式升序填 uniform（= 着色器的 tie-break 序）。
@@ -6175,9 +6433,14 @@ impl Renderer {
         if bins_on {
             self.upload_light_bins(&binned_lights, vp, width, height);
         }
-        // GI 探针表上传（R83，仅 mode=1）：mode=0 帧一个 write_buffer 都不发
-        // （零开销默认路径，命令流与 R82 一致）。
-        if gi_on {
+        // GI 表上传（R83 mode = 1 **全量** / R88 mode = 2 **增量**）：
+        // mode = 0 帧一个 write_buffer 都不发（零开销默认路径，命令流与
+        // R82 一致）。DDGI 优先（裁定 2）⇒ 烘焙探针集在场也不写。
+        if ddgi_on {
+            if let Some(grid) = ddgi_grid.as_deref() {
+                self.upload_ddgi(grid);
+            }
+        } else if baked_on {
             if let Some(set) = gi_set.as_deref() {
                 self.upload_gi_probes(set);
             }
@@ -9615,6 +9878,7 @@ impl Renderer {
                 cube_view: &self.probe_cube_view,
                 gi_probes: &self.gi_sh.off_probes_buf,
                 gi_params: &self.gi_sh.off_params_buf,
+                gi_depth: &self.ddgi.off_depth_buf,
             },
             ScreenSpaceGlobalsResources {
                 params_buf: &self.ssr.off_params_buf,

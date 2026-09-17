@@ -5,6 +5,194 @@
 
 ## [Unreleased]
 
+### Added（R88：DDGI 动态全局光照 v1——规则探针网格 × 时间片滚动重照明 × 深度感知混合）
+
+路线图 v5 第三梯队「全局光照」1/2（R88 DDGI v1 → R89 DDGI v2）。**闭合
+§8.52①**（R83 的径向权重不感知遮挡，「隔着薄墙的两个探针在墙两侧互相
+串味」，影响半径是唯一隔离手段），附带缓解 §8.52⑩（探针布局是作者责任）。
+R83 / R64 的数据与路径**一字不动**，继续作 mode = 0/1 的兼容轨与对照轨。
+开工前设计定稿（决策点裁定与理由）留档在 `docs/ddgi_v1_design.md`。
+
+- **规则探针网格（`iris_render::ddgi`，纯资源态、不落实体）**：
+  `DdgiSettings` 资源**缺席 = DDGI 关**（渲染器一个 `write_buffer` 都不发、
+  binding 20 绑 4 B 哑缓冲、mode 维持 R83 裁决）。格心点阵
+  `min + (i + 0.5)·spacing_eff`、索引序 **x 最快**（⇒ 滚动刷新是 x 行扫描）；
+  `bounds = None` ⇒ 静态几何 AABB 外扩 1×spacing **且 Y 下限额外抬
+  0.5×spacing**（探针埋地板下会把地板上的着色点判成「墙后」⇒ 整片 GI 被
+  抑制）。不落实体的理由：避免 256 实体的 ECS 开销与 `&mut World` spawn
+  限制（`&World` 的系统无法注册新资源 / 组件类型）。
+- **确定性抽稀（不是按序截断）**：超 `MAX_IRRADIANCE_PROBES`（256）⇒
+  `stride_for_capacity` 求**最小整数 k** 使 `⌈nx/k⌉·⌈ny/k⌉·⌈nz/k⌉ ≤ 256`
+  （整数二分 + `checked_mul`，无浮点搜索 ⇒ 逐位确定；`nx` 饱和到
+  `usize::MAX` 也不 panic），`spacing_eff = spacing × k` + `log::warn!` 一次。
+  网格仍规则无洞、**覆盖范围不变**——按序截断会砍掉远端一整块空间 ⇒ 该块
+  GI 直接回退 env，出现可见的空间断界。半径用解析式 `spacing_eff × 1.5`
+  （规则网格的最近邻恒定 ⇒ 不跑 O(n²) 的 `derive_probe_radii`；单测断言
+  二者在规则点云上**逐位一致**，防口径漂移）。
+- **时间片滚动重照明（复用 R52a 的 BVH 追踪器）**：`advance` 纯函数自
+  cursor 起环形扫描至多 n 个位置取前 k 个 dirty 者，`cursor'` = 最后被更新者
+  的下一位；收敛帧数 = `⌈n_dirty / k⌉`（解析可断言，默认 256/2 = 128 帧
+  ≈ 2.1 s @60fps）。**光照指纹**（`light_dir`/`light_color`/`sky_color`/
+  `bounces`/`rays_per_face` 的 `to_bits` 固定序位组合）或**几何 generation**
+  变化 ⇒ 全表标脏但**不清空旧值**（旧值继续用、逐帧刷新 ⇒ 无闪烁，这正是
+  DDGI 的时域行为）。**稳态（无脏探针）⇒ tick 立即 return**：静止场景 +
+  恒定光照的 CPU 与上传成本双零（「缺席 = 零开销」文化的延伸）。
+- **安装帧粗填**（`DDGI_PREFILL_GRID = 2`，6×2² = 24 方向/探针，满载一次性
+  ≈ 3.3 ms）：避免前 `⌈n/k⌉` 帧出现「SH = 0 的黑波按网格索引序扫过场景」。
+  粗填**只填 SH、深度矩置中性**（μ = 天空哨兵、σ² = 0 ⇒ 深度项恒 1）：
+  粗填档 2 < 深度格 8 无法整除映射，且保守方向正确（粗填期可能短暂漏光，
+  `⌈n/k⌉` 帧内被真深度取代，优于黑波）。
+- **单探针重照明 `probe_relight`：SH 投影与深度两阶矩同一批射线**（⇒ 深度项
+  **零额外光线成本**）。SH 累加与 R83 的 `project_probe_sh` **逐式同构**
+  （固定面序 × 固定行列序 × f64 定序累加 × `cube_texel_solid_angle` 精确
+  固体角权 × 出口 `sh_lambert_convolve` ⇒ E/π 直读）。
+- **深度表的数据形态**：每探针 **cube-face 参数化**两阶矩，6 面 × 8² 纹素 ×
+  `(μ, σ²)` = 384 × 2 个 f32 = **3072 B/探针**，满载 **768 KiB**（binding 20
+  的 `array<f32>` **标量数组**）。索引式
+  `(probe × 384 + texel) × 2 + moment`、`texel = face × 64 + row × 8 + col`
+  （CPU/WGSL 同式，源码层看门 + 往返双射 + 逐格穷举三重钉住）。
+  **σ² 在 CPU 用 f64 求差后钳 `≥ (0.1μ)²`**：`E[t²] − μ²` 在 f32 里会灾难性
+  抵消（单测量化：μ = 1e4、σ = 1e-3 时 f32 求差归零、f64 保住信号），钳位
+  同时消掉「单纹素零方差 ⇒ chebyshev 退化为硬阶跃」⇒ **着色器零减法、
+  零钳位**。未命中 ⇒ **有限**哨兵 `DDGI_SKY_DEPTH = 1e4`（不用 `inf`：会
+  污染矩累加 ⇒ σ² 变 NaN）；深度 = `hit.t + BAKE_SHADOW_BIAS`（`t` 从偏移后
+  的射线原点起算，加回偏移才与片元侧 `distance(x, p)` 同原点；单测直证
+  「垂直向下到地板的深度恰为探针高度」= 偏移往返精确抵消）。
+- **深度感知混合（关键算法）**：`w_i = gi_probe_weight(d_i, r_i) ×
+  ddgi_depth_weight(d_i, μ_i, σ²_i)`——径向窗是 R83 原式 `(1−(d/r)²)²`
+  **零改动**；深度项是 DDGI 原式的 **chebyshev 单侧上界**：`dist ≤ μ ⇒ 1`
+  （着色点在探针可见范围内），`dist > μ ⇒ σ²/(σ² + (dist−μ)²)`（按「真实
+  深度 ≥ dist」的概率上界衰减 ⇒ 墙后权重趋 0）。**双剪枝**（`radial > 0`
+  且 `w > 0`）后才做 9 项 SH 点积。角分辨率 ≈11.25°/纹素（面心），
+  nearest-texel 无双线性插值。
+- **hysteresis 旋钮默认 0（关）**：`sh = old × α + fresh × (1 − α)` 逐系数
+  （深度矩同款）。默认关 ⇒「收敛帧数 = `⌈n/k⌉`」可解析断言；α = 0 逐位等于
+  纯替换、α = 1 冻结、α = 0.5 解析中点三条单测钉住。
+- **GPU 接线**：binding **20** = 深度表 read-only storage（组 0 的 0..=19
+  已满；片元阶段只读 storage 计数 = 4（16/17/18/20），**恰在** WebGPU 默认
+  `maxStorageBuffersPerShaderStage = 4` 之内 ⇒ 下一轮再加片元 storage 必须
+  先申请特性或改用纹理）；binding 19 参数扩位 `x = mode(0/1/2)`、
+  `y = 探针数`、`z = DDGI_DEPTH_GRID`、`w = 深度项开关`。**不扩 `Globals`**
+  ⇒ `skybox.wgsl` 的并行布局陷阱零触碰、看门单测不动。768 KiB 真表
+  **惰性创建**（首个 mode = 2 帧，照 `AoGpu` / `OccGpu`），关闭帧绑 4 B 全零
+  哑缓冲；SH 表沿用 binding 18 的 40 KiB 现缓冲（`ShProbeRaw` **零改动**）。
+  **mode 门三支**：mode 0 与 mode 1 的**语句逐条不动** ⇒ R83 / R64 既有 GPU
+  断言原值通过（R78「双路径位等价 + 均匀门」纪律）。
+- **三态裁决与互斥（裁定 2）**：`DdgiGrid` 非空 ⇒ mode = 2 + **整表替换**
+  binding 18/19 + **忽略** `IrradianceProbeSet`（`log::warn!` 一次；两份间接
+  漫反射叠加会**双重计入**天空与色溢，物理错误）；DDGI 缺席 ⇒ R83 裁决原样
+  （`has_sh()` ⇒ 1，否则 0）。loc14 逐实体载荷改由
+  `DdgiGrid::instance_payload` 给出（`sh_blend_l0` 的零阶径向混合 + 标志位，
+  **与 R83 带 SH 的集同口径**）——这份 xyz 只被 mode = 0 的路径（探针捕获 /
+  RT 相机**恒 mode 0**，§8.52⑦ 同款立场）消费，主视图只读标志位。
+- **运行期光照口径**（`iris_engine::ddgi::ddgi_bake_params`，纯函数可单测）：
+  `light_dir` = `DirectionalLight.direction`、`light_color` = `color × intensity`、
+  **`sky_color` = `settings.sky_color.unwrap_or(ambient)`**（裁定 3：R80 昼夜
+  **免费联动**；**不乘 `EnvironmentSettings.intensity`**——`ibl_env` 已被
+  `env_params.y` 缩放，预乘会双计）、`shadow_softness` = 0（硬影单射线）、
+  `sky_samples` = 1（本路径不做半球采样）、`bounces` ≤ 1。
+  `globals.ambient` 的常量补光项**不动**（独立的美术补光预算）。
+- **编排（`DdgiPlugin`，`DefaultPlugins` 已含）**：Startup 插入空 `DdgiGrid`
+  （`&World` 的系统无法注册新资源类型）、Update 注册 `tick_ddgi` 并行系统，
+  **注册在 `DayNightPlugin` 之后** ⇒ 昼夜当帧写的方向光当帧被 DDGI 消费。
+  两阶段模式（读 settings / light、需要重建时才 `collect_bake_triangles` →
+  `resource_mut::<DdgiGrid>` 写回）；**稳态帧一次三角形都不收集**（几何变化
+  靠宿主 `geometry_generation` 显式宣告，照 `SkySource.generation` /
+  `ensure_environment` 先例）。prelude 两级都补齐（R74 的 §8.26⑧ 摩擦不重演）。
+- **确定性**：轮转序 = 纯索引环形扫描（无哈希迭代序）；重照明 = 固定面序 ×
+  固定行列序 × f64 定序累加；深度矩 = 固定子格序 f64 累加 + CPU f64 域求差
+  钳位；指纹 = `to_bits` 固定序位组合；hysteresis = 固定 α 的一阶确定性递推；
+  跨帧累积 ⇒ **双会话 48 帧逐帧逐位**（像素 FNV 序列 + CPU 表哈希序列双断言，
+  R60/R62b 范式）。**两条等价锚点**：①`hysteresis = 0` 且单帧 `k ≥ n` ⇒ 表
+  逐位等于「全量重照明一遍」；②`rays_per_face = SH_CUBE_GRID`(32) ⇒ SH 表
+  **逐位等于** `probe_sh_coefficients`（跨模块锚点，同时证明
+  `probe_sh_radiance` 改薄壳未漂移）。跨适配器位级不可保（§8.51 / §8.52⑤
+  同款边界）。
+- **成本账（`rays_per_face = 16` 的质量档，裁定 1）**：每探针 6×16² = 1536
+  方向 = 3072 条射线（primary + 反弹点硬影）≈ **0.83 ms**（1000 三角 BVH，
+  基线取 `bake.rs` 模块文档实测的 0.27 µs/ray）；默认 k = 2 的脏帧
+  ≈ **1.7 ms/帧**；显存 768 KiB（惰性）+ 40 KiB（既有）；上传增量
+  ≈ **6.3 KiB/脏帧、稳态 0 B**。**昼夜循环场景是持续脏表**（光照每帧变）⇒
+  1.7 ms/帧是常态开销而非峰值；可调档位 `rays_per_face = 8` ⇒ 0.42 ms/帧、
+  `probes_per_frame = 1` ⇒ 0.83 ms/帧（收敛 256 帧）。着色器侧全表线性扫描
+  ≤ 256 探针，双剪枝使增量约 10 op/探针。
+- **对照模式 `Renderer::set_ddgi_depth_weight_enabled(bool)`**（默认 `true`，
+  照 `set_legacy_probe_parallax` / `set_legacy_shadow_bias` 先例）：只改片元的
+  权重口径、**不改重照明与深度表的内容** ⇒ 两侧像素差只能来自 chebyshev 项，
+  是「漏光抑制有效性」断言的必要开关。不是运行时诊断可视化。
+- **观测**：`FrameStats::ddgi_updated`（本帧重照明探针数，取自
+  `DdgiGrid::stats().last_updated`，**不进任何排序键**）+ `DdgiStats`
+  （probe_count / dirty_count / ticks / stride / spacing_eff）。
+- **测试**：CPU 34 项解析 / 逐位单测（`iris-render/src/ddgi.rs`）+ 7 项编排
+  单测（`iris-engine/src/ddgi.rs`）+ GPU 6 项（`tests/ddgi_render.rs`，文件内
+  `GPU_SERIAL` 互斥、跨世界对照各用独立渲染器）。GPU 六条：①**缺席逐位不变**
+  （无网格 / 空网格 / 有 settings 但网格空 三者逐字节相等，且**空 DDGI 网格
+  不得扰动 R83 的 mode = 1 裁决**）②开关可判别 + **门口梯度**（受试点 =
+  **共享墙的西侧面**而非地板：墙面法线 −X ⇒ `NdotL ≤ 0` ⇒ 直射项结构性为零
+  ⇒ 像素里只剩常量 ambient + 间接漫反射；跨模式作差 ⇒ 镜面 / 天空 / 色调
+  映射项抵消；梯度本身走 CPU 对照轨——沿墙面扫 z 剖面断言 GI 随离门口的距离
+  **严格单调衰减**且首末落差 ≥ 3×（实测 4.04×），暗室全封闭 ⇒ 梯度只能来自
+  门口）③**漏光抑制有效性**（同一世界同一渲染器只翻深度项开关；墙面 ROI
+  亮度比 ≥ 1.8 且绝对差 ≥ 60，实测 2.88 / 265；CPU 三条精确归因：穿墙权重
+  < 0.25（实测 0.059）、同侧探针 ≥ 0.9（实测 1.0，射线恰命中 ROI 所在墙面
+  ⇒ μ ≥ dist）、**开阔无遮挡处关 / 开比 ≈ 1**（实测 1.011 ⇒ 遮挡感知而非
+  一律调暗）；ROI 避开门口这个混淆源）④**滚动收敛**
+  （`ddgi_updated` 序列 = k,k,…,尾帧,0,0 + `⌈n/k⌉` 帧后画面 FNV ≡「k = n
+  一帧全量重照明」+ CPU 表逐位）⑤双会话 48 帧逐帧逐位 ⑥昼夜联动（光照
+  阶跃 ⇒ L0 单调跟随、`⌈n/k⌉` 帧后逐位到位）。
+- **验收图**：`examples/ddgi_snapshot.rs` → `docs/ddgi.png`（2×2：DDGI 关 |
+  DDGI 开 | 深度项关（漏光对照）| 夜间相位；场景 = 一墙分隔亮 / 暗两室、
+  **门口是唯一连通**，相机在暗室内；受试点同两条 GPU 测试取**墙面**，梯度上端
+  取 `z = 0.9`（门口边缘 0.75 之外、仍在墙上）——首稿取 `z = 0` 落在门洞里，
+  量到的是透过门洞的东侧场地而非墙面，验收轮已修正；面板 1–3 走 `sun_envelope`
+  / `ambient_envelope` 的真实昼间档（面板 4 的昼夜联动要求如此）⇒ 常量 ambient
+  + env 镜面项稀释像素比（实测漏光比 1.253 / 差 117，未被稀释的量级见
+  `tests/ddgi_render.rs` 的 2.88）；warmup = `⌈n/k⌉ + 1` 帧并在 example 内
+  断言 `dirty_count == 0`——不许拿未收敛的表出验收图；跨运行逐字节一致 +
+  双会话 FNV 断言）。
+
+#### 与规格的偏离（4 条主偏离 + 2 条小澄清，全部有依据）
+
+1. **mode 2 的 `Σw ≤ ε` 兜底改为回退 `env_irradiance`**（R83 是回退最近
+   探针）——回退最近探针会**绕过深度项** ⇒ 墙后片元吃到墙另一侧探针的辐照
+   = 正是本轮要消灭的漏光，等于把它从后门放回来。
+2. **增量上传偏离 R83 的「每帧重传」**——①数据量 19×（40 KiB → 768 KiB）；
+   ②DDGI **有** dirty / cursor / `probe_stamp` 变更记账，不需要靠重传规避
+   比对成本；③与 README 既有「实例缓冲跨帧持久：静态场景零上传，动态实体
+   仅传变化段」同纪律。R83 的每帧重传路径**一字不动**（mode = 1 帧照旧）。
+3. **`probe_sh_radiance` 改薄壳**（函数体搬进新的 `probe_ray_radiance_depth`，
+   返回 `(L, t)`）——辐射率口径必须有单一事实源，逐式复制会在后续修订中悄悄
+   漂移；看门两道：R83 既有测试**原值通过** + 等价锚点② 逐位相等。
+4. **深度存 cube-face 参数化而非八面体图集**（DDGI 论文原味是 oct atlas）——
+   与 SH 投影**同批射线** ⇒ 零额外光线成本，且省掉 oct 编解码的 CPU/WGSL
+   双侧镜像与看门面（确定性面更小）。
+5. （小澄清）binding 19 的 `w` 分量承载**深度项对照开关**（设计稿 §7.1 写
+   「w 保留 0」——那条理由是「σ² 已在 CPU 钳过、着色器不需要
+   `DDGI_SIGMA_REL`」，成立；但 §7.4 要求的对照模式必须有落脚处，`w` 是唯一
+   空位，照 `probe_params.count.w` 承载视差开关的先例）。
+6. （小澄清）重照明指纹在设计稿的四项之外**追加 `rays_per_face`**（它决定
+   每探针的射线预算，变了旧表就不再是同一口径的产物 ⇒ 必须全表标脏）；
+   `shadow_softness` / `sky_samples` **不入**指纹（本路径不消费它们，入指纹
+   会让无关旋钮误判全表脏——单测双向钉住）。
+
+### 已知限制（§8.57，18 条）
+
+单色天空（不吃 `SkySource`）/ 无点光·聚光·emissive 参与重照明 / 1 次反弹
+上限 / 几何变化靠 `geometry_generation` 显式宣告（**移动的墙与开合的门在宣告
+前会投影出陈旧遮挡**）/ 光照突变后 `⌈n/k⌉` 帧收敛（期间表是新旧混合，无
+闪烁但滞后）/ 深度角分辨率 6×8² + nearest-texel 无双线性 / σ² 每纹素只有
+`(G/8)²` 条射线 + 10% 下限钳 ⇒ **厚度 < σ 的薄墙仍可能漏**（chebyshev 是
+概率上界不是精确可见性）/ 嵌入几何的探针不做 relocation（贡献被抑制但白占
+预算）/ hysteresis 默认关 ⇒ 滚动推进时可能有轻微空间撕裂 / 跨适配器位级
+不可保 / CPU 单线程内联重照明（未用 R73 分片并行）/ 与光照贴图·反射探针·SSR
+的合成语义未修订（**R89**）/ `sky_color` 默认取 ambient 而 ambient 同时是
+常量补光项的来源 ⇒ **天空底色双计**（配平：显式覆盖 `sky_color` 或调低
+ambient）/ 无探针持久化 / **片元阶段只读 storage 缓冲占满 4/4** / 着色器全表
+线性扫描（无逐探针空间加速结构）/ 探针不落实体（编辑器里看不见、不能逐个调）/
+**网格覆盖范围外回退 env ⇒ 可见等值线**（`Σw ≤ ε` 兜底是 env 天空常量而半径
+是有限球 ⇒ 验收图里天花板与墙交接处的扇贝形亮带就是这条等值线：探针层高 1.3
++ 半径 2.4 ⇒ 只够到 y = 3.7；修法是抬 `bounds` 盖住所有会被着色的表面）。
+
 ### Added（R87：虚拟几何体 V4——分页流送 + 遮挡整合，**连役 4/4 收官**）
 
 路线图 v5 第三梯队 R84–R87 连役 4/4 收官。MVP 边界延续（无 visbuffer /
