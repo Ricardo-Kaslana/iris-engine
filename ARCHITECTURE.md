@@ -2348,6 +2348,17 @@ glTF / HDR 错误经 `From` 映射保上下文）。
 - **无分支回退**：wasm 的 WebGPU 实现普遍无 BC 特性、native 老 GPU 同样
   可能没有——不写任何 cfg，运行时特性检测天然覆盖（web 自动 RGBA8），
   与「wasm 只需编译可用 + 优雅降级」的平台策略一致。
+- **BC7（Mode 6）显式声明路径（C5a）**：`texture_bc7::encode_bc7`——
+  决策树新增**最高优先 BC 分支**（无压缩否决 > BC7 声明 > BC3 声明 >
+  BC1 自动分层 > RGBA8 回退），三处口径同步（`texture_gpu_bytes` /
+  `gpu_bytes_estimate_mipped` / `ensure_texture`）。BC7 **永不自动**：
+  只认 `TextureStore::declare_bc7` / manifest `compression: "bc7"`；
+  不透明与带 alpha 统一覆盖（组合 RGBA 端点 8-bit、每像素 4-bit 权重
+  = 16 级，vs BC1 的 4 级），1 B/px 与 BC3 同占用、质量更高。策略
+  全整数确定性（端点逐通道 min/max + 逐像素 16 档全扫 + P-bit 多数票
+  + anchor 端点交换归一），CPU 往返解码 + **GPU 硬件解码保真**双闸
+  （后者是「自洽地错」的唯一兜底，见 §8.63）。诚实限制见 §8.63
+  （仅 Mode 6 / 端点策略 / 共享 P-bit ±1 / mip 走 RGBA8 域降采样）。
 - **编码器**（`texture_bcn::encode_bc1`，纯函数、全整数运算、零 unsafe）：
   逐 4×4 块取 RGB 距离最远的两像素为端点（O(16²) 确定性暴力，与
   PCA / 范围法的取舍见模块文档——质量略差但逐位可复现），**按 RGB565
@@ -6726,6 +6737,20 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     `node_names` 是前提（GLB 实例播放器自带，手写空表恒 no-op）；
     归一化只处理声明前缀表（`mixamorig`/`bip01`/`mocap`/`ue4-skel`），
     语义改名不吃 alias 表就断绑，引擎不猜。
+63. **BC7 编码 v1（C5a，§4.18 BC7 段）的诚实边界**——①**只产 Mode 6**
+    （单分区组合 RGBA）：多分区高细节块、旋转独立 alpha（Mode 4/5）
+    不生成；CPU 解码器同样只读 Mode 6（外部多模式 BC7 资产 GPU 硬件
+    照绘，引擎侧校验读回查不了——随 KTX2 消费方出现再补全模式解码）；
+    ②**端点策略 = 逐通道 min/max + 逐像素最优权重**（无端点-权重联合
+    迭代）：对角分布块误差高于离线优化工具（rgbcx / enc7 级），解析界
+    ±(跨度/15 + 1) 锁在单测——声明门语义是「作者选格式」，不是
+    「引擎与离线工具等质」；③**P-bit 四通道共享**（Mode 6 规范形态）：
+    LSB 不合多数票的通道端点被 ±1 重构造（解析测试锁死该量化面）；
+    ④BC7 永不自动 ⇒ 全不透明纹理默认仍走 BC1（0.5 B/px），声明 BC7
+    是「花一倍内存买 16 级权重 + 8-bit 端点」的显式取舍；⑤mip 链走
+    RGBA8 域逐级降采样后重编码（非压缩域直降）；⑥manifest
+    `compression` 字段解析 + 择新已备，但**清单驱动的自动声明接线**
+    （loader 按条目调 `declare_bc7`）随 KTX2 容器同批接入（下一增量）。
 
 ## 9. 关键设计取舍记录
 

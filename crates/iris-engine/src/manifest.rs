@@ -79,6 +79,24 @@ struct ManifestEntryRaw {
     priority: i32,
     #[serde(default)]
     bc3: bool,
+    /// C5a 显式压缩声明（`"none" | "bc1" | "bc3" | "bc7"`）；缺省 = None
+    /// （未声明）。与 legacy `bc3: true` 并存时本字段赢（择新）。
+    #[serde(default)]
+    compression: Option<String>,
+}
+
+/// 纹理压缩声明（C5a）：manifest `compression` 字段的解析形态。
+/// 决策树消费口径见 `TextureStore` 各 `is_*_declared`（BC1 自动分层
+/// 规则仍是缺省行为——本枚举表达的是**作者显式意图**）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Compression {
+    /// 显式要求无压缩（数据贴图质量声明的清单表达；等价于
+    /// `declare_uncompressed`）。
+    None,
+    Bc1,
+    Bc3,
+    /// BC7（引擎编码器只产 Mode 6，见 `iris_render::texture_bc7`）。
+    Bc7,
 }
 
 /// 清单内的一条资产条目。
@@ -93,7 +111,24 @@ pub struct ManifestEntry {
     /// 纹理压缩标志（R59）：该条目的入库纹理声明走 BC3 上传
     /// （带 alpha 才实际生效；见 [`crate::texture_bcn`] 分层规则——
     /// iris-render re-export，见 `iris_engine::prelude`）。
+    /// **legacy 视图**：`compression` 缺省时 `bc3: true` 映射为
+    /// [`Compression::Bc3`]；`compression` 在场时本字段不再是事实源
+    /// （保留仅为构造兼容，新代码读 [`Self::compression`]）。
     pub bc3: bool,
+    /// 显式压缩声明（C5a）：`None`（字段缺席）= 未声明（走现行分层
+    /// 规则）；与 legacy `bc3` 并存时**本字段赢**（择新不报错）。
+    pub compression: Option<Compression>,
+}
+
+impl ManifestEntry {
+    /// 生效压缩声明（择新规则的单一事实源）。
+    pub fn effective_compression(&self) -> Option<Compression> {
+        match self.compression {
+            Some(c) => Some(c),
+            None if self.bc3 => Some(Compression::Bc3),
+            None => None,
+        }
+    }
 }
 
 /// 资产清单：路径 → 条目的确定性集合。
@@ -125,11 +160,25 @@ impl AssetManifest {
                     "条目路径不能为空字符串".to_string(),
                 ));
             }
+            let compression = match raw.compression.as_deref() {
+                None => None,
+                Some("none") => Some(Compression::None),
+                Some("bc1") => Some(Compression::Bc1),
+                Some("bc3") => Some(Compression::Bc3),
+                Some("bc7") => Some(Compression::Bc7),
+                Some(other) => {
+                    return Err(ManifestError::Validation(format!(
+                        "条目「{}」的 compression 值未知：「{other}」（支持 none / bc1 / bc3 / bc7）",
+                        raw.path
+                    )));
+                }
+            };
             let entry = ManifestEntry {
                 path: raw.path.clone(),
                 kind,
                 priority: raw.priority,
                 bc3: raw.bc3,
+                compression,
             };
             if manifest.entries.insert(raw.path.clone(), entry).is_some() {
                 return Err(ManifestError::Validation(format!(
@@ -321,4 +370,36 @@ mod tests {
     }
 
     use crate::vfs::AssetSource;
+
+    /// C5a：`compression` 显式声明解析 + legacy `bc3` 读兼容映射 +
+    /// 双声明择新 + 非法值中文拒绝。
+    #[test]
+    fn compression_parses_with_legacy_mapping() {
+        let json = r#"{
+            "assets": [
+                { "path": "a.png", "kind": "raw", "compression": "bc7" },
+                { "path": "b.png", "kind": "raw", "bc3": true },
+                { "path": "c.png", "kind": "raw", "bc3": true, "compression": "none" },
+                { "path": "d.png", "kind": "raw" }
+            ]
+        }"#;
+        let manifest = AssetManifest::parse(json.as_bytes()).unwrap();
+        let get = |p: &str| {
+            manifest
+                .get(p)
+                .unwrap_or_else(|| panic!("条目 {p} 应存在"))
+                .effective_compression()
+        };
+        assert_eq!(get("a.png"), Some(Compression::Bc7), "显式 bc7");
+        assert_eq!(get("b.png"), Some(Compression::Bc3), "legacy bc3 映射");
+        assert_eq!(get("c.png"), Some(Compression::None), "双声明择新");
+        assert_eq!(get("d.png"), None, "双缺席 = 未声明（现行分层规则）");
+
+        let bad = r#"{ "assets": [ { "path": "x", "kind": "raw", "compression": "bc9" } ] }"#;
+        let err = AssetManifest::parse(bad.as_bytes()).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Validation(m) if m.contains("bc9")),
+            "非法 compression 应中文拒绝，实际 {err}"
+        );
+    }
 }

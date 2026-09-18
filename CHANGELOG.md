@@ -5,6 +5,35 @@
 
 ## [Unreleased]
 
+### Added（C5a-1 闭合战役 · 格式役——BC7 Mode 6 编码器 × manifest 声明门 × 上传决策树）
+
+路线图 v5 清账战役批次六第一增量（池 #11 三件套之「编码决策树 + 声明门」；
+KTX2 容器随后脚）。BC7 **永不自动**（用户裁决定稿：只做 Mode 6、
+manifest 新增显式 `compression` 字段、旧 `bc3` 读兼容）：
+
+- **`texture_bc7`（新模块）**：`encode_bc7` 全整数确定性编码器（逐块
+  端点 = 逐通道 min/max、逐像素 16 档权重全扫并列取先、P-bit 多数票、
+  anchor 端点交换归一）+ `decode_bc7_mode6`（DirectXTex `D3DX_BC7::
+  Decode` 逐式移植的 CPU 镜像）+ 128-bit LSB-first 位流 reader/writer
+  互逆对。**双闸验证**：CPU 编→解往返解析锁（纯色逐位、±步距界、
+  共享 P-bit 的 ±1 量化面、确定性两跑）+ **GPU 硬件解码保真**（引擎
+  块流经真实硬件 BC7 采样器与 RGBA8 参考帧全帧误差 <3——「自洽地错」
+  位序的唯一兜底闸）。
+- **声明门三口径**：`TextureStore::declare_bc7`/`is_bc7_declared`/
+  `add_bc7_declared` 侧表 + 决策树**最高优先 BC 分支**（无压缩否决 >
+  BC7 > BC3 > BC1 自动 > RGBA8）——`texture_gpu_bytes` /
+  `gpu_bytes_estimate_mipped` / `ensure_texture` 三处同步（R66e 两口径
+  纪律推广到三口径）；`Bc7RgbaUnorm[(Srgb)]` 格式随 `cpu.srgb` 分流、
+  mip 链走 `mip_chain_bc7`（RGBA8 域降采样后逐级编码）；
+  `Renderer::texture_is_bc7` 观测口。
+- **manifest `compression` 字段**：`Compression { None, Bc1, Bc3, Bc7 }`
+  解析（非法值中文拒绝）+ legacy `bc3: true` 读兼容映射 + 双声明择新
+  （`effective_compression()` 单一事实源）。
+- 诚实边界 §8.63 六条（仅 Mode 6 / 端点策略非联合优化 / P-bit 共享
+  量化面 / 永不自动的内存取舍 / mip 在 RGBA8 域 / 清单自动接线随
+  KTX2 批）。
+- 测试 +13（bc7 单元 9 · GPU 端到端 2 · 三口径估算 1 · manifest 解析 1）。
+
 ### Added（C3 闭合战役 · 物理深化役——CCD × 铰链关节 × 可断关节，全部「缺席 = 逐位不变」）
 
 路线图 v5 清账战役第四批（C0 文档健康 → C1 原语小件 → C2 渲染伪影 →

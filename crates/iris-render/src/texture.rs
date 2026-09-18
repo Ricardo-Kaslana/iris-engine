@@ -16,6 +16,14 @@
 //! 未声明纹理维持既有 RGBA8 / BC1 决策树逐位不变。声明表用
 //! `BTreeSet`（确定性文化：迭代序 = 句柄序，与 broadphase 同规约）。
 //!
+//! **BC7 声明（C5a）**：[`TextureStore::declare_bc7`] /
+//! [`TextureStore::is_bc7_declared`] 同构第三张侧表——BC7（引擎编码器
+//! 只产 Mode 6，见 [`crate::texture_bc7`]）**永不自动**：缺席 = 决策树
+//! 逐位不变；在场 = 该纹理改走 `Bc7RgbaUnorm[(Srgb)]`（不透明与带
+//! alpha 统一覆盖，1 B/px）。BC7 与 BC3 双声明时 **BC7 赢**（同
+//! 1 B/px、质量更高；三处口径 `texture_gpu_bytes` /
+//! `gpu_bytes_estimate_mipped` / `renderer::ensure_texture` 同步择新）。
+//!
 //! **无压缩声明（R66e）**：[`TextureStore::declare_uncompressed`] /
 //! [`TextureStore::is_uncompressed_declared`] 是 BC 决策树的**前置否决**——
 //! 声明句柄跳过 BC1/BC3 直走 RGBA8 + mip 链。动机：BC1 的通道耦合端点
@@ -172,6 +180,26 @@ pub fn mip_chain_bc(width: u32, height: u32, rgba: &[u8], bc3: bool) -> Vec<Vec<
             } else {
                 crate::texture_bcn::encode_bc1(&px, w, h)
             }
+        })
+        .collect()
+}
+
+/// BC7 mip 链（C5a）：与 [`mip_chain_bc`] 同款「逐级 RGBA8 降采样后
+/// 编码」通路（[mip_chain_bc] 的 bc3 布尔无法表达第三格式，另立函数
+/// 避免三态布尔），级数口径一致——降采样到 4×4 为止（BC7 块同为 4×4）。
+pub fn mip_chain_bc7(width: u32, height: u32, rgba: &[u8]) -> Vec<Vec<u8>> {
+    mip_chain_rgba8(width, height, rgba)
+        .into_iter()
+        .enumerate()
+        .take_while(|(level, _)| {
+            let w = (width >> level).max(1);
+            let h = (height >> level).max(1);
+            w >= 4 && h >= 4
+        })
+        .map(|(level, px)| {
+            let w = (width >> level).max(1);
+            let h = (height >> level).max(1);
+            crate::texture_bc7::encode_bc7(&px, w, h)
         })
         .collect()
 }
@@ -348,6 +376,13 @@ pub struct TextureStore {
     /// 经 manifest 声明走 BC3 上传的句柄表（R59，见模块文档）。
     /// 缺席 = 既有 RGBA8 / BC1 决策树逐位不变——默认路径零改动。
     bc3_declared: BTreeSet<u32>,
+    /// 经理入期 / 工具链**显式声明走 BC7（Mode 6）压缩**的句柄表（C5a）。
+    /// BC7 **永不自动**（与 BC1 的「全不透明自动压缩」不同——1 B/px 与
+    /// 质量取舍归作者）：缺席 = 决策树逐位不变；在场 = 该纹理改走
+    /// `Bc7RgbaUnorm[(Srgb)]`（不透明与带 alpha 统一覆盖，见
+    /// `texture_bc7` 模块文档）。与 `bc3_declared` 同时在场时 **BC7 赢**
+    /// （同 1 B/px、质量更高——声明冲突按更新能力静默择高，不报错）。
+    bc7_declared: BTreeSet<u32>,
     /// 声明**不走 BC 块压缩**的句柄表（R66e）：数据贴图（法线 / ORM，
     /// `srgb = false`）走 RGBA8 + mip 链。BC1 的通道耦合端点插值在法线
     /// 图上产生近距块状伪梯度（iris-exp frictions ⑨：皮肤近距块斑，
@@ -362,6 +397,7 @@ impl Default for TextureStore {
         Self {
             textures: vec![CpuTexture::solid([255, 255, 255, 255])],
             bc3_declared: BTreeSet::new(),
+            bc7_declared: BTreeSet::new(),
             uncompressed: BTreeSet::new(),
         }
     }
@@ -411,6 +447,25 @@ impl TextureStore {
         self.bc3_declared.contains(&handle.0)
     }
 
+    /// 登记纹理并**同时声明 BC7 压缩**（C5a）：等价 `add` + `declare_bc7`，
+    /// 一步完成「manifest `compression: "bc7"` → 入库声明」。
+    pub fn add_bc7_declared(&mut self, texture: CpuTexture) -> TextureHandle {
+        let handle = self.add(texture);
+        self.bc7_declared.insert(handle.0);
+        handle
+    }
+
+    /// 为已存在的句柄补 BC7 声明（C5a）：与 [`Self::declare_bc3`] 同
+    /// 纪律——声明只需发生在首次 GPU 上传前；重复声明幂等。
+    pub fn declare_bc7(&mut self, handle: TextureHandle) -> bool {
+        self.bc7_declared.insert(handle.0)
+    }
+
+    /// 该句柄是否声明了 BC7 压缩（渲染器决策树与显存估算共用）。
+    pub fn is_bc7_declared(&self, handle: TextureHandle) -> bool {
+        self.bc7_declared.contains(&handle.0)
+    }
+
     /// 为已存在的句柄补**无压缩**声明（R66e）：数据贴图（法线 / ORM）
     /// 不走 BC1/BC3 块压缩（BC1 对法线的近距块状伪梯度，frictions ⑨）。
     /// 声明只需发生在**首次 GPU 上传前**（渲染器懒上传）；重复声明幂等。
@@ -452,7 +507,14 @@ impl TextureStore {
         if self.uncompressed.contains(&handle.0) {
             return t.width as u64 * t.height as u64 * 4;
         }
+        // BC7 声明（C5a）优先级高于 BC3：同为 1 B/px、质量更高，
+        // 双声明择高（不报错）
         if feature_bc
+            && self.bc7_declared.contains(&handle.0)
+            && crate::texture_bc7::bc7_eligible(t.width, t.height, &t.rgba, feature_bc)
+        {
+            (t.width as u64 / 4) * (t.height as u64 / 4) * 16
+        } else if feature_bc
             && self.bc3_declared.contains(&handle.0)
             && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)
         {
@@ -500,11 +562,19 @@ impl TextureStore {
                 let handle = TextureHandle(index as u32);
                 // 无压缩声明（R66e）= RGBA8 链口径
                 let raw = self.uncompressed.contains(&handle.0);
+                // BC7（C5a）声明择高于 BC3，与 `texture_gpu_bytes` / 渲染器
+                // 决策树同优先级——三处口径恒同步（R66e「两口径同步」纪律）
+                let bc7 = !raw
+                    && feature_bc
+                    && self.bc7_declared.contains(&handle.0)
+                    && crate::texture_bc7::bc7_eligible(t.width, t.height, &t.rgba, feature_bc);
                 let bc3 = !raw
+                    && !bc7
                     && feature_bc
                     && self.bc3_declared.contains(&handle.0)
                     && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc);
                 let bc1 = !raw
+                    && !bc7
                     && !bc3
                     && crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc);
                 let mut extra = 0u64;
@@ -514,10 +584,12 @@ impl TextureStore {
                     h = (h / 2).max(1);
                     // BC 链止于 4×4（压缩 copy extent 块宽整数倍约束，
                     // 与 mip_chain_bc 同口径）；RGBA8 链到 1×1
-                    if (bc3 || bc1) && (w < 4 || h < 4) {
+                    if (bc7 || bc3 || bc1) && (w < 4 || h < 4) {
                         break;
                     }
-                    extra += if bc3 {
+                    extra += if bc7 {
+                        crate::texture_bc7::encoded_len_bc7(w, h)
+                    } else if bc3 {
                         crate::texture_bcn::encoded_len_bc3(w, h)
                     } else if bc1 {
                         crate::texture_bcn::encoded_len(w, h)
@@ -895,6 +967,41 @@ mod tests {
             store.gpu_bytes_estimate_mipped(true),
             4 + 8 * 8 * 4 + (64 + 16 + 4),
             "声明后 = RGBA8 完整链增量（到 1×1）"
+        );
+    }
+
+    /// BC7 声明（C5a）三口径：基级 1 B/px、mip 链止于 4×4、双声明择新
+    /// （BC7 赢 BC3 / BC1——不透明纹理从 BC1 0.5 B/px 升到 BC7 1 B/px
+    /// 是**作者声明换质量**的显式代价，永不自动的反面即声明必生效）。
+    #[test]
+    fn bc7_declaration_switches_estimates_and_wins_over_bc3() {
+        let mut store = TextureStore::new();
+        let opaque = CpuTexture::checkerboard(1, 8, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let h = store.add(opaque);
+        assert_eq!(
+            store.gpu_bytes_estimate(true),
+            4 + 2 * 2 * 8,
+            "未声明 = BC1 口径"
+        );
+        assert!(store.declare_bc7(h));
+        assert!(!store.declare_bc7(h), "重复声明幂等");
+        assert_eq!(
+            store.gpu_bytes_estimate(true),
+            4 + 2 * 2 * 16,
+            "声明后 = BC7 16 B/块（即便全不透明也尊重声明）"
+        );
+        // 链口径：8×8 → 4×4 一级（16 B），再下 2×2 < 4 止
+        assert_eq!(
+            store.gpu_bytes_estimate_mipped(true),
+            4 + 2 * 2 * 16 + 16,
+            "mip 链增量与基级同 BC7 口径"
+        );
+        // 双声明择新：再声明 BC3 不改变事实源（BC7 赢）
+        store.declare_bc3(h);
+        assert_eq!(
+            store.gpu_bytes_estimate(true),
+            4 + 2 * 2 * 16,
+            "BC7 优先于 BC3"
         );
     }
 

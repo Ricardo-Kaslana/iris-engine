@@ -133,6 +133,7 @@ pub mod sss;
 pub mod surface;
 pub mod terrain;
 pub mod texture;
+pub mod texture_bc7;
 pub mod texture_bcn;
 pub mod ui;
 pub mod visibility;
@@ -275,6 +276,9 @@ pub mod prelude {
     pub use crate::texture::{
         CpuTexture, MipSettings, TextureHandle, TextureStore, downsample_rgba8, mip_chain_bc,
         mip_chain_rgba8, mip_level_count,
+    };
+    pub use crate::texture_bc7::{
+        BC7_BLOCK_BYTES, bc7_eligible, decode_bc7_mode6, encode_bc7, encoded_len_bc7,
     };
     pub use crate::texture_bcn::{
         BC1_BLOCK_BYTES, BC3_BLOCK_BYTES, bc1_eligible, bc3_eligible, encode_bc1, encode_bc3,

@@ -362,12 +362,16 @@ struct GpuTexture {
     /// 上传时是否走了 BC3 压缩（R59：`texture_is_bc3` 的观测口径，
     /// 与 `bc1` 恒互斥——分层决策树一次只走一条压缩路径）。
     bc3: bool,
+    /// 上传时是否走了 BC7 压缩（C5a：`texture_is_bc7` 观测口径；与
+    /// `bc1`/`bc3` 恒互斥——决策树只走一条）。
+    bc7: bool,
 }
 
 /// 单次纹理上传走的路径（`ensure_texture` 决策树的内部分类，标签与
 /// 观测口径共用一个来源）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompressedPath {
+    Bc7,
     Bc3,
     Bc1,
     Rgba8,
@@ -3721,6 +3725,7 @@ impl Renderer {
             // 1×1 兜底纹理非 4 对齐，恒走 RGBA 路径（决策树与其一致）
             bc1: false,
             bc3: false,
+            bc7: false,
         };
         let mut texture_gpu = HashMap::new();
         texture_gpu.insert(0u32, white_gpu);
@@ -11016,26 +11021,56 @@ impl Renderer {
         // alpha 纹理走 BC3（1 B/px），全不透明仍归 BC1（分层互斥，
         // 见 `bc3_eligible` / `bc1_eligible` 文档）。
         let declared_bc3 = store.is_some_and(|s| s.is_bc3_declared(handle));
+        // BC7 声明（C5a）：**永不自动**——只有显式声明（manifest
+        // `compression: "bc7"` / `declare_bc7`）的纹理进入本路径；与
+        // BC3 双声明时 BC7 赢（同 1 B/px、质量更高）。
+        let declared_bc7 = store.is_some_and(|s| s.is_bc7_declared(handle));
         // 无压缩声明（R66e）：数据贴图（法线 / ORM）质量优先，跳过 BC 块
         // 压缩（BC1 对法线的近距块状伪梯度，frictions ⑨）；未声明 = 既有
         // 决策树逐位不变
         let declared_raw = store.is_some_and(|s| s.is_uncompressed_declared(handle));
+        let use_bc7 = !declared_raw
+            && declared_bc7
+            && crate::texture_bc7::bc7_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
+        if use_bc7 {
+            log::info!(
+                "纹理 {handle:?}（{width}×{height}）经声明走 BC7（Mode 6）压缩上传（显存 1/4）"
+            );
+        }
         let use_bc3 = !declared_raw
+            && !use_bc7
             && declared_bc3
             && crate::texture_bcn::bc3_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
         if use_bc3 {
             log::info!("纹理 {handle:?}（{width}×{height}）经声明走 BC3 压缩上传（显存 1/4）");
         }
         let use_bc1 = !declared_raw
+            && !use_bc7
             && !use_bc3
             && crate::texture_bcn::bc1_eligible(width, height, &cpu.rgba, self.gpu.supports_bc());
         if use_bc1 {
             log::info!("纹理 {handle:?}（{width}×{height}）走 BC1 压缩上传（显存 1/8）");
         }
-        // 压缩路径：数据为 4×4 块流，bytes_per_row 按块计（BC3 宽/4 块
-        // × 16B、BC1 × 8B）；回退路径：RGBA8 逐字节（Cow 借用源数据，
-        // 零拷贝）。
-        let (format, data, bytes_per_row, path) = if use_bc3 {
+        // 压缩路径：数据为 4×4 块流，bytes_per_row 按块计（BC7 / BC3
+        // 宽/4 块 × 16B、BC1 × 8B）；回退路径：RGBA8 逐字节（Cow 借用
+        // 源数据，零拷贝）。
+        let (format, data, bytes_per_row, path) = if use_bc7 {
+            let blocks = crate::texture_bc7::encode_bc7(&cpu.rgba, width, height);
+            debug_assert_eq!(
+                blocks.len() as u64,
+                crate::texture_bc7::encoded_len_bc7(width, height)
+            );
+            (
+                if cpu.srgb {
+                    wgpu::TextureFormat::Bc7RgbaUnormSrgb
+                } else {
+                    wgpu::TextureFormat::Bc7RgbaUnorm
+                },
+                std::borrow::Cow::Owned(blocks),
+                (width / 4) * 16,
+                CompressedPath::Bc7,
+            )
+        } else if use_bc3 {
             let blocks = crate::texture_bcn::encode_bc3(&cpu.rgba, width, height);
             debug_assert_eq!(
                 blocks.len() as u64,
@@ -11088,6 +11123,7 @@ impl Renderer {
         // 白色兜底（句柄 0）根本不进本函数。
         let mip_levels: Vec<Vec<u8>> = if self.mip_anisotropy.is_some() && !cpu.rgba.is_empty() {
             match path {
+                CompressedPath::Bc7 => crate::texture::mip_chain_bc7(width, height, &cpu.rgba),
                 CompressedPath::Bc3 => crate::texture::mip_chain_bc(width, height, &cpu.rgba, true),
                 CompressedPath::Bc1 => {
                     crate::texture::mip_chain_bc(width, height, &cpu.rgba, false)
@@ -11099,6 +11135,7 @@ impl Renderer {
         };
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: match path {
+                CompressedPath::Bc7 => Some("iris.texture.bc7"),
                 CompressedPath::Bc3 => Some("iris.texture.bc3"),
                 CompressedPath::Bc1 => Some("iris.texture.bc1"),
                 CompressedPath::Rgba8 => Some("iris.texture"),
@@ -11148,7 +11185,8 @@ impl Renderer {
                         level_w.div_ceil(4) * 8,
                         level_w.div_ceil(4) * level_h.div_ceil(4) * 8,
                     ),
-                    CompressedPath::Bc3 => (
+                    // BC7 与 BC3 同为 16 B/4×4 块（C5a）
+                    CompressedPath::Bc3 | CompressedPath::Bc7 => (
                         level_w.div_ceil(4) * 16,
                         level_w.div_ceil(4) * level_h.div_ceil(4) * 16,
                     ),
@@ -11204,6 +11242,7 @@ impl Renderer {
                 sampler,
                 bc1: path == CompressedPath::Bc1,
                 bc3: path == CompressedPath::Bc3,
+                bc7: path == CompressedPath::Bc7,
             },
         );
     }
@@ -11220,6 +11259,14 @@ impl Renderer {
     /// 内存对账用。
     pub fn texture_is_bc3(&self, handle: TextureHandle) -> bool {
         self.texture_gpu.get(&handle.0).is_some_and(|t| t.bc3)
+    }
+
+    /// 该纹理句柄的 GPU 上传是否走了 BC7 压缩（C5a）：只对经**显式声明**
+    /// （manifest `compression: "bc7"` 或 `TextureStore::declare_bc7`）的
+    /// 纹理成立——BC7 永不自动。未上传 / 不存在 / 回退 RGBA8 均 `false`
+    /// （与 `texture_is_bc1` / `texture_is_bc3` 三态恒互斥）。
+    pub fn texture_is_bc7(&self, handle: TextureHandle) -> bool {
+        self.texture_gpu.get(&handle.0).is_some_and(|t| t.bc7)
     }
 
     /// 光照贴图图集的懒上传（R52c）：`Rgba16Float` 线性 HDR 纹理，数据源
