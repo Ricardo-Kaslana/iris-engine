@@ -292,7 +292,10 @@ pub struct PhysicsPlugin;
 
 impl Plugin for PhysicsPlugin {
     fn build(&self, app: &mut App) {
-        use iris_core::physics::{Collider, ContactTracker, RigidBody, step_physics};
+        use iris_core::physics::{
+            BrokenJoints, Collider, ContactTracker, JointBroken, RigidBody, prune_broken_joints,
+            step_physics,
+        };
         use iris_core::prelude::{Access, CollisionEnded, CollisionStarted, Stage, Transform};
         // 接触事件资源 + 差分基线：游戏侧不注册即得（事件资源缺席时
         // step_physics 静默跳过产出，自建 App 也可按需手动注册）
@@ -309,6 +312,13 @@ impl Plugin for PhysicsPlugin {
                 .read::<iris_core::physics::ContactSolverV2>(),
             step_physics,
         );
+        // 可断关节（C3）：断裂兑现——step_physics 只入队（&World 无法
+        // 改组件表），本系统同阶段稍后消费队列移除关节组件并发
+        // JointBroken 事件。注册为常规（独占）系统，排在 step_physics
+        // 之后（调度器按注册序分批）。
+        app.world.register_event::<JointBroken>();
+        app.world.insert_resource(BrokenJoints::default());
+        app.schedule.add_system(Stage::Update, prune_broken_joints);
     }
 }
 

@@ -253,15 +253,17 @@
 //! ));
 //! ```
 //!
-//! # 约束与关节（位置约束集：距离 / 摆动 / 目标点）
+//! # 约束与关节（位置约束集：距离 / 摆动 / 铰链 / 目标点）
 //!
 //! 机关门 / 吊灯 / 弹簧板（R36）与**真人形 ragdoll**（R50）的地基。
 //! R50 之前 v1 是纯位置物理（只有线速度），语义完整的旋转铰链无法诚实
 //! 实现——**角速度积分 + 旋转感知胶囊落地后，旋转约束随之解锁**：
 //! [`SwingJoint`]（摆动锥限位 + 肢体轴方向修正）是第一个真正消费旋转的
 //! 约束，[`crate::ragdoll`] v2 的胶囊肢人形靠它接线肩 / 胯 / 肘 / 膝。
-//! 仍**没有** hinge / twist 两自由度铰链（限制「只能单向弯」需要它），
-//! v1 用锥近似（见诚实边界）。三个关节组件：
+//! C3（关节 / 约束 v2）补上 **[`HingeJoint`] 单轴铰链**（双轴对齐把摆动
+//! 自由度全闭合 + 扭转角限位 + 速率限制马达）——「只能单向弯」的肘 /
+//! 膝与开合门自此有合法表达；同轮交付**可断关节**（[`JointBreak`]
+//! 标记 + [`prune_broken_joints`] 兑现）。四个关节组件：
 //!
 //! - [`DistanceJoint`]：距离约束——`stiffness = 1` 硬约束（双向刚杆）、
 //!   `(0, 1)` 弹簧（部分修正投影）+ 轴向相对速度 `damping`；
@@ -269,6 +271,9 @@
 //!   距离投影 + 摆动锥限位（锥轴随父端旋转）+ 子端肢体轴的最小弧方向
 //!   修正 + 两轴速度阻尼；修正**全给子端**（层级投影，见类型文档的实测
 //!   论证）；
+//! - [`HingeJoint`]（C3）：**铰链关节**——锚点距离 + 双轴对齐（摆动闭合）
+//!   再叠加绕铰链线的扭转角限位与速率限制马达（位置级伺服、无扭矩 /
+//!   惯量语义——算式与退化规则见 [`solve_hinge_joint`]）；
 //! - [`TargetJoint`]：目标点约束——把实体拉向世界固定点，`rest_distance`
 //!   给出「停在距目标多近」的到达半径（0 = 精确到达）。
 //!
@@ -285,8 +290,8 @@
 //! 修正是绝对覆盖，同轮后解的关节能看到前面改过的朝向 ⇒ 肢体链自根
 //! 向叶逐级对齐）。
 //!
-//! 约束轮内的求解顺序固定：**距离关节 → 摆动关节 → 目标点关节**，各自
-//! 按收集序（= 组件存储序）。
+//! 约束轮内的求解顺序固定：**距离关节 → 摆动关节 → 铰链关节 → 目标点
+//! 关节**，各自按收集序（= 组件存储序）。
 //!
 //! - **距离约束**：当前距离 d 与 `rest_length` 偏差 `err = d − rest`，
 //!   沿连线按动体数均分修正（静态端 share = 0 不动）；弹簧
@@ -301,9 +306,14 @@
 //!   缩放、切向分量按 `1 − damping` 缩放——到达时速度归零的临界阻尼
 //!   **近似**（精确临界解需要力模型与质量，v1 用速度缩放代替，诚实
 //!   声明，见 [`solve_target_joint`]）；
+//! - **铰链约束（C3）**：三段（锚点距离 → 双轴最小弧对齐 → 绕铰链线的
+//!   扭转限位 / 马达刚体旋转），同样**只作用于子端**；马达是速率受限的
+//!   伺服投影（`|Δθ| ≤ rate × dt`，仍受限位钳制）——无扭矩 / 惯量语义
+//!   （见 [`HingeJoint`] 诚实限制）；
 //! - **确定性**：约束收集序 = 组件存储序（query 遍历序）、两端位置 /
-//!   旋转取自同一快照、求解顺序固定（距离 → 摆动 → 目标点）、无随机源
-//!   ——既有逐位确定性测试不受影响，关节场景同样 bit 级可复现（单测守护）。
+//!   旋转取自同一快照、求解顺序固定（距离 → 摆动 → 铰链 → 目标点）、
+//!   无随机源——既有逐位确定性测试不受影响，关节场景同样 bit 级可复现
+//!   （单测守护）。
 //!
 //! ## 诚实边界（v1 约束）
 //!
@@ -311,8 +321,14 @@
 //!   频率，「弹性」是每轮部分修正的视觉弹跳语义；需要精确能量行为的
 //!   场景请由游戏逻辑自管；
 //! - **双向刚杆**：距离约束靠近与远离都修正（非「只拉不推」的绳）；
-//! - **锥限位不区分弯曲平面**：肘 / 膝的「只能单向弯」需要 hinge + twist
-//!   两自由度约束，[`SwingJoint`] 用锥近似（超限方向一律拉回锥面）；
+//! - **锥限位不区分弯曲平面（[`SwingJoint`] 自身语义）**：肘 / 膝的
+//!   「只能单向弯」自 C3 起用 [`HingeJoint`] 合法表达（单轴 + 扭转
+//!   限位）；`SwingJoint` 维持锥近似——超限方向一律拉回锥面，ragdoll
+//!   的既有接线不因此轮改动（两关节并存、各自 opt-in）；
+//! - **可断关节判据 = 位置修正量**（C3）：`step_physics` 是 `&World`
+//!   系统，断裂只能「入队 + 后继 [`prune_broken_joints`] 兑现」两拍
+//!   （同帧 Update 内落地）；无牛顿级断裂阈值语义（v1 位置投影制没有
+//!   可读的关节力，见 [`JointBreak`] 文档）；
 //! - **摆动关节是层级投影**：子端被投影到父端，父端不被子端拽动 ⇒ 躯干
 //!   靠自身接触承托、不靠腿的约束提着（尸体要的语义）；代价是**链必须
 //!   根先叶后**（[`crate::ragdoll::RagdollDesc::links`] 的定义序），乱序
@@ -348,13 +364,32 @@
 //! ));
 //! ```
 //!
+//! # 连续碰撞检测（CCD，C3）
+//!
+//! 「积分一步跳」的高速贯穿闭合，两个入口同为**拆子步**形态、各自
+//! opt-in（缺席 = v1 逐位）：
+//!
+//! - **刚体侧** [`Ccd`] 组件：动体挂上后，`step_physics` 积分把本帧
+//!   位移按段长（自动 = 碰撞体最小投影宽度 [`ColliderShape::min_width`]，
+//!   或显式 `max_step`）拆成等分子步，在首个「终点嵌入静态 / 运动学
+//!   障碍」的子步停住——嵌入终点交还给**本帧**接触管线（推离 / 反弹 /
+//!   `CollisionStarted` 全部照旧），弹丸撞墙而非穿墙。核心是纯函数
+//!   [`ccd_substepped_displacement`]（解析可单测）；
+//! - **角色侧** [`crate::character::move_and_slide_ccd`]：五步管线的
+//!   子步包装（闭合其「全贯穿不检出」的 v1 诚实边界）。
+//!
+//! 捕获保证的区间论证与诚实限制（静态障碍专属 / 子步数封顶 / 起点
+//! 嵌入 / sensor 不阻挡 / 亚阈值逐位兼容锚）见 [`Ccd`] 类型文档。
+//!
 //! # v1 限制（诚实清单）
 //!
-//! - **AABB 不随实体旋转（OBB 留后续轮）**：[`ColliderShape::Box`] 是世界
-//!   轴对齐包围盒，`Transform.rotation` 对它**无语义**（检测忽略）——旋转
-//!   实体的碰撞盒不跟着转；**旋转体请用胶囊**（R50 起胶囊轴随实体旋转，
-//!   是唯一旋转感知的形状）。OBB / SAT 升级是后续轮的事，本轮范围明确
-//!   不含（Box 的 AABB 语义一字未动 ⇒ 既有场景逐位不变）；
+//! - **AABB 不随实体旋转（OBB 仍未交付，C3 裁定缓行）**：
+//!   [`ColliderShape::Box`] 是世界轴对齐包围盒，`Transform.rotation` 对它
+//!   **无语义**（检测忽略）——旋转实体的碰撞盒不跟着转；**旋转体请用
+//!   胶囊**（R50 起胶囊轴随实体旋转，是唯一旋转感知的形状）。OBB / 凸包
+//!   需要 GJK 类新检测内核，其浮点确定性设计专章（
+//!   `docs/private/gjk-determinism.md`）过审前不动码（闭合战役裁定④）；
+//!   （Box 的 AABB 语义一字未动 ⇒ 既有场景逐位不变）；
 //! - **接触不产生角冲量（R50 诚实限制）**：碰撞只改**位置与线速度**——
 //!   落地不会自动「滚起来」、偏心撞击不会让物体打转。角动量只由
 //!   「初值（[`RigidBody::angular_velocity`]）+ 角阻尼 + 约束（
@@ -594,6 +629,25 @@ impl ColliderShape {
         Self::Capsule {
             radius,
             half_height,
+        }
+    }
+
+    /// 任意方向的最小投影宽度（米）：Sphere = `2r`、Capsule = `2r`
+    /// （垂直轴向是最小方向）、Box = 三边全长的最小值。退化 / 非法
+    /// 尺寸（非有限或 ≤ 0 分量）返回 `0.0`——CCD 自动段长消费本值，
+    /// 0 ⇒ 检出关闭（见 [`Ccd`]）。
+    pub fn min_width(&self) -> f32 {
+        let width = match *self {
+            Self::Sphere { radius } => 2.0 * radius,
+            Self::Capsule { radius, .. } => 2.0 * radius,
+            Self::Box { half_extents } => {
+                2.0 * half_extents.x.min(half_extents.y).min(half_extents.z)
+            }
+        };
+        if width.is_finite() && width > 0.0 {
+            width
+        } else {
+            0.0
         }
     }
 }
@@ -846,7 +900,8 @@ pub struct TargetJoint {
 ///   同理由）；
 /// - **锥形限位不区分弯曲平面**：肘 / 膝的「只能单向弯」需要 hinge +
 ///   twist 限位（两自由度约束），v1 用锥近似——超限方向一律拉回锥面，
-///   不阻止「侧向弯」；
+///   不阻止「侧向弯」（两自由度铰链自 C3 起由 [`HingeJoint`] 提供，
+///   本关节语义保持不变、两者并存各自 opt-in）；
 /// - **挂载体 / 目标端限制**同 [`DistanceJoint`]（挂载体须为碰撞体动体；
 ///   `target` 无效 / despawn → 本帧跳过不 panic）；
 /// - **退化跳过**：两锚点重合（距离与锥面方向都不定）或 `rest_offset`
@@ -872,6 +927,242 @@ pub struct SwingJoint {
     /// 只在求解首轮施加）：抑制悬挂肢体在重力下的持续加速与链的震荡
     /// ——**必要性见类型文档的诚实边界**。
     pub damping: f32,
+}
+
+/// 铰链关节（C3 关节 / 约束 v2）：把挂载实体（**a 端 / 门板侧**）绕
+/// 父端 b 的一条世界直线（铰链轴）单自由度转动——锚点距离 +
+/// 双轴对齐（摆动自由度全闭合）+ 扭转角限位 + 可选马达。闭合 R50
+/// 声明的「无 hinge / twist 两自由度铰链」（门 / 阀轮 / 肘膝单向弯
+/// 的合法表达；`SwingJoint` 的锥近似见其文档）。语义规范 = 求解纯
+/// 函数 [`solve_hinge_joint`] 文档。
+///
+/// # 角度口径
+///
+/// - **零位**：`rot_b·ref_b` 与 `rot_a·ref_a` 的扭转重合（两参考向
+///   各自对轴 Gram-Schmidt 正交化后张成同一半平面）；
+/// - **符号**：右手系绕 `axis_b`（随父端旋转）为正；
+/// - 限位 `[twist_min, twist_max]` 自动排序；马达（
+///   `motor_max_rate > 0` 时激活）以「每帧至多 `rate × dt` 弧度」的
+///   速率限制向 `motor_target` 伺服，结果仍受限位钳制（马达不能把门
+///   推出限位）。
+///
+/// # 诚实限制
+///
+/// - **位置级马达**：速率限制的伺服投影，无扭矩 / 惯量语义（推不动
+///   的门照样被目标角拖着走；需要真实力矩请用角速度初值 + 约束近似）；
+/// - **旋转修正为绝对覆盖**（同 [`SwingJoint`] 第③段）：不读取也不
+///   改写 `RigidBody::angular_velocity`——绕轴转动的**动力学惯性**
+///   不在 v1 语义内（门板自身的 ω 由游戏 / 接触演化）；
+/// - 挂载体 / 目标端 / 无效跳过规则同 [`DistanceJoint`]；参考向退化
+///   （零长 / 与轴平行）⇒ 扭转段（限位 + 马达）跳过、对齐段照跑；
+///   轴向退化（零长）⇒ 整关节跳过（不凭空选轴）；
+/// - **确定性**：全程纯函数（`atan2` 只在扭转角测量与马达增量出现，
+///   同输入逐位一致；见模块文档 CPU 数学口径）。
+#[derive(Clone, Copy, Debug, PartialEq, Component)]
+pub struct HingeJoint {
+    /// 父端 / 铰链座实体；无效实体 = 约束跳过（同 [`DistanceJoint`]）。
+    pub target: Entity,
+    /// a（挂载体）的**本地**锚点。
+    pub anchor_a: Vec3,
+    /// b（`target`）的**本地**锚点（铰链窝）。
+    pub anchor_b: Vec3,
+    /// 锚点距离 rest（米）：销轴铰链取 `0`，偏心铰链取销心距。
+    pub rest_length: f32,
+    /// a 的**本地**铰链轴：被第②段对齐到 b 的铰链轴（摆动全闭合）。
+    pub axis_a: Vec3,
+    /// b 的**本地**铰链轴（随父端旋转，与 [`SwingJoint`] 锥轴同口径）。
+    pub axis_b: Vec3,
+    /// a 的**本地**参考向（扭转零位标记）。
+    pub ref_a: Vec3,
+    /// b 的**本地**参考向（扭转零位标记）。
+    pub ref_b: Vec3,
+    /// 扭转角下限（弧度，相对零位；与上限自动排序）。
+    pub twist_min_radians: f32,
+    /// 扭转角上限（弧度）。
+    pub twist_max_radians: f32,
+    /// 马达目标角（弧度）；仅 `motor_max_rate_radians_per_sec > 0` 时生效。
+    pub motor_target_radians: f32,
+    /// 马达速率上限（弧度/秒）；`0` / 负 / 非有限 = 被动铰链（无马达）。
+    pub motor_max_rate_radians_per_sec: f32,
+    /// 松弛强度 `(0, 1]`：1 = 每轮全额投影（硬约束）；越界钳制（同
+    /// [`SwingJoint::stiffness`]）。
+    pub stiffness: f32,
+    /// 锚点连线**轴向**相对速度每帧衰减 `[0, 1)`（首轮施加，同
+    /// [`SwingJoint::damping`]；断开能量泵通路的理由全同）。
+    pub damping: f32,
+}
+
+/// 可断关节标记（C3 关节 / 约束 v2）：挂在**关节挂载体**（a 端实体，
+/// 与任一关节组件同挂）上 ⇒ 当帧该实体全部关节的位置修正累计超过
+/// `max_correction_per_frame` 即**断裂**：关节组件被移除（四种关节
+/// 一律清除）、产出 [`JointBroken`] 事件。组件缺席 = 关节永不 break
+/// （v1 语义逐位不变；应力的采集与累加不改写任何求解结果）。
+///
+/// # 工作机制（两系统接力）
+///
+/// [`step_physics`]（`&World`，无法移除组件）把「超阈实体」记入
+/// [`BrokenJoints`] 队列；**同阶段稍后**的 [`prune_broken_joints`]
+/// （`&mut World`，`PhysicsPlugin` 自动注册）消费队列：移除关节 +
+/// 发事件。二者缺一则断裂不落地——自建 App 只跑 `step_physics` 时
+/// 超阈信息停留在队列里（下一次 prune 时兑现，语义不变只延迟）。
+///
+/// # 诚实限制
+///
+/// - **判据 = 位置修正量**（米/帧，四种关节全部计入、跨松弛轮累加）
+///   而非力 / 冲量——v1 求解是位置投影制，没有真实的关节力可读
+///   （“多大牛顿会断”表达不了，“被约束硬拉回多少米算勉强”表达得了）；
+///   旋转修正**不**计入（铰链 / 摆动的姿态覆盖不带米量纲应力）；
+/// - 阈值 `≤ 0`（负值钳为 0）= 求解出任意非零位置修正即断（完全被动
+///   对齐的关节应力恒 0 不断）；非有限阈值按「永不断裂」处理；
+/// - 断裂作用于**实体**而非单条关节：同实体多关节（如链上双约束）
+///   一起清除——v1 无「按关节记账」的应力归属。
+#[derive(Clone, Copy, Debug, PartialEq, Component)]
+pub struct JointBreak {
+    /// 每帧位置修正累计上限（米）：超过即断裂。
+    pub max_correction_per_frame: f32,
+}
+
+/// 关节断裂事件（C3）：[`prune_broken_joints`] 移除关节组件时产出
+/// （一实体一条；携带挂载体 id——断裂当帧实体仍存活，组件已除）。
+/// 由 `Events<JointBroken>` 承接（`PhysicsPlugin` 注册；缺席 =
+/// `try_send_event` 静默跳过，与接触事件同款资源缺席语义）。
+#[derive(Clone, Copy, Debug, PartialEq, Event)]
+pub struct JointBroken {
+    /// 关节挂载体（a 端；其上的关节组件已被移除）。
+    pub entity: Entity,
+}
+
+/// 断裂队列资源（C3）：[`step_physics`] 写入（尝试型锁下经内部可变性
+/// 推进，同 [`ContactTracker`] 口径）、[`prune_broken_joints`] 消费。
+/// 集合 [`std::collections::BTreeSet`]（迭代序 = 实体位序字典序 =
+/// 事件产出顺序跨平台确定）。资源缺席 = 断裂处理整体关闭（step 侧
+/// 无处记账即不判定，逐位不变）。
+#[derive(Default, Resource)]
+pub struct BrokenJoints {
+    /// 待处理断裂的挂载体位（`Entity::to_bits`）。
+    pub pending: std::collections::BTreeSet<u64>,
+}
+
+/// 连续碰撞检测（CCD，C3 闭合轮）：挂在**动体**（[`Collider`] +
+/// [`RigidBody`]）上 ⇒ 本帧积分位移不再一步应用——按段长拆成等分
+/// 子步，逐步子步终点与静态 / 运动学障碍做重叠检出，**在首个嵌入
+/// 子步停住**（终点留在障碍内，本帧接触管线照常推离 / 反弹 / 产出
+/// [`CollisionStarted`]——弹丸「撞到墙」而非穿墙）。组件缺席 = v1
+/// 单步跳，逐位不变。
+///
+/// # 捕获保证（为什么段长取最小宽度）
+///
+/// 与障碍的「中心重叠窗口」沿运动方向的宽度 = `障碍厚度 + 本体投影
+/// 宽度` ≥ 本体最小宽度 [`ColliderShape::min_width()`]；相邻子步终点
+/// 间距 ≤ 该宽度时，**必有一个终点落入窗口**（区间论证：两点间距 s
+/// ≤ 窗口宽 W 时不可能同时落在窗口两侧之外）⇒ 任意厚度的静态障碍
+/// 都被捕获。显式 `max_step` 大于本体宽度时该保证消失（调用方自担，
+/// 见诚实边界②）。
+///
+/// # 诚实限制
+///
+/// - ① 只对照**静态 / 运动学**障碍（动-动高速贯穿 v1 不检出）；
+/// - ② 子步数封顶 [`MAX_CCD_SEGMENTS`] ⇒ 保护距离有上界
+///   （`段长 × 上限`，超出即单步跳完剩余位移，可能贯穿）；
+/// - ③ 起点已嵌入时首子步终点即判重叠 ⇒ 每帧至多走一段
+///   （与角色扫掠「起点嵌入不去穿」同源；常态下本帧接触推离已解除）；
+/// - ④ sensor 不阻挡、不为它停步（穿过触发区不减速）；
+/// - ⑤ 碰撞过滤位组（`groups` / `mask`）对 CCD 检查同样适用；
+/// - ⑥ 位置停步而**速度不清零**——反弹 / 摩擦由本帧接触求解接管
+///   （CCD 本身不改任何速度语义）；
+/// - ⑦ 亚阈值速度（`|v×dt| ≤ 段长`）**单步跳、与未挂 Ccd 逐位一致**
+///   ——低速弹道 / 常规落体不因此轮改变任何既有场景。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Component)]
+pub struct Ccd {
+    /// 子步段长上限（米）。`0` / 负 / 非有限 = 自动取碰撞体
+    /// [`ColliderShape::min_width()`]（捕获保证见类型文档）；
+    /// 正值 = 显式段长（更小 ⇒ 更保守更贵，大于本体宽度 ⇒ 保证消失）。
+    pub max_step: f32,
+}
+
+/// CCD 子步数上限：单帧至多推进 `段长 × 该值`（诚实限制②的保护
+/// 距离上界）；默认段长（米级弹体 ~0.2–1 m）下覆盖 60 Hz 任何现实
+/// 弹速，纯防御性封顶（确定性：与速度大小无关的常数迭代界）。
+pub const MAX_CCD_SEGMENTS: usize = 64;
+
+/// CCD 静态障碍快照条目：位置 + 旋转 + 形状 + 位组 + 掩码
+/// （[`ccd_substepped_displacement`] 消费；掩码按主检测同款对称口径
+/// `(ccd.groups & s.mask) != 0 && (s.groups & ccd.mask) != 0` 应用）。
+pub type CcdStatic = (StaticObstacle, u32, u32);
+
+/// CCD 分段积分（纯函数，脱离 World 单测）：把 `displacement` 拆成
+/// `ceil(|d| / 段长)`（封顶 [`MAX_CCD_SEGMENTS`]）个等分子步，逐步
+/// 累加并在**首个与障碍重叠的终点**停住；全程无重叠则走完（返回
+/// 完整拆分段之和）。返回本帧位置增量（调用方 `pos += 增量`）。
+///
+/// - 段长：`max_step > 0` 且有限取显式值，否则取 `shape.min_width()`
+///   （自动口径为 0 的退化形状 ⇒ 关闭，原样返回）；
+/// - `|displacement| ≤ 段长`（含 `steps == 1` 的一切情形）⇒ **原样
+///   返回输入位移**——与 v1 单步跳逐位一致（诚实限制⑦的兼容锚，
+///   单测 `to_bits` 锁定）；
+/// - 重叠判据与扫掠同款：`detect_pair_rotated` 穿透 > [`SWEEP_CONTACT_EPSILON`]
+///   （切向噪声不算嵌入）；子步长 `|d|/steps` 的浮点除法同样确定。
+#[allow(clippy::too_many_arguments)] // 纯函数入参即算法签名（同 solve_hinge_joint 口径）
+pub fn ccd_substepped_displacement(
+    start: Vec3,
+    displacement: Vec3,
+    rotation: Quat,
+    shape: &ColliderShape,
+    groups: u32,
+    mask: u32,
+    max_step: f32,
+    statics: &[CcdStatic],
+) -> Vec3 {
+    let step_limit = if max_step.is_finite() && max_step > 0.0 {
+        max_step
+    } else {
+        shape.min_width()
+    };
+    let length = displacement.length();
+    if step_limit <= 0.0 || length <= step_limit {
+        return displacement; // v1 逐位一致路径（含退化形状关闭）
+    }
+    let steps = (length / step_limit).ceil() as usize;
+    let steps = steps.min(MAX_CCD_SEGMENTS);
+    let segment = displacement / steps as f32;
+    let mut pos = start;
+    let mut advanced = Vec3::ZERO;
+    for _ in 0..steps {
+        pos += segment;
+        advanced += segment;
+        if ccd_static_overlap(pos, rotation, shape, groups, mask, statics) {
+            break; // 停在首个嵌入终点：本帧接触管线接管
+        }
+    }
+    advanced
+}
+
+/// 子步终点重叠检查：该位置上与任一（过滤位组通过的）静态障碍有
+/// 真实重叠（穿透 > [`SWEEP_CONTACT_EPSILON`]）。迭代序 = 快照收集
+/// 序（确定性），只消费存在性。
+fn ccd_static_overlap(
+    pos: Vec3,
+    rotation: Quat,
+    shape: &ColliderShape,
+    groups: u32,
+    mask: u32,
+    statics: &[CcdStatic],
+) -> bool {
+    statics.iter().any(
+        |&((static_pos, static_rotation, static_shape), static_groups, static_mask)| {
+            (groups & static_mask) != 0
+                && (static_groups & mask) != 0
+                && detect_pair_rotated(
+                    pos,
+                    rotation,
+                    shape,
+                    static_pos,
+                    static_rotation,
+                    &static_shape,
+                )
+                .is_some_and(|contact| contact.penetration > SWEEP_CONTACT_EPSILON)
+        },
+    )
 }
 
 /// 一次接触（纯数据）：法线 + 穿透深度。由 [`detect_pair`] 产出。
@@ -1953,6 +2244,211 @@ pub fn solve_swing_joint(
     }
 }
 
+/// 铰链关节求解输出（纯数据，形态同 [`SwingResponse`]）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HingeResponse {
+    /// a（挂载体）的位置修正。
+    pub delta_pos_a: Vec3,
+    /// b（父端）的位置修正（层级投影恒零，见 [`solve_hinge_joint`]）。
+    pub delta_pos_b: Vec3,
+    /// a 的速度修正（首轮轴向阻尼，`Vec3::ZERO` = 未施加）。
+    pub delta_vel_a: Vec3,
+    /// b 的速度修正（层级投影恒零）。
+    pub delta_vel_b: Vec3,
+    /// a 的旋转（**绝对覆盖**；`None` = 本段无修正，见
+    /// [`solve_hinge_joint`] 第②③段）。
+    pub rotation_a: Option<Quat>,
+}
+
+/// 绕世界直线的刚体旋转（纯函数辅助，[`solve_hinge_joint`] 第③段）：
+/// 把点 `point` 绕「过 `pivot`、单位方向 `axis`」的直线转 `angle`
+/// 弧度（右手系）。分解为「沿轴分量（不动）+ 垂直分量（四元数旋转）」
+/// ——无需构造 Mat4，`axis` 单位向量前提下是精确旋转。
+fn rotate_about_axis_line(point: Vec3, pivot: Vec3, axis: Vec3, angle: f32) -> Vec3 {
+    let rel = point - pivot;
+    let along = axis * rel.dot(axis);
+    let perp = rel - along;
+    pivot + along + Quat::from_axis_angle(axis, angle) * perp
+}
+
+/// 铰链关节求解（C3 纯函数）：锚点距离投影 + 铰链轴对齐 + 扭转角
+/// 限位 / 马达三段，修正归属为**层级投影**（全给 a，理由与
+/// [`solve_swing_joint`] 相同——根先叶后链上每轮末尾精确满足）。
+///
+/// # 三段算式
+///
+/// 1. **锚点距离**：`pa = pos_a + rot_a·anchor_a`、`pb = pos_b +
+///    rot_b·anchor_b`，`err = |pb − pa| − rest_length` 沿连线按
+///    `stiffness` 投影到 a（与 [`solve_distance_joint`] 同式的单层版）；
+/// 2. **铰链轴对齐**：`û_a = normalize(rot_a·axis_a)`、`û_b =
+///    normalize(rot_b·axis_b)`（轴随父端旋转，解剖学口径同 SwingJoint
+///    锥轴），最小弧 `Quat::from_rotation_arc(û_a, û_b)` 左乘 `rot_a`
+///    （`stiffness < 1` 走 [`nlerp`]）——摆动两自由度全闭合；
+/// 3. **扭转限位 / 马达**：两参考向对 `û_b` 做 Gram-Schmidt 正交化
+///    （`ref_a` 用第②段后的旋转），测**带符号扭转角** `θ =
+///    atan2((r_b × r_a)·û_b, r_b·r_a)`（零位 = 两参考向重合）；
+///    目标角 `θ* = clamp(θ + clamp(motor_target − θ, ±rate×dt), lo,
+///    hi)`（马达未激活时 `rate = 0`，退化为纯限位钳制），修正
+///    `Δ = θ* − θ` 以**绕铰链线（过 pb、方向 û_b）的刚体旋转**落实：
+///    `rotation_a ← from_axis_angle(û_b, Δ)·rot_a`（按 stiffness
+///    nlerp）、`pa ← rotate_about_axis_line(pa, pb, û_b, Δ_eff)`
+///    （位置修正 = `pa' − pa` 全记 a；绕过 pb 的轴旋转保 `|pb − pa|`
+///    不变 ⇒ 与第①段正交，同 SwingJoint「只改方向不改距离」口径）。
+///
+/// # 退化与钳制（确定性优先）
+///
+/// - `axis_a` / `axis_b` 零长或非有限 ⇒ **整关节跳过**（全零响应、
+///   `rotation_a: None`——不凭空选轴）；
+/// - 参考向零长 / 与轴平行（正交化残差 `≤ SEGMENT_EPSILON_SQ`）⇒
+///   第③段跳过（限位与马达都不定），①②照跑；
+/// - 限位 `min > max` 自动排序；非有限限位按 `[-π, π]` 全开处理；
+///   `stiffness` 钳 `[0, 1]`、`damping` 钳 `[0, 1)`；马达速率非有限
+///   或 `≤ 0` = 被动；
+/// - 已满足（限位内且无马达 ⇒ `Δ = 0`；轴已对齐 ⇒ `arc == IDENTITY`）
+///   时**零修正、不写旋转**——幂等锚（限位内门不抖、`normalize` 末位
+///   不改写姿态，与 SwingJoint「限位内零修正」同款，单测逐位锁定）。
+#[allow(clippy::too_many_arguments)]
+pub fn solve_hinge_joint(
+    pos_a: Vec3,
+    rot_a: Quat,
+    vel_a: Option<Vec3>,
+    pos_b: Vec3,
+    rot_b: Quat,
+    vel_b: Option<Vec3>,
+    joint: HingeJoint,
+    dt: f32,
+    apply_velocity: bool,
+) -> HingeResponse {
+    let zero = HingeResponse {
+        delta_pos_a: Vec3::ZERO,
+        delta_pos_b: Vec3::ZERO,
+        delta_vel_a: Vec3::ZERO,
+        delta_vel_b: Vec3::ZERO,
+        rotation_a: None,
+    };
+    let axis_b = joint.axis_b.normalize_or_zero();
+    if axis_b == Vec3::ZERO {
+        return zero; // 父端轴退化：整关节跳过
+    }
+    let stiffness = joint.stiffness.clamp(0.0, 1.0);
+    // 层级投影：修正全给 a（a 必为动体——收集期已保证 vel_a 为 Some；
+    // 保留 share 口径与 swing 同款，防御直调路径传 None）
+    let share_a = if vel_a.is_some() { 1.0 } else { 0.0 };
+
+    // ---- ① 锚点距离投影 ----
+    let anchor_a = pos_a + rot_a * joint.anchor_a;
+    let anchor_b = pos_b + rot_b * joint.anchor_b;
+    let delta = anchor_b - anchor_a;
+    let mut delta_pos_a = Vec3::ZERO;
+    if delta.length_squared() > SEGMENT_EPSILON_SQ {
+        let dist = delta.length_squared().sqrt();
+        let err = dist - joint.rest_length;
+        delta_pos_a = (delta / dist) * (err * stiffness) * share_a;
+    }
+    let moved_a = anchor_a + delta_pos_a;
+
+    // ---- ② 铰链轴对齐（摆动全闭合）----
+    let axis_a = joint.axis_a.normalize_or_zero();
+    let mut rotation = rot_a;
+    if axis_a != Vec3::ZERO {
+        let current = (rotation * axis_a).normalize_or_zero();
+        let desired = (rot_b * axis_b).normalize_or_zero();
+        if current != Vec3::ZERO && desired != Vec3::ZERO {
+            let arc = Quat::from_rotation_arc(current, desired);
+            if arc != Quat::IDENTITY {
+                let aligned = arc * rotation;
+                rotation = if stiffness >= 1.0 {
+                    aligned
+                } else {
+                    nlerp(rotation, aligned, stiffness)
+                };
+            }
+        }
+    }
+    let mut rotated = rotation != rot_a;
+
+    // ---- ③ 扭转限位 / 马达（绕铰链线的刚体旋转）----
+    let world_axis = (rot_b * axis_b).normalize_or_zero();
+    let ref_b = orthogonal_against(rot_b * joint.ref_b, world_axis);
+    let ref_a = orthogonal_against(rotation * joint.ref_a, world_axis);
+    let mut delta_angle = 0.0f32;
+    if let (Some(rb), Some(ra)) = (ref_b, ref_a) {
+        let mut theta = rb.cross(ra).dot(world_axis).atan2(rb.dot(ra));
+        if !theta.is_finite() {
+            theta = 0.0; // atan2(0,0)：参考向共线退化，视作零位
+        }
+        // 限位（非有限 ⇒ [-π, π] 全开）
+        let lo = if joint.twist_min_radians.is_finite() {
+            joint.twist_min_radians
+        } else {
+            -std::f32::consts::PI
+        };
+        let hi = if joint.twist_max_radians.is_finite() {
+            joint.twist_max_radians
+        } else {
+            std::f32::consts::PI
+        };
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        // 马达：速率受限的伺服增量（无马达 ⇒ 增量为 0）
+        let rate = joint.motor_max_rate_radians_per_sec;
+        let mut target = theta;
+        if rate.is_finite() && rate > 0.0 && joint.motor_target_radians.is_finite() {
+            let max_step = rate * dt.max(0.0);
+            target += (joint.motor_target_radians - theta).clamp(-max_step, max_step);
+        }
+        delta_angle = target.clamp(lo, hi) - theta;
+    }
+    if delta_angle != 0.0 {
+        let applied = delta_angle * stiffness;
+        rotation = Quat::from_axis_angle(world_axis, applied) * rotation;
+        rotated = true;
+        let moved_a_new = rotate_about_axis_line(moved_a, anchor_b, world_axis, applied);
+        delta_pos_a += moved_a_new - moved_a;
+    }
+
+    // ---- 速度响应（仅首轮）：锚点连线轴向阻尼（同 swing 第①轴）----
+    let (delta_vel_a, delta_vel_b) = if apply_velocity {
+        let damp = (1.0 - joint.damping).clamp(0.0, 1.0);
+        let rel = vel_a.unwrap_or(Vec3::ZERO) - vel_b.unwrap_or(Vec3::ZERO);
+        let line = delta.normalize_or_zero();
+        if line == Vec3::ZERO {
+            (Vec3::ZERO, Vec3::ZERO)
+        } else {
+            let delta_rel = damp_along(rel, line, damp) - rel;
+            (delta_rel * share_a, Vec3::ZERO)
+        }
+    } else {
+        (Vec3::ZERO, Vec3::ZERO)
+    };
+
+    HingeResponse {
+        delta_pos_a,
+        delta_pos_b: Vec3::ZERO,
+        delta_vel_a,
+        delta_vel_b,
+        // 收敛判据：末位舍入不再改变姿态时**不写回**（马达到位后 Δ 停在
+        // f32 ulp 级残量，rotation 数值已不动——写出 None 让关节真正失活）
+        rotation_a: if rotated && rotation != rot_a {
+            Some(rotation)
+        } else {
+            None
+        },
+    }
+}
+
+/// 对单位向量 `axis` 做 Gram-Schmidt 正交化并归一：残差 `≤
+/// SEGMENT_EPSILON_SQ`（零长 / 与轴平行）返回 `None`（调用方按退化
+/// 跳过，不凭空选方向）。
+fn orthogonal_against(v: Vec3, axis: Vec3) -> Option<Vec3> {
+    let perp = v - axis * v.dot(axis);
+    let sq = perp.length_squared();
+    if sq > SEGMENT_EPSILON_SQ {
+        Some(perp / sq.sqrt())
+    } else {
+        None
+    }
+}
+
 /// **静态障碍快照**（R50）：位置 + 旋转 + 形状。旋转感知查询
 /// （[`resolve_static_push_rotated`] / [`shape_sweep_rotated`] /
 /// [`crate::character::move_and_slide_statics_rotated`]）的入参元素——
@@ -2319,13 +2815,26 @@ pub fn step_physics(world: &World) {
     let mut collected: Vec<(Entity, Collider, Option<RigidBody>)> = Vec::new();
     let mut positions: Vec<Vec3> = Vec::new();
     let mut rotations: Vec<Quat> = Vec::new();
-    world.query::<(Entity, &Transform, &Collider, Option<&RigidBody>)>(
-        |(entity, transform, collider, rigid)| {
-            collected.push((entity, *collider, rigid.copied()));
-            positions.push(transform.position);
-            rotations.push(transform.rotation);
-        },
-    );
+    // CCD 标记快照（C3）：与 positions 平行；缺席 = None = v1 单步跳。
+    let mut ccds: Vec<Option<Ccd>> = Vec::new();
+    world.query::<(
+        Entity,
+        &Transform,
+        &Collider,
+        Option<&RigidBody>,
+        Option<&Ccd>,
+    )>(|(entity, transform, collider, rigid, ccd)| {
+        collected.push((entity, *collider, rigid.copied()));
+        positions.push(transform.position);
+        rotations.push(transform.rotation);
+        // sensor 动体不启用 CCD（诚实限制④的动体侧：触发区穿过去的
+        // 语义本就不该被停步）
+        ccds.push(if collider.is_sensor {
+            None
+        } else {
+            ccd.copied()
+        });
+    });
     let n = collected.len();
 
     // 仅受力积分体：只有 RigidBody（无 Collider）的实体——不参与碰撞，
@@ -2426,6 +2935,41 @@ pub fn step_physics(world: &World) {
         }
     });
 
+    // 铰链关节（C3 关节 / 约束 v2）：挂载体 / 目标端 / 无效跳过规则与
+    // 摆动关节逐条相同；求解序排在摆动之后、目标点之前（结构完整性组，
+    // 收集序 = 组件存储序 = 求解序，确定性）。
+    let mut hinge_joints: Vec<(usize, HingeJoint, JointEnd)> = Vec::new();
+    world.query::<(Entity, &HingeJoint)>(|(entity, joint)| {
+        let Some(&owner) = body_index.get(&entity.to_bits()) else {
+            return; // 挂载体不是碰撞体：跳过（同距离 / 摆动关节）
+        };
+        if is_static[owner] {
+            return;
+        }
+        let end = match body_index.get(&joint.target.to_bits()) {
+            Some(&index) => JointEnd::Body(index),
+            None => match world.get::<Transform>(joint.target) {
+                Some(transform) => JointEnd::Anchor(transform.position, transform.rotation),
+                None => return,
+            },
+        };
+        hinge_joints.push((owner, *joint, end));
+    });
+
+    // 可断关节标记（C3）：实体位 → 阈值（BTreeMap 字典序 = 判定与入队
+    // 顺序确定）。应力采集仅在「有标记且 BrokenJoints 资源在场」时开启
+    // ——两者任一缺席 = 不采集不判定，v1 路径逐位不变。
+    let mut breakables: std::collections::BTreeMap<u64, f32> = std::collections::BTreeMap::new();
+    world.query::<(Entity, &JointBreak)>(|(entity, joint_break)| {
+        breakables.insert(entity.to_bits(), joint_break.max_correction_per_frame);
+    });
+    let break_enabled = !breakables.is_empty() && world.try_resource::<BrokenJoints>().is_some();
+    let mut stress: Vec<f32> = if break_enabled {
+        vec![0.0; n]
+    } else {
+        Vec::new()
+    };
+
     // 本帧接触对（首求解轮采样，差分产出事件用）：位序归一化对 →
     // (归一化方向法线, 穿透)。BTreeMap 字典序 = 事件产出顺序确定。
     let mut current_contacts: std::collections::BTreeMap<(u64, u64), (Vec3, f32)> =
@@ -2441,6 +2985,27 @@ pub fn step_physics(world: &World) {
         .iter()
         .map(|(_, _, rigid)| rigid.map(|b| b.angular_velocity).unwrap_or(Vec3::ZERO))
         .collect();
+    // CCD 静态障碍快照（C3）：仅当帧内有挂 Ccd 的动体才构建（无则
+    // 零成本，v1 路径逐位不变）。口径 = effective_static（is_static ∥
+    // 运动学；is_static 向量已含「无 RigidBody 缺席静态」），排除
+    // sensor（诚实限制④）；快照取帧初位置 / 旋转——静态与运动学体
+    // 本步内不被物理挪动（运动学位移归游戏，帧初即定），与主检测
+    // 消费同一份快照，一致。
+    let any_ccd = (0..n).any(|i| !is_static[i] && !is_kinematic[i] && ccds[i].is_some());
+    let ccd_statics: Vec<CcdStatic> = if any_ccd {
+        (0..n)
+            .filter(|&i| (is_static[i] || is_kinematic[i]) && !collected[i].1.is_sensor)
+            .map(|i| {
+                (
+                    (positions[i], rotations[i], collected[i].1.shape),
+                    collected[i].1.groups,
+                    collected[i].1.mask,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     for index in 0..n {
         if is_static[index] || is_kinematic[index] {
             continue;
@@ -2449,7 +3014,26 @@ pub fn step_physics(world: &World) {
         let mut velocity = rigid.velocity;
         velocity += PHYSICS_GRAVITY * rigid.gravity_scale * dt;
         velocity *= (-rigid.linear_damping * dt).exp();
-        positions[index] += velocity * dt;
+        let displacement = velocity * dt;
+        let start = positions[index];
+        positions[index] += match ccds[index] {
+            // 挂 Ccd 的动体：分段推进（亚阈值位移原样返回 = v1 逐位，
+            // 见 Ccd 诚实限制⑦）
+            Some(ccd) => {
+                let collider = collected[index].1;
+                ccd_substepped_displacement(
+                    start,
+                    displacement,
+                    rotations[index],
+                    &collider.shape,
+                    collider.groups,
+                    collider.mask,
+                    ccd.max_step,
+                    &ccd_statics,
+                )
+            }
+            None => displacement,
+        };
         velocities[index] = Some(velocity);
         // 角积分（R50）：与线性积分**不耦合**（位置积分不含 ω 项——既有
         // free_fall 等测试零改动守护）。零角速度整段跳过：既有场景的
@@ -2831,6 +3415,9 @@ pub fn step_physics(world: &World) {
             if let JointEnd::Body(index) = end {
                 positions[index] += response.delta_pos_b;
             }
+            if break_enabled {
+                stress[owner] += response.delta_pos_a.length() + response.delta_pos_b.length();
+            }
             if iteration == 0 {
                 // 速度写回；params 快照无需同步——其速度只在首轮的接触
                 // 速度响应中被消费，且接触先于约束轮
@@ -2873,6 +3460,46 @@ pub fn step_physics(world: &World) {
             if let Some(rotation) = response.rotation_a {
                 rotations[owner] = rotation;
             }
+            if break_enabled {
+                stress[owner] += response.delta_pos_a.length() + response.delta_pos_b.length();
+            }
+            if iteration == 0 {
+                if let Some(v) = velocities[owner].as_mut() {
+                    *v += response.delta_vel_a;
+                }
+                if let JointEnd::Body(index) = end {
+                    if let Some(v) = velocities[index].as_mut() {
+                        *v += response.delta_vel_b;
+                    }
+                }
+            }
+        }
+        // 铰链关节（C3）：三段求解见 [`solve_hinge_joint`]；位置修正
+        // 与旋转都只作用于 a（层级投影，父端 share 恒零）；速度响应
+        // （锚线轴向阻尼）与其余关节同轮同理由（仅首轮）。
+        for &(owner, joint, end) in &hinge_joints {
+            let (pos_b, rot_b, vel_b) = match end {
+                JointEnd::Body(index) => (positions[index], rotations[index], velocities[index]),
+                JointEnd::Anchor(pos, rot) => (pos, rot, None),
+            };
+            let response = solve_hinge_joint(
+                positions[owner],
+                rotations[owner],
+                velocities[owner],
+                pos_b,
+                rot_b,
+                vel_b,
+                joint,
+                dt,
+                iteration == 0,
+            );
+            positions[owner] += response.delta_pos_a;
+            if let Some(rotation) = response.rotation_a {
+                rotations[owner] = rotation;
+            }
+            if break_enabled {
+                stress[owner] += response.delta_pos_a.length();
+            }
             if iteration == 0 {
                 if let Some(v) = velocities[owner].as_mut() {
                     *v += response.delta_vel_a;
@@ -2888,9 +3515,34 @@ pub fn step_physics(world: &World) {
             let response =
                 solve_target_joint(positions[owner], velocities[owner], joint, iteration == 0);
             positions[owner] += response.delta_pos_a;
+            if break_enabled {
+                stress[owner] += response.delta_pos_a.length();
+            }
             if iteration == 0 {
                 if let Some(v) = velocities[owner].as_mut() {
                     *v += response.delta_vel_a;
+                }
+            }
+        }
+    }
+
+    // 断裂判定（C3）：超阈实体只入队记账（&World 无法改组件表，移除
+    // 与事件由 prune_broken_joints 兑现）。判据 = 严格大于（应力恰等
+    // 阈值不算断）；阈值负值钳 0、非有限永不断裂（消毒，见 JointBreak
+    // 文档）。迭代序 = BTreeMap 字典序 ⇒ 入队顺序确定。
+    if break_enabled {
+        if let Some(mut broken) = world.try_resource_mut::<BrokenJoints>() {
+            for (bits, threshold) in &breakables {
+                let Some(&index) = body_index.get(bits) else {
+                    continue; // 挂载体不是碰撞体（其关节未被求解过）
+                };
+                let limit = if threshold.is_finite() {
+                    threshold.max(0.0)
+                } else {
+                    f32::INFINITY
+                };
+                if stress[index] > limit {
+                    broken.pending.insert(*bits);
                 }
             }
         }
@@ -2992,6 +3644,36 @@ fn emit_contact_events(
     }
     for event in ended {
         world.try_send_event(event);
+    }
+}
+
+/// 断裂兑现系统（C3，`&mut World` 常规系统，`PhysicsPlugin` 在
+/// [`step_physics`] 之后注册）：消费 [`BrokenJoints`] 队列——移除超阈
+/// 实体上的**全部**关节组件（[`DistanceJoint`] / [`SwingJoint`] /
+/// [`TargetJoint`] / [`HingeJoint`]），有实际移除才产出 [`JointBroken`]
+/// 事件（队列中已被 despawn 的实体静默出队，事件不产出）。
+///
+/// 资源缺席 = 整体 no-op（与接触事件同款「不注册即关」口径）；消费序
+/// = 位序字典序（`BTreeSet`），同输入两次运行的事件序列逐项一致。
+pub fn prune_broken_joints(world: &mut World) {
+    let Some(mut queue) = world.try_resource_mut::<BrokenJoints>() else {
+        return;
+    };
+    if queue.pending.is_empty() {
+        return;
+    }
+    let broken: Vec<u64> = std::mem::take(&mut queue.pending).into_iter().collect();
+    drop(queue);
+    for bits in broken {
+        let entity = Entity::from_bits(bits);
+        let mut removed = false;
+        removed |= world.remove_component::<DistanceJoint>(entity).is_some();
+        removed |= world.remove_component::<SwingJoint>(entity).is_some();
+        removed |= world.remove_component::<TargetJoint>(entity).is_some();
+        removed |= world.remove_component::<HingeJoint>(entity).is_some();
+        if removed {
+            world.try_send_event(JointBroken { entity });
+        }
     }
 }
 
@@ -8425,6 +9107,624 @@ mod solver_v2_tests {
             "e=0 球应静止贴地（v1 行为不变），实际 y={} v={:?}",
             p.y,
             v
+        );
+    }
+
+    // ---- C3 CCD：纯函数 / 集成（子步捕获 + 兼容锚） ----
+
+    /// 逐位指纹（CCD 兼容锚用）：分量 `to_bits` 数组。
+    fn bits3(v: Vec3) -> [u32; 3] {
+        [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]
+    }
+
+    /// 薄墙静态盒：中心 `(5,0,0)`、x 半厚 0.1（y/z 取大尺寸排除侧滑）。
+    fn ccd_wall_at_x5() -> CcdStatic {
+        (
+            (
+                Vec3::new(5.0, 0.0, 0.0),
+                Quat::IDENTITY,
+                ColliderShape::Box {
+                    half_extents: Vec3::new(0.1, 5.0, 5.0),
+                },
+            ),
+            1,
+            1,
+        )
+    }
+
+    /// `min_width`：球 2r、胶囊 2r（垂直轴向最小）、盒 2×最小半边长；
+    /// 退化 / 非有限尺寸返回 0（CCD 关闭口径）。
+    #[test]
+    fn min_width_is_twice_smallest_extent() {
+        assert_eq!(
+            ColliderShape::Sphere { radius: 0.5 }.min_width(),
+            1.0,
+            "球最小宽度 = 直径"
+        );
+        assert_eq!(
+            ColliderShape::capsule(0.3, 0.9).min_width(),
+            0.6,
+            "胶囊最小宽度 = 端帽直径（垂直轴向）"
+        );
+        assert_eq!(
+            ColliderShape::Box {
+                half_extents: Vec3::new(2.0, 3.0, 1.0)
+            }
+            .min_width(),
+            2.0,
+            "盒最小宽度 = 2×最小半边长（z=1 → 2）"
+        );
+        assert_eq!(
+            ColliderShape::Sphere { radius: 0.0 }.min_width(),
+            0.0,
+            "退化半径 0 ⇒ 0"
+        );
+        assert_eq!(
+            ColliderShape::Sphere { radius: f32::NAN }.min_width(),
+            0.0,
+            "非有限 ⇒ 0"
+        );
+    }
+
+    /// 亚阈值兼容锚：`|位移| ≤ 段长` ⇒ 原样返回输入位移（逐位 = v1
+    /// 单步跳；恰在边界 `length == step` 同样归亚阈值侧）。
+    #[test]
+    fn ccd_below_threshold_returns_displacement_bitwise() {
+        let shape = ColliderShape::Sphere { radius: 0.5 }; // 自动段长 = 1.0
+        let statics = [ccd_wall_at_x5()];
+        for d in [Vec3::new(0.9, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)] {
+            let out = ccd_substepped_displacement(
+                Vec3::ZERO,
+                d,
+                Quat::IDENTITY,
+                &shape,
+                1,
+                1,
+                0.0,
+                &statics,
+            );
+            assert_eq!(
+                bits3(out),
+                bits3(d),
+                "位移 {d} ≤ 段长 1.0 ⇒ 原样返回（v1 逐位）"
+            );
+        }
+    }
+
+    /// 薄墙捕获（解析精确值）：v1 单步跳终点 (10,0,0) 不重叠 ⇒ 穿墙；
+    /// 自动段长 1.0（球 r=0.5）拆 10 子步，落点序列 1..10 中 x=5.0
+    /// 落入重叠窗口 `[4.4, 5.6]` ⇒ 停在首个嵌入终点。
+    #[test]
+    fn ccd_catches_thin_wall_that_single_jump_tunnels() {
+        let shape = ColliderShape::Sphere { radius: 0.5 };
+        let statics = [ccd_wall_at_x5()];
+        // v1 口径的「穿墙存在性」：终点位置与墙无重叠（这就是被闭合的 bug）
+        assert!(
+            !ccd_static_overlap(
+                Vec3::new(10.0, 0.0, 0.0),
+                Quat::IDENTITY,
+                &shape,
+                1,
+                1,
+                &statics
+            ),
+            "对照组：终点 (10,0,0) 应在墙外（单步跳穿过的机制本身）"
+        );
+        let out = ccd_substepped_displacement(
+            Vec3::ZERO,
+            Vec3::new(10.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            &shape,
+            1,
+            1,
+            0.0,
+            &statics,
+        );
+        // 段长 10/10 = 1.0 的浮点整值 ⇒ 累加精确
+        assert_eq!(out, Vec3::new(5.0, 0.0, 0.0), "应停在首个嵌入落点 x=5.0");
+    }
+
+    /// 过滤位组：被 `(groups & mask)` 对称掩码排除的墙不为 CCD 停步
+    /// （全程走完 10.0）。
+    #[test]
+    fn ccd_respects_collision_masks() {
+        let shape = ColliderShape::Sphere { radius: 0.5 };
+        let wall_isolated = (
+            ccd_wall_at_x5().0,
+            2u32, // groups
+            2u32, // mask
+        );
+        let out = ccd_substepped_displacement(
+            Vec3::ZERO,
+            Vec3::new(10.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            &shape,
+            1, // bullet groups
+            1, // bullet mask
+            0.0,
+            &[wall_isolated],
+        );
+        assert_eq!(out, Vec3::new(10.0, 0.0, 0.0), "过滤掉的墙不阻挡 CCD");
+    }
+
+    /// 退化形状关闭：半径 0 的球自动段长 0 ⇒ 原样返回（逐位 v1，
+    /// 不凭空选轴、不除零）。
+    #[test]
+    fn ccd_degenerate_shape_disables_bitwise() {
+        let shape = ColliderShape::Sphere { radius: 0.0 };
+        let d = Vec3::new(10.0, 0.0, 0.0);
+        let out = ccd_substepped_displacement(
+            Vec3::ZERO,
+            d,
+            Quat::IDENTITY,
+            &shape,
+            1,
+            1,
+            0.0,
+            &[ccd_wall_at_x5()],
+        );
+        assert_eq!(bits3(out), bits3(d), "自动段长 0 ⇒ CCD 关闭");
+    }
+
+    /// 高速弹丸集成：v1 对照穿过 0.2 m 薄墙零事件；挂 `Ccd` 后同场景
+    /// 停步于墙前、本帧照常产出 `CollisionStarted`；再验逐位确定性。
+    #[test]
+    fn ccd_component_stops_bullet_and_fires_contact_event() {
+        fn build(with_ccd: bool) -> (World, Entity) {
+            let mut world = World::new();
+            world.insert_resource(Time::default());
+            world.register_event::<CollisionStarted>();
+            world.insert_resource(ContactTracker::default());
+            // 薄墙：x 半厚 0.1、中心 (1.5, 1, 0)（球弹道高度）
+            world.spawn((
+                Transform::from_xyz(1.5, 1.0, 0.0),
+                Collider::static_box(Vec3::new(0.1, 1.0, 0.2)),
+            ));
+            let bullet = world.spawn((
+                Transform::from_xyz(0.0, 1.0, 0.0),
+                Collider::dynamic_sphere(0.25, 0.0),
+                RigidBody {
+                    // 122 而非 120：120×(1/60) 在 f32 恰等于 2.0 ⇒ 4 子步
+                    // 落点正逢墙中心（推离法线并列的退化对照），122 使
+                    // 首个嵌入落点稳落在近面一侧
+                    velocity: Vec3::new(122.0, 0.0, 0.0),
+                    gravity_scale: 0.0, // 隔离水平贯穿（只验 CCD 本体）
+                    ..RigidBody::default()
+                },
+            ));
+            if with_ccd {
+                world.insert(bullet, Ccd { max_step: 0.0 });
+            }
+            (world, bullet)
+        }
+        // v1 对照：单帧位移 ≈ 2.033 m，终点落在重叠窗口 [1.15, 1.85] 之外 ⇒
+        // 穿墙且零接触事件（被闭合的 bug 在场证明）
+        let (control, bullet_control) = build(false);
+        step(&control, 1.0 / 60.0);
+        let pass_x = control.get::<Transform>(bullet_control).unwrap().position.x;
+        assert!(pass_x > 2.0, "v1 对照应穿墙而过（x={pass_x}）");
+        assert_eq!(
+            control.try_events::<CollisionStarted>().map(|e| e.len()),
+            Some(0),
+            "v1 对照穿墙不产出任何接触事件"
+        );
+        // CCD：自动段长 2r = 0.5 ⇒ ceil(2.033/0.5) = 5 子步，首个嵌入
+        // 落点 x≈1.22（重叠窗口 [1.15, 1.85]、近面一侧）⇒ 本帧接触管线
+        // 推离回恰好相切（x≈1.15）并产出 started
+        let (guarded, bullet) = build(true);
+        step(&guarded, 1.0 / 60.0);
+        let stopped = guarded.get::<Transform>(bullet).unwrap().position;
+        assert!(
+            stopped.x < 1.4,
+            "CCD 弹体不应越过墙近面 x=1.4（实际 {stopped}）"
+        );
+        assert_eq!(
+            guarded.try_events::<CollisionStarted>().map(|e| e.len()),
+            Some(1),
+            "停步嵌入 ⇒ 本帧恰一条 started 事件"
+        );
+        // 确定性：同构建两跑 8 步，位置 to_bits 逐位一致
+        let trace = |with_ccd: bool| {
+            let (world, entity) = build(with_ccd);
+            let mut bits = Vec::new();
+            for _ in 0..8 {
+                step(&world, 1.0 / 60.0);
+                bits.push(bits3(world.get::<Transform>(entity).unwrap().position));
+            }
+            bits
+        };
+        assert_eq!(trace(true), trace(true), "CCD 同输入两跑逐位一致");
+    }
+
+    // ---- C3 关节 / 约束 v2：铰链（限位 / 马达）与可断关节 ----
+
+    /// 标准门板铰链：b 在原点、轴 +Y、参考向 +X、限位 [−limit, limit]、
+    /// 零位对齐（yaw 绕 Y 即扭转角，右手系与求解同向）。
+    fn door_hinge(limit: f32, motor: [f32; 2]) -> HingeJoint {
+        HingeJoint {
+            target: Entity::from_bits(0), // 调用方覆写为真实 b
+            anchor_a: Vec3::ZERO,
+            anchor_b: Vec3::ZERO,
+            rest_length: 0.0,
+            axis_a: Vec3::Y,
+            axis_b: Vec3::Y,
+            ref_a: Vec3::X,
+            ref_b: Vec3::X,
+            twist_min_radians: -limit,
+            twist_max_radians: limit,
+            motor_target_radians: motor[0],
+            motor_max_rate_radians_per_sec: motor[1],
+            stiffness: 1.0,
+            damping: 0.0,
+        }
+    }
+
+    /// 绕 +Y 的 yaw 四元数（与求解的扭转角同向，构造即已知 θ）。
+    fn yaw(y: f32) -> Quat {
+        Quat::from_rotation_y(y)
+    }
+
+    /// 求解输出里 a 的实际扭转角（绝对姿态；无修正时回退输入旋转）。
+    fn twist_of(response: &HingeResponse, fallback: Quat) -> f32 {
+        let rot = response.rotation_a.unwrap_or(fallback);
+        let ra = rot * Vec3::X;
+        Vec3::X.cross(ra).dot(Vec3::Y).atan2(Vec3::X.dot(ra))
+    }
+
+    /// 限位内零修正（幂等锚）：θ = 0.2 ∈ [−π/4, π/4] ⇒ 全零响应、
+    /// 不写旋转（与 SwingJoint「限位内零修正」同款逐位口径）。
+    #[test]
+    fn hinge_within_limits_is_identity() {
+        let joint = door_hinge(std::f32::consts::FRAC_PI_4, [0.0, 0.0]);
+        let response = solve_hinge_joint(
+            Vec3::ZERO,
+            yaw(0.2),
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            1.0 / 60.0,
+            true,
+        );
+        assert_eq!(response.delta_pos_a, Vec3::ZERO);
+        assert_eq!(response.delta_pos_b, Vec3::ZERO);
+        assert_eq!(response.delta_vel_a, Vec3::ZERO);
+        assert_eq!(response.rotation_a, None, "限位内不写旋转（末位不改写）");
+    }
+
+    /// 超限拉回锥界：θ = 1.0 > π/4 ⇒ 一步精确到 π/4（stiffness 1），
+    /// 且带锚点偏移时绕轴旋转保锚距（①③正交声明的解析对照）。
+    #[test]
+    fn hinge_beyond_limit_clamps_to_boundary() {
+        let limit = std::f32::consts::FRAC_PI_4;
+        let mut joint = door_hinge(limit, [0.0, 0.0]);
+        joint.anchor_a = Vec3::new(0.6, 0.5, 0.0); // 偏心锚（门板重心侧）
+        let rot_a = yaw(1.0);
+        let response = solve_hinge_joint(
+            Vec3::new(2.0, 1.0, -1.0),
+            rot_a,
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            1.0 / 60.0,
+            true,
+        );
+        let theta = twist_of(&response, rot_a);
+        assert!(
+            (theta - limit).abs() < 1e-4,
+            "θ=1.0 应拉回限位界 π/4，实际 {theta}"
+        );
+        // 合成锚点语义：rest = 0 的销轴 ⇒ ①把两锚拉到重合，③绕「过
+        // pb 的轴」旋转不挪 pivot ⇒ 修正后 a 锚与 b 锚重合（①③正交）
+        let final_anchor_a =
+            Vec3::new(2.0, 1.0, -1.0) + rot_a * joint.anchor_a + response.delta_pos_a;
+        assert!(
+            final_anchor_a.length() < 1e-4,
+            "销轴铰链（rest=0）修正后两锚应重合，实际偏差 {}",
+            final_anchor_a.length()
+        );
+    }
+
+    /// 马达速率限制（解析）：θ₀ = 0、target = π/2、rate = 1 rad/s、
+    /// dt = 1/60 ⇒ 单步增量恰 `rate × dt`；连跑到位需
+    /// `ceil((π/2)/(rate·dt))` 步（末步取余），到位后不再写旋转。
+    #[test]
+    fn hinge_motor_is_rate_limited_and_settles() {
+        let joint = door_hinge(
+            std::f32::consts::PI, // 全开限位（纯验马达）
+            [std::f32::consts::FRAC_PI_2, 1.0],
+        );
+        let dt = 1.0 / 60.0;
+        let mut rot = Quat::IDENTITY;
+        // 单步增量 = rate×dt（π/2 ≫ rate·dt，钳在速率而非余量）
+        let first = solve_hinge_joint(
+            Vec3::ZERO,
+            rot,
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            dt,
+            false,
+        );
+        rot = first.rotation_a.unwrap();
+        assert!(
+            (twist_of(&first, Quat::IDENTITY) - dt).abs() < 1e-6,
+            "单步推进量应 = rate×dt ≈ {dt}，实际 {}",
+            twist_of(&first, Quat::IDENTITY)
+        );
+        // 连跑到位：步数 = ceil(目标角/步长) ∈ [94, 96]（解析 95），
+        // 到位后马达失活（Δ = 0 ⇒ rotation_a: None）
+        let mut steps = 1;
+        let mut settled = false;
+        for _ in 0..200 {
+            let response = solve_hinge_joint(
+                Vec3::ZERO,
+                rot,
+                Some(Vec3::ZERO),
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                None,
+                joint,
+                dt,
+                false,
+            );
+            match response.rotation_a {
+                Some(next) => {
+                    rot = next;
+                    steps += 1;
+                }
+                None => {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        assert!(settled, "200 步内应收敛到 target");
+        // 解析步数 = ceil((π/2) / (1 rad/s × 1/60 s)) = 95
+        assert!((94..=96).contains(&steps), "到步数应 ≈ 95，实际 {steps}");
+        let final_theta = twist_of(
+            &HingeResponse {
+                delta_pos_a: Vec3::ZERO,
+                delta_pos_b: Vec3::ZERO,
+                delta_vel_a: Vec3::ZERO,
+                delta_vel_b: Vec3::ZERO,
+                rotation_a: None,
+            },
+            rot,
+        );
+        assert!(
+            (final_theta - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "收敛终点应为 motor_target = π/2，实际 {final_theta}"
+        );
+    }
+
+    /// 马达不能越限位：target = 2.0、限位 [−π/4, π/4]、速率再大也只
+    /// 钳到限位界。
+    #[test]
+    fn hinge_motor_cannot_exceed_limits() {
+        let joint = door_hinge(std::f32::consts::FRAC_PI_4, [2.0, 1000.0]);
+        let response = solve_hinge_joint(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            1.0,
+            false,
+        );
+        let theta = twist_of(&response, Quat::IDENTITY);
+        assert!(
+            (theta - std::f32::consts::FRAC_PI_4).abs() < 1e-4,
+            "大速率马达也只能到限位界 π/4，实际 {theta}"
+        );
+    }
+
+    /// 轴对齐段（②）：a 轴被绕 Z 倾斜 ⇒ 最小弧转回与 b 轴（+Y）平行；
+    /// 限位取全开、参考向取轴本身（③ 退化跳过），只有 ② 在动。
+    #[test]
+    fn hinge_aligns_axes_and_skips_degenerate_twist() {
+        let mut joint = door_hinge(std::f32::consts::PI, [0.0, 0.0]);
+        joint.ref_a = Vec3::Y; // 与轴平行 ⇒ ③ 退化跳过
+        joint.ref_b = Vec3::Y;
+        let rot_a = Quat::from_rotation_z(0.5);
+        let response = solve_hinge_joint(
+            Vec3::ZERO,
+            rot_a,
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            1.0 / 60.0,
+            true,
+        );
+        let aligned = response.rotation_a.expect("轴不齐应写旋转");
+        let world_axis = aligned * Vec3::Y;
+        assert!(
+            (world_axis - Vec3::Y).length() < 1e-6,
+            "② 应把 a 轴对齐到 +Y，实际 {world_axis}"
+        );
+        assert_eq!(response.delta_pos_a, Vec3::ZERO, "①③ 均无修正");
+    }
+
+    /// 退化与消毒：b 轴零长 ⇒ 整关节跳过；限位 min > max ⇒ 自动排序
+    /// （等效 [π/4, −π/4] 取 [−π/4, π/4]，θ = 1.0 仍拉回 π/4）。
+    #[test]
+    fn hinge_degenerate_and_sanitized_inputs() {
+        let mut joint = door_hinge(std::f32::consts::FRAC_PI_4, [0.0, 0.0]);
+        joint.axis_b = Vec3::ZERO;
+        let response = solve_hinge_joint(
+            Vec3::ZERO,
+            yaw(1.0),
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            1.0 / 60.0,
+            true,
+        );
+        assert_eq!(response.delta_pos_a, Vec3::ZERO, "轴退化整关节跳过");
+        assert_eq!(response.rotation_a, None);
+
+        joint = door_hinge(std::f32::consts::FRAC_PI_4, [0.0, 0.0]);
+        joint.twist_min_radians = std::f32::consts::FRAC_PI_4;
+        joint.twist_max_radians = -std::f32::consts::FRAC_PI_4; // 倒装
+        let response = solve_hinge_joint(
+            Vec3::ZERO,
+            yaw(1.0),
+            Some(Vec3::ZERO),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            None,
+            joint,
+            1.0 / 60.0,
+            true,
+        );
+        let theta = twist_of(&response, yaw(1.0));
+        assert!(
+            (theta - std::f32::consts::FRAC_PI_4).abs() < 1e-4,
+            "min > max 应自动排序后钳到 π/4，实际 {theta}"
+        );
+    }
+
+    /// 可断关节闭环：锚死在远处 static 上的距离关节每帧硬拉（应力
+    /// 远超阈值 0.1）⇒ step 入队、prune 移除组件并发 `JointBroken`；
+    /// 后续帧自由落体。对照组：不挂 `JointBreak` 永不断、无资源时
+    /// 有标记也不断（双重缺席开关）。
+    #[test]
+    fn joint_break_queue_prunes_and_fires_event() {
+        fn build(mode: u8) -> (World, Entity) {
+            let mut world = World::new();
+            world.insert_resource(Time::default());
+            world.register_event::<JointBroken>();
+            if mode != 2 {
+                world.insert_resource(BrokenJoints::default());
+            }
+            // 锚点：静态格于 (0, 6, 0)
+            let anchor = world.spawn((
+                Transform::from_xyz(0.0, 6.0, 0.0),
+                Collider::static_box(Vec3::new(0.1, 0.1, 0.1)),
+            ));
+            let bundle = (
+                Transform::from_xyz(0.0, 1.0, 0.0),
+                Collider::dynamic_sphere(0.2, 0.0),
+                RigidBody::default(),
+                DistanceJoint {
+                    target: anchor,
+                    rest_length: 0.5, // 每帧被硬拉 ≈ 4.3 m ⇒ 应力远超 0.1
+                    stiffness: 1.0,
+                    damping: 0.0,
+                },
+            );
+            let body = world.spawn(bundle);
+            if mode == 0 {
+                world.insert(
+                    body,
+                    JointBreak {
+                        max_correction_per_frame: 0.1,
+                    },
+                );
+            }
+            (world, body)
+        }
+        // mode 0：挂标记 ⇒ 一步入队 + prune 断 + 事件 + 后续自由落体
+        let (mut world, body) = build(0);
+        step(&world, 1.0 / 60.0);
+        assert_eq!(
+            world
+                .try_resource::<BrokenJoints>()
+                .map(|q| q.pending.len()),
+            Some(1),
+            "超阈实体应入队"
+        );
+        prune_broken_joints(&mut world);
+        assert!(
+            world.get::<DistanceJoint>(body).is_none(),
+            "prune 后关节组件应被移除"
+        );
+        assert_eq!(
+            world.try_events::<JointBroken>().map(|e| e.len()),
+            Some(1),
+            "断裂事件恰一条"
+        );
+        assert!(
+            world
+                .try_resource::<BrokenJoints>()
+                .is_some_and(|q| q.pending.is_empty()),
+            "队列已被消费"
+        );
+        // mode 1：无标记 ⇒ 永不断（v1 兼容锚）
+        let (mut world, body) = build(1);
+        for _ in 0..5 {
+            step(&world, 1.0 / 60.0);
+            prune_broken_joints(&mut world);
+        }
+        assert!(
+            world.get::<DistanceJoint>(body).is_some(),
+            "不挂 JointBreak 的关节永不断裂"
+        );
+        // mode 2：标记在场但 BrokenJoints 资源缺席 ⇒ 整体关闭
+        let (mut world, body) = build(0);
+        world.remove_resource::<BrokenJoints>();
+        step(&world, 1.0 / 60.0);
+        prune_broken_joints(&mut world);
+        assert!(
+            world.get::<DistanceJoint>(body).is_some(),
+            "队列资源缺席 ⇒ 断裂处理不启用"
+        );
+    }
+
+    /// 铰链集成：step_physics 接线（收集 → 约束轮 → Transform 写回）
+    /// ——超限的门一步拉回限位内、静止后姿态逐位不动（幂等锚）。
+    #[test]
+    fn hinge_in_step_physics_settles_within_limits() {
+        let mut world = World::new();
+        world.insert_resource(Time::default());
+        let frame = world.spawn((
+            Transform::from_xyz(0.0, 1.0, 0.0),
+            Collider::static_box(Vec3::new(0.1, 1.0, 0.1)),
+        ));
+        let mut joint = door_hinge(std::f32::consts::FRAC_PI_4, [0.0, 0.0]);
+        joint.target = frame;
+        joint.rest_length = 1.2; // 锚距静止态（①无修正，只验 ②③）
+        let door = world.spawn((
+            Transform::from_xyz(1.2, 1.0, 0.0),
+            Collider::dynamic_sphere(0.2, 0.0),
+            RigidBody {
+                gravity_scale: 0.0, // 隔离：只验铰链
+                ..RigidBody::default()
+            },
+            joint,
+        ));
+        // 出生即超限：yaw 1.0 > π/4
+        world.get_mut::<Transform>(door).unwrap().rotation = yaw(1.0);
+        step(&world, 1.0 / 60.0);
+        let settled = world.get::<Transform>(door).unwrap().rotation;
+        assert_ne!(settled, yaw(1.0), "超限姿态应被修正");
+        let theta = {
+            let ra = settled * Vec3::X;
+            Vec3::X.cross(ra).dot(Vec3::Y).atan2(Vec3::X.dot(ra))
+        };
+        assert!(
+            (theta - std::f32::consts::FRAC_PI_4).abs() < 1e-4,
+            "一步（2 松弛轮同解）应到限位界，实际 {theta}"
+        );
+        // 幂等：限位内再 step 姿态逐位不动
+        let bits_before = [settled.x.to_bits(), settled.w.to_bits()];
+        step(&world, 1.0 / 60.0);
+        let after = world.get::<Transform>(door).unwrap().rotation;
+        assert_eq!(
+            [after.x.to_bits(), after.w.to_bits()],
+            bits_before,
+            "限位内零修正 ⇒ 写回逐位不变"
         );
     }
 }

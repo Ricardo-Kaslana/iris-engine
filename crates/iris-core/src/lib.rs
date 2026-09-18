@@ -50,8 +50,8 @@ pub mod prelude {
     };
     // `use iris_core::prelude::*;` 后即可直接 `#[derive(Component)]`
     pub use crate::character::{
-        CharacterOutput, CharacterParams, move_and_slide, move_and_slide_statics,
-        move_and_slide_statics_rotated,
+        CharacterOutput, CharacterParams, move_and_slide, move_and_slide_ccd,
+        move_and_slide_statics, move_and_slide_statics_rotated, move_and_slide_statics_rotated_ccd,
     };
     pub use crate::commands::{Command, CommandQueue, apply_commands};
     pub use crate::component::Component;
@@ -69,10 +69,11 @@ pub mod prelude {
         in_view_cone, perception_system, within_hearing,
     };
     pub use crate::physics::{
-        BodyType, Collider, ColliderShape, CollisionEnded, CollisionStarted, ContactSolverV2,
-        ContactTracker, DistanceJoint, ImpulseParams, PHYSICS_GRAVITY, RigidBody,
-        RigidContactState, StaticObstacle, SwingJoint, TargetJoint, contact_point_rotated,
-        effective_static, inv_inertia_world, shape_inertia, solve_contact_impulse, step_physics,
+        BodyType, BrokenJoints, Ccd, Collider, ColliderShape, CollisionEnded, CollisionStarted,
+        ContactSolverV2, ContactTracker, DistanceJoint, HingeJoint, ImpulseParams, JointBreak,
+        JointBroken, PHYSICS_GRAVITY, RigidBody, RigidContactState, StaticObstacle, SwingJoint,
+        TargetJoint, contact_point_rotated, effective_static, inv_inertia_world,
+        prune_broken_joints, shape_inertia, solve_contact_impulse, step_physics,
     };
     pub use crate::query::QueryPart;
     pub use crate::ragdoll::{

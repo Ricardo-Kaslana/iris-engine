@@ -69,8 +69,11 @@
 //!   t = 0」处理，角色原地卡住（不做深度去穿透，调用方应保证出生点合法）；
 //! - **一步一台阶**：单次调用至多接受一次抬升，同帧连续多级台阶由后续
 //!   帧继续（楼梯逐帧爬升）；
-//! - **全贯穿不检出**：单帧位移大于障碍厚度的完全贯穿沿 [`shape_sweep`]
-//!   的诚实边界返回未命中（单帧位移受 `vel × dt` 自然限制，常规步长无虞）；
+//! - **全贯穿不检出（C3 起有 CCD 包装）**：单帧位移大于障碍厚度的完全
+//!   贯穿沿 [`shape_sweep`] 的诚实边界返回未命中（单帧位移受 `vel × dt`
+//!   自然限制，常规步长无虞）；冲刺 / 弹射等高速玩法用
+//!   [`move_and_slide_ccd`] 把单帧位移拆成子步检出（刚体侧对应
+//!   `physics::Ccd` 组件）；
 //! - **确定性**：全程纯函数、固定迭代轮数（水平 4 轮、扫掠二分 24 次、
 //!   投影收敛 4 轮）、无随机源——同输入两次调用逐位一致（单测守护）。
 //!
@@ -106,7 +109,7 @@
 //! - **薄板 / 薄墙穿通**：单帧水平位移大于障碍厚度的完全贯穿沿扫掠的
 //!   诚实边界不检出（见下「v1 诚实边界」）——厚度 ≥ `radius` 的平台在
 //!   常规速度（`vel × dt` < 厚度）下无虞；弹射 / 冲刺类玩法要么加厚
-//!   碰撞体，要么把单帧位移拆小。
+//!   碰撞体，要么用 [`move_and_slide_ccd`]（C3）将单帧位移拆小。
 //!
 //! # 用法
 //!
@@ -131,8 +134,8 @@
 use glam::{Quat, Vec3};
 
 use crate::physics::{
-    Collider, ColliderShape, PHYSICS_GRAVITY, RigidBody, StaticObstacle, shape_sweep,
-    shape_sweep_rotated,
+    Collider, ColliderShape, MAX_CCD_SEGMENTS, PHYSICS_GRAVITY, RigidBody, StaticObstacle,
+    shape_sweep, shape_sweep_rotated,
 };
 use crate::transform::Transform;
 use crate::world::World;
@@ -403,6 +406,83 @@ pub fn move_and_slide(
         }
     });
     move_and_slide_statics_rotated(pos, velocity, dt, params, &statics)
+}
+
+/// 运动学角色控制器的 **CCD 包装**（C3 闭合轮）：把单帧位移拆成至多
+/// [`MAX_CCD_SEGMENTS`] 段、每段 ≤ 段长的子步，逐段走完整五步管线并
+/// 链式回灌 `(position, velocity)`——冲刺 / 弹射玩法下「全贯穿不检出」
+/// （[`move_and_slide`] 的诚实边界）被闭合：任何一段的扫掠位移都不
+/// 大于胶囊宽度量级，薄墙无法整段被跳过。
+///
+/// - **段长**：`max_segment > 0` 且有限取显式值（米）；`0` / 负 / 非
+///   有限 = 自动取 `params.radius`（胶囊最小宽度 `2r` 的一半，保守
+///   捕获界）。显式段长大于 `2 × radius` 时捕获保证消失（自担）；
+/// - **亚阈值兼容锚**：`|velocity| × dt ≤ 段长` ⇒ `steps = 1`，结果与
+///   [`move_and_slide_statics_rotated`] **逐位一致**（同一次调用，无
+///   拆分歧义）——常规行走速度不因此轮改变任何行为；
+/// - **代价**：每子步完整跑五步管线（水平 4 轮 + 台阶 + 向下扫掠），
+///   成本 × 子步数；静态快照只收集一次（子步间障碍不动，与单帧
+///   语义一致）；
+/// - **确定性**：子步数 = `ceil(|v|×dt / 段长)`（输入速度的纯函数、
+///   封顶常数），子步长 `dt / steps` 为确定除法——同输入两次调用
+///   逐位一致（单测守护）；重力按子步分摊（`n × g·dt/n`），与单次
+///   `g·dt` 有浮点结合序差——新入口无 v1 逐位义务，仅保证自身确定。
+pub fn move_and_slide_ccd(
+    world: &World,
+    pos: Vec3,
+    velocity: Vec3,
+    dt: f32,
+    params: &CharacterParams,
+    max_segment: f32,
+) -> CharacterOutput {
+    let mut statics: Vec<StaticObstacle> = Vec::new();
+    world.query::<(&Transform, &Collider, Option<&RigidBody>)>(|(transform, collider, rigid)| {
+        if crate::physics::effective_static(collider, rigid) {
+            statics.push((transform.position, transform.rotation, collider.shape));
+        }
+    });
+    move_and_slide_statics_rotated_ccd(pos, velocity, dt, params, max_segment, &statics)
+}
+
+/// [`move_and_slide_ccd`] 的纯函数核心（静态障碍快照显式给出，旋转
+/// 感知口径）——脱离 World 单测。断言同 [`move_and_slide_statics`]。
+///
+/// # Panics
+/// 同 [`move_and_slide_statics`]（首个子步即由内核断言）。
+pub fn move_and_slide_statics_rotated_ccd(
+    pos: Vec3,
+    velocity: Vec3,
+    dt: f32,
+    params: &CharacterParams,
+    max_segment: f32,
+    statics: &[StaticObstacle],
+) -> CharacterOutput {
+    let step = if max_segment.is_finite() && max_segment > 0.0 {
+        max_segment
+    } else {
+        params.radius
+    };
+    // 规划口径：输入速度 × dt 的水平 / 合成位移预估（竖直向下落每帧
+    // 重力增量 g·dt ≪ 半径，不构成贯穿源；见函数文档）
+    let planned = velocity.length() * dt;
+    let steps = if step > 0.0 {
+        (planned / step).ceil() as usize
+    } else {
+        1
+    };
+    let steps = steps.clamp(1, MAX_CCD_SEGMENTS);
+    let sub_dt = dt / steps as f32;
+    let mut position = pos;
+    let mut vel = velocity;
+    let mut out: Option<CharacterOutput> = None;
+    for _ in 0..steps {
+        let next = move_and_slide_statics_rotated(position, vel, sub_dt, params, statics);
+        position = next.position;
+        vel = next.velocity;
+        out = Some(next);
+    }
+    // steps ≥ 1 ⇒ 循环必执行（钳制语义，非可失败的运行时检查）
+    out.expect("CCD 子步数 ≥ 1，输出必存在")
 }
 
 /// 台阶尝试（水平被阻挡时调用）：抬起 `step_height` 重试水平位移，成功
@@ -912,5 +992,106 @@ mod tests {
             out.position.y
         );
         assert!((out.position.x - DT).abs() < 1e-6);
+    }
+
+    // ---- C3 CCD 包装（全贯穿检出的闭合） ----
+
+    /// 逐位指纹（CCD 兼容锚用）：分量 `to_bits` 数组。
+    fn bits3(v: Vec3) -> [u32; 3] {
+        [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]
+    }
+
+    /// 薄墙（x∈[0.5,0.7]，高 4 m）静态快照。
+    fn thin_wall_statics() -> Vec<StaticObstacle> {
+        vec![(
+            Vec3::new(0.6, 0.9, 0.0),
+            Quat::IDENTITY,
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.1, 2.0, 2.0),
+            },
+        )]
+    }
+
+    /// 高速冲刺（120 m/s，单帧位移 2 m ≫ 墙厚 + 胶囊宽）：v1 全贯穿
+    /// 不检出（终点越过重叠窗口 [0.1, 1.1]，x 落到 −0.8）；CCD 包装
+    /// 拆子步后首个嵌入终点 (0.8) 被扫掠括住 ⇒ 挡在墙近面外（x≈1.1）。
+    #[test]
+    fn ccd_wrapper_blocks_dash_through_thin_wall() {
+        let statics = thin_wall_statics();
+        let start = Vec3::new(1.2, 0.9, 0.0);
+        let dash = Vec3::new(-120.0, 0.0, 0.0);
+        let tunneled = move_and_slide_statics_rotated(start, dash, DT, &params(), &statics);
+        assert!(
+            tunneled.position.x < 0.1,
+            "v1 对照：单帧应整段穿过薄墙（bug 在场证明，x={}）",
+            tunneled.position.x
+        );
+        let blocked = move_and_slide_statics_rotated_ccd(start, dash, DT, &params(), 0.0, &statics);
+        assert!(
+            blocked.position.x > 0.9,
+            "CCD 包装应挡在墙近面外（x≈1.1，实际 {}）",
+            blocked.position.x
+        );
+    }
+
+    /// 亚阈值兼容锚：`|v|×dt ≤ 段长` ⇒ 单段调用，结果与
+    /// [`move_and_slide_statics_rotated`] 逐位一致（新入口对常规速度
+    /// 零行为改变）。
+    #[test]
+    fn ccd_wrapper_below_threshold_matches_single_call_bitwise() {
+        let statics: Vec<StaticObstacle> = vec![(
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+            ColliderShape::Box {
+                half_extents: Vec3::new(50.0, 1.0, 50.0),
+            },
+        )];
+        let single = move_and_slide_statics_rotated(
+            standing(3.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            DT,
+            &params(),
+            &statics,
+        );
+        let wrapped = move_and_slide_statics_rotated_ccd(
+            standing(3.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            DT,
+            &params(),
+            0.0,
+            &statics,
+        );
+        assert_eq!(
+            bits3(wrapped.position),
+            bits3(single.position),
+            "steps=1 ⇒ 位置逐位 = 单次调用"
+        );
+        assert_eq!(
+            bits3(wrapped.velocity),
+            bits3(single.velocity),
+            "steps=1 ⇒ 速度逐位 = 单次调用"
+        );
+        assert_eq!(wrapped.grounded, single.grounded);
+    }
+
+    /// 确定性：高速冲刺场景两跑 10 帧，逐帧 `(position, velocity)`
+    /// to_bits 全等。
+    #[test]
+    fn ccd_wrapper_is_deterministic_across_two_runs() {
+        let run = || {
+            let statics = thin_wall_statics();
+            let mut pos = Vec3::new(4.0, 0.9, 0.0);
+            let mut vel = Vec3::new(-120.0, 0.0, 0.0);
+            let mut trace = Vec::new();
+            for _ in 0..10 {
+                let out =
+                    move_and_slide_statics_rotated_ccd(pos, vel, DT, &params(), 0.0, &statics);
+                pos = out.position;
+                vel = out.velocity;
+                trace.push((bits3(pos), bits3(vel)));
+            }
+            trace
+        };
+        assert_eq!(run(), run(), "CCD 包装同输入两跑逐位一致");
     }
 }

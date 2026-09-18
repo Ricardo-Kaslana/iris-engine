@@ -921,7 +921,7 @@ cargo run -p iris-assault --example gen_assault_assets --release # 重新生成 
 ## 测试
 
 ```sh
-cargo test --workspace   # 1546 项测试（release 1543 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 1584 项测试（release 1581 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：
@@ -1086,6 +1086,7 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 WebGPU 适配器/设备 → 全渲染栈 → HUD 叠加）在浏览器主线程上逐帧运行。
 
 - [x] 闭合战役 C2·渲染伪影役（诚实声明清账批次三，路线图 v5 暂停新功能后的清账战役：贴花受光 / 光照贴图 mip / 粒子 v2 序列化 / 探针编辑入口——`DecalLighting` 资源在场时贴花逐片元乘「方向光 Lambert + ambient」因子（逆盒矩阵重建法线、朝相机翻正，缺席 = v1 逐位不变 + 中性光照退化锚）；`MipSettings` 在场时光照贴图上传线性域 2×2 box mip 链 + 三线性采样器（`mip_chain_half_bytes`，缺席 = 单 mip 逐字段一致）；关卡档新增 `particles_v2` 与 `probe` 段（全配置字段往返位级一致、运行态不入档、退化半边长加载期拒绝）；编辑器 `M` 摆放反射探针 + `[ ]`/`- =` 步进 + 探针入 undo 快照（修复声明的 undo 丢失 bug）+ 烘焙回报 `probe_count`；闭合 §8.14/19/31⑤/37⑧/51⑩ 五条诚实声明，全部既有像素锁原值通过）
+- [x] 闭合战役 C3·物理深化役（诚实声明清账批次四：CCD / 铰链关节 / 可断关节，全 opt-in、缺席 = 逐位不变——刚体 `Ccd` 组件把积分位移按「本体最小投影宽度」拆等分子步、首个嵌入终点停步交还本帧接触管线（区间论证捕获任意厚度静态障碍、亚阈值位移逐位 = v1，高速弹丸不再穿墙）；角色 `move_and_slide_ccd` 子步包装闭合「全贯穿不检出」；`HingeJoint` 单轴铰链（双轴对齐闭合摆动自由度 + 绕铰链线扭转限位 + 速率限制伺服马达）；`JointBreak` + `BrokenJoints` 队列 + `prune_broken_joints` 两拍兑现（判据 = 每帧位置修正累计量，断裂清该实体全部关节并发 `JointBroken`）；OBB+凸包按裁定走 GJK 确定性设计专章门禁（`docs/private/gjk-determinism.md`，建议 OBB-SAT 先行 / 凸包缓行——待过审）；闭合 §8.27②/28 声明，诚实边界新增 §8.59）
 
 ## License
 
