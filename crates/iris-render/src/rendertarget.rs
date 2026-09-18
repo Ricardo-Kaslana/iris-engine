@@ -17,8 +17,9 @@
 //!
 //! ## v1 限制（诚实清单，见 ARCHITECTURE §8.20）
 //!
-//! - **无 `resize`**：RT 尺寸创建后固定，尺寸变化需重建 store 条目（v1
-//!   不做运行时 resize——监控屏分辨率一般固定，读回 / 重分配留待后续）；
+//! - **尺寸变化 = 下一帧整体重建**：[`RenderTargetStore::resize`] 改 CPU
+//!   描述后，渲染器按句柄比对尺寸、失配重建 GPU 资源（重建帧旧内容即刻
+//!   作废，读回 / 增量重分配仍不做）；
 //! - **多 RT 相机数量上限 2**：超出部分 `log::warn` 跳过（小地图 + 监控屏
 //!   两个典型用例，多视口编排是后续路线图）；
 //! - 0 号句柄无特殊保留（与 `TextureStore` 的白色 0 号不同）：任何句柄都
@@ -71,6 +72,23 @@ impl RenderTargetStore {
         self.targets.get(handle.0 as usize)
     }
 
+    /// 运行时改尺寸（闭合 §8.20「无 resize」条）：更新 CPU 侧描述并返回
+    /// `true`；句柄无效返回 `false`（不新建条目——建条目是 `add` 的语义）。
+    /// 宽高下限 1（钳制口径与 [`RenderTargetStore::add`] 一致）。
+    ///
+    /// GPU 侧生效方式：渲染器每帧按句柄比对缓存资源尺寸与本描述，失配则
+    /// **整体重建**（旧纹理 / 缓冲随缓存条目释放；RT 实例缓冲本就每帧
+    /// 全量上传，无增量损失）。同尺寸重复调用是良性空操作（缓存比对
+    /// 相等 ⇒ GPU 零动作）。
+    pub fn resize(&mut self, handle: RenderTargetHandle, width: u32, height: u32) -> bool {
+        let Some(spec) = self.targets.get_mut(handle.0 as usize) else {
+            return false;
+        };
+        spec.width = width.max(1);
+        spec.height = height.max(1);
+        true
+    }
+
     pub fn len(&self) -> usize {
         self.targets.len()
     }
@@ -119,6 +137,37 @@ mod tests {
         let h = store.add(0, 0);
         let spec = store.get(h).unwrap();
         assert_eq!((spec.width, spec.height), (1, 1), "零尺寸钳制到 1×1");
+    }
+
+    /// `resize`（§8.20 闭合）：有效句柄改尺寸返回 true 并即时反映到
+    /// `get`；无效句柄 false 且**不新建条目**；零/负尺寸钳到 1（与 `add`
+    /// 同口径）；`len` 全程不变。
+    #[test]
+    fn resize_updates_existing_entries_and_rejects_invalid_handles() {
+        let mut store = RenderTargetStore::new();
+        let a = store.add(200, 200);
+        assert!(store.resize(a, 320, 180), "有效句柄应成功");
+        assert_eq!(
+            store.get(a),
+            Some(&RenderTargetSpec {
+                width: 320,
+                height: 180
+            })
+        );
+        assert!(
+            !store.resize(RenderTargetHandle(99), 64, 64),
+            "无效句柄必须 false"
+        );
+        assert_eq!(store.len(), 1, "resize 不得新建条目");
+        assert!(store.resize(a, 0, 0));
+        assert_eq!(
+            store.get(a).unwrap(),
+            &RenderTargetSpec {
+                width: 1,
+                height: 1
+            },
+            "钳制口径与 add 一致"
+        );
     }
 
     #[test]

@@ -5,6 +5,45 @@
 
 ## [Unreleased]
 
+### Added（C1 闭合战役 · 原语小件轮——四件独立小项，全部「缺席 = 逐位不变」形态）
+
+路线图 v5 暂停新功能后的清账战役第二批（计划 = `docs/private/closure-plan-v1.md`，
+用户裁定 2026-09-18：全范围 / 顺序 C0→C1→… / 光照口径⑫ 挂账）。
+
+- **`World::register_component` + `is_component_registered`（iris-core，闭合
+  §8.42）**：`&mut World` 侧一次性幂等预注册，根治「早期 `insert_registered`
+  补写在未注册类型上静默落空」的装配顺序坑（iris-infiltration 实景：旧图元
+  滞留与新房 z-fighting、两轮排查）。顺手修一处**文档 / 代码落差**：
+  `insert_registered` 未注册分支此前实际不 warn（§8.42 原文写「只 warn」），
+  C1 起真发 warn 且消息直指预注册 API。两态返回口径写明（None = 失败或
+  无旧值，成败经回读 / 自检判别），不 breaking 改签名。
+- **`RenderTargetStore::resize`（iris-render，闭合 §8.20 一条）**：CPU 描述
+  即时改尺寸（无效句柄 false、零尺寸钳 1 与 `add` 同口径）；渲染器
+  `GpuRenderTarget` 增尺寸记账，`ensure` 失配臂**整体重建**（RT 实例缓冲
+  本就每帧全量上传，无增量损失）；GPU 锚 = 「先 64 占缓存 → resize 96
+  重建」与「直建 96」逐像素一致 + 同尺寸空操作快路锚；`rendertarget_render.rs`
+  全文件补 `GPU_SERIAL` 互斥（AGENTS 纪律，六项曾漏配）。
+- **LOD v2：双阈值滞回 + 包围球中心参照（iris-render，闭合 §8.16 两子项）**：
+  新资源 `LodSettings { hysteresis, bounds_center }`——**缺席 = v1 逐位不变**
+  （照 TaaSettings / SsrSettings 缺席范式）；高→低阈值 `s·(1+h)`、低→高
+  `s·(1−h)`、带内维持原档；`h = 0` 三档 prev 全部逐位退化 v1 `select`
+  （兼容锚：CPU 参数扫描 + GPU「记忆残留仍照单阈值」帧）。跨帧记忆
+  （实体位 → 档位，`BTreeMap` 确定序）**只由主相机收集更新**，RT / 探针 /
+  水体捕获按当帧单阈值（多上下文分表语义可疑，明说为诚实边界）；
+  `bounds_center` 参照系只对 **high 网格** 取界（防「选中档位反馈进距离」
+  自激振荡，无 CPU bounds 回退原点 = 保守方向）；`LodMesh3` 不吃本设置。
+  消毒：h 非有限回 0、负钳 0、1.0 钳 0.999。GPU 判别用例：滞回带五帧
+  振荡序列（两个判别点 = v1 会切、v2 维持）+ 偏心网格三帧参照切换。
+- **`TextureStore::add_uncompressed_declared`（iris-render，闭合 §8.45 可达性）**：
+  一步式「登记 + 无压缩声明」（与 `add_bc3_declared` 同族）——引擎原生
+  程序化数据贴图此前拿不到 glTF 加载器的自动声明，近距法线可见 BC1 块状
+  伪梯度（frictions ⑨ 同款机理）。默认口径不变（常规 `add` 仍走 BC1 树），
+  等价锚 = 一步式 ≡ `add + declare`（目录 / 声明位 / 显存估算三口径）。
+
+零渲染路径漂移：四件全为「默认 / 缺席 = 既有基线零改动」形态（全部 FNV
+锁预期原值通过；lod_render / rendertarget_render 为新增用例）。测试基线
++9（debug/release 同步，收官数字见 AGENTS.md）。
+
 ### Docs（C0 闭合战役 · 文档健康轮——零代码改动）
 
 路线图 v5 暂停新功能开发、转入诚实声明清账战役的第一批（计划全文

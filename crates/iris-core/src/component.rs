@@ -170,6 +170,11 @@ impl Components {
             .or_insert_with(|| RwLock::new(Box::new(SparseSet::<C>::new())));
     }
 
+    /// 该类型的存储是否已注册（[`World::is_component_registered`] 的底层判据）。
+    pub fn is_registered<C: Component>(&self) -> bool {
+        self.stores.contains_key(&TypeId::of::<C>())
+    }
+
     fn cell<C: Component>(&self) -> Option<&RwLock<Box<dyn ErasedStore>>> {
         self.stores.get(&TypeId::of::<C>())
     }

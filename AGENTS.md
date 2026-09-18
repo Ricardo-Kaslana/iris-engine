@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1546 / release 1543**（R89 收官：+4 项覆盖度 CPU 单测 + 1 项 SSR 合成权重镜像 + 1 项 BakeExcluded 收集排除 + 3 项 level.ddgi 子段 + 5 项编辑器 DDGI headless + 5 项 GPU 锚（R88 六项零改动原值通过）；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1555 / release 1552**（C1 原语小件轮收官：+2 `register_component` 单测 + 2 LOD v2 滞回纯函数 + 1 RT resize CPU + 1 一步式无压缩声明 + 2 项 lod_render GPU v2 + 1 项 rendertarget_render resize GPU；四件全「缺席/默认 = 逐位不变」形态，全部既有 FNV 基线零改动原值通过；另 rendertarget/lod 两 GPU 套件本轮补 `GPU_SERIAL`；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 

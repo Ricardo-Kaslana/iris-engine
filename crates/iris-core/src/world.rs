@@ -118,11 +118,15 @@ impl World {
         self.components.insert(entity, component)
     }
 
-    /// 向实体插入组件，要求该组件存储**已注册**（世界中已有同型组件）。
-    /// 与 [`World::insert`] 的区别：不注册新存储——因此 `&World` 即可调用
+    /// 向实体插入组件，要求该组件存储**已注册**（世界中已有同型组件，
+    /// 或经 [`World::register_component`] 预注册）。与 [`World::insert`]
+    /// 的区别：不注册新存储——因此 `&World` 即可调用
     /// （存储已存在时插入不是结构性修改，并行系统可用的写路径，照
-    /// 尝试型锁模式）。存储未注册或实体已失效时返回 `None` 并 warn
-    /// （不 panic——调用方按缺席语义处理）。
+    /// 尝试型锁模式）。存储未注册或实体已失效时返回 `None` 并 **warn**
+    /// （不 panic——调用方按缺席语义处理；预注册是消除该失败的正解，
+    /// 见 §8.42）。注意返回值的两态口径：`None` = 失败（未注册 / 失效
+    /// 实体，均伴随 warn）或成功且无旧值；「有旧值」必然伴随成功，
+    /// 成败判别请用 [`World::is_component_registered`] 前提或插后回读。
     pub fn insert_registered<C: Component>(&self, entity: Entity, component: C) -> Option<C> {
         if !self.contains(entity) {
             log::warn!(
@@ -131,7 +135,15 @@ impl World {
             );
             return None;
         }
-        let mut store = self.components.borrow_mut::<C>()?;
+        let Some(mut store) = self.components.borrow_mut::<C>() else {
+            log::warn!(
+                "组件类型 {} 的存储未注册，实体 {entity:?} 的 insert_registered 已丢弃；\
+                 请先在独占上下文调用 World::register_component::<{}>()（§8.42）",
+                std::any::type_name::<C>(),
+                std::any::type_name::<C>()
+            );
+            return None;
+        };
         store.insert(entity, component)
     }
 
@@ -152,6 +164,25 @@ impl World {
 
     pub fn remove_component<C: Component>(&mut self, entity: Entity) -> Option<C> {
         self.components.remove::<C>(entity)
+    }
+
+    /// 预注册组件类型 `C` 的存储（幂等——重复注册为空操作）。
+    ///
+    /// 动机（§8.42）：[`World::insert_registered`] 对**未注册**类型静默失败
+    /// （返回 `None` + warn），而注册是结构性修改需要 `&mut World`——
+    /// 「先隐藏关卡图元、后创建角色」这类装配顺序下，早期 `&World` 系统的
+    /// 补写会整批落空（实景：旧图元滞留渲染与新建建筑 z-fighting，两轮排查）。
+    /// 本 API 把「注册」从「碰巧被首次 `spawn`/`insert` 触发」升级为启动期
+    /// 的显式声明：插件在 `Startup`（独占上下文）为运行期要补写的组件类型
+    /// 一次性预注册，此后并行系统的 `insert_registered` 恒可用。
+    pub fn register_component<C: Component>(&mut self) {
+        self.components.register::<C>();
+    }
+
+    /// 组件类型 `C` 的存储是否已注册——[`World::insert_registered`] 前提的
+    /// 运行期自检（未注册即其 `None` 分支的真实成因）。
+    pub fn is_component_registered<C: Component>(&self) -> bool {
+        self.components.is_registered::<C>()
     }
 
     /// 遍历查询 `( &A, &mut B, ... )`：对每个拥有全部所需组件的实体调用 `f`。
@@ -522,5 +553,52 @@ mod tests {
             let p = world.get::<Position>(e).unwrap();
             assert_eq!(p.0, 7.0);
         });
+    }
+
+    /// §8.42 闭合：`register_component` 预注册后，`insert_registered` 对
+    /// 「世界中尚无同型组件」的类型也能成功补写（未注册 = 丢弃 + warn 的
+    /// 旧语义保持——注册与否经 `get` 回读可判别）。
+    #[test]
+    fn register_component_enables_insert_registered_on_fresh_world() {
+        let mut world = World::new();
+        let e = world.spawn((Position(1.0),));
+        // 未注册（Velocity 从未 spawn/insert 过）：补写被丢弃
+        assert!(
+            !world.is_component_registered::<Velocity>(),
+            "全新类型不应已注册"
+        );
+        world.insert_registered(e, Velocity(3.0));
+        assert!(
+            world.get::<Velocity>(e).is_none(),
+            "未注册时补写必须失败（值不可见）"
+        );
+        // 预注册（幂等：重复调用无害）后：补写成功
+        world.register_component::<Velocity>();
+        world.register_component::<Velocity>();
+        assert!(world.is_component_registered::<Velocity>());
+        assert!(
+            world.insert_registered(e, Velocity(3.0)).is_none(),
+            "首次补写无旧值可带出"
+        );
+        assert_eq!(world.get::<Velocity>(e).unwrap().0, 3.0);
+    }
+
+    /// 预注册不改变既有插入语义：已有同型组件时 `insert_registered`
+    /// 带出**旧值**（Some(old) 必然伴随成功写回）。
+    #[test]
+    fn register_component_preserves_old_value_semantics() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let e = world.spawn_empty();
+        assert!(
+            world.insert_registered(e, Position(2.0)).is_none(),
+            "首次插入无旧值"
+        );
+        let old = world.insert_registered(e, Position(5.0));
+        assert!(
+            matches!(&old, Some(p) if p.0 == 2.0),
+            "重复补写应带出旧值 2.0"
+        );
+        assert_eq!(world.get::<Position>(e).unwrap().0, 5.0);
     }
 }

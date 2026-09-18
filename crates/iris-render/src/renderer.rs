@@ -39,7 +39,7 @@ use crate::light_bins::{
 };
 use crate::lightmap::{LightmapBinding, LightmapHandle, LightmapStore, NO_LIGHTMAP};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
-use crate::mesh::{LodMesh, MeshHandle, MeshStore, upload_mesh};
+use crate::mesh::{LodMesh, LodSettings, MeshHandle, MeshStore, upload_mesh};
 use crate::occlusion::{
     AABB_CORNERS, AABB_INDEX_COUNT, AABB_INDICES, AabbInstanceRaw, OcclusionCulling, world_aabb,
 };
@@ -351,6 +351,10 @@ struct GpuMaterial {
 /// 线性 HDR 中间缓冲（几何渲到此处）+ ACES 色调映射绑定组 + RT 相机专用
 /// 全局 uniform / 绑定组 + RT 实例缓冲。全部按句柄惰性创建、跨帧持有。
 struct GpuRenderTarget {
+    /// 构建时的尺寸（像素）——与 [`RenderTargetStore`] 描述失配即触发整体
+    /// 重建（`resize` 的 GPU 侧生效路径，见 rendertarget.rs 模块文档）。
+    width: u32,
+    height: u32,
     /// RT 颜色纹理（Rgba8UnormSrgb）：`UiImageRtt` 采样目标。
     #[allow(dead_code)]
     color: wgpu::Texture,
@@ -493,8 +497,15 @@ pub struct Renderer {
     sss_lut_tex: wgpu::Texture,
     sss_lut_view: wgpu::TextureView,
     /// 渲染目标（R40）GPU 缓存：句柄 → 颜色 / 深度 / HDR / 绑定组 /
-    /// 专用全局与实例缓冲。按句柄惰性创建、跨帧持有（尺寸不变时零重建）。
+    /// 专用全局与实例缓冲。按句柄惰性创建、跨帧持有（尺寸不变时零重建；
+    /// `resize` 失配即重建，见 rendertarget.rs）。
     render_target_gpu: HashMap<u32, GpuRenderTarget>,
+    /// LOD v2（C1）跨帧记忆：实体位 → 上一帧**主相机**收集的档位
+    /// （true = high）。仅 `LodSettings` 资源在场时读写；缺席 = 恒空表
+    /// 零触碰（v1 逐位不变）。不参与 `reset_taa`（相机无关的场景侧
+    /// 状态，与探针域同立场，§8.58⑩）；滞留条目（despawn 实体）是
+    /// 每实体 8 字节级的有界垃圾，随句柄复用自愈。
+    lod_v2_memory: std::collections::BTreeMap<u64, bool>,
     /// RT 色调映射共享采样器 + 合成参数（泛光 0 / 曝光 1 / 暗角 0——RT
     /// 无后处理链，恒中性）。两者所有 RT 共用。
     rt_blit_sampler: wgpu::Sampler,
@@ -2129,22 +2140,59 @@ fn double_sided_of(materials: &MaterialStore, handle: MaterialHandle) -> bool {
         .unwrap_or(false)
 }
 
-/// LOD 网格解析（R30 / R51）：挂 [`LodMesh3`](crate::terrain::LodMesh3) 的实体按距离在 3 级间
+/// LOD 网格解析（R30 / R51；C1 升级 v2）：挂 [`LodMesh3`](crate::terrain::LodMesh3) 的实体按距离在 3 级间
 /// 选（地形 chunk，见 `terrain.rs`）；否则挂 [`LodMesh`] 的实体按距离
-/// 选 high / low（距离 = 实体原点到相机 eye 的欧氏距离，v1 不用包围球
-/// 中心，取舍见组件文档）；未挂载回退 `MeshHandle` 旧语义；皆无返回
-/// `None`（收集跳过该实体——查询带多个 `Option` 后「无任何网格句柄」
-/// 成为合法查询命中）。
+/// 选 high / low——**`lod_v2 = None`（世界无 `LodSettings`）= v1 口径
+/// 逐位不变**（实体原点到 eye 的欧氏距离、单阈值）；带设置时主相机收集
+/// 走双阈值滞回 + 可选包围球中心（`LodMesh::select_hysteresis`，§8.16
+/// 闭合），记忆经 `lod_memory` 读写（辅助上下文 RT / 捕获传 `None` =
+/// 无历史 = 当帧单阈值，见 `LodSettings` 文档）；未挂载回退 `MeshHandle`
+/// 旧语义；皆无返回 `None`（收集跳过该实体——查询带多个 `Option` 后
+/// 「无任何网格句柄」成为合法查询命中）。
+#[allow(clippy::too_many_arguments)]
 fn resolve_mesh_handle(
     lod: Option<&LodMesh>,
     lod3: Option<&crate::terrain::LodMesh3>,
     mesh: Option<&MeshHandle>,
     eye: Vec3,
     origin: Vec3,
+    lod_v2: Option<LodSettings>,
+    mut lod_memory: Option<&mut std::collections::BTreeMap<u64, bool>>,
+    mesh_store: &MeshStore,
+    model: Mat4,
+    entity_bits: u64,
 ) -> Option<MeshHandle> {
     match (lod3, lod, mesh) {
         (Some(lod3), ..) => Some(lod3.select(eye, origin)),
-        (None, Some(lod), _) => Some(lod.select(eye, origin)),
+        (None, Some(lod), _) => match lod_v2 {
+            None => Some(lod.select(eye, origin)),
+            Some(settings) => {
+                // 距离参照：包围球中心（high 网格 CPU bounds，缺席回退
+                // 原点 = v1 保守口径）或实体原点（v1 口径）。中心只对
+                // high 取——两个参照系共用一个点，避免选中档位反馈进
+                // 距离计算造成自激振荡。
+                let point = if settings.bounds_center {
+                    mesh_store
+                        .get(lod.high)
+                        .and_then(|data| data.bounds())
+                        .map(|(min, max)| {
+                            model.transform_point3((Vec3::from(min) + Vec3::from(max)) * 0.5)
+                        })
+                        .unwrap_or(origin)
+                } else {
+                    origin
+                };
+                let dist = eye.distance(point);
+                let prev = lod_memory
+                    .as_ref()
+                    .and_then(|m| m.get(&entity_bits).copied());
+                let (handle, high) = lod.select_hysteresis(dist, prev, settings.hysteresis);
+                if let Some(m) = &mut lod_memory {
+                    m.insert(entity_bits, high);
+                }
+                Some(handle)
+            }
+        },
         (None, None, Some(mesh)) => Some(*mesh),
         (None, None, None) => None,
     }
@@ -2261,6 +2309,8 @@ fn collect_instances(
     skinned: &mut Vec<SkinnedItem>,
     transparent: &mut Vec<TransparentItem>,
     transparent_skinned: &mut Vec<TransparentSkinnedItem>,
+    lod_v2: Option<LodSettings>,
+    mut lod_memory: Option<&mut std::collections::BTreeMap<u64, bool>>,
 ) -> CollectCounts {
     items.clear();
     skinned.clear();
@@ -2352,7 +2402,18 @@ fn collect_instances(
         // LOD 距离选择：挂 LodMesh 按距离选 high / low，否则 MeshHandle；
         // 两者皆无（纯 Skin 实体，合法但不可渲染）静默跳过。
         // 蒙皮路径不参与 LodMesh3（地形 chunk 恒非蒙皮，R51）
-        let Some(m) = resolve_mesh_handle(lod, None, mesh, eye, gt.position()) else {
+        let Some(m) = resolve_mesh_handle(
+            lod,
+            None,
+            mesh,
+            eye,
+            gt.position(),
+            lod_v2,
+            lod_memory.as_deref_mut(),
+            mesh_store,
+            gt.matrix(),
+            e.to_bits(),
+        ) else {
             return;
         };
         skinned_entities.insert(e.to_bits());
@@ -2406,7 +2467,18 @@ fn collect_instances(
         }
         // LOD 距离选择（组件缺席 = MeshHandle 旧语义；皆无跳过——
         // 挂了材质却没有任何网格句柄的实体不可渲染）
-        let Some(m) = resolve_mesh_handle(lod, lod3, mesh, eye, gt.position()) else {
+        let Some(m) = resolve_mesh_handle(
+            lod,
+            lod3,
+            mesh,
+            eye,
+            gt.position(),
+            lod_v2,
+            lod_memory.as_deref_mut(),
+            mesh_store,
+            gt.matrix(),
+            e.to_bits(),
+        ) else {
             return;
         };
         let model = gt.matrix();
@@ -2521,6 +2593,10 @@ pub struct CpuCollector {
     skinned: Vec<SkinnedItem>,
     transparent: Vec<TransparentItem>,
     transparent_skinned: Vec<TransparentSkinnedItem>,
+    /// LOD v2 滞回记忆（与 `Renderer::lod_v2_memory` 同构——本入口的
+    /// 契约就是「与渲染器帧内调用完全一致」，主路径的世界带 `LodSettings`
+    /// 时这里同样按当帧世界资源走 v2 判定）。
+    lod_memory: std::collections::BTreeMap<u64, bool>,
 }
 
 impl CpuCollector {
@@ -2541,6 +2617,7 @@ impl CpuCollector {
         eye: Vec3,
         frustum: &Frustum,
     ) -> CpuCollectResult {
+        let lod_v2 = world.try_resource::<LodSettings>().map(|s| *s);
         let counts = collect_instances(
             world,
             mesh_store,
@@ -2552,6 +2629,8 @@ impl CpuCollector {
             &mut self.skinned,
             &mut self.transparent,
             &mut self.transparent_skinned,
+            lod_v2,
+            Some(&mut self.lod_memory),
         );
         CpuCollectResult {
             visible: counts.visible,
@@ -3916,6 +3995,7 @@ impl Renderer {
             sss_lut_tex,
             sss_lut_view,
             render_target_gpu: HashMap::new(),
+            lod_v2_memory: std::collections::BTreeMap::new(),
             rt_blit_sampler,
             rt_post_params_buf,
             skin_gpu: HashMap::new(),
@@ -4742,6 +4822,10 @@ impl Renderer {
             &mut skinned,
             &mut transparent,
             &mut transparent_skinned,
+            // 探针捕获 = v1 选择口径（当帧纯距离、无滞回记忆）——捕获
+            // 上下文的历史不该污染主视图，LodSettings 只作用于主相机收集
+            None,
+            None,
         );
         // 与主 pass 同款合批：不透明按 (网格, 材质) 键排序（同键区间一次 draw）
         items.sort_by_key(|item| item.key);
@@ -6540,6 +6624,9 @@ impl Renderer {
             &mut skinned,
             &mut transparent,
             &mut transparent_skinned,
+            // 主相机收集 = LOD v2 唯一消费点（缺席 = None = v1 逐位不变）
+            world.try_resource::<LodSettings>().map(|s| *s),
+            Some(&mut self.lod_v2_memory),
         );
         items.sort_unstable_by_key(|item| item.key);
         // 透明排序：视深降序（远 → 近，back-to-front）——alpha 混合不满足
@@ -9946,16 +10033,28 @@ impl Renderer {
             globals_bg,
             instance_buf: None,
             instance_capacity: 0,
+            width: width.max(1),
+            height: height.max(1),
         }
     }
 
-    /// 若句柄尚无 GPU 资源则构建并缓存；尺寸变化时**不重建**（v1 无
-    /// resize，见 [`RenderTargetStore`] 文档——尺寸由 store 创建时决定）。
+    /// 若句柄尚无 GPU 资源则构建并缓存；**尺寸与 store 描述失配则整体
+    /// 重建**（[`RenderTargetStore::resize`] 的生效路径——旧纹理 / 缓冲随
+    /// 缓存条目替换即刻释放，实例缓冲本就每帧全量上传无增量损失）。
+    /// 尺寸一致的常态帧走零动作快路（既有逐位行为不变）。
     fn ensure_render_target(&mut self, handle: RenderTargetHandle, width: u32, height: u32) {
-        if !self.render_target_gpu.contains_key(&handle.0) {
-            let rt = self.build_render_target(width, height);
-            self.render_target_gpu.insert(handle.0, rt);
-            log::debug!("渲染目标 {handle:?} GPU 资源已构建（{width}×{height}）");
+        let (w, h) = (width.max(1), height.max(1));
+        let resizes = match self.render_target_gpu.get(&handle.0) {
+            Some(rt) if rt.width == w && rt.height == h => return,
+            Some(_) => true,
+            None => false,
+        };
+        let rt = self.build_render_target(w, h);
+        self.render_target_gpu.insert(handle.0, rt);
+        if resizes {
+            log::debug!("渲染目标 {handle:?} 尺寸变更，GPU 资源已重建（{w}×{h}）");
+        } else {
+            log::debug!("渲染目标 {handle:?} GPU 资源已构建（{w}×{h}）");
         }
     }
 
@@ -10033,6 +10132,9 @@ impl Renderer {
             &mut skinned,
             &mut transparent,
             &mut transparent_skinned,
+            // RT 相机 = v1 选择口径（无滞回记忆，见 LodSettings 文档）
+            None,
+            None,
         );
         items.sort_unstable_by_key(|item| item.key);
         transparent.sort_unstable_by(|a, b| {
@@ -10383,6 +10485,9 @@ impl Renderer {
             &mut skinned,
             &mut transparent,
             &mut transparent_skinned,
+            // 水体反射捕获 = v1 选择口径（同探针 / RT 立场）
+            None,
+            None,
         );
         // 透明列表不消费（捕获不画透明）——原样归还 scratch
         items.sort_unstable_by_key(|item| item.key);
@@ -11193,6 +11298,8 @@ mod tests {
             skinned,
             &mut transparent,
             &mut transparent_skinned,
+            None,
+            None,
         )
     }
 
@@ -11472,6 +11579,8 @@ mod tests {
             &mut skinned,
             &mut transparent,
             &mut transparent_skinned,
+            None,
+            None,
         );
         assert_eq!(counts.visible, 5);
         assert_eq!(counts.culled, 0);

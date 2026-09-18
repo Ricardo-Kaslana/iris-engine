@@ -218,7 +218,8 @@ pub mod prelude {
     };
     pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{
-        LodMesh, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex, primitives,
+        LodMesh, LodSettings, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex,
+        primitives,
     };
     pub use crate::meshlet::{
         MAX_MESHLET_CLUSTERS, MESHLET_CLUSTER_MAX_TRIANGLES, MESHLET_CLUSTER_MAX_VERTICES,

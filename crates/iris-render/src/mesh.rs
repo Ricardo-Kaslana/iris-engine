@@ -18,10 +18,9 @@ pub struct MeshHandle(pub u32);
 /// 展开；对称网格原点即中心，偏心网格远处剔除边界略保守，误差可接受）。
 ///
 /// v1 已知限制（诚实清单）：
-/// - **无滞回**（hysteresis）：实体距离在 `switch_distance` 边界附近
-///   抖动时，两网格可能逐帧来回切换（几何体量变化 + 显存换入换出）。
-///   需要时游戏侧可给 `switch_distance` 加时间平滑，引擎内双阈值滞回
-///   在路线图；
+/// - ~~**无滞回**（hysteresis）~~ **C1 已闭合**：世界带 [`LodSettings`]
+///   资源时主相机收集走双阈值滞回（[`LodMesh::select_hysteresis`]），
+///   资源缺席 = 本节原文语义逐位不变；
 /// - 高低模一般共享材质（切换只换几何）；两句柄指向不同材质时切换帧
 ///   批次重排是合法行为，但可能触发额外 draw call。
 #[derive(Clone, Copy, Debug, PartialEq, iris_core::Component)]
@@ -43,6 +42,73 @@ impl LodMesh {
             self.high
         } else {
             self.low
+        }
+    }
+
+    /// LOD v2 选择纯函数（C1 · 闭合 §8.16「无滞回」条）：**双阈值滞回**。
+    ///
+    /// 口径（`h =` 入参 `hysteresis` 消毒后 ∈ [0, 0.999]；非有限输入回 0）：
+    /// - `prev_high = Some(true)`：留在 high 当且仅当 `dist <= s·(1+h)`
+    ///   （越出外阈值才降 low）；
+    /// - `prev_high = Some(false)`：升 high 当且仅当 `dist <= s·(1−h)`
+    ///   （必须进入内阈值——滞回「带」内维持原档，两阈值之间无跳变）；
+    /// - `prev_high = None`（无历史：首帧 / 新实体 / 无记忆上下文）：
+    ///   `dist <= s`，与 [`LodMesh::select`] 同式。
+    ///
+    /// **`h = 0` 时三分支全部退化为 `dist <= s`，与 v1 `select` 逐位一致**
+    /// （滞回带零宽 ⇒ 记忆不参与判定）——这是「新设置默认无害」的兼容
+    /// 论证，由单测逐位钉住。边界归近侧口径在全部 prev 形态保持。
+    /// 返回（选中句柄，是否 high）——布尔供调用侧写回跨帧记忆。
+    pub fn select_hysteresis(
+        &self,
+        dist: f32,
+        prev_high: Option<bool>,
+        hysteresis: f32,
+    ) -> (MeshHandle, bool) {
+        let s = self.switch_distance;
+        let h = if hysteresis.is_finite() {
+            hysteresis.clamp(0.0, 0.999)
+        } else {
+            0.0
+        };
+        let high = match prev_high {
+            Some(true) => dist <= s * (1.0 + h),
+            Some(false) => dist <= s * (1.0 - h),
+            None => dist <= s,
+        };
+        (if high { self.high } else { self.low }, high)
+    }
+}
+
+/// LOD v2 选择参数（C1 · 闭合 §8.16）：World 资源，**缺席 = v1 口径
+/// 逐位不变**（照 `TaaSettings` / `SsrSettings` 的缺席语义范式）。
+///
+/// 生效范围（诚实边界）：只作用于 [`LodMesh`] 的**主相机**收集——
+/// 滞回是跨帧记忆，而每帧存在多个收集上下文（RT 相机 / 探针捕获 /
+/// 水体捕获，各自视锥独立），记忆按相机分表会放大状态面且语义可疑
+/// （辅助相机的历史不该污染主视图），故辅助上下文一律维持当帧纯距离
+/// 判定（v1 式）；地形 [`LodMesh3`](crate::terrain::LodMesh3) 的三级
+/// 选择不在本轮范围（chunk 有滞回需求的场景请走实体级 LodMesh）。
+/// `Renderer::reset_taa` 不清本记忆（与探针域同立场：相机无关的场景
+/// 侧时域状态）。
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct LodSettings {
+    /// 滞回带相对宽度，消毒后钳 [0, 0.999]（非有限输入回 0 = 单阈值）。
+    /// 0.15 ≈ 切换点两侧各 15% 的缓冲带，可吸收边界抖动的典型量级。
+    pub hysteresis: f32,
+    /// 距离参照 = **high 网格包围球中心**（世界系，经模型矩阵变换）
+    /// 而非实体原点。偏心网格（原点不在几何中部）的切换边界更准确；
+    /// 网格无 CPU 包围盒时回退实体原点（v1 口径，保守方向）。
+    /// `false` = 实体原点（v1 口径）。
+    pub bounds_center: bool,
+}
+
+impl Default for LodSettings {
+    /// 默认「开」：资源**在场**即是作者的启用声明（缺席才是关闭）。
+    fn default() -> Self {
+        Self {
+            hysteresis: 0.15,
+            bounds_center: true,
         }
     }
 }
@@ -620,6 +686,94 @@ mod tests {
         // 超界 0.001 m 用 low
         let past_edge = Vec3::new(2.0, 1.0, 13.0); // 距离 11 > 10
         assert_eq!(lod.select(past_edge, origin), MeshHandle(3), "超界用 low");
+    }
+
+    /// LOD v2 兼容锚（C1）：**h = 0 时三档 prev 与 v1 `select` 逐位一致**
+    /// ——滞回带零宽 ⇒ 跨帧记忆不参与判定 ⇒ 「在场但保守」的新设置无害。
+    #[test]
+    fn lod_select_hysteresis_zero_band_equals_v1_bitwise() {
+        let lod = LodMesh {
+            high: MeshHandle(7),
+            low: MeshHandle(3),
+            switch_distance: 10.0,
+        };
+        for dist in [0.0f32, 9.9, 10.0, 10.000_001, 11.0, 1e9, f32::NAN] {
+            let v1 = lod.select(Vec3::ZERO, Vec3::new(0.0, 0.0, dist));
+            for prev in [None, Some(true), Some(false)] {
+                let (got, high) = lod.select_hysteresis(dist, prev, 0.0);
+                assert_eq!(
+                    (got, high),
+                    (v1, v1 == MeshHandle(7)),
+                    "dist = {dist}, prev = {prev:?}：h=0 必须逐位等于 v1"
+                );
+            }
+        }
+    }
+
+    /// LOD v2 滞回有效性（C1 · 非默认值断言，R89 规约）：s = 10、h = 0.2
+    /// ⇒ 外阈值 12 / 内阈值 8。带内（8, 12）维持原档——同一距离因 prev
+    /// 不同得到不同档位，这正是防边界抖动的机制；出带即切换，边界归近侧。
+    #[test]
+    fn lod_select_hysteresis_band_holds_previous_level() {
+        let lod = LodMesh {
+            high: MeshHandle(7),
+            low: MeshHandle(3),
+            switch_distance: 10.0,
+        };
+        // prev=high：11 在带内 → 维持 high；13 越外阈值 → low；恰 12 归近侧
+        assert_eq!(
+            lod.select_hysteresis(11.0, Some(true), 0.2),
+            (MeshHandle(7), true)
+        );
+        assert_eq!(
+            lod.select_hysteresis(12.0, Some(true), 0.2),
+            (MeshHandle(7), true)
+        );
+        assert_eq!(
+            lod.select_hysteresis(13.0, Some(true), 0.2),
+            (MeshHandle(3), false)
+        );
+        // prev=low：9 在带内 → 维持 low；7 进内阈值 → high；恰 8 归近侧
+        assert_eq!(
+            lod.select_hysteresis(9.0, Some(false), 0.2),
+            (MeshHandle(3), false)
+        );
+        assert_eq!(
+            lod.select_hysteresis(8.0, Some(false), 0.2),
+            (MeshHandle(7), true)
+        );
+        assert_eq!(
+            lod.select_hysteresis(7.0, Some(false), 0.2),
+            (MeshHandle(7), true)
+        );
+        // 无历史（首帧/新实体）：单阈值 s=10
+        assert_eq!(
+            lod.select_hysteresis(11.0, None, 0.2),
+            (MeshHandle(3), false)
+        );
+        assert_eq!(
+            lod.select_hysteresis(10.0, None, 0.2),
+            (MeshHandle(7), true)
+        );
+        // 消毒：负值钳 0（= v1 单阈值）、NaN/inf 回 0、1.0 钳 0.999
+        assert_eq!(
+            lod.select_hysteresis(10.0, Some(false), -3.0),
+            (MeshHandle(7), true)
+        );
+        assert_eq!(
+            lod.select_hysteresis(10.0, Some(false), f32::NAN),
+            (MeshHandle(7), true)
+        );
+        assert_eq!(
+            lod.select_hysteresis(10.0, Some(false), f32::INFINITY),
+            (MeshHandle(7), true)
+        );
+        let (h, _) = lod.select_hysteresis(10.9, Some(true), 1.0); // 内阈值 ≈0.01×10 → 10.9 带外?
+        assert_eq!(
+            h,
+            MeshHandle(7),
+            "prev=high 且 h 钳 0.999 ⇒ 外阈值 19.99，10.9 维持 high"
+        );
     }
 
     /// 内存统计（R30）：顶点 32B + 索引 4B + 蒙皮属性 32B 逐网格累加。

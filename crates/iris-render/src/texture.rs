@@ -386,6 +386,18 @@ impl TextureStore {
         handle
     }
 
+    /// 登记纹理并**同时声明无压缩**（C1 · 闭合 §8.45）：等价 `add` +
+    /// `declare_uncompressed` 一步完成。面向**引擎原生数据贴图**——程序化
+    /// 生成的法线 / ORM（如 [`CpuTexture::brick_normal_orm`]）不经 glTF
+    /// 加载器、拿不到自动声明，此前只能命中 BC1 决策树（近距块状伪梯度，
+    /// frictions ⑨ 同款机理）。与 R66e 声明门同纪律：**前置否决**只影响
+    /// 该句柄的上传路径，未声明的原生资产维持 BC1 口径（既有基线零漂移）。
+    pub fn add_uncompressed_declared(&mut self, texture: CpuTexture) -> TextureHandle {
+        let handle = self.add(texture);
+        self.uncompressed.insert(handle.0);
+        handle
+    }
+
     /// 为已存在的句柄补 BC3 声明（R59）：GLB / 场景先经常规入口 spawn
     /// （纹理已入目录），消费方再按 manifest 标志逐句柄补声明——声明
     /// 只需发生在**首次 GPU 上传前**（渲染器懒上传，首帧 draw 才编码）。
@@ -884,5 +896,40 @@ mod tests {
             4 + 8 * 8 * 4 + (64 + 16 + 4),
             "声明后 = RGBA8 完整链增量（到 1×1）"
         );
+    }
+
+    /// 一步式无压缩登记（C1 · 闭合 §8.45）：`add_uncompressed_declared`
+    /// 与「`add` + `declare_uncompressed`」在目录形态 / 声明位 / 显存估算
+    /// 三口径下完全等价；未走该口的常规 `add` 不受影响（既有 BC1 基线）。
+    #[test]
+    fn add_uncompressed_declared_matches_add_plus_declare() {
+        let opaque = CpuTexture::checkerboard(1, 8, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let mut one_step = TextureStore::new();
+        let h1 = one_step.add_uncompressed_declared(opaque.clone());
+        let mut two_step = TextureStore::new();
+        let h2 = two_step.add(opaque.clone());
+        two_step.declare_uncompressed(h2);
+        assert_eq!(h1, h2, "句柄分配口径与 add 一致");
+        assert_eq!(one_step.len(), two_step.len());
+        assert_eq!(
+            one_step.get(h1).map(|t| &t.rgba),
+            two_step.get(h2).map(|t| &t.rgba),
+            "目录内容等价"
+        );
+        assert!(one_step.is_uncompressed_declared(h1));
+        assert_eq!(
+            one_step.gpu_bytes_estimate(true),
+            two_step.gpu_bytes_estimate(true),
+            "一步式与两步式显存估算逐位一致"
+        );
+        assert_eq!(
+            one_step.gpu_bytes_estimate_mipped(true),
+            two_step.gpu_bytes_estimate_mipped(true)
+        );
+        // 对照组：常规 add 的原生数据贴图仍走 BC1 口径（未声明不受波及）
+        let mut plain = TextureStore::new();
+        let h3 = plain.add(opaque);
+        assert!(!plain.is_uncompressed_declared(h3));
+        assert_eq!(plain.gpu_bytes_estimate(true), 4 + 32, "未声明 = BC1 口径");
     }
 }

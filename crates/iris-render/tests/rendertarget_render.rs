@@ -20,6 +20,10 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Transform, World};
 use iris_render::prelude::*;
 
+/// 重负载 GPU 套件文件内串行互斥（AGENTS.md 纪律：同文件多测试并行共用
+/// 单适配器会挂死；R82/R89 控制轮实锤先例照 `ssr_render.rs::GPU_SERIAL`）。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 无光照分析场景（表面只出自发光，见模块文档）。主相机资源与 RT 相机
 /// 由调用方设置。
 fn dark_world() -> World {
@@ -82,6 +86,7 @@ fn spawn_rt_camera(world: &mut World, height: f32, target: RenderTargetHandle) {
 /// 心）、RT 区域外主视图为暗背景（主路径不受 RT 干扰）。
 #[test]
 fn rt_content_visible_via_ui_image_rtt() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -159,6 +164,7 @@ fn rt_content_visible_via_ui_image_rtt() {
 ///（不考虑 UI），主 pass 像素与无 RT 时逐像素一致。
 #[test]
 fn main_view_pixels_unchanged_with_rt_camera() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -208,6 +214,7 @@ fn main_view_pixels_unchanged_with_rt_camera() {
 /// 但不影响主视图统计（FrameStats 口径 = 主几何）。
 #[test]
 fn rt_camera_does_not_change_frame_stats() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(128, 128) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -235,6 +242,7 @@ fn rt_camera_does_not_change_frame_stats() {
 /// 红色溢出。
 #[test]
 fn ui_image_draws_texture_pixels() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -289,6 +297,7 @@ fn ui_image_draws_texture_pixels() {
 /// 影响（region-diff 证明 RT 内容确实落在该区域）。
 #[test]
 fn ui_image_rtt_region_renders_rt_content() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -377,6 +386,7 @@ fn ui_image_rtt_region_renders_rt_content() {
 /// 无 RT 相机 = 主视图行为零变化。
 #[test]
 fn no_rt_store_keeps_baseline() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(128, 128) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -401,5 +411,85 @@ fn no_rt_store_keeps_baseline() {
     assert_eq!(
         a, b,
         "无 RT store 与空 store 的主 pass 像素必须一致（缺席 = 无 RT 相机）"
+    );
+}
+
+/// 用例七「resize 重建正确性」（C1 · §8.20 闭合）：
+/// ①「先建 64×64 再 resize 到 96×96」的渲染结果必须与「直接建 96×96」
+///   **逐像素一致**——尺寸失配重建出的 GPU 资源与新建严格等价；
+/// ②「resize 到同尺寸」是良性空操作——与完全不 resize 逐像素一致
+///   （ensure 快路零动作的证据）；
+/// ③以上全程只动 RT 侧，主视图（含 UiImageRtt 区域）像素即断言对象。
+#[test]
+fn rt_resize_rebuild_matches_fresh_target_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    // 场景工厂：初建尺寸 initial，随后（可选）resize 到 to。
+    let scene = |initial: (u32, u32), to: Option<(u32, u32)>| {
+        let mut world = dark_world();
+        {
+            let mut camera = world.resource_mut::<Camera>();
+            camera.eye = Vec3::new(0.0, 1.8, 100.0);
+            camera.target = Vec3::new(0.0, 1.8, 101.0);
+        }
+        let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let red = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(2.0, 0.0, 0.0));
+        world.spawn((Transform::from_xyz(0.0, 1.0, 0.0), cube, red));
+        ensure_rt_store(&mut world);
+        let rt = world
+            .resource_mut::<RenderTargetStore>()
+            .add(initial.0, initial.1);
+        if let Some((w, h)) = to {
+            assert!(
+                world.resource_mut::<RenderTargetStore>().resize(rt, w, h),
+                "有效句柄 resize 应成功"
+            );
+            assert_eq!(
+                world
+                    .resource::<RenderTargetStore>()
+                    .get(rt)
+                    .map(|s| (s.width, s.height)),
+                Some((w.max(1), h.max(1))),
+                "CPU 描述应立即反映新尺寸"
+            );
+        }
+        spawn_rt_camera(&mut world, 4.0, rt);
+        world.spawn((
+            UiRect {
+                position: [8.0, 8.0],
+                size: [64.0, 64.0],
+            },
+            UiImageRtt { target: rt },
+            UiColor::default(),
+        ));
+        propagate_transforms(&mut world);
+        world
+    };
+    // 帧序刻意安排：先让缓存停在 64×64，再走 resize→96（**真实触发重建**
+    // ——失配臂被覆盖），最后直建 96 作逐像素对照（同句柄同尺寸 = 快路，
+    // 二者像素必须一致 ⇒ 重建产物 ≡ 新建产物）。
+    renderer.render(&scene((64, 64), None));
+    let _ = renderer.read_pixels();
+    // ①先建 64 再 resize 96 —— 重建路径
+    renderer.render(&scene((64, 64), Some((96, 96))));
+    let resized = renderer.read_pixels();
+    // ①直建 96 —— 对照路径（缓存已 96，ensure 快路零动作）
+    renderer.render(&scene((96, 96), None));
+    let fresh = renderer.read_pixels();
+    assert_eq!(
+        fresh, resized,
+        "resize 重建后的 GPU 资源必须与新尺寸直接创建逐像素一致"
+    );
+    // ②同尺寸 resize = 空操作（与不 resize 逐像素一致）
+    renderer.render(&scene((96, 96), Some((96, 96))));
+    let noop = renderer.read_pixels();
+    assert_eq!(
+        fresh, noop,
+        "resize 到同尺寸必须与不 resize 逐像素一致（良性空操作）"
     );
 }
