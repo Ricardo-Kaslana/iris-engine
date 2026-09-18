@@ -118,6 +118,7 @@ pub mod material;
 pub mod mesh;
 pub mod meshlet;
 pub mod meshlet_stream;
+pub mod morph;
 pub mod occlusion;
 pub mod offscreen;
 pub mod particles;
@@ -234,6 +235,7 @@ pub mod prelude {
         MESHLET_NO_GROUP, MESHLET_PAGE_CLUSTERS, MeshletPageTable, MeshletStreamSettings,
         ResidencyManager, ResidencyOps, ResidencySelection, select_lod_cluster_ranges_resident,
     };
+    pub use crate::morph::{MorphData, MorphTarget, MorphWeights, blend_morph_vertices};
     pub use crate::occlusion::OcclusionCulling;
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::particles::{

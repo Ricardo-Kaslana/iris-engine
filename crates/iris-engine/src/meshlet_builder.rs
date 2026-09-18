@@ -1177,6 +1177,7 @@ mod tests {
             skin: None,
             tangents: None,
             uv2: None,
+            morph: None,
         };
         let mesh = build_meshlets(&tri.vertices, &tri.indices);
         assert_eq!(mesh.clusters.len(), 1);

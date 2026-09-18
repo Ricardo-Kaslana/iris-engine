@@ -436,6 +436,7 @@ impl Assembly {
             },
             tangents: None,
             uv2: None,
+            morph: None,
         };
         smooth_normals(&mut mesh);
         compute_tangents(&mut mesh);

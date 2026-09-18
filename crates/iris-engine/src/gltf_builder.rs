@@ -927,6 +927,7 @@ mod tests {
             skin: None,
             tangents: None,
             uv2: None,
+            morph: None,
         }
     }
 

@@ -294,6 +294,31 @@ struct SkinnedItem {
     instance: InstanceRaw,
     /// 关节矩阵（列主序平铺后直接上传）。
     joint_matrices: Vec<glam::Mat4>,
+    /// 形变权重快照（C4a，收集期从 [`MorphWeights`](crate::morph::MorphWeights)
+    /// 拷入）：None = 实体无权重组件（绑定姿势）。由 `resolve_morphs`
+    /// 消费——CPU 混合上传逐实体顶点缓冲并填 [`Self::vertex_override`]。
+    morph_weights: Option<Vec<f32>>,
+    /// 逐实体混合顶点缓冲（C4a）：None = 绑共享网格的静态 VBO（现路径
+    /// 逐位不变）；Some 时蒙皮绘制分支（主 / 透明 / 阴影 / 场景深度 /
+    /// RT / 探针捕获 / 水面）slot 0 改绑本缓冲。
+    vertex_override: Option<wgpu::Buffer>,
+}
+
+impl SkinnedItem {
+    /// slot 0 顶点缓冲取用（形变覆盖优先，见 [`Self::vertex_override`]）。
+    fn vertex_buf<'a>(&'a self, mesh: &'a GpuMesh) -> &'a wgpu::Buffer {
+        self.vertex_override.as_ref().unwrap_or(&mesh.vertex_buf)
+    }
+}
+
+/// 逐形变实体的 GPU 侧顶点缓冲（C4a）：容量复用 + 权重位图案脏检。
+/// 键 = 蒙皮实体位标识（与 `GpuSkin` 同构同键，生命周期同为只增缓存）。
+struct MorphGpu {
+    vertex_buf: wgpu::Buffer,
+    /// 缓冲字节容量（顶点数变大时整体重建——LOD 切换 / 换网格句柄形态）。
+    capacity_bytes: u64,
+    /// 上次上传的权重位图案（一致 ⇒ 不重混合、不重上传）。
+    last_weights: Vec<u32>,
 }
 
 /// 一帧内收集到的透明绘制项：不透明项额外携带视深排序键。
@@ -517,6 +542,13 @@ pub struct Renderer {
     rt_post_params_buf: wgpu::Buffer,
     /// 蒙皮实体位标识 → 关节矩阵缓冲。
     skin_gpu: HashMap<u64, GpuSkin>,
+    /// 蒙皮实体位标识 → 形变混合顶点缓冲（C4a；仅带
+    /// [`MorphWeights`](crate::morph::MorphWeights) 且网格有 morph 表的
+    /// 实体进入，缺席路径零触碰）。
+    morph_gpu: HashMap<u64, MorphGpu>,
+    /// 形变顶点缓冲的实际上传帧次累计（观测口径：脏检生效时不增长，
+    /// 供测试断言「静态权重 ⇒ 零重上传」）。
+    morph_uploads: u64,
     /// 方向光级联阴影贴图：R32Float 2D 数组（2048² × SHADOW_CASCADES 层，
     /// R 存光空间深度），持有纹理以保证 view 有效。
     #[allow(dead_code)]
@@ -2399,7 +2431,8 @@ fn collect_instances(
         Option<&LodMesh>,
         &Skin,
         Option<&Visibility>,
-    )>(|(e, gt, mat, mesh, lod, skin, visibility)| {
+        Option<&crate::morph::MorphWeights>,
+    )>(|(e, gt, mat, mesh, lod, skin, visibility, morph_weights)| {
         // 自身 HIDDEN 跳过 + 祖先链级联（任一祖先隐藏 ⇒ 子树全隐藏）
         if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
@@ -2440,6 +2473,8 @@ fn collect_instances(
             instance: InstanceRaw::from_matrix(model)
                 .with_probe(probe_payload(gt.position(), lightmap)),
             joint_matrices,
+            morph_weights: morph_weights.map(|w| w.weights.clone()),
+            vertex_override: None,
         };
         if alpha_of(material_store, *mat) == AlphaMode::Blend {
             let center_world =
@@ -4005,6 +4040,8 @@ impl Renderer {
             rt_blit_sampler,
             rt_post_params_buf,
             skin_gpu: HashMap::new(),
+            morph_gpu: HashMap::new(),
+            morph_uploads: 0,
             shadow_map,
             shadow_map_view,
             shadow_depth_buf,
@@ -4877,6 +4914,8 @@ impl Renderer {
                 .queue
                 .write_buffer(&skin.joint_buf, 0, &joint_bytes);
         }
+        // 形变目标解算（C4a，蒙皮绘制前的 slot 0 覆盖；全体缺席时零触碰）
+        self.resolve_morphs(&mesh_store, &mut skinned, &mut transparent_skinned);
         self.ensure_probe_instance_capacity(raws.len());
         if !raws.is_empty() {
             let instance_buf = self
@@ -5076,7 +5115,7 @@ impl Renderer {
                 for (i, item) in skinned.iter().enumerate() {
                     let mesh = &self.mesh_gpu[&item.mesh];
                     let skin = &self.skin_gpu[&item.skin_entity];
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                     pass.set_vertex_buffer(
                         1,
                         mesh.skin_buf
@@ -5170,7 +5209,7 @@ impl Renderer {
                         });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                         pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                         pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
                         pass.set_vertex_buffer(
@@ -7052,6 +7091,9 @@ impl Renderer {
                 .queue
                 .write_buffer(&skin.joint_buf, 0, &joint_bytes);
         }
+        // 形变目标解算（C4a，阴影 / 主 / 深度各 pass 消费同一份覆盖，
+        // 全体缺席时零触碰——脏检保证静态权重不重混合不重上传）
+        self.resolve_morphs(&mesh_store, &mut skinned, &mut transparent_skinned);
         // 4b. 透明普通项的网格 / 材质懒上传（透明蒙皮已在 4a 覆盖）。
         // 透明路径不采样光照贴图（v1 限制）⇒ 图集槽位恒 NO_LIGHTMAP。
         for item in &transparent {
@@ -7200,7 +7242,7 @@ impl Renderer {
                     for (i, item) in skinned.iter().enumerate() {
                         let mesh = &self.mesh_gpu[&item.mesh];
                         let skin = &self.skin_gpu[&item.skin_entity];
-                        shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        shadow_pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                         shadow_pass.set_vertex_buffer(
                             1,
                             mesh.skin_buf
@@ -7324,7 +7366,7 @@ impl Renderer {
                             for (i, item) in skinned.iter().enumerate() {
                                 let mesh = &self.mesh_gpu[&item.mesh];
                                 let skin = &self.skin_gpu[&item.skin_entity];
-                                point_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                                point_pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                                 point_pass.set_vertex_buffer(
                                     1,
                                     mesh.skin_buf
@@ -7677,7 +7719,7 @@ impl Renderer {
                     });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                     // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                     pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                     // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
@@ -7995,7 +8037,7 @@ impl Renderer {
                     });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                     // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                     pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                     // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
@@ -8204,7 +8246,7 @@ impl Renderer {
                 for (i, item) in skinned.iter().enumerate() {
                     let mesh = &self.mesh_gpu[&item.mesh];
                     let skin = &self.skin_gpu[&item.skin_entity];
-                    depth_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    depth_pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                     depth_pass.set_vertex_buffer(
                         1,
                         mesh.skin_buf
@@ -10191,6 +10233,8 @@ impl Renderer {
             );
             self.ensure_skin(item.skin_entity, item.joint_matrices.len());
         }
+        // 形变目标解算（C4a，RT 几何 pass 消费同一份覆盖）
+        self.resolve_morphs(mesh_store, &mut skinned, &mut transparent_skinned);
         for item in &transparent {
             self.ensure_mesh(mesh_store, MeshHandle((item.key >> 32) as u32));
             self.ensure_material(
@@ -10322,7 +10366,7 @@ impl Renderer {
                         });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                         // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                         pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                         // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
@@ -10390,7 +10434,7 @@ impl Renderer {
                             });
                             pass.set_bind_group(1, &material.bind_group, &[]);
                             pass.set_bind_group(2, &skin.bind_group, &[]);
-                            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                            pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                             // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
                             pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
                             // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
@@ -10540,6 +10584,8 @@ impl Renderer {
                 .queue
                 .write_buffer(&skin.joint_buf, 0, &joint_bytes);
         }
+        // 形变目标解算（C4a，水面反射 / 水下绘制消费同一份覆盖）
+        self.resolve_morphs(mesh_store, &mut skinned, &mut transparent_skinned);
         // 反射实例：专用缓冲每帧全量上传（主缓冲带跨帧增量镜像，复用会
         // 破坏其一致性）
         self.ensure_water_instance_capacity(refl_total + refl_skinned);
@@ -10649,7 +10695,7 @@ impl Renderer {
                         let skin = &self.skin_gpu[&item.skin_entity];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                         pass.set_vertex_buffer(
                             1,
                             mesh.skin_buf
@@ -10728,7 +10774,7 @@ impl Renderer {
                         let skin = &self.skin_gpu[&item.skin_entity];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
                         pass.set_vertex_buffer(
                             1,
                             mesh.skin_buf
@@ -10849,6 +10895,101 @@ impl Renderer {
                 capacity,
             },
         );
+    }
+
+    /// 形变目标解算（C4a）：带权重快照且网格有 morph 表的蒙皮项，CPU
+    /// 混合出本帧顶点并上传逐实体顶点缓冲，填 `vertex_override`。
+    ///
+    /// 脏检：容量足够且权重位图案与上次上传一致 ⇒ **不重混合、不重
+    /// 上传**（缓冲仍被复用，覆盖照常生效）——「静态权重 ⇒ 逐帧字节
+    /// 不变」的口径由 `morph_uploads` 观测计数钉住。
+    ///
+    /// 缺席语义：`morph_weights` 为 None（组件缺席）或网格无 morph 表
+    /// ⇒ 项保持 `vertex_override = None`，绑共享网格静态 VBO，现路径
+    /// 逐位不变（v1 只对蒙皮路径生效的裁剪见 `morph.rs` 模块文档）。
+    fn resolve_morphs(
+        &mut self,
+        mesh_store: &MeshStore,
+        skinned: &mut [SkinnedItem],
+        transparent_skinned: &mut [TransparentSkinnedItem],
+    ) {
+        for item in skinned
+            .iter_mut()
+            .chain(transparent_skinned.iter_mut().map(|t| &mut t.skinned))
+        {
+            let Some(weights) = item.morph_weights.take() else {
+                continue;
+            };
+            let Some(base) = mesh_store.get(MeshHandle(item.mesh)) else {
+                continue;
+            };
+            let Some(morph) = base.morph.as_ref() else {
+                continue;
+            };
+            let bytes: u64 =
+                (base.vertices.len() * std::mem::size_of::<crate::mesh::Vertex>()) as u64;
+            let key = item.skin_entity;
+            let bits: Vec<u32> = weights.iter().map(|w| w.to_bits()).collect();
+            let clean = self
+                .morph_gpu
+                .get(&key)
+                .is_some_and(|entry| entry.last_weights == bits && bytes <= entry.capacity_bytes);
+            if clean {
+                // 权重位图案未变 ⇒ 不重混合、不重上传（缓冲内容照常生效）
+                let entry = self.morph_gpu.get(&key).expect("上查在场");
+                item.vertex_override = Some(entry.vertex_buf.clone());
+                continue;
+            }
+            let blended = crate::morph::blend_morph_vertices(&base.vertices, morph, &weights);
+            let mut dirty = false;
+            if !self.morph_gpu.contains_key(&key) {
+                let vertex_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.morph.vbo"),
+                    // 空网格兜底 4 字节（wgpu 零大小缓冲的常规口径）
+                    size: bytes.max(4),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.morph_gpu.insert(
+                    key,
+                    MorphGpu {
+                        vertex_buf,
+                        capacity_bytes: bytes.max(4),
+                        last_weights: Vec::new(),
+                    },
+                );
+                dirty = true;
+            }
+            let entry = self.morph_gpu.get_mut(&key).expect("形变缓冲刚建好必在场");
+            if bytes > entry.capacity_bytes {
+                // 容量不足（换网格句柄 / LOD 切换顶点数变大）：整体重建
+                entry.vertex_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("iris.morph.vbo"),
+                    size: bytes.max(4),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                entry.capacity_bytes = bytes.max(4);
+                dirty = true;
+            }
+            if dirty || entry.last_weights != bits {
+                if bytes > 0 {
+                    self.gpu.queue.write_buffer(
+                        &entry.vertex_buf,
+                        0,
+                        bytemuck::cast_slice(&blended),
+                    );
+                }
+                entry.last_weights.clone_from(&bits);
+                self.morph_uploads += 1;
+            }
+            item.vertex_override = Some(entry.vertex_buf.clone());
+        }
+    }
+
+    /// 形变上传帧次累计观测（C4a，测试口径）。
+    pub fn morph_uploads(&self) -> u64 {
+        self.morph_uploads
     }
 
     fn ensure_texture(&mut self, store: Option<&TextureStore>, handle: TextureHandle) {

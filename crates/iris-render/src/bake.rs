@@ -2003,6 +2003,7 @@ mod tests {
             skin: None,
             tangents: None,
             uv2: None,
+            morph: None,
         };
         let handle = world.resource_mut::<MeshStore>().add(mesh);
         let scaled = world.spawn((

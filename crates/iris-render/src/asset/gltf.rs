@@ -151,6 +151,17 @@ fn default_scale() -> [f32; 3] {
 struct GltfMesh {
     #[serde(default)]
     primitives: Vec<GltfPrimitive>,
+    /// glTF `mesh.extras`：仅取 `targetNames`（形变目标名，与
+    /// `primitives[].targets` 按序对应，C4a）；其余 extras 键忽略。
+    #[serde(default)]
+    extras: Option<GltfMeshExtras>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GltfMeshExtras {
+    #[serde(default)]
+    target_names: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +172,11 @@ struct GltfPrimitive {
     indices: Option<usize>,
     #[serde(default)]
     material: Option<usize>,
+    /// glTF morphTargets（C4a）：每个条目是「属性名 → 增量 accessor」的
+    /// 映射（POSITION / NORMAL 为 VEC3 增量，规范允许只给子集）。
+    /// v1 只取 POSITION / NORMAL，其余通道（TEXCOORD 增量等）忽略。
+    #[serde(default)]
+    targets: Vec<HashMap<String, usize>>,
 }
 
 #[derive(Deserialize)]
@@ -775,7 +791,80 @@ impl GltfLoader {
             tangents,
             // 光照贴图 UV 是烘焙产物、不进 glTF（R52c，见 MeshData::uv2 文档）
             uv2: None,
+            morph: self.build_morph(mesh_index, primitive, vertex_count)?,
         })
+    }
+
+    /// 组装单个 primitive 的形变目标表（C4a，glTF morphTargets）。
+    ///
+    /// 口径：
+    /// - `targets` 为空 ⇒ `None`（无 morph 数据的标准形态）；
+    /// - 增量 accessor 走 [`read_floats`](Self::read_floats) 同一扇门：
+    ///   稠密 FLOAT VEC3 之外的形态（稀疏 / 非浮点 / 分量数不符）沿用
+    ///   解析器全池的 `Unsupported` 语义（§8.24）；
+    /// - 规范允许目标只声明属性子集：缺 POSITION 时位置增量补零表
+    ///   （纯法线形变合法）；POSITION 与 NORMAL 皆缺 ⇒ `Unsupported`
+    ///   （该目标无任何可执行通道）；
+    /// - 其余通道（TEXCOORD_0 增量等）v1 忽略（模块声明见 `morph.rs`）。
+    fn build_morph(
+        &self,
+        mesh_index: usize,
+        primitive: &GltfPrimitive,
+        vertex_count: usize,
+    ) -> Result<Option<crate::morph::MorphData>, GltfError> {
+        if primitive.targets.is_empty() {
+            return Ok(None);
+        }
+        let names = self
+            .doc
+            .meshes
+            .get(mesh_index)
+            .and_then(|m| m.extras.as_ref())
+            .map(|e| e.target_names.clone())
+            .unwrap_or_default();
+        let mut targets = Vec::with_capacity(primitive.targets.len());
+        for (index, map) in primitive.targets.iter().enumerate() {
+            let position_deltas = match map.get("POSITION") {
+                Some(&accessor) => self.read_deltas(accessor, vertex_count)?,
+                None => vec![[0.0; 3]; vertex_count],
+            };
+            let normal_deltas = match map.get("NORMAL") {
+                Some(&accessor) => Some(self.read_deltas(accessor, vertex_count)?),
+                None => None,
+            };
+            if !map.contains_key("POSITION") && normal_deltas.is_none() {
+                return Err(GltfError::Unsupported(format!(
+                    "mesh #{mesh_index} 的 morph target #{index} 既无 POSITION 也无 NORMAL 增量"
+                )));
+            }
+            targets.push(crate::morph::MorphTarget::new(
+                names.get(index).cloned(),
+                position_deltas,
+                normal_deltas,
+            ));
+        }
+        Ok(Some(crate::morph::MorphData::new(targets)))
+    }
+
+    /// 读取一个 VEC3 增量 accessor 并按顶点数对账。
+    fn read_deltas(
+        &self,
+        accessor: usize,
+        vertex_count: usize,
+    ) -> Result<Vec<[f32; 3]>, GltfError> {
+        let (data, comps) = self.read_floats(accessor)?;
+        if comps != 3 {
+            return Err(GltfError::OutOfRange("morph 增量必须是 VEC3".into()));
+        }
+        if data.len() / 3 != vertex_count {
+            return Err(GltfError::OutOfRange(format!(
+                "morph 增量顶点数 {} 与 primitive 顶点数 {vertex_count} 不一致",
+                data.len() / 3
+            )));
+        }
+        Ok((0..vertex_count)
+            .map(|i| [data[i * 3], data[i * 3 + 1], data[i * 3 + 2]])
+            .collect())
     }
 
     /// 读取图片（外部文件或 data URI）并解码为 CPU 纹理。
@@ -2455,6 +2544,132 @@ mod tests {
             skin_attrs[1].weights
         );
         Ok(())
+    }
+
+    /// morph 三角 fixture：POSITION + 2 个 target（各 POSITION/NORMAL
+    /// VEC3 增量）+ `mesh.extras.targetNames`（C4a）。
+    fn morph_triangle_parts() -> (String, Vec<u8>) {
+        let mut bin: Vec<u8> = Vec::new();
+        let mut push_vec3s = |rows: &[[f32; 3]]| {
+            for r in rows {
+                bin.extend_from_slice(&r.map(f32::to_le_bytes).concat());
+            }
+        };
+        push_vec3s(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]); // POSITION
+        push_vec3s(&[[0.1, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.0, 0.0]]); // t0 POSITION 增量
+        push_vec3s(&[[0.0, 0.5, 0.0], [0.0, 0.5, 0.0], [0.0, 0.5, 0.0]]); // t0 NORMAL 增量
+        push_vec3s(&[[0.0, -0.2, 0.0], [0.0, -0.2, 0.0], [0.0, -0.2, 0.0]]); // t1 POSITION 增量
+        push_vec3s(&[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]); // t1 NORMAL 增量
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "buffers": [{"byteLength": 180}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0,   "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36,  "byteLength": 36},
+                {"buffer": 0, "byteOffset": 72,  "byteLength": 36},
+                {"buffer": 0, "byteOffset": 108, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 144, "byteLength": 36}
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"},
+                {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC3"},
+                {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC3"},
+                {"bufferView": 4, "componentType": 5126, "count": 3, "type": "VEC3"}
+            ],
+            "meshes": [{
+                "primitives": [{
+                    "attributes": {"POSITION": 0},
+                    "targets": [
+                        {"POSITION": 1, "NORMAL": 2},
+                        {"POSITION": 3, "NORMAL": 4}
+                    ]
+                }],
+                "extras": {"targetNames": ["grin", "nod"]}
+            }],
+            "nodes": [{"mesh": 0}],
+            "scenes": [{"nodes": [0]}],
+            "scene": 0
+        }"#;
+        (json.to_string(), bin)
+    }
+
+    /// C4a：glTF morphTargets 加载——targets + extras.targetNames 进
+    /// `MeshData.morph`（名称对齐、增量值、无 morph 资产保持 None）。
+    #[test]
+    fn loads_morph_targets_from_glb() -> Result<(), GltfError> {
+        let dir = std::env::temp_dir().join(format!("iris-gltf-morph-{}-1", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = morph_triangle_parts();
+        let path = dir.join("morph.glb");
+        std::fs::write(&path, write_glb(&json, &bin)).unwrap();
+
+        let mut world = world_with_stores();
+        spawn_gltf_instance(&mut world, &path)?;
+        let store = world.resource::<MeshStore>();
+        let data = store.get(MeshHandle(0)).expect("网格已加载");
+        let morph = data.morph.as_ref().expect("targets 应进 morph 侧表");
+        assert_eq!(morph.target_count(), 2);
+        assert_eq!(morph.targets[0].name.as_deref(), Some("grin"));
+        assert_eq!(morph.targets[1].name.as_deref(), Some("nod"));
+        assert_eq!(morph.targets[0].position_deltas.len(), 3);
+        assert_eq!(morph.targets[0].position_deltas[0], [0.1, 0.0, 0.0]);
+        assert_eq!(
+            morph.targets[0].normal_deltas.as_ref().unwrap()[1],
+            [0.0, 0.5, 0.0]
+        );
+        assert_eq!(morph.targets[1].position_deltas[2], [0.0, -0.2, 0.0]);
+
+        // 加载口径对账：零权重混合 = 基座逐位（含无 NORMAL 属性时补的
+        // 面法线路径——基座顶点数与增量表长一致）
+        let zero = crate::morph::blend_morph_vertices(&data.vertices, morph, &[0.0, 0.0]);
+        for (a, b) in data.vertices.iter().zip(&zero) {
+            assert_eq!(a.position, b.position, "零权重位置");
+            assert_eq!(a.normal, b.normal, "零权重法线");
+        }
+        // 单权重解析值：w = [1, 0] ⇒ 位置 +0.1、法线 (0,1,0) 混合
+        // (0,0.5,0) 后归一化 = (0,1,0)…增量后 (0,1.5,0)/1.5 = (0,1,0)
+        let grin = crate::morph::blend_morph_vertices(&data.vertices, morph, &[1.0, 0.0]);
+        assert_eq!(grin[0].position, [0.1, 0.0, 0.0]);
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// C4a 拒收面：目标既无 POSITION 也无 NORMAL ⇒ Unsupported；
+    /// 增量顶点数与 primitive 不符 ⇒ OutOfRange。
+    #[test]
+    fn rejects_malformed_morph_targets() {
+        let dir = std::env::temp_dir().join(format!("iris-gltf-morph-{}-2", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json, bin) = morph_triangle_parts();
+
+        // 空通道目标
+        let empty = json.replace("{\"POSITION\": 1, \"NORMAL\": 2}", "{\"TEXCOORD_0\": 1}");
+        assert!(empty.contains("TEXCOORD_0"), "fixture 补丁须生效");
+        let path = dir.join("morph_empty_channel.glb");
+        std::fs::write(&path, write_glb(&empty, &bin)).unwrap();
+        let mut world = world_with_stores();
+        let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
+        assert!(
+            matches!(err, GltfError::Unsupported(_)),
+            "无任何可执行通道的目标应拒收，实际 {err:?}"
+        );
+
+        // 增量计数 2 ≠ 顶点数 3
+        let mismatch = json.replace(
+            "{\"bufferView\": 3, \"componentType\": 5126, \"count\": 3, \"type\": \"VEC3\"}",
+            "{\"bufferView\": 3, \"componentType\": 5126, \"count\": 2, \"type\": \"VEC3\"}",
+        );
+        assert!(mismatch.contains("\"count\": 2"), "fixture 补丁须生效");
+        let path = dir.join("morph_count.glb");
+        std::fs::write(&path, write_glb(&mismatch, &bin)).unwrap();
+        let mut world = world_with_stores();
+        let err = spawn_gltf_instance(&mut world, &path).unwrap_err();
+        assert!(
+            matches!(err, GltfError::OutOfRange(_)),
+            "增量计数与顶点数不符应越界，实际 {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

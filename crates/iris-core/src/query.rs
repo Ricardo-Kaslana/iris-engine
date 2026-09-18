@@ -185,6 +185,10 @@ impl_query_part_for_tuple!(A, B, C, D);
 impl_query_part_for_tuple!(A, B, C, D, E);
 impl_query_part_for_tuple!(A, B, C, D, E, F);
 impl_query_part_for_tuple!(A, B, C, D, E, F, G);
+// C4a：渲染器蒙皮收集需 8 项（+ Option<&MorphWeights>）。序稳定性论证
+// 不变——len / entity_at 恒委托首元素（guard.0），追加可选访问器不改
+// 收集迭代序。
+impl_query_part_for_tuple!(A, B, C, D, E, F, G, H);
 
 #[cfg(test)]
 mod tests {

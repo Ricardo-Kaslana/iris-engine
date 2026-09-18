@@ -209,14 +209,17 @@ pub const UV2_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayo
     }],
 };
 
-/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线 / 光照贴图 UV 属性）。
+/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线 / 光照贴图 UV / 形变目标属性）。
 ///
 /// 组件缺席语义：`skin` 缺席 = 非蒙皮网格；`tangents` 缺席 = 网格无
 /// 顶点切线——法线贴图扰动所需的 TBN 由着色器在屏幕空间用
 /// `dpdx/dpdy` 推导（`standard.wgsl`），两种路径对无切线消费的材质
 /// （法线槽位缺省）渲染结果零影响；`uv2` 缺席 = 网格无光照贴图 UV——
 /// 渲染器绑常驻零垫，配合材质侧 `lightmap_mask = 0`，间接光走原 IBL
-/// 路径**逐位不变**（R52c 硬约束，论证见 `lightmap.rs` 模块文档）。
+/// 路径**逐位不变**（R52c 硬约束，论证见 `lightmap.rs` 模块文档）；
+/// `morph` 缺席 = 网格无形变目标（权重组件在场也无效）——Some 时
+/// `vertices` 恒为绑定姿势，形变顶点是渲染期按权重混合的临时产物，
+/// 不回写本表（C4a，见 `morph.rs` 模块文档）。
 #[derive(Clone, Debug, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
@@ -233,6 +236,12 @@ pub struct MeshData {
     /// （每实体一份网格副本——UV2 是逐实体的图集坐标，共享网格必须分裂，
     /// 见该函数文档）。
     pub uv2: Option<Vec<[f32; 2]>>,
+    /// 形变目标表（C4a，glTF morphTargets 语义）：`vertices` 保持绑定
+    /// 姿势，增量在 [`morph`](crate::morph) 侧表；Some 时各目标增量长度
+    /// 必须与 `vertices` 一致。**渲染期只对蒙皮实体生效**——逐实体权重
+    /// [`MorphWeights`](crate::morph::MorphWeights) 在场时 CPU 混合上传
+    /// 专用顶点缓冲（缺席 = 绑定姿势 = 原路径逐位不变，口径见模块文档）。
+    pub morph: Option<crate::morph::MorphData>,
 }
 
 impl MeshData {
@@ -566,6 +575,7 @@ impl MeshStore {
                     })
                     + data.tangents.as_ref().map_or(0, |t| (t.len() * 16) as u64)
                     + data.uv2.as_ref().map_or(0, |u| (u.len() * 8) as u64)
+                    + data.morph.as_ref().map_or(0, |m| m.memory_bytes())
             })
             .sum()
     }
@@ -1001,6 +1011,7 @@ mod tests {
             ]),
             tangents: None,
             uv2: None,
+            morph: None,
         };
         let _ = upload_mesh(&gpu, &data);
     }
