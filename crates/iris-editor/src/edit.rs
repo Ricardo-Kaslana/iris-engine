@@ -2708,6 +2708,9 @@ pub fn nav_bounds_from_statics(statics: &[(Vec3, ColliderShape)]) -> Option<(Vec
     for (position, shape) in statics {
         let half = match shape {
             ColliderShape::Box { half_extents } => *half_extents,
+            // OBB（C3d）：旋转按轴对齐语义忽略、取半边长外包——与
+            // Box 同款简化口径（覆盖域只用于视图取景，偏小无害）
+            ColliderShape::OrientedBox { half_extents } => *half_extents,
             ColliderShape::Sphere { radius } => Vec3::splat(*radius),
             ColliderShape::Capsule {
                 radius,
@@ -3417,6 +3420,10 @@ pub fn collider_label(collider: &Collider) -> String {
         ColliderShape::Sphere { radius } => format!("sphere({radius:.2})"),
         ColliderShape::Box { half_extents } => format!(
             "box({:.2},{:.2},{:.2})",
+            half_extents.x, half_extents.y, half_extents.z
+        ),
+        ColliderShape::OrientedBox { half_extents } => format!(
+            "obb({:.2},{:.2},{:.2})",
             half_extents.x, half_extents.y, half_extents.z
         ),
         ColliderShape::Capsule {

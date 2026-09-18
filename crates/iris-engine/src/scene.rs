@@ -1037,13 +1037,17 @@ struct ColliderSection {
 }
 
 /// 碰撞形状段：`{"sphere": {"radius": ..}}` / `{"box": {"half_extents": [..]}}`
-/// / `{"capsule": {"radius": .., "half_height": ..}}`（外部标签形式）。
-/// AABB 不随实体旋转、胶囊轴恒竖直（物理 v1 约定，见 iris-core::physics）。
+/// / `{"capsule": {"radius": .., "half_height": ..}}`
+/// / `{"oriented_box": {"half_extents": [..]}}`（外部标签形式；OBB 的
+/// 姿态取实体 `transform.rotation`——形状段只存半边长，旋转不重复
+/// 入档）。AABB 不随实体旋转、胶囊轴恒竖直（物理 v1 约定），OBB 为
+/// 旋转盒的 opt-in 变体（C3d，见 iris-core::physics）。
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum ColliderShapeSection {
     Sphere { radius: f32 },
     Box { half_extents: [f32; 3] },
+    OrientedBox { half_extents: [f32; 3] },
     Capsule { radius: f32, half_height: f32 },
 }
 
@@ -1052,6 +1056,9 @@ impl ColliderShapeSection {
         match self {
             Self::Sphere { radius } => ColliderShape::Sphere { radius },
             Self::Box { half_extents } => ColliderShape::Box {
+                half_extents: half_extents.into(),
+            },
+            Self::OrientedBox { half_extents } => ColliderShape::OrientedBox {
                 half_extents: half_extents.into(),
             },
             Self::Capsule {
@@ -1070,6 +1077,9 @@ impl ColliderShapeSection {
         match shape {
             ColliderShape::Sphere { radius } => Self::Sphere { radius: *radius },
             ColliderShape::Box { half_extents } => Self::Box {
+                half_extents: half_extents.to_array(),
+            },
+            ColliderShape::OrientedBox { half_extents } => Self::OrientedBox {
                 half_extents: half_extents.to_array(),
             },
             ColliderShape::Capsule {
@@ -3600,5 +3610,49 @@ mod tests {
         let registry = world.resource::<SceneAssetRegistry>();
         assert_eq!(registry.meshes.len(), 2, "登记表按句柄一条");
         assert_eq!(registry.materials.len(), 2);
+    }
+
+    /// OBB 形状段（C3d）：`{"oriented_box": {"half_extents": [..]}}`
+    /// 加载为 [`ColliderShape::OrientedBox`]，save ↔ load 往返位级一致
+    /// （旋转不入形状段——姿态归实体 `transform.rotation`）。
+    #[test]
+    fn oriented_box_shape_loads_and_roundtrips() {
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "obb.scene.json",
+            r#"{
+                "entities": [{
+                    "transform": { "position": [1.0, 0.5, 0.0], "rotation": [0.0, 0.3826834323650898, 0.0, 0.9238795325112867] },
+                    "collider": { "shape": { "oriented_box": { "half_extents": [0.6, 0.1, 2.4] } }, "static": true }
+                }]
+            }"#,
+        );
+        let collider = *world.get::<Collider>(entities[0]).unwrap();
+        assert_eq!(
+            collider.shape,
+            ColliderShape::OrientedBox {
+                half_extents: Vec3::new(0.6, 0.1, 2.4)
+            }
+        );
+        assert!(collider.is_static);
+        // 旋转照常入 transform（形状段只存半边长）
+        let rot = world.get::<Transform>(entities[0]).unwrap().rotation;
+        assert!((rot.y - 0.382_683_43).abs() < 1e-6, "yaw45 四元数照原样");
+
+        let out = test_dir().join("obb_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            text.contains(r#""oriented_box""#),
+            "保存的 JSON 应含 oriented_box 形状段：{text}"
+        );
+        let mut world_b = fresh_world();
+        let again = load_scene(&mut world_b, &out).expect("二次加载");
+        assert_eq!(
+            world_b.get::<Collider>(again[0]).unwrap().shape,
+            collider.shape,
+            "OBB 段往返位级一致"
+        );
     }
 }

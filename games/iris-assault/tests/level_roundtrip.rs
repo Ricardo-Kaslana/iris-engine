@@ -83,6 +83,9 @@ fn dump_world(world: &World) -> Vec<String> {
             let shape = match c.shape {
                 ColliderShape::Sphere { radius } => format!("sphere({})", bits(radius)),
                 ColliderShape::Box { half_extents } => format!("box({:?})", bits3(half_extents)),
+                ColliderShape::OrientedBox { half_extents } => {
+                    format!("obb({:?})", bits3(half_extents))
+                }
                 ColliderShape::Capsule {
                     radius,
                     half_height,

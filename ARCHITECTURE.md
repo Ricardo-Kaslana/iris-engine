@@ -580,13 +580,16 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
   阶、全贯穿不检出（**C3 起有 `move_and_slide_ccd` 子步包装闭合**——
   原入口语义不变）。
 - **v1 限制（诚实清单）**：
-  1. **AABB 不随实体旋转（OBB 仍未交付，C3 专章门禁）**：`ColliderShape::Box` 是世界
-     轴对齐包围盒，`rotation` 对它无语义——旋转实体的碰撞盒不跟着转
-     （物理体应使用不旋转的实体，或把旋转只给表现子实体）；**旋转体的
-     碰撞请用胶囊**：`ColliderShape::Capsule` 自 R50 起轴随实体旋转
-     （检测 / 射线 / 扫掠 / 推离全链），恒等旋转与 R31 逐位一致。
-     OBB / 凸包升级需先过确定性设计专章（`docs/private/gjk-determinism.md`，
-     C3 交付：建议 OBB 走 SAT 闭式先行、凸包 GJK 缓行——待裁定）；
+  1. **AABB 语义固化 + OBB 独立变体（C3d 专章 P1 过审交付）**：
+     `ColliderShape::Box` 是世界轴对齐包围盒，`rotation` 对它无语义
+     （v1 固化，既有场景逐位不变）；**旋转的盒用
+     `ColliderShape::OrientedBox`**——obb×obb **SAT 15 轴闭式**（无迭代、
+     无超越函数，OBB 内核算子看门单测锁死；相切不算接触、并列分离轴
+     取固定枚举序首位、准平行叉积轴跳过分立），obb×{Sphere, Capsule,
+     Box} 经局部系刚体变换复用既有闭式；射线局部系 slab、broadphase
+     包围 AABB、v2 惯性随体旋转；恒等旋转与 Box 数值等价（±1e-5）但
+     非逐位路径（opt-in 变体）。任意凸包（GJK/EPA，专章 P2）**维持
+     缓行**待真实消费方；`Capsule`（R50）仍是第二旋转感知形状；
   2. **物理体须为根实体**：`step_physics` 把 `Transform.position` /
      `rotation` 当世界坐标读写，与层级并用时须自行保证物理体无父级
      （或父级变换恒等）；
@@ -629,6 +632,11 @@ world.query::<(&Position, &mut Velocity)>(|(pos, vel)| { ... });
 系统（`PhysicsPlugin` 注册）：判据 = 每帧位置修正累计量（米），step 只
 入队、prune 移除组件并发 `JointBroken` 事件——断裂作用于实体（该实体
 全部关节一起清）。诚实清单增补进 §8.59。
+**C3d 追补（同役续，专章 P1 过审拆段）**：④ **OBB**
+`ColliderShape::OrientedBox`——obb×obb SAT 15 轴闭式 + 其余组合局部系
+变换复用（全闭式无迭代、算子看门 / 固定种子 200 池 / 边界归属 / step
+集成四件套验收，见 `docs/private/gjk-determinism.md` 与 §8.60；凸包
+P2 维持缓行）。
 
 **地形集成（R51，零扩展）**：heightmap 地形的碰撞拼块（见 §4.23）就是
 一批普通 `Collider::static_box` 静态体——接触检测、射线 / 扫掠查询、
@@ -5929,10 +5937,11 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     侧躺仍可能埋臂**（单胶囊躯干的肩窝在轴外 > 躯干半径；释放转轴已绕肩线
     规避主路径，实测埋深 0.028 m；根治需多胶囊 / OBB 躯干——v2 角冲量
     侧向缓解、结构性根治仍需 OBB 躯干）。
-    另：**Box 仍世界轴对齐 AABB**（`rotation` 无语义，OBB 升级随
-    `docs/private/gjk-determinism.md` 专章门禁（C3 交付，建议 SAT 闭式
-    先行、凸包缓行——待裁定）；
-    旋转体的碰撞用胶囊；v2 惯性张量同此口径——盒惯性世界轴对齐）。
+    另：**Box 仍世界轴对齐 AABB**（`rotation` 无语义，v1 固化）；旋转盒
+    自 C3d 起用独立变体 `ColliderShape::OrientedBox`（SAT 闭式，见
+    §8.60；ragdoll 的 OBB 躯干**能力已就位、接线未迁移**）；
+    旋转体的碰撞用胶囊或 OBB；v2 惯性张量——盒类中 OBB 随体旋转、
+    Box 仍世界轴对齐）。
 28. **heightmap 地形 v1 的诚实限制（R51）**——完整清单在 terrain.rs
     模块文档与 §4.23，此处索引：①**碰撞是台阶不是光滑坡面**（盒顶按
     cell 阶梯，视觉网格连续；单 cell 高差超 step_height 的陡面照挡）；
@@ -6623,6 +6632,24 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     组件表的结构约束，非设计偏好）；④**角色 CCD 包装的重力按子步
     分摊**——与单次调用有浮点结合序差（新入口无 v1 逐位义务，仅保证
     自身确定；亚阈值位移逐位 = 原入口的兼容锚在单测锁定）。
+60. **OBB（OrientedBox，C3d 专章 P1）的诚实边界**——完整语义在
+    `physics.rs` OBB 段与形状文档，此处索引：①**obb×obb 接触点是
+    中心连线中点**（`contact_point_rotated` 入口口径）——单点力臂对
+    面接触偏粗，v2 角冲量在 obb×obb 上的扭矩分布是近似（obb×{球,
+    胶囊, 盒} 走局部系复用各自的最近点近似，无此退化）；②**nav 不
+    支持 OBB 顶面**（nav 静态体快照无旋转入参 ⇒ `covering_surface`
+    保守 `None`，斜置平台不可作导航顶面；侧障高度 / 投影间隙取
+    包围球 / 外接圆保守近似——只多阻不漏放）；③**恒等旋转非逐位
+    路径**（obb(ID) 与 Box 数值等价 ±1e-5、命中性一致，但变换链乘序
+    不同——opt-in 变体无逐位义务，既有 `Box` 场景零义务不变）；
+    ④**准平行叉积轴跳过**（两轴夹角正弦² ≤ 1e-6 时该轴判分由面法线
+    接管——游戏尺度角度误差 < 0.06°、穿透误差 < 1e-3·尺寸，标准 SAT
+    取舍）；⑤**接触语义分两级**：obb×obb 相切 = 不接触（`overlap ≤ 0`
+    分离，`box_box` 同式），而 obb×sphere 继承 `sphere_box` 的闭区间
+    （恰相切报穿透 0）——下游 `SWEEP_CONTACT_EPSILON` 过滤本就抹平
+    该差异，行为一致、声明留档；⑥**编辑器 nav 取景按 AABB 忽略旋转**
+    （覆盖域仅视图框定用途）；⑦ 任意**凸包 GJK/EPA 维持缓行**
+    （专章 P2，待消费方）。
 
 ## 9. 关键设计取舍记录
 

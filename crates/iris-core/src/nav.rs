@@ -1030,6 +1030,11 @@ fn covering_surface(point: Vec3, pos: Vec3, shape: &ColliderShape) -> Option<f32
                 None
             }
         }
+        // OBB（C3d）：nav 的静态体快照只有 (位置, 形状)、**无旋转**——
+        // 斜置 OBB 的顶面投影无法如实判定，保守不供顶面（宁缺勿错：
+        // 误供矩形投影会让寻路踩到旋转平台之外的虚空）。需要导航
+        // 顶面用 Box / 恒竖直胶囊 / 球（§8.60 声明）。
+        ColliderShape::OrientedBox { .. } => None,
         ColliderShape::Sphere { radius } => sphere_cap_surface(dx, dz, pos.y, radius, 0.0),
         ColliderShape::Capsule {
             radius,
@@ -1061,6 +1066,9 @@ fn surface_standable(point: Vec3, pos: Vec3, shape: &ColliderShape, sin_slope: f
     let dz = point.z - pos.z;
     match *shape {
         ColliderShape::Box { .. } => true,
+        // OBB：covering_surface 不供顶面（无旋转快照，见其注释），
+        // 本判定随之恒 false（不可达配对不会进到这里，写全防语义漂移）
+        ColliderShape::OrientedBox { .. } => false,
         ColliderShape::Sphere { radius } => {
             let rho_sq = dx * dx + dz * dz;
             let limit = radius * sin_slope;
@@ -1088,6 +1096,9 @@ fn side_obstacle_height(point: Vec3, pos: Vec3, shape: &ColliderShape, agent_rad
     let rho_sq = dx * dx + dz * dz;
     match *shape {
         ColliderShape::Box { half_extents } => pos.y + half_extents.y,
+        // OBB（无旋转快照）：取任意姿态下的最高界 = 半边长向量长度
+        // （包围球顶）——侧障判定只会**偏保守**（多挡不漏放），安全方向
+        ColliderShape::OrientedBox { half_extents } => pos.y + half_extents.length(),
         ColliderShape::Sphere { radius } => {
             let rho_inner = (rho_sq.sqrt() - agent_radius).max(0.0);
             sphere_cap_surface(rho_inner, 0.0, pos.y, radius, 0.0).unwrap_or(0.0)
@@ -1118,6 +1129,12 @@ fn xz_clearance(point: Vec3, pos: Vec3, shape: &ColliderShape) -> f32 {
             let ox = (dx.abs() - half_extents.x).max(0.0);
             let oz = (dz.abs() - half_extents.z).max(0.0);
             (ox * ox + oz * oz).sqrt()
+        }
+        // OBB（无旋转快照）：XZ 投影的外接圆（√(hx²+hz²)）保守近似——
+        // 间隙只会**偏小**（多阻不漏放），与侧障高度同款安全方向
+        ColliderShape::OrientedBox { half_extents } => {
+            let r = (half_extents.x * half_extents.x + half_extents.z * half_extents.z).sqrt();
+            ((dx * dx + dz * dz).sqrt() - r).max(0.0)
         }
     }
 }

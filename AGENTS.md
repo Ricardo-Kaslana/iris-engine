@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1584 / release 1581**（C3 物理深化役收官：+6 CCD 纯函数与弹丸集成（含 v1 穿墙在场对照 + 亚阈值逐位锚）+ 3 角色 `move_and_slide_ccd` 包装 + 7 铰链（解析 6 + step 集成 1，限位幂等 / 马达速率 / 退化消毒）+ 1 可断关节闭环（入队→prune→事件→双开关对照）；三件全 opt-in「缺席 = 逐位不变」形态，全部既有物理 / 游戏快照测试零改动原值通过；OBB+凸包走 GJK 确定性专章门禁（docs/private/gjk-determinism.md 待裁定）；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1595 / release 1592**（C3 物理深化役收官·含 C3d 追补：+6 CCD 纯函数与弹丸集成（含 v1 穿墙在场对照 + 亚阈值逐位锚）+ 3 角色 `move_and_slide_ccd` 包装 + 7 铰链（解析 6 + step 集成 1，限位幂等 / 马达速率 / 退化消毒）+ 1 可断关节闭环（入队→prune→事件→双开关对照）+ 11 OBB（SAT 算子看门 / 固定种子 200 池两跑逐位 / 相切与并列边界归属 / 恒等旋转兼容对照 / 包围八角点 / 射线 slab / step 斜板分离 / 关卡段往返）；四件全 opt-in「缺席 = 逐位不变」形态，全部既有物理与游戏快照测试零改动原值通过；凸包 GJK/EPA 按专章 P2 缓行；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1584 / release 1581）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1595 / release 1592）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -139,7 +139,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1584 / release 1581；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1595 / release 1592；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65

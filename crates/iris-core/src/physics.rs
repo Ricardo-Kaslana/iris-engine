@@ -383,13 +383,13 @@
 //!
 //! # v1 限制（诚实清单）
 //!
-//! - **AABB 不随实体旋转（OBB 仍未交付，C3 裁定缓行）**：
+//! - **AABB 语义固化 + OBB 独立变体（C3d 专章 P1 过审交付）**：
 //!   [`ColliderShape::Box`] 是世界轴对齐包围盒，`Transform.rotation` 对它
-//!   **无语义**（检测忽略）——旋转实体的碰撞盒不跟着转；**旋转体请用
-//!   胶囊**（R50 起胶囊轴随实体旋转，是唯一旋转感知的形状）。OBB / 凸包
-//!   需要 GJK 类新检测内核，其浮点确定性设计专章（
-//!   `docs/private/gjk-determinism.md`）过审前不动码（闭合战役裁定④）；
-//!   （Box 的 AABB 语义一字未动 ⇒ 既有场景逐位不变）；
+//!   **无语义**（既有场景逐位不变）；**旋转的盒用
+//!   [`ColliderShape::OrientedBox`]**——obb×obb SAT 15 轴闭式、其余组合
+//!   局部系刚体变换复用既有闭式（无迭代、无超越函数，算子看门单测锁
+//!   定；相切不接触、并列取枚举序首位）。任意凸包（GJK/EPA）仍缓行
+//!   （专章 P2，待真实消费方）；v2 惯性随体旋转（同胶囊口径）。
 //! - **接触不产生角冲量（R50 诚实限制）**：碰撞只改**位置与线速度**——
 //!   落地不会自动「滚起来」、偏心撞击不会让物体打转。角动量只由
 //!   「初值（[`RigidBody::angular_velocity`]）+ 角阻尼 + 约束（
@@ -453,10 +453,11 @@ pub const PHYSICS_GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 /// 减弱堆叠场景的单帧残余穿透（速度响应只在首轮施加，见 [`solve_contact`]）。
 pub const SOLVER_ITERATIONS: usize = 2;
 
-/// 碰撞形状。Sphere 与世界轴对齐 Box（AABB **不随实体旋转**——OBB/SAT
-/// 留后续轮）+ **旋转感知** Capsule（R50：轴 = 实体
+/// 碰撞形状。Sphere + 世界轴对齐 Box（AABB **不随实体旋转**，v1 固化
+/// 语义）+ **旋转感知** Capsule（R50：轴 = 实体
 /// [`Transform::rotation`](crate::transform::Transform) 旋转后的本地 ±Y，
-/// 检测 / 射线 / 扫掠全链跟随；`Quat::IDENTITY` 即恒竖直，与 R31 逐位一致）。
+/// 检测 / 射线 / 扫掠全链跟随；`Quat::IDENTITY` 即恒竖直，与 R31 逐位
+/// 一致）+ **旋转感知** OrientedBox（C3d：SAT 闭式，见其文档）。
 #[derive(Clone, Copy, Debug, PartialEq, Component)]
 pub enum ColliderShape {
     /// 球体（各向同性：`rotation` 无语义，检测忽略之）。
@@ -464,10 +465,24 @@ pub enum ColliderShape {
         /// 半径（米）。
         radius: f32,
     },
-    /// 轴对齐包围盒（AABB，**不随实体旋转**：`rotation` 被忽略——旋转体的
-    /// 碰撞请用胶囊，见模块文档 v1 限制）。
+    /// 轴对齐包围盒（AABB，**不随实体旋转**：`rotation` 被忽略——该语义
+    /// 为 v1 固化、既有场景逐位不变；需要旋转的盒用
+    /// [`ColliderShape::OrientedBox`]）。
     Box {
         /// 半边长（米）。
+        half_extents: Vec3,
+    },
+    /// 定向包围盒（OBB，C3d 专章 P1）：半边长表达在**本地轴**上，姿态取
+    /// 实体 [`Transform::rotation`](crate::transform::Transform)（旋转
+    /// 矩阵三列 = 三条世界轴向）。检测为闭式：obb×obb 走 **SAT 15 轴**
+    /// （6 面法线 + 9 叉积轴，准平行叉积轴跳过、并列取固定枚举序首位、
+    /// 相切不算接触，`box_box` 同口径）；obb×{Sphere, Capsule, Box}
+    /// 经**局部系刚体变换**复用既有闭式路径（法线旋回世界）。射线为
+    /// 局部系 slab；broadphase 取包围 AABB；惯量随体旋转（同胶囊口径）。
+    /// **恒等旋转与 [`Self::Box`] 数值等价（±1e-6）但非逐位路径**——
+    /// 旋转碰撞是 opt-in 变体，`Box` 原语义一字未动。
+    OrientedBox {
+        /// 本地三轴半边长（米）。
         half_extents: Vec3,
     },
     /// 胶囊：圆柱段 + 两端半球端帽（角色控制器的标准形状，也是 R50 起
@@ -562,6 +577,32 @@ impl Collider {
         }
     }
 
+    /// 静态 OBB（旋转薄墙 / 斜置平台 / 多胶囊外的躯干盒），弹性 0。
+    /// 姿态取实体 `Transform.rotation`（C3d，见
+    /// [`ColliderShape::OrientedBox`]）。
+    pub fn static_obb(half_extents: Vec3) -> Self {
+        Self {
+            shape: ColliderShape::OrientedBox { half_extents },
+            is_static: true,
+            restitution: 0.0,
+            is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
+        }
+    }
+
+    /// 动态 OBB（旋转刚体盒——门板 / 机关件；姿态随实体旋转演化）。
+    pub fn dynamic_obb(half_extents: Vec3, restitution: f32) -> Self {
+        Self {
+            shape: ColliderShape::OrientedBox { half_extents },
+            is_static: false,
+            restitution,
+            is_sensor: false,
+            groups: u32::MAX,
+            mask: u32::MAX,
+        }
+    }
+
     /// 静态胶囊（角色 / 胶囊柱 / 横倒圆柱），弹性 0。`half_height ≥ radius`
     /// 断言。轴随实体 [`Transform::rotation`](crate::transform::Transform)
     /// （R50）——恒等旋转即竖直。
@@ -633,14 +674,15 @@ impl ColliderShape {
     }
 
     /// 任意方向的最小投影宽度（米）：Sphere = `2r`、Capsule = `2r`
-    /// （垂直轴向是最小方向）、Box = 三边全长的最小值。退化 / 非法
-    /// 尺寸（非有限或 ≤ 0 分量）返回 `0.0`——CCD 自动段长消费本值，
-    /// 0 ⇒ 检出关闭（见 [`Ccd`]）。
+    /// （垂直轴向是最小方向）、Box / OrientedBox = 三边全长的最小值
+    /// （OBB 的旋转不改变「任意方向投影宽度 ≥ 最小全长」）。退化 /
+    /// 非法尺寸（非有限或 ≤ 0 分量）返回 `0.0`——CCD 自动段长消费
+    /// 本值，0 ⇒ 检出关闭（见 [`Ccd`]）。
     pub fn min_width(&self) -> f32 {
         let width = match *self {
             Self::Sphere { radius } => 2.0 * radius,
             Self::Capsule { radius, .. } => 2.0 * radius,
-            Self::Box { half_extents } => {
+            Self::Box { half_extents } | Self::OrientedBox { half_extents } => {
                 2.0 * half_extents.x.min(half_extents.y).min(half_extents.z)
             }
         };
@@ -1340,8 +1382,10 @@ pub fn detect_pair(
 ///   的端点即得旋转感知，**零数学改动**（收敛性论证见各函数文档：交替
 ///   投影对任意方向的段同样单调收缩，轮数上界不变）；
 /// - **Sphere**：各向同性，`rotation` 无语义（忽略）；
-/// - **Box**：仍是**世界轴对齐** AABB，`rotation` 被忽略——OBB/SAT 升级
-///   留后续轮（诚实清单见模块文档）；**旋转体的碰撞请用胶囊**。
+/// - **Box**：仍是**世界轴对齐** AABB，`rotation` 被忽略（v1 固化语义，
+///   既有场景逐位不变）；**旋转的盒用 [`ColliderShape::OrientedBox`]**
+///   （C3d：obb×obb SAT 15 轴闭式、其余组合局部系变换复用既有闭式，
+///   见 [`obb_detect_pair`]）。
 pub fn detect_pair_rotated(
     a_pos: Vec3,
     a_rotation: Quat,
@@ -1350,6 +1394,14 @@ pub fn detect_pair_rotated(
     b_rotation: Quat,
     b_shape: &ColliderShape,
 ) -> Option<Contact> {
+    // C3d：任一侧为 OrientedBox ⇒ OBB 专有分发（双方都不是 OBB 时
+    // 下面的 match 照旧执行——既有形状对的算术与调用序逐位不变）。
+    if matches!(
+        (a_shape, b_shape),
+        (ColliderShape::OrientedBox { .. }, _) | (_, ColliderShape::OrientedBox { .. })
+    ) {
+        return obb_detect_pair(a_pos, a_rotation, a_shape, b_pos, b_rotation, b_shape);
+    }
     match (a_shape, b_shape) {
         (ColliderShape::Sphere { radius: ra }, ColliderShape::Sphere { radius: rb }) => {
             sphere_sphere(a_pos, *ra, b_pos, *rb)
@@ -1439,6 +1491,9 @@ pub fn detect_pair_rotated(
                 penetration,
             })
         }
+        // OBB 配对已由入口守卫分流到 obb_detect_pair——此臂不可达；
+        // 兜底不接触（保守，编译器要求写全）
+        (ColliderShape::OrientedBox { .. }, _) | (_, ColliderShape::OrientedBox { .. }) => None,
     }
 }
 
@@ -1567,7 +1622,8 @@ pub fn shape_inertia(shape: &ColliderShape, mass: f32) -> (f32, f32, f32) {
             let i = 0.4 * mass * radius * radius;
             (i, i, i)
         }
-        ColliderShape::Box { ref half_extents } => {
+        ColliderShape::Box { ref half_extents }
+        | ColliderShape::OrientedBox { ref half_extents } => {
             let h = half_extents;
             let full = |a: f32, b: f32| mass * (4.0 * (a * a + b * b)) / 12.0;
             (full(h.y, h.z), full(h.x, h.z), full(h.x, h.y))
@@ -1621,7 +1677,8 @@ pub fn inv_inertia_world(shape: &ColliderShape, rotation: Quat, inv_mass: f32) -
     match *shape {
         // 球各向同性、盒世界轴对齐：都不随旋转
         ColliderShape::Sphere { .. } | ColliderShape::Box { .. } => diag(ix, iy, iz),
-        ColliderShape::Capsule { .. } => {
+        // 胶囊与 OBB 的碰撞都是旋转感知的（R50 / C3d），惯性随体旋转
+        ColliderShape::Capsule { .. } | ColliderShape::OrientedBox { .. } => {
             let r = Mat3::from_quat(rotation);
             r * diag(ix, iy, iz) * r.transpose()
         }
@@ -1663,6 +1720,40 @@ pub fn contact_point_rotated(
             return 0.5;
         }
         ((p - a0).dot(ab) / denom).clamp(0.0, 1.0)
+    }
+    // C3d：OBB 参与的配对——(obb, obb) 取中心连线中点（力臂近似粗，
+    // §8.60 声明）；(obb, X)/(X, obb) 经局部系变换复用既有近似、点旋回
+    // 世界。非 OBB 配对落入下方原 match，逐位不变。
+    use ColliderShape::OrientedBox;
+    match (a_shape, b_shape) {
+        (OrientedBox { .. }, OrientedBox { .. }) => {
+            return (a_pos + b_pos) * 0.5;
+        }
+        (OrientedBox { half_extents: ah }, _) => {
+            let inv = a_rotation.conjugate();
+            let local = contact_point_rotated(
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                &ColliderShape::Box { half_extents: *ah },
+                inv * (b_pos - a_pos),
+                inv * b_rotation,
+                b_shape,
+            );
+            return a_rotation * local + a_pos;
+        }
+        (_, OrientedBox { half_extents: bh }) => {
+            let inv = b_rotation.conjugate();
+            let local = contact_point_rotated(
+                inv * (a_pos - b_pos),
+                inv * a_rotation,
+                a_shape,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                &ColliderShape::Box { half_extents: *bh },
+            );
+            return b_rotation * local + b_pos;
+        }
+        _ => {}
     }
     match (a_shape, b_shape) {
         (ColliderShape::Sphere { radius: ra }, ColliderShape::Sphere { radius: rb }) => {
@@ -1752,6 +1843,11 @@ pub fn contact_point_rotated(
         | (ColliderShape::Box { .. }, ColliderShape::Sphere { .. })
         | (ColliderShape::Box { .. }, ColliderShape::Capsule { .. }) => {
             contact_point_rotated(b_pos, b_rotation, b_shape, a_pos, a_rotation, a_shape)
+        }
+        // OBB 配对已在函数入口按「中心中点 / 局部系复用」口径返回——
+        // 此臂不可达（编译器要求写全），值与入口的 obb×obb 口径一致
+        (ColliderShape::OrientedBox { .. }, _) | (_, ColliderShape::OrientedBox { .. }) => {
+            (a_pos + b_pos) * 0.5
         }
     }
 }
@@ -2616,6 +2712,150 @@ fn signum(x: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// OBB 几何（C3d 专章 P1：OrientedBox 的 SAT 闭式与局部系变换分发）
+//
+// 确定性口径（docs/private/gjk-determinism.md 的条款在本轮的实际消费）：
+// 全部为闭式运算（dot / cross / sqrt / 除法），**无超越函数、无迭代
+// 收敛**（SAT 是固定 15 轴的枚举比较）；边界归属逐处写死——相切
+// （overlap 恰为 0）算**不接触**（与 `box_box` 同款）、分离轴并列时取
+// **固定枚举序首位**、中心重合的法线符号走 `signum`（零取正）。
+// ---------------------------------------------------------------------------
+
+/// 叉积轴的准平行跳过阈：两轴夹角的**正弦平方** ≤ `1e-6`（约 0.1° 内）
+/// 时叉积退化跳过——其分离判定已由两侧面法线轴覆盖，跳过避免对近零
+/// 向量归一放大舍入噪声（标准 SAT 退化处理，确定分支）。
+const OBB_AXIS_PARALLEL_EPS_SQ: f32 = 1e-6;
+
+/// OBB 沿查询轴 `axis`（不必单位化；结果按同轴等比缩放）的投影半径：
+/// `Σ_i h_i·|axis·u_i|`，`u_i` = 旋转矩阵列（世界系本地轴）。
+fn obb_radius_along(half: &Vec3, axes: &Mat3, axis: Vec3) -> f32 {
+    half.x * axis.dot(axes.x_axis).abs()
+        + half.y * axis.dot(axes.y_axis).abs()
+        + half.z * axis.dot(axes.z_axis).abs()
+}
+
+/// OBB×OBB 相交与穿透（SAT 15 轴，闭式）：把 b 变换进 a 的局部系
+/// （刚体运动保穿透深度与角度），候选分离轴固定枚举序 =
+/// `[a0, a1, a2, b0, b1, b2, a0×b0, a0×b1, a0×b2, a1×b0, …, a2×b2]`
+/// （面法线 3+3 + 叉积 9；叉积准平行跳过，见
+/// [`OBB_AXIS_PARALLEL_EPS_SQ`]）。
+///
+/// 逐轴：`overlap = rA + rB − |proj(中心差)|`；任一轴 `overlap ≤ 0` ⇒
+/// 存在分离轴 ⇒ `None`（相切不接触）。全轴重叠 ⇒ 接触法线 =
+/// **最小 overlap 轴**（并列取枚举序首位——`<` 严格比较保首位）、方向
+/// 从 a 指向 b（`signum` 定心重合退化），穿透 = 该 overlap。
+fn obb_obb_sat(
+    a_pos: Vec3,
+    a_rotation: Quat,
+    a_half: &Vec3,
+    b_pos: Vec3,
+    b_rotation: Quat,
+    b_half: &Vec3,
+) -> Option<Contact> {
+    // a 局部系：a 在原点恒等；b 带相对位姿
+    let inv = a_rotation.conjugate();
+    let rel = inv * (b_pos - a_pos);
+    let rb = Mat3::from_quat(inv * b_rotation);
+    let a_axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    let b_axes = [rb.x_axis, rb.y_axis, rb.z_axis];
+    let mut best: Option<(f32, Vec3)> = None; // (最小 overlap, 局部法线 a→b)
+    // 面法线 6 轴 + 叉积 9 轴——固定顺序闭包（无向量分配、无迭代界问题）
+    let mut consider = |axis: Vec3| -> Option<()> {
+        // 面轴已由旋转矩阵保证单位长（四元数归一语义）；叉积轴需归一
+        let len_sq = axis.length_squared();
+        if len_sq <= OBB_AXIS_PARALLEL_EPS_SQ {
+            return Some(()); // 准平行退化：跳过（等价「该轴无新信息」）
+        }
+        let l = axis / len_sq.sqrt();
+        let radius_a = a_half.x * l.x.abs() + a_half.y * l.y.abs() + a_half.z * l.z.abs();
+        let radius_b = obb_radius_along(b_half, &rb, l);
+        let proj = l.dot(rel);
+        let overlap = radius_a + radius_b - proj.abs();
+        if overlap <= 0.0 {
+            return None; // 分离轴命中（相切归此侧）
+        }
+        if best.is_none_or(|(best_overlap, _)| overlap < best_overlap) {
+            best = Some((overlap, l * signum(proj)));
+        }
+        Some(())
+    };
+    for axis in a_axes.iter().chain(b_axes.iter()) {
+        consider(*axis)?;
+    }
+    for a_axis in a_axes {
+        for b_axis in b_axes {
+            consider(a_axis.cross(b_axis))?;
+        }
+    }
+    let (penetration, normal_local) = best?;
+    Some(Contact {
+        normal: a_rotation * normal_local,
+        penetration,
+    })
+}
+
+/// OBB 参与的形状对分发（[`detect_pair_rotated`] 的 OBB 支路）：
+///
+/// - **(OBB, OBB)**：[`obb_obb_sat`]（15 轴 SAT）；
+/// - **(OBB, X)**：把 X 变换进 OBB 局部系（OBB 变成原点 AABB），调
+///   [`detect_pair_rotated`] 的既有闭式路径（sphere_box / capsule_box /
+///   box_box / 球帽族），法线旋回世界系——**零新数学**：旋转误差只在
+///   刚体变换的乘序上，闭式内核逐式复用；
+/// - **(X, OBB)**：对称方向（a 变换进 b 局部系，顺序不交换 ⇒ 法线
+///   方向约定天然保持，仍从 a 指向 b）。
+///
+/// 恒等旋转数值等价于 Box 路径（±1e-6，单测对照；非逐位——变换链
+/// 引入的乘序差异，opt-in 变体无逐位义务）。
+fn obb_detect_pair(
+    a_pos: Vec3,
+    a_rotation: Quat,
+    a_shape: &ColliderShape,
+    b_pos: Vec3,
+    b_rotation: Quat,
+    b_shape: &ColliderShape,
+) -> Option<Contact> {
+    use ColliderShape::OrientedBox;
+    match (a_shape, b_shape) {
+        (OrientedBox { half_extents: ah }, OrientedBox { half_extents: bh }) => {
+            obb_obb_sat(a_pos, a_rotation, ah, b_pos, b_rotation, bh)
+        }
+        (OrientedBox { half_extents: ah }, other) => {
+            let inv = a_rotation.conjugate();
+            let local = detect_pair_rotated(
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                &ColliderShape::Box { half_extents: *ah },
+                inv * (b_pos - a_pos),
+                inv * b_rotation,
+                other,
+            )?;
+            Some(Contact {
+                normal: a_rotation * local.normal,
+                penetration: local.penetration,
+            })
+        }
+        (other, OrientedBox { half_extents: bh }) => {
+            let inv = b_rotation.conjugate();
+            let local = detect_pair_rotated(
+                inv * (a_pos - b_pos),
+                inv * a_rotation,
+                other,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                &ColliderShape::Box { half_extents: *bh },
+            )?;
+            Some(Contact {
+                normal: b_rotation * local.normal,
+                penetration: local.penetration,
+            })
+        }
+        // 不可达：本函数仅在任一侧为 OBB 时被调用（detect_pair_rotated
+        // 入口守卫），兜底保守返回不接触
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 胶囊几何（detect_pair 的 capsule 系列辅助，全部纯函数、确定性）
 // R50：轴段朝向由实体旋转给出（capsule_axis），几何算法只吃「段的两个
 // 端点」——旋转感知是**入参替换**而非数学改动。
@@ -2770,6 +3010,11 @@ fn collider_aabb(pos: Vec3, rotation: Quat, shape: &ColliderShape) -> (Vec3, Vec
             (pos - r, pos + r)
         }
         ColliderShape::Box { half_extents } => (pos - half_extents, pos + half_extents),
+        // OBB 的包围 AABB：半跨度 = |R|·h（旋转矩阵绝对值按列加权）
+        ColliderShape::OrientedBox { half_extents } => {
+            let half = Mat3::from_quat(rotation).abs() * half_extents;
+            (pos - half, pos + half)
+        }
         ColliderShape::Capsule {
             radius,
             half_height,
@@ -3996,6 +4241,14 @@ pub fn ray_vs_shape_rotated(
     let (t, normal) = match shape {
         ColliderShape::Sphere { radius } => ray_sphere(origin, dir, pos, *radius)?,
         ColliderShape::Box { half_extents } => ray_box(origin, dir, pos, half_extents)?,
+        // OBB：射线变换进局部系走 ray_box slab（刚体变换保 t——dir 单位、
+        // 旋转保长），法线旋回世界
+        ColliderShape::OrientedBox { half_extents } => {
+            let inv = rotation.conjugate();
+            let (t, normal_local) =
+                ray_box(inv * (origin - pos), inv * dir, Vec3::ZERO, half_extents)?;
+            (t, rotation * normal_local)
+        }
         ColliderShape::Capsule {
             radius,
             half_height,
@@ -9725,6 +9978,387 @@ mod solver_v2_tests {
             [after.x.to_bits(), after.w.to_bits()],
             bits_before,
             "限位内零修正 ⇒ 写回逐位不变"
+        );
+    }
+
+    // ---- C3d OBB-SAT（专章 P1 验收四件套：算子看门 / 固定种子池 /
+    // 边界归属 / 解析对照；零变化锁 = 全部既有测试原值通过）----
+
+    /// splitmix64 计数流（确定性伪随机：纯整数位运算，禁 rand 依赖——
+    /// particles `mix64` 同款范式）。
+    fn obb_mix64(x: u64) -> u64 {
+        let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// [0,1) 确定浮点（24 位尾数截断，纯整数路径）。
+    fn obb_unit(stream: u64) -> f32 {
+        ((stream >> 40) & 0xFF_FFFF) as f32 / (1u32 << 24) as f32
+    }
+
+    /// 专章验收①：OBB 内核源码级**算子看门**——无超越函数
+    /// （GJK 确定性专章 R1 条款的制度化，照 skybox globals 影子契约
+    /// 模式）。
+    #[test]
+    fn obb_kernel_uses_no_transcendental_functions() {
+        const SRC: &str = include_str!("physics.rs");
+        let start = SRC.find("fn obb_radius_along").expect("OBB 内核起点存在");
+        let end = SRC[start..]
+            .find("// 胶囊几何")
+            .map(|offset| start + offset)
+            .expect("OBB 段后接胶囊段");
+        let region = &SRC[start..end];
+        for banned in [
+            "sin(", "cos(", "tan(", "asin", "acos", "atan", "powf", "powi", "exp(", "ln(", "log(",
+            "hypot",
+        ] {
+            assert!(
+                !region.contains(banned),
+                "OBB 内核禁超越函数（专章 R1），发现 {banned:?}"
+            );
+        }
+    }
+
+    /// 专章验收③（相切归属）：半长 0.5 正方盒**恰相切** ⇒ `None`
+    /// （与 `box_box` 同款闭区间口径）；推进 0.01 ⇒ 穿透 = 0.01、
+    /// 法线 +X（X 向重叠 0.01 最浅，Y/Z 全宽重叠 1.0，无并列歧义）。
+    #[test]
+    fn obb_tangent_not_contact_and_micro_overlap_analytic() {
+        let obb = ColliderShape::OrientedBox {
+            half_extents: Vec3::splat(0.5),
+        };
+        let touching = detect_pair_rotated(
+            Vec3::new(-0.5, 0.0, 0.0),
+            Quat::IDENTITY,
+            &obb,
+            Vec3::new(0.5, 0.0, 0.0),
+            Quat::IDENTITY,
+            &obb,
+        );
+        assert!(touching.is_none(), "面相切（overlap 恰 0）不算接触");
+        let overlapped = detect_pair_rotated(
+            Vec3::new(-0.49, 0.0, 0.0),
+            Quat::IDENTITY,
+            &obb,
+            Vec3::new(0.5, 0.0, 0.0),
+            Quat::IDENTITY,
+            &obb,
+        )
+        .expect("0.01 重叠应检出");
+        assert!(
+            (overlapped.penetration - 0.01).abs() < 1e-5,
+            "穿透应 ≈ 0.01，实际 {}",
+            overlapped.penetration
+        );
+        assert!(
+            (overlapped.normal - Vec3::X).length() < 1e-6,
+            "法线从 a 指向 b ⇒ +X，实际 {:?}",
+            overlapped.normal
+        );
+    }
+
+    /// 专章验收③（并列归属）：同心长方盒（he 1/2/3）三轴重叠 2/4/6
+    /// ⇒ 最浅 X；正方盒同心真并列 ⇒ 取枚举序首位 X、中心重合退化
+    /// 符号按 `signum` 零取正。
+    #[test]
+    fn obb_axis_tie_takes_first_enumeration_order() {
+        let a = ColliderShape::OrientedBox {
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let contact = detect_pair_rotated(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &a,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &a,
+        )
+        .expect("同心盒必重叠");
+        assert_eq!(contact.normal, Vec3::X, "最浅轴 X（并列取首位、零距取正）");
+        assert_eq!(contact.penetration, 2.0, "X 向全宽 2×1.0");
+    }
+
+    /// 专章验收④（兼容对照）：恒等旋转的 obb×sphere / obb×obb(ID)
+    /// 与 Box 路径数值一致（±1e-5；opt-in 变体无逐位义务，见形状文档）。
+    #[test]
+    fn obb_identity_rotation_matches_box_paths() {
+        let half = Vec3::new(0.5, 1.5, 2.5);
+        let obb = ColliderShape::OrientedBox { half_extents: half };
+        let aabb = ColliderShape::Box { half_extents: half };
+        let sphere = ColliderShape::Sphere { radius: 0.7 };
+        for center in [Vec3::new(1.2, 0.3, -0.4), Vec3::new(-0.9, 2.0, 1.1)] {
+            let via_obb = detect_pair_rotated(
+                center,
+                Quat::IDENTITY,
+                &obb,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                &sphere,
+            );
+            let via_box = detect_pair_rotated(
+                center,
+                Quat::IDENTITY,
+                &aabb,
+                Vec3::ZERO,
+                Quat::IDENTITY,
+                &sphere,
+            );
+            match (via_obb, via_box) {
+                (Some(a), Some(b)) => {
+                    assert!(
+                        (a.penetration - b.penetration).abs() < 1e-5
+                            && (a.normal - b.normal).length() < 1e-5,
+                        "恒等旋转 obb×sphere 应 ≈ box×sphere：{a:?} vs {b:?}"
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("obb/box 恒等路径命中性不一致"),
+            }
+        }
+        let via_obb = detect_pair_rotated(
+            Vec3::X * 0.8,
+            Quat::IDENTITY,
+            &obb,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &obb,
+        );
+        let via_box = detect_pair_rotated(
+            Vec3::X * 0.8,
+            Quat::IDENTITY,
+            &aabb,
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            &aabb,
+        );
+        let (Some(a), Some(b)) = (via_obb, via_box) else {
+            panic!("x 向重叠 = 1.0 − 0.8 = 0.2 必命中")
+        };
+        assert!(
+            (a.penetration - b.penetration).abs() < 1e-5 && a.normal == b.normal,
+            "obb(ID)×obb(ID) 应 ≈ box×box：{a:?} vs {b:?}"
+        );
+    }
+
+    /// obb×obb **斜置解析对照**：a（单位正方盒）转 +45°、b（z 向加长
+    /// 1.5）转 −45°（a 局部系中 b 净转 90°，X/Z 投影半径 = {1,1}/{1.5,1}）
+    /// ——最浅重叠轴唯一为 Z（X 向 0.662 vs Z 向 0.162，避免 1 ulp
+    /// 并列歧义），穿透 = `2 − 2.6·cos45`、法线 = 世界 `q45·Ẑ`。
+    #[test]
+    fn obb_obb_yawed_pair_matches_analytic_penetration() {
+        let obb = ColliderShape::OrientedBox {
+            half_extents: Vec3::splat(1.0),
+        };
+        let obb_long = ColliderShape::OrientedBox {
+            half_extents: Vec3::new(1.0, 1.0, 1.5),
+        };
+        let q45 = Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let contact = detect_pair_rotated(
+            Vec3::new(-1.3, 0.0, 0.0),
+            q45,
+            &obb,
+            Vec3::new(1.3, 0.0, 0.0),
+            q45.inverse(),
+            &obb_long,
+        )
+        .expect("中心距 2.6：Z 向 overlap = 2 − 2.6·cos45 ≈ 0.162 > 0");
+        let expected = 2.0 - 2.6 * core::f32::consts::SQRT_2 * 0.5;
+        assert!(
+            (contact.penetration - expected).abs() < 1e-4,
+            "解析穿透 {expected}，实际 {}",
+            contact.penetration
+        );
+        assert!(
+            (contact.normal - q45 * Vec3::Z).length() < 1e-4,
+            "法线应为世界 a 局部 Ẑ = q45·Ẑ，实际 {:?}",
+            contact.normal
+        );
+    }
+
+    /// obb×obb **准平行叉积轴退化**：同转 45° 的对置盒——相对姿态为
+    /// 恒等、9 条叉积轴全退化（跳过），判定由面法线轴接管：穿透 =
+    /// `2 − √2`（X 向中心偏移投影 = 2·cos45 = √2，两侧投影半径各 1）。
+    #[test]
+    fn obb_obb_parallel_axes_degeneracy_handled() {
+        let he = Vec3::splat(1.0);
+        let obb = ColliderShape::OrientedBox { half_extents: he };
+        let q = Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let contact = detect_pair_rotated(
+            Vec3::new(-1.0, 0.0, 0.0),
+            q,
+            &obb,
+            Vec3::new(1.0, 0.0, 0.0),
+            q,
+            &obb,
+        )
+        .expect("中心距 2 < 2√2 ⇒ 重叠");
+        let expected = 2.0 - core::f32::consts::SQRT_2; // = 2×1 − 2.828·(1/2·2)=2−√2
+        assert!(
+            (contact.penetration - expected).abs() < 1e-4,
+            "穿透 = 2 − √2 ≈ {expected}，实际 {}",
+            contact.penetration
+        );
+    }
+
+    /// 专章验收②**固定种子确定性池**：200 组随机 obb×obb 构型
+    /// （splitmix64 计数流生成姿态 / 半长 / 间距）——同构型两跑
+    /// `(命中性, 法线, 穿透)` to_bits 逐项全等；命中与非命中都有
+    /// 代表（判别性托底）。
+    #[test]
+    fn obb_deterministic_fixed_seed_pool() {
+        let bits3v = |v: Vec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+        let trace = || -> Vec<Option<([u32; 3], u32)>> {
+            let mut out = Vec::new();
+            for i in 0..200u64 {
+                let mk = |k: u64| obb_unit(obb_mix64(i.wrapping_mul(97).wrapping_add(k)));
+                let half_a = Vec3::new(0.2 + mk(1), 0.2 + mk(2), 0.2 + mk(3));
+                let half_b = Vec3::new(0.2 + mk(4), 0.2 + mk(5), 0.2 + mk(6));
+                let pa = Vec3::new(mk(7) * 4.0 - 2.0, 0.0, 0.0);
+                let pb = pa + Vec3::new(0.5 + mk(0) * 2.5, mk(8) - 0.5, mk(9) - 0.5);
+                let qa = Quat::from_rotation_y(mk(2) * 3.0 - 1.5)
+                    * Quat::from_rotation_x(mk(5) * 3.0 - 1.5);
+                let qb = Quat::from_rotation_z(mk(3) * 3.0 - 1.5)
+                    * Quat::from_rotation_y(mk(6) * 3.0 - 1.5);
+                let a = ColliderShape::OrientedBox {
+                    half_extents: half_a,
+                };
+                let b = ColliderShape::OrientedBox {
+                    half_extents: half_b,
+                };
+                out.push(
+                    detect_pair_rotated(pa, qa, &a, pb, qb, &b)
+                        .map(|c| (bits3v(c.normal), c.penetration.to_bits())),
+                );
+            }
+            out
+        };
+        let first = trace();
+        let hits = first.iter().filter(|entry| entry.is_some()).count();
+        assert_eq!(first, trace(), "OBB 固定种子池两跑 to_bits 全等");
+        assert!(
+            (20..180).contains(&hits),
+            "构型池应同时覆盖命中与非命中（实际命中 {hits}/200）"
+        );
+    }
+
+    /// broadphase 包围盒：yaw/pitch 复合旋转 OBB 的 `collider_aabb`
+    /// 必含全部 8 个旋转角点（漏角 = broadphase 漏对风险的直接检验）。
+    #[test]
+    fn obb_aabb_contains_all_rotated_corners() {
+        let half = Vec3::new(1.5, 0.5, 2.0);
+        let center = Vec3::new(3.0, -1.0, 0.5);
+        let q = Quat::from_rotation_y(0.9) * Quat::from_rotation_x(-1.7);
+        let (min, max) = collider_aabb(
+            center,
+            q,
+            &ColliderShape::OrientedBox { half_extents: half },
+        );
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    let corner = center + q * (half * Vec3::new(sx, sy, sz));
+                    assert!(
+                        corner.x >= min.x - 1e-5
+                            && corner.y >= min.y - 1e-5
+                            && corner.z >= min.z - 1e-5
+                            && corner.x <= max.x + 1e-5
+                            && corner.y <= max.y + 1e-5
+                            && corner.z <= max.z + 1e-5,
+                        "旋转角点 {corner} 落在包围 AABB [( {min}, {max} )] 之外"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 射线 OBB：恒等姿态 t = 4（盒心 5、半长 1）法线 −X；yaw90 的
+    /// (2,1,1) 盒沿 X ≡ AABB (1,1,2)（斜置 slab 正确性的兼容对照）。
+    #[test]
+    fn obb_ray_matches_analytic_slab() {
+        let obb = ColliderShape::OrientedBox {
+            half_extents: Vec3::splat(1.0),
+        };
+        let hit = ray_vs_shape_rotated(
+            Vec3::ZERO,
+            Vec3::X,
+            100.0,
+            Vec3::new(5.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            &obb,
+        )
+        .expect("沿 X 直视应命中");
+        assert!((hit.t - 4.0).abs() < 1e-5, "t 应为 4.0，实际 {}", hit.t);
+        assert!(
+            (hit.normal - -Vec3::X).length() < 1e-5,
+            "近面法线 −X，实际 {:?}",
+            hit.normal
+        );
+        let yaw90 = ColliderShape::OrientedBox {
+            half_extents: Vec3::new(2.0, 1.0, 1.0),
+        };
+        let aabb = ColliderShape::Box {
+            half_extents: Vec3::new(1.0, 1.0, 2.0),
+        };
+        let t_yaw = ray_vs_shape_rotated(
+            Vec3::ZERO,
+            Vec3::X,
+            100.0,
+            Vec3::new(6.0, 0.0, 0.0),
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            &yaw90,
+        )
+        .expect("yaw90 命中");
+        let t_aabb = ray_vs_shape(Vec3::ZERO, Vec3::X, 100.0, Vec3::new(6.0, 0.0, 0.0), &aabb)
+            .expect("AABB 命中");
+        assert!(
+            (t_yaw.t - t_aabb.t).abs() < 1e-4,
+            "yaw90 (2,1,1) ≡ (1,1,2) AABB：{} vs {}",
+            t_yaw.t,
+            t_aabb.t
+        );
+    }
+
+    /// step 集成：45° 斜置静态 OBB 薄墙 + 嵌入出生的动球 ⇒ 沿 **SAT
+    /// 斜法线**分离（AABB 口径会沿假轴推出）、接触事件恰一条。
+    #[test]
+    fn obb_wall_in_step_separates_along_sat_normal() {
+        let mut world = World::new();
+        world.insert_resource(Time::default());
+        world.register_event::<CollisionStarted>();
+        world.insert_resource(ContactTracker::default());
+        world.spawn((
+            Transform {
+                position: Vec3::ZERO,
+                rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_4),
+                scale: Vec3::ONE,
+            },
+            Collider::static_obb(Vec3::new(0.1, 2.0, 2.0)),
+        ));
+        let ball = world.spawn((
+            Transform::from_xyz(0.2, 0.0, 0.0),
+            Collider::dynamic_sphere(0.3, 0.0),
+            RigidBody {
+                gravity_scale: 0.0, // 隔离：只验分离方向
+                ..RigidBody::default()
+            },
+        ));
+        for _ in 0..10 {
+            step(&world, 1.0 / 60.0);
+        }
+        let pos = world.get::<Transform>(ball).unwrap().position;
+        let wall_normal = Quat::from_rotation_y(std::f32::consts::FRAC_PI_4) * Vec3::X;
+        let signed = pos.dot(wall_normal);
+        // 分离态精确值 = 板半厚 0.1 + 球半径 0.3（自板中心平面量起）
+        assert!(
+            (signed - 0.4).abs() < 1e-2,
+            "球应贴在斜板面外（中心平面起法向距离 = 0.1+0.3），实际 {signed}（pos {pos}）"
+        );
+        assert_eq!(
+            world.try_events::<CollisionStarted>().map(|e| e.len()),
+            Some(1),
+            "重叠出生 ⇒ 恰一条 started"
         );
     }
 }

@@ -272,6 +272,12 @@ fn collider_dump(world: &World, entity: Entity) -> Option<String> {
             bits(half_extents.y),
             bits(half_extents.z)
         ),
+        ColliderShape::OrientedBox { half_extents } => format!(
+            "obb [{}, {}, {}]",
+            bits(half_extents.x),
+            bits(half_extents.y),
+            bits(half_extents.z)
+        ),
         ColliderShape::Capsule {
             radius,
             half_height,
