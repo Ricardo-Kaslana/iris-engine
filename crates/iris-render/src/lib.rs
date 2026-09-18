@@ -135,6 +135,7 @@ pub mod terrain;
 pub mod texture;
 pub mod texture_bc7;
 pub mod texture_bcn;
+pub mod texture_ktx2;
 pub mod ui;
 pub mod visibility;
 pub mod water;
@@ -283,6 +284,9 @@ pub mod prelude {
     pub use crate::texture_bcn::{
         BC1_BLOCK_BYTES, BC3_BLOCK_BYTES, bc1_eligible, bc3_eligible, encode_bc1, encode_bc3,
         encoded_len, encoded_len_bc3, padded_extent,
+    };
+    pub use crate::texture_ktx2::{
+        KTX2_IDENTIFIER, Ktx2BcFormat, Ktx2Error, Ktx2Image, build_ktx2, parse_ktx2,
     };
     pub use crate::ui::{
         Focusable, UiAnchor, UiAnchorPoint, UiButton, UiClickEvent, UiColor, UiFocus, UiImage,

@@ -390,6 +390,36 @@ pub struct TextureStore {
     /// 不变（引擎原生资产内存优先），glTF 加载器为法线 / ORM 自动声明
     /// （外部资产质量优先）。
     uncompressed: BTreeSet<u32>,
+    /// KTX2 预压缩纹理侧表（C5a-2）：句柄 → 容器带来的块数据（免运行时
+    /// 编码直传 GPU）。在场短路 BC 决策树（格式由容器声明，声明门不再
+    /// 参与）；`textures[handle]` 对同句柄保持**元数据占位**（宽高/
+    /// srgb 真值、`rgba` 空表——误读空表的地方都应先查本表，渲染器 /
+    /// 估算两口径恒先查）。BTreeMap 固定序（内存对账遍历确定性）。
+    compressed: std::collections::BTreeMap<u32, CompressedLevels>,
+}
+
+/// KTX2 容器预压缩载荷（C5a-2，[`TextureStore::compressed`] 侧表值）。
+#[derive(Clone, Debug)]
+pub struct CompressedLevels {
+    /// 容器 vkFormat 白名单类别（块字节 / srgb 由它决定）。
+    pub format: crate::texture_ktx2::Ktx2BcFormat,
+    /// 基级宽/高（各级 = max(1, dim >> p) 推算块数，与容器对账一致）。
+    pub width: u32,
+    pub height: u32,
+    /// 各级块数据（下标 = mip 级；mipPadding 已在解析期剥离）。
+    pub levels: Vec<Vec<u8>>,
+}
+
+impl CompressedLevels {
+    /// 级 p 的宽/高（规范 max(1, dim >> p)）。
+    pub fn level_extent(&self, p: usize) -> (u32, u32) {
+        ((self.width >> p).max(1), (self.height >> p).max(1))
+    }
+
+    /// 全级字节合计（CPU 驻留口径 = GPU 占用口径，预压缩无放大）。
+    pub fn total_bytes(&self) -> u64 {
+        self.levels.iter().map(|l| l.len() as u64).sum()
+    }
 }
 
 impl Default for TextureStore {
@@ -399,6 +429,7 @@ impl Default for TextureStore {
             bc3_declared: BTreeSet::new(),
             bc7_declared: BTreeSet::new(),
             uncompressed: BTreeSet::new(),
+            compressed: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -466,6 +497,41 @@ impl TextureStore {
         self.bc7_declared.contains(&handle.0)
     }
 
+    /// KTX2 文件字节流入库为预压缩纹理（C5a-2）：`textures` 槽位放
+    /// 元数据占位（宽高 / srgb 真值、`rgba` 空表），块数据进
+    /// `compressed` 侧表。渲染器首查侧表：BC 能力在场直传免编码；
+    /// 无 BC 特性设备白图兜底 + 告警（`texture_ktx2` 文档限制④——
+    /// 容器不带 RGBA8 回退数据，编码路径的自动回退在此是奢侈品）。
+    pub fn add_ktx2(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<TextureHandle, crate::texture_ktx2::Ktx2Error> {
+        let img = crate::texture_ktx2::parse_ktx2(bytes)?;
+        let placeholder = CpuTexture {
+            width: img.width,
+            height: img.height,
+            rgba: Vec::new(),
+            srgb: img.format.srgb(),
+        };
+        let handle = self.add(placeholder);
+        self.compressed.insert(
+            handle.0,
+            CompressedLevels {
+                format: img.format,
+                width: img.width,
+                height: img.height,
+                levels: img.levels,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// 预压缩载荷查询口（渲染器上传分支与显存估算共用；消费方判格式
+    /// 用 [`CompressedLevels::format`]）。
+    pub fn compressed_levels(&self, handle: TextureHandle) -> Option<&CompressedLevels> {
+        self.compressed.get(&handle.0)
+    }
+
     /// 为已存在的句柄补**无压缩**声明（R66e）：数据贴图（法线 / ORM）
     /// 不走 BC1/BC3 块压缩（BC1 对法线的近距块状伪梯度，frictions ⑨）。
     /// 声明只需发生在**首次 GPU 上传前**（渲染器懒上传）；重复声明幂等。
@@ -490,12 +556,17 @@ impl TextureStore {
         self.textures.is_empty()
     }
 
-    /// CPU 源内存占用（字节）：Σ 宽×高×4（RGBA8 源数据，不含 Vec 的
-    /// 分配器开销）。「低占用」卖点的观测口径之一。
+    /// CPU 侧纹理目录驻留字节：RGBA8 源 = Σ 宽×高×4；KTX2 预压缩纹理
+    /// （C5a-2）= 全级块字节（其 `rgba` 占位空表，不按尺寸虚计）。
+    /// 「低占用」卖点的观测口径之一。
     pub fn memory_bytes(&self) -> u64 {
         self.textures
             .iter()
-            .map(|t| t.width as u64 * t.height as u64 * 4)
+            .enumerate()
+            .map(|(index, t)| match self.compressed.get(&(index as u32)) {
+                Some(c) => c.total_bytes(),
+                None => t.width as u64 * t.height as u64 * 4,
+            })
             .sum()
     }
 
@@ -503,21 +574,24 @@ impl TextureStore {
     /// 共用的决策树——两口径之差恒等于 mip 链的增量，不含其他因素）。
     fn texture_gpu_bytes(&self, index: usize, t: &CpuTexture, feature_bc: bool) -> u64 {
         let handle = TextureHandle(index as u32);
+        // KTX2 预压缩（C5a-2）：容器格式即事实源，短路决策树（基级 =
+        // 级 0 块字节；无 BC 特性的估算按块字节照计——上传兜底白图是
+        // 运行期事实，显存口径不预支兜底）
+        if let Some(c) = self.compressed.get(&handle.0) {
+            return c.levels.first().map_or(0, |l| l.len() as u64);
+        }
         // 无压缩声明（R66e）优先于一切 BC 路径（数据贴图质量优先）
         if self.uncompressed.contains(&handle.0) {
             return t.width as u64 * t.height as u64 * 4;
         }
-        // BC7 声明（C5a）优先级高于 BC3：同为 1 B/px、质量更高，
-        // 双声明择高（不报错）
-        if feature_bc
-            && self.bc7_declared.contains(&handle.0)
-            && crate::texture_bc7::bc7_eligible(t.width, t.height, &t.rgba, feature_bc)
-        {
-            (t.width as u64 / 4) * (t.height as u64 / 4) * 16
-        } else if feature_bc
-            && self.bc3_declared.contains(&handle.0)
-            && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)
-        {
+        // BC7 / BC3 声明（C5a / R59）同为 16 B/块，估算字节相等（双声明
+        // 择高的「BC7 赢」只影响上传格式选择，不改字节口径 ⇒ 合并分支）
+        let bc7_or_bc3 = feature_bc
+            && ((self.bc7_declared.contains(&handle.0)
+                && crate::texture_bc7::bc7_eligible(t.width, t.height, &t.rgba, feature_bc))
+                || (self.bc3_declared.contains(&handle.0)
+                    && crate::texture_bcn::bc3_eligible(t.width, t.height, &t.rgba, feature_bc)));
+        if bc7_or_bc3 {
             (t.width as u64 / 4) * (t.height as u64 / 4) * 16
         } else if crate::texture_bcn::bc1_eligible(t.width, t.height, &t.rgba, feature_bc) {
             (t.width as u64 / 4) * (t.height as u64 / 4) * 8
@@ -560,6 +634,11 @@ impl TextureStore {
             .map(|(index, t)| {
                 let base = self.texture_gpu_bytes(index, t, feature_bc);
                 let handle = TextureHandle(index as u32);
+                // KTX2 预压缩（C5a-2）：mip 增量 = 容器自带级表，不走
+                // 决策树链推算
+                if let Some(c) = self.compressed.get(&handle.0) {
+                    return base + c.levels.iter().skip(1).map(|l| l.len() as u64).sum::<u64>();
+                }
                 // 无压缩声明（R66e）= RGBA8 链口径
                 let raw = self.uncompressed.contains(&handle.0);
                 // BC7（C5a）声明择高于 BC3，与 `texture_gpu_bytes` / 渲染器
@@ -1038,5 +1117,57 @@ mod tests {
         let h3 = plain.add(opaque);
         assert!(!plain.is_uncompressed_declared(h3));
         assert_eq!(plain.gpu_bytes_estimate(true), 4 + 32, "未声明 = BC1 口径");
+    }
+
+    /// KTX2 预压缩侧表登记（C5a-2）：`add_ktx2` 在 `textures` 槽位放
+    /// 元数据占位（宽高 / srgb 真值、`rgba` 空表），块数据进 `compressed`
+    /// 侧表；常规 `add` 句柄侧表恒 `None`（既有 BC 决策树零波及）。
+    /// 显存 / 驻留两口径按容器块字节照计（短路 BC 声明门——格式由容器
+    /// 声明即事实源）。
+    #[test]
+    fn add_ktx2_populates_side_table_and_short_circuits_estimates() {
+        // 16×16 BC7 双 mip 容器（基级 256 B + 二级 64 B）
+        let bytes = crate::texture_ktx2::build_ktx2(145, 16, 16, &[vec![7u8; 256], vec![9u8; 64]]);
+        let mut store = TextureStore::new();
+        // 常规句柄对照组（默认白图 = 句柄 0，未入侧表）
+        assert!(store.compressed_levels(TextureHandle(0)).is_none());
+        let h = store.add_ktx2(&bytes).expect("合法 KTX2 应入库");
+        assert_eq!((h.0), 1, "接在白图之后分配");
+        let c = store.compressed_levels(h).expect("预压缩侧表应有载荷");
+        assert_eq!(c.format, crate::texture_ktx2::Ktx2BcFormat::Bc7Unorm);
+        assert_eq!((c.width, c.height), (16, 16));
+        assert_eq!(c.levels.len(), 2);
+        assert_eq!(c.total_bytes(), 256 + 64);
+        // 元数据占位：宽高真值 / srgb 由容器定 / rgba 空表
+        let meta = store.get(h).unwrap();
+        assert_eq!((meta.width, meta.height), (16, 16));
+        assert!(!meta.srgb, "vkFormat 145 = BC7_UNORM（非 sRGB）");
+        assert!(meta.rgba.is_empty(), "占位空表，块数据在侧表");
+        // CPU 驻留 = 白图(1×1×4=4) + 预压缩全级(320)
+        assert_eq!(store.memory_bytes(), 4 + 320);
+        // 显存估算：基级块字节照计（无 BC 特性同样照计——兜底白图是运行
+        // 期事实，估算不预支）；mip 增量 = 容器自带级表（走 side-table 分支）
+        let base = store.texture_gpu_bytes(h.0 as usize, meta, false);
+        assert_eq!(base, 256, "基级 = 级 0 块字节");
+        assert_eq!(
+            store.gpu_bytes_estimate(false) - 4,
+            256,
+            "扣白图后 = KTX2 基级（白图未压缩 4 B）"
+        );
+        assert_eq!(
+            store.gpu_bytes_estimate_mipped(false) - 4,
+            256 + 64,
+            "mip 增量走容器级表（320 − 256 = 64）"
+        );
+    }
+
+    /// KTX2 入库的失败面：非法字节 ⇒ `Err` 且不改动目录（句柄不分配、
+    /// 侧表不落半截载荷）。
+    #[test]
+    fn add_ktx2_rejects_bad_bytes_without_mutating_store() {
+        let mut store = TextureStore::new();
+        let before = store.len();
+        assert!(store.add_ktx2(&[0, 1, 2, 3]).is_err());
+        assert_eq!(store.len(), before, "解析失败不入库");
     }
 }

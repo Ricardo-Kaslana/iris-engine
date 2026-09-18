@@ -1678,9 +1678,15 @@ fn mark_gltf_tree(world: &mut World, entity: Entity) {
     }
 }
 
-/// 读取并解码贴图文件（PNG / JPEG，复用依赖树内的 image crate）。
+/// 读取并解码贴图文件（PNG / JPEG / KTX2，复用依赖树内的 image crate）。
 /// `srgb` 按材质槽位：基色 = 颜色数据（sRGB 上传），法线 / ORM =
 /// 线性数据（原样上传）——数据字节相同、GPU 采样解释不同。
+///
+/// **KTX2（C5a-2）**：扩展名命中 `.ktx2` ⇒ 走容器块数据直入库
+/// （[`TextureStore::add_ktx2`]），免 PNG/JPEG 解码 + 免运行时编码——
+/// 预压缩资产的存在意义。**sRGB 语义由容器 vkFormat 决定**（作者在
+/// 烘焙时选 BC7_UNORM / BC7_SRGB），`srgb` 形参在此不参与（格式事实源
+/// 是容器而非材质槽位；无 BC 特性设备白图兜底见 `texture_ktx2` 限制④）。
 fn load_texture(
     world: &mut World,
     sub: &SubAssets<'_>,
@@ -1688,8 +1694,19 @@ fn load_texture(
     srgb: bool,
 ) -> Result<TextureHandle, SceneError> {
     let bytes = sub.read(rel)?;
-    let decoded = image::load_from_memory(&bytes)
-        .map_err(|e| SceneError::Unsupported(format!("贴图解码失败（支持 PNG / JPEG）：{e}")))?;
+    if rel
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("ktx2"))
+    {
+        let handle = world
+            .resource_mut::<TextureStore>()
+            .add_ktx2(&bytes)
+            .map_err(|e| SceneError::Unsupported(format!("KTX2 贴图解码失败：{e:?}")))?;
+        return Ok(handle);
+    }
+    let decoded = image::load_from_memory(&bytes).map_err(|e| {
+        SceneError::Unsupported(format!("贴图解码失败（支持 PNG / JPEG / KTX2）：{e}"))
+    })?;
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
     Ok(world.resource_mut::<TextureStore>().add(CpuTexture {
@@ -2512,6 +2529,59 @@ mod tests {
                 .texture,
             Some("unit_tex.png".to_string()),
             "贴图路径应登记（save 还原用）"
+        );
+    }
+
+    /// KTX2 预压缩贴图装载（C5a-2 · 场景接线）：`"texture": "x.ktx2"` ⇒
+    /// `load_texture` 按扩展名短路到 [`TextureStore::add_ktx2`]——块数据
+    /// 进 `compressed` 侧表、`textures` 槽位只放元数据占位（rgba 空表），
+    /// 路径照常登记（save 还原用）。证明「.ktx2 资产在场景管线里可用」
+    /// 这条端到端接入口，而不只是渲染器单点。
+    #[test]
+    fn material_texture_loads_ktx2_precompressed() {
+        use iris_render::prelude::{Ktx2BcFormat, build_ktx2, encode_bc7};
+        let dir = test_dir();
+        // 8×8 纯色 BC7(sRGB) 预压缩容器（单 mip：2×2 块 ×16 B = 64 B）
+        let rgba = [255u8, 10, 20, 255].repeat(8 * 8);
+        let blocks = encode_bc7(&rgba, 8, 8);
+        let bytes = build_ktx2(146, 8, 8, &[blocks]);
+        std::fs::write(dir.join("unit_pre.ktx2"), &bytes).expect("写测试 KTX2");
+
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "ktx2_material.scene.json",
+            r#"{
+                "entities": [{
+                    "material": { "color": [1.0, 1.0, 1.0, 1.0], "texture": "unit_pre.ktx2" }
+                }]
+            }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let material = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .expect("材质应已注册")
+            .clone();
+        assert_ne!(material.texture, TextureHandle(0), "预压缩贴图应已载入");
+        let textures = world.resource::<TextureStore>();
+        let c = textures
+            .compressed_levels(material.texture)
+            .expect("应进预压缩侧表");
+        assert_eq!(c.format, Ktx2BcFormat::Bc7Srgb);
+        assert_eq!((c.width, c.height), (8, 8));
+        assert_eq!(c.levels.len(), 1);
+        let meta = textures.get(material.texture).unwrap();
+        assert!(meta.rgba.is_empty(), "占位空表（块数据在侧表）");
+        assert_eq!(
+            world
+                .resource::<SceneAssetRegistry>()
+                .materials
+                .get(&handle.0)
+                .unwrap()
+                .texture,
+            Some("unit_pre.ktx2".to_string()),
+            "路径应登记"
         );
     }
 

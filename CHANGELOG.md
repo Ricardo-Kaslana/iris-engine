@@ -5,6 +5,38 @@
 
 ## [Unreleased]
 
+### Added（C5a-2 闭合战役 · 格式役——KTX2 预压缩容器 × 直传上传 × 场景接线）
+
+路线图 v5 清账战役批次六第二增量（池 #11 三件套收口：容器 + 消费口）。
+用户裁决定稿：**仅未压缩载荷 + mip 级**（supercompressionScheme = 0，
+BasisLZ/Zstd/ZLIB 拒收——零新依赖取向）；三层接线 + 一处场景入口：
+
+- **`texture_ktx2`（新模块）**：`parse_ktx2` 定长头 80 B + 级表解析
+  （2D 单面、BC1/BC3/BC7 白名单 vkFormat 以 Khronos `vk.xml` 为准
+  ——BC7 = 145/146，非连续算术枚举）、mipPadding 剥离、五类拒收
+  （标识符/截断/白名单外/矛盾级表/不支持旋钮）；`build_ktx2` 产侧
+  对偶（本引擎可读的最小容器，28 B 占位 DFD——非通用导出器，诚实
+  声明进 §8.64②）。
+- **目录侧表**：`TextureStore::add_ktx2`——块数据进 `compressed`
+  BTreeMap（确定性遍历），`textures` 槽位只留元数据占位（宽高/srgb
+  真值、rgba 空表）；`memory_bytes` / `gpu_bytes_estimate` /
+  `gpu_bytes_estimate_mipped` 三口径短路决策树按容器字节照计（格式
+  由容器声明即事实源，声明门不再参与）。
+- **渲染器直传**：`ensure_texture` 首查侧表 ⇒ `upload_compressed` 免
+  运行时编码逐级 `write_texture`（`bytes_per_row` 按级算、链止于维数
+  <4 与 `mip_chain_bc` 同口径）；`texture_is_bc1/3/7` 观测口径按容器
+  族置位；兜底两处：基级非 4 对齐 / 无 BC 特性设备 ⇒ 白图 + 告警
+  （容器无 RGBA8 回退数据，区别于编码路径的自动回退）。
+- **场景接线**：`load_texture` 按扩展名 `.ktx2` 短路入库（sRGB 语义
+  随容器 vkFormat，材质槽位形参不参与）；§8.63⑥ 同步闭合为「消费方
+  接线范式」（r59_snapshot 改走 `effective_compression()` 单口分发
+  BC3/BC7——引擎 loader 交字节不注册是设计，非缺口）。
+- 旧「拒绝清单禁 KTX2/DDS」两处声明修正（§8.35③ 与加载期编码论证段）：
+  解禁的是 `.ktx2` 独立资产文件形态，GLB 内嵌 PNG data URI 不变；
+  §8.17「仍无 BC7」过期修正（C5a 已补，指向 §8.63）；新立 §8.64 五条。
+- 测试 +11（ktx2 解析单元 6 · 目录侧表 2 · GPU 端到端 2（含硬件解码
+  保真兜底闸）· 场景 `.ktx2` 装载 1）。下一增量 C5b 热重载局部（#12）。
+
 ### Added（C5a-1 闭合战役 · 格式役——BC7 Mode 6 编码器 × manifest 声明门 × 上传决策树）
 
 路线图 v5 清账战役批次六第一增量（池 #11 三件套之「编码决策树 + 声明门」；

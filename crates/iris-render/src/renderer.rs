@@ -10902,6 +10902,122 @@ impl Renderer {
         );
     }
 
+    /// KTX2 预压缩直传（C5a-2）：按容器 vkFormat 建纹理并逐级
+    /// `write_texture`（bytes_per_row = ⌈级宽/4⌉×块字节，与编码路径
+    /// 同口径）。保守裁剪两处（与本仓 BC1 决策树的 4 对齐纪律同源）：
+    /// 基级维数非 4 倍数 ⇒ 白图兜底 + 告警（wgpu 对压缩纹理的块对齐
+    /// 校验面）；维数 < 4 的尾级跳过上传且不计入 `mip_level_count`
+    /// （与 `mip_chain_bc` 「链止于 4×4」同口径，容器多出的 2/1 级
+    /// 数据驻留 CPU 侧不浪费显存——采样器永远取不到的级无意义）。
+    /// 观测口径 `texture_is_bc1/3/7` 按容器族置位，两条路径语义统一。
+    fn upload_compressed(
+        &mut self,
+        handle: TextureHandle,
+        levels: &crate::texture::CompressedLevels,
+    ) {
+        use crate::texture_ktx2::Ktx2BcFormat;
+        if levels.width % 4 != 0 || levels.height % 4 != 0 {
+            log::warn!(
+                "KTX2 纹理 {handle:?} 基级 {}×{} 非 4 对齐，绑白色兜底（压缩纹理块对齐保守口径）",
+                levels.width,
+                levels.height
+            );
+            return;
+        }
+        // 逐级维数 ≥4 才上传（链止于 4×4，与 `mip_chain_bc` 同口径；
+        // 基级已过 4 对齐闸 ⇒ 至少 1 级，`max(1)` 只是防御性兜底）。
+        let uploadable = levels
+            .levels
+            .iter()
+            .enumerate()
+            .take_while(|(i, _)| {
+                let (lw, lh) = levels.level_extent(*i);
+                lw >= 4 && lh >= 4
+            })
+            .count();
+        let wgpu_format = match levels.format {
+            Ktx2BcFormat::Bc1Unorm => wgpu::TextureFormat::Bc1RgbaUnorm,
+            Ktx2BcFormat::Bc1Srgb => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+            Ktx2BcFormat::Bc3Unorm => wgpu::TextureFormat::Bc3RgbaUnorm,
+            Ktx2BcFormat::Bc3Srgb => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+            Ktx2BcFormat::Bc7Unorm => wgpu::TextureFormat::Bc7RgbaUnorm,
+            Ktx2BcFormat::Bc7Srgb => wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+        };
+        let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.texture.ktx2"),
+            size: wgpu::Extent3d {
+                width: levels.width,
+                height: levels.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: uploadable.max(1) as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let block = levels.format.block_bytes() as u32;
+        for (level, data) in levels.levels.iter().enumerate().take(uploadable) {
+            let (lw, lh) = levels.level_extent(level);
+            let bytes_per_row = lw.div_ceil(4) * block;
+            self.gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: lw,
+                    height: lh,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mips_on = self.mip_anisotropy.is_some();
+        let sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: if mips_on {
+                wgpu::MipmapFilterMode::Linear
+            } else {
+                wgpu::MipmapFilterMode::Nearest
+            },
+            anisotropy_clamp: self.mip_anisotropy.map_or(1, |a| (a as u16).clamp(1, 16)),
+            ..Default::default()
+        });
+        self.texture_gpu.insert(
+            handle.0,
+            GpuTexture {
+                view,
+                sampler,
+                bc1: matches!(
+                    levels.format,
+                    Ktx2BcFormat::Bc1Unorm | Ktx2BcFormat::Bc1Srgb
+                ),
+                bc3: matches!(
+                    levels.format,
+                    Ktx2BcFormat::Bc3Unorm | Ktx2BcFormat::Bc3Srgb
+                ),
+                bc7: matches!(
+                    levels.format,
+                    Ktx2BcFormat::Bc7Unorm | Ktx2BcFormat::Bc7Srgb
+                ),
+            },
+        );
+    }
+
     /// 形变目标解算（C4a）：带权重快照且网格有 morph 表的蒙皮项，CPU
     /// 混合出本帧顶点并上传逐实体顶点缓冲，填 `vertex_override`。
     ///
@@ -11008,6 +11124,22 @@ impl Renderer {
         };
         let width = cpu.width.max(1);
         let height = cpu.height.max(1);
+        // KTX2 预压缩纹理（C5a-2）：容器已带块数据，短路 RGBA8/编码
+        // 决策树直传 GPU——预压缩资产的存在意义就是免运行时编码。
+        // 无 BC 特性设备：容器不带 RGBA8 回退数据 ⇒ 告警后返回（不
+        // 入 texture_gpu，绑定层落到白色兜底纹理，与「句柄不存在」同
+        // 一路径；这是 §8.63/texture_ktx2 限制④的诚实形态）。
+        if let Some(levels) = store.and_then(|s| s.compressed_levels(handle)) {
+            if !self.gpu.supports_bc() {
+                log::warn!(
+                    "纹理 {handle:?} 是 KTX2 预压缩（{:?}）但设备无 BC 特性，绑白色兜底",
+                    levels.format
+                );
+                return;
+            }
+            self.upload_compressed(handle, levels);
+            return;
+        }
         // R30 BC1 压缩决策树（决策纯函数与 TextureStore::gpu_bytes_estimate
         // 共用）：特性启用 + 尺寸 4 对齐 + 全不透明 → 8 倍显存节省；
         // 任一不满足回退 RGBA8（web / 无特性 / 非对齐 / 半透明自动命中，

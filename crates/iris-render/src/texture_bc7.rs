@@ -201,11 +201,11 @@ pub fn encode_block_bc7(pixels: &[[u8; 4]; 16]) -> [u8; BC7_BLOCK_BYTES] {
         writer.bit(0);
     }
     writer.bit(1); // 模式 6 一元前缀
-    for ch in 0..4 {
-        writer.bits(ra[ch] >> 1, 7);
+    for c in ra {
+        writer.bits(c >> 1, 7);
     }
-    for ch in 0..4 {
-        writer.bits(rb[ch] >> 1, 7);
+    for c in rb {
+        writer.bits(c >> 1, 7);
     }
     writer.bit(p0);
     writer.bit(p1);
@@ -268,7 +268,7 @@ impl<'a> BitReader<'a> {
         }
         let v = (self.bytes[self.pos >> 3] >> (self.pos & 7)) & 1;
         self.pos += 1;
-        Some(v as u8)
+        Some(v)
     }
     fn bits(&mut self, count: usize) -> Option<u8> {
         let mut v = 0u32;
@@ -440,13 +440,14 @@ mod tests {
         let mut bytes = [0u8; 16];
         {
             let mut w = BitWriter::new(&mut bytes);
-            w.bits(0b1010_11, 7);
+            // 0b10_1011：LSB-first 先写低 2 位 `11` 再写 5 位 `101`
+            w.bits(0b10_1011, 7);
             w.bit(1);
             w.bits(0xFF, 8);
             w.bits(0b101, 3);
         }
         let mut r = BitReader::new(&bytes);
-        assert_eq!(r.bits(7).unwrap(), 0b1010_11);
+        assert_eq!(r.bits(7).unwrap(), 0b10_1011);
         assert_eq!(r.bit().unwrap(), 1);
         assert_eq!(r.bits(8).unwrap(), 0xFF);
         assert_eq!(r.bits(3).unwrap(), 0b101);

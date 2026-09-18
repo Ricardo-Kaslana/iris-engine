@@ -131,10 +131,21 @@ fn main() {
             .spawn_instance(&mut w, "r59_actor.glb", &actor_bytes)
             .unwrap();
         for entry in manifest.entries() {
-            if entry.bc3 {
-                for &h in &inst.textures {
-                    w.resource_mut::<TextureStore>().declare_bc3(h);
+            // C5a-2：单点消费口 `effective_compression()`（Some > legacy
+            // bc3 > None）——清单标志 → 纹理句柄声明的接线范式（loader 交
+            // 字节、消费方按条目声明；BC7 与 BC3 同从此口择格式）。
+            match entry.effective_compression() {
+                Some(Compression::Bc3) => {
+                    for &h in &inst.textures {
+                        w.resource_mut::<TextureStore>().declare_bc3(h);
+                    }
                 }
+                Some(Compression::Bc7) => {
+                    for &h in &inst.textures {
+                        w.resource_mut::<TextureStore>().declare_bc7(h);
+                    }
+                }
+                _ => {}
             }
         }
         w.resource::<TextureStore>().gpu_bytes_estimate(true)

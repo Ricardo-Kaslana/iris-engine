@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1635 / release 1632**（C4 动画役 C4a 形变目标 +12（CPU 混合解析与逐位锚 8 / gltf 加载与拒收 2 / GPU 端到端 2——像素级零权重缺席锚 + 位移 + 阴影一致性）+ C4b 状态机 v2 与运行时重定向 +15（守卫边界 / 声明序 / 一帧一条 / 自环 / ClipFinished / 复合守卫 / 中性默认 / 越界 panic / 两跑确定性 / 系统步检 / 重定向四形态 / 归一化）；两件全 opt-in「缺席 = 逐位不变」，全部既有物理/渲染/游戏快照测试零改动原值通过；C4c 动画压缩按三门「需要闭合」偏弱已裁出回池；C5a-1 BC7 Mode 6 编码器 +13（texture_bc7 单测 9 含共享 P-bit ±1 量化面 / 三口径估算 1 / GPU 硬件解码保真 2 / manifest compression 解析 1；BC7 永不自动、DirectXTex 权威位序移植、GPU 硬件解码兜「自洽位序错」底、§8.63）；下一增量 C5a-2 KTX2 上传通路 + C5b 热重载；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1646 / release 1643**（C4a 形变目标 +12 / C4b 状态机 v2 与运行时重定向 +15 / C5a-1 BC7 Mode 6 编码器 +13（texture_bc7 单测 9 含共享 P-bit ±1 量化面 / 三口径估算 1 / GPU 硬件解码保真 2 / manifest compression 解析 1）/ C5a-2 KTX2 容器 +11（解析单元 6 含拒收五类与 mipPadding 剥离 / 目录侧表 2 / GPU 端到端 2 含硬件解码保真兜底闸 / 场景 `.ktx2` 装载 1）；BC7 永不自动、DirectXTex 权威位序移植、KTX2 仅未压缩 + mip 级用户裁定、C4c 动画压缩按三门偏弱已裁出回池；全部 opt-in「缺席 = 逐位不变」，既有物理/渲染/游戏快照测试零改动原值通过；下一增量 C5b 热重载局部；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1635 / release 1632）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1646 / release 1643）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -139,7 +139,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1635 / release 1632；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1646 / release 1643；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
