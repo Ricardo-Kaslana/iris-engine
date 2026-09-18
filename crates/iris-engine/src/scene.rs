@@ -41,6 +41,8 @@
 //!       "point_light": { "color": [1,1,1], "intensity": 20, "range": 30,
 //!                        "shadows": false },
 //!       "particles": { "blend": "alpha", "spawn_rate": 90.0, /* 全可选 */ },
+//!       "particles_v2": { "blend": "additive", "trail_length": 12, /* 全可选 */ },
+//!       "probe": { "half_extents": [4, 3, 4], "falloff": 0.5 },
 //!       "collider":  { "shape": { "sphere": { "radius": 0.5 } },
 //!                      "static": true, "restitution": 0.2 },
 //!       "rigidbody": { "gravity_scale": 1.0, "friction": 0.3,
@@ -69,6 +71,10 @@
 //! initial_speed / velocity_jitter / gravity_scale / size_start / size_end /
 //! color_start / color_end / max_particles），缺省 = `new(Alpha)`。运行期
 //! 状态（粒子池 / 计数器）不入档——重载后发射器从新鲜状态开始。
+//! **particles_v2 段**（C2 · 闭合 §8.51⑩）：[`ParticleEmitterV2`]（R82
+//! GPU 轨）同形态——v1 全部字段 + `trail_length` / `trail_width`，缺省 =
+//! `ParticleEmitterV2::new(Alpha)`；帧队列 / 池游标 / 存活批表等运行期
+//! 状态同样不入档。两轨互不感知（§8.14 并存语义），同一实体双段皆挂合法。
 //!
 //! # 往返（save ↔ load）
 //!
@@ -149,7 +155,8 @@ use iris_render::asset::{
 use iris_render::prelude::{
     AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, MaterialDef,
     MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, ParticleBlend, ParticleEmitter,
-    PointLight, SkySource, SkySourceKind, TextureHandle, TextureStore, Visibility, grass_textures,
+    ParticleEmitterV2, PointLight, ReflectionProbe, SkySource, SkySourceKind, TextureHandle,
+    TextureStore, Visibility, grass_textures,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -476,6 +483,13 @@ struct EntitySection {
     point_light: Option<PointLightSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     particles: Option<ParticleSection>,
+    /// 粒子 v2 轨（R82 GPU 发射器）配置段（C2 · 闭合 §8.51⑩ 序列化留白）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    particles_v2: Option<ParticleV2Section>,
+    /// 反射探针段（C2 · 闭合 §8.37⑧ 编辑器入口的序列化半边）：
+    /// [`ReflectionProbe`] 配置字段，缺省 = 组件 `Default`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe: Option<ProbeSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collider: Option<ColliderSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -875,6 +889,136 @@ impl ParticleSection {
             color_start: emitter.color_start,
             color_end: emitter.color_end,
             max_particles: emitter.max_particles as u64,
+        }
+    }
+}
+
+/// 粒子 v2 段（C2 · 闭合 §8.51⑩「v2 场景序列化留白」）：
+/// [`ParticleEmitterV2`]（R82 GPU 轨）的全部**配置字段**，各字段缺省 =
+/// `ParticleEmitterV2::new(Alpha)`（60 粒/秒、1 秒寿命、拖尾 8 点 / 全宽
+/// 0.06、池上限 = 固定池容量）。与 v1 段同哲学：帧队列 / 池游标 / 存活
+/// 批表等运行期状态不入档——重载后发射器从新鲜状态开始。
+///
+/// `max_particles` 以 u64 承载（wasm32 `usize` 值域防御，同 v1 段）；
+/// `trail_length` 的使用期钳制（1..=拖尾上限）在渲染侧，序列化如实往返。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+pub struct ParticleV2Section {
+    pub blend: ParticleBlendSection,
+    pub spawn_rate: f32,
+    pub burst_count: u32,
+    pub emitter_lifetime: f32,
+    pub particle_lifetime: f32,
+    pub initial_speed: f32,
+    pub velocity_jitter: f32,
+    pub gravity_scale: f32,
+    pub size_start: f32,
+    pub size_end: f32,
+    pub color_start: [f32; 4],
+    pub color_end: [f32; 4],
+    pub max_particles: u64,
+    pub trail_length: u32,
+    pub trail_width: f32,
+}
+
+impl Default for ParticleV2Section {
+    fn default() -> Self {
+        Self::from_emitter(&ParticleEmitterV2::new(ParticleBlend::Alpha))
+    }
+}
+
+impl ParticleV2Section {
+    fn to_emitter(self) -> Result<ParticleEmitterV2, SceneError> {
+        let blend = match self.blend {
+            ParticleBlendSection::Alpha => ParticleBlend::Alpha,
+            ParticleBlendSection::Additive => ParticleBlend::Additive,
+        };
+        let max_particles = usize::try_from(self.max_particles).map_err(|_| {
+            SceneError::OutOfRange(format!(
+                "particles_v2.max_particles = {} 超出本平台 usize 值域",
+                self.max_particles
+            ))
+        })?;
+        let mut emitter = ParticleEmitterV2::new(blend);
+        emitter.spawn_rate = self.spawn_rate;
+        emitter.burst_count = self.burst_count;
+        emitter.emitter_lifetime = self.emitter_lifetime;
+        emitter.particle_lifetime = self.particle_lifetime;
+        emitter.initial_speed = self.initial_speed;
+        emitter.velocity_jitter = self.velocity_jitter;
+        emitter.gravity_scale = self.gravity_scale;
+        emitter.size_start = self.size_start;
+        emitter.size_end = self.size_end;
+        emitter.color_start = self.color_start;
+        emitter.color_end = self.color_end;
+        emitter.max_particles = max_particles;
+        emitter.trail_length = self.trail_length;
+        emitter.trail_width = self.trail_width;
+        Ok(emitter)
+    }
+
+    fn from_emitter(emitter: &ParticleEmitterV2) -> Self {
+        Self {
+            blend: match emitter.blend {
+                ParticleBlend::Alpha => ParticleBlendSection::Alpha,
+                ParticleBlend::Additive => ParticleBlendSection::Additive,
+            },
+            spawn_rate: emitter.spawn_rate,
+            burst_count: emitter.burst_count,
+            emitter_lifetime: emitter.emitter_lifetime,
+            particle_lifetime: emitter.particle_lifetime,
+            initial_speed: emitter.initial_speed,
+            velocity_jitter: emitter.velocity_jitter,
+            gravity_scale: emitter.gravity_scale,
+            size_start: emitter.size_start,
+            size_end: emitter.size_end,
+            color_start: emitter.color_start,
+            color_end: emitter.color_end,
+            max_particles: emitter.max_particles as u64,
+            trail_length: emitter.trail_length,
+            trail_width: emitter.trail_width,
+        }
+    }
+}
+
+/// 反射探针段（C2 · 闭合 §8.37⑧ 的序列化半边）：[`ReflectionProbe`]
+/// 的全部配置字段，缺省 = 组件 `Default`（半边长 5 m、过渡带
+/// [`PROBE_DEFAULT_FALLOFF`]）。加载校验半边长 `is_valid`（正有限三分量，
+/// 越界报 [`SceneError::OutOfRange`]——退化盒在收集期会被跳过并告警，
+/// 与其静默失效不如加载期拒绝）；探针**捕获内容不持久化**（§8.37⑦
+/// 立场维持：每次启动重烘，档里只有布局参数）。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+pub struct ProbeSection {
+    pub half_extents: [f32; 3],
+    pub falloff: f32,
+}
+
+impl Default for ProbeSection {
+    fn default() -> Self {
+        Self::from_probe(&ReflectionProbe::default())
+    }
+}
+
+impl ProbeSection {
+    fn to_probe(self) -> Result<ReflectionProbe, SceneError> {
+        let probe = ReflectionProbe {
+            half_extents: self.half_extents.into(),
+            falloff: self.falloff.max(0.0),
+        };
+        if !probe.is_valid() {
+            return Err(SceneError::OutOfRange(format!(
+                "probe.half_extents = {:?} 须为正的有限数（探针影响域不可退化）",
+                self.half_extents
+            )));
+        }
+        Ok(probe)
+    }
+
+    fn from_probe(probe: &ReflectionProbe) -> Self {
+        Self {
+            half_extents: probe.half_extents.to_array(),
+            falloff: probe.falloff,
         }
     }
 }
@@ -1472,6 +1616,15 @@ fn spawn_section(
         world.insert(entity, particles.to_emitter()?);
     }
 
+    if let Some(particles_v2) = &section.particles_v2 {
+        world.insert(entity, particles_v2.to_emitter()?);
+    }
+
+    if let Some(probe) = section.probe {
+        let probe = probe.to_probe()?;
+        world.insert(entity, probe);
+    }
+
     if let Some(collider) = section.collider {
         world.insert(
             entity,
@@ -1717,6 +1870,17 @@ fn build_entity_section(
     // 发射器从新鲜状态开始，模块文档「诚实清单」）
     if let Some(emitter) = world.get::<ParticleEmitter>(entity) {
         section.particles = Some(ParticleSection::from_emitter(&emitter));
+    }
+
+    // particles_v2（C2）：同哲学——只写配置字段；帧队列 / 池游标 /
+    // 存活批表等运行期状态不入档
+    if let Some(emitter) = world.get::<ParticleEmitterV2>(entity) {
+        section.particles_v2 = Some(ParticleV2Section::from_emitter(&emitter));
+    }
+
+    // 反射探针（C2）：纯配置组件，全字段往返
+    if let Some(probe) = world.get::<ReflectionProbe>(entity) {
+        section.probe = Some(ProbeSection::from_probe(&probe));
     }
 
     if let Some(collider) = world.get::<Collider>(entity) {
@@ -3248,6 +3412,152 @@ mod tests {
                 "配置字段应往返一致"
             );
         }
+    }
+
+    /// particles_v2 段（C2 · 闭合 §8.51⑩）：配置字段进组件（缺省 =
+    /// `ParticleEmitterV2::new(Alpha)`——拖尾 8 点 / 全宽 0.06 / 池上限 =
+    /// 固定池容量），save ↔ load 往返逐字段位级一致；运行期状态不入档
+    /// （重载后池游标 / 存活估计归零，与 v1 段同哲学）。
+    #[test]
+    fn particles_v2_section_loads_and_roundtrips() {
+        use iris_render::prelude::PARTICLES_V2_MAX;
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "particles_v2.scene.json",
+            r#"{
+                "entities": [
+                    { "name": "jet2",
+                      "particles_v2": { "blend": "additive", "spawn_rate": 90.0,
+                                        "particle_lifetime": 1.6, "initial_speed": 6.0,
+                                        "velocity_jitter": 0.35, "size_start": 0.22,
+                                        "size_end": 0.05,
+                                        "color_start": [1.2, 0.9, 0.45, 0.85],
+                                        "color_end": [0.4, 0.5, 0.8, 0.0],
+                                        "max_particles": 2048,
+                                        "trail_length": 12, "trail_width": 0.08 } },
+                    { "name": "puff", "particles_v2": { "burst_count": 64 } }
+                ]
+            }"#,
+        );
+        let jet = world
+            .get::<ParticleEmitterV2>(entities[0])
+            .expect("particles_v2 段应进组件");
+        assert_eq!(jet.blend, ParticleBlend::Additive);
+        assert_eq!(jet.spawn_rate.to_bits(), 90.0f32.to_bits());
+        assert_eq!(jet.particle_lifetime.to_bits(), 1.6f32.to_bits());
+        assert_eq!(jet.size_start.to_bits(), 0.22f32.to_bits());
+        assert_eq!(
+            jet.color_start.map(f32::to_bits),
+            [1.2f32, 0.9, 0.45, 0.85].map(f32::to_bits)
+        );
+        assert_eq!(jet.max_particles, 2048);
+        assert_eq!(jet.trail_length, 12, "拖尾字段进组件");
+        assert_eq!(jet.trail_width.to_bits(), 0.08f32.to_bits());
+        assert_eq!(jet.spawn_cursor(), 0, "加载即新鲜状态（无运行期残留）");
+        assert_eq!(jet.alive_estimate(), 0);
+
+        // 缺省字段 = new(Alpha)：只写 burst 一段，其余照默认（含拖尾 8 / 0.06）
+        let puff = world.get::<ParticleEmitterV2>(entities[1]).unwrap();
+        assert_eq!(puff.blend, ParticleBlend::Alpha);
+        assert_eq!(puff.burst_count, 64);
+        assert_eq!(puff.spawn_rate.to_bits(), 60.0f32.to_bits(), "缺省发射率");
+        assert_eq!(puff.trail_length, 8, "缺省拖尾点数");
+        assert_eq!(
+            puff.trail_width.to_bits(),
+            0.06f32.to_bits(),
+            "缺省拖尾全宽"
+        );
+        assert_eq!(
+            puff.max_particles, PARTICLES_V2_MAX as usize,
+            "缺省池上限 = 固定池容量"
+        );
+        drop(jet);
+        drop(puff);
+
+        // save → load：配置逐字段位级一致
+        let out = test_dir().join("particles_v2_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains(r#""particles_v2""#), "particles_v2 段应写出");
+        assert!(text.contains(r#""trail_length""#), "拖尾字段必须随段序列化");
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out).expect("重载");
+        for (&a, &b) in entities.iter().zip(&entities_b) {
+            let ea = world.get::<ParticleEmitterV2>(a).unwrap();
+            let eb = world_b.get::<ParticleEmitterV2>(b).unwrap();
+            assert_eq!(
+                ParticleV2Section::from_emitter(&ea),
+                ParticleV2Section::from_emitter(&eb),
+                "v2 配置字段应往返一致"
+            );
+        }
+    }
+
+    /// probe 段（C2 · 闭合 §8.37⑧ 序列化半边）：全字段进组件 + 往返
+    /// 位级一致；缺省 = 组件 `Default`；退化半边长加载期拒绝
+    /// （`OutOfRange`，不静默进收集期告警路径）。
+    #[test]
+    fn probe_section_loads_roundtrips_and_rejects_degenerate_extents() {
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "probe.scene.json",
+            r#"{
+                "entities": [
+                    { "name": "hall_probe", "transform": { "position": [0.0, 2.0, 0.0] },
+                      "probe": { "half_extents": [4.0, 3.0, 4.0], "falloff": 1.25 } },
+                    { "name": "default_probe", "probe": {} }
+                ]
+            }"#,
+        );
+        let probe = world
+            .get::<ReflectionProbe>(entities[0])
+            .expect("probe 段应进组件");
+        assert_eq!(
+            probe.half_extents.to_array(),
+            [4.0f32, 3.0, 4.0],
+            "半边长逐分量入组件"
+        );
+        assert_eq!(probe.falloff.to_bits(), 1.25f32.to_bits());
+        let defaulted = world.get::<ReflectionProbe>(entities[1]).unwrap();
+        assert_eq!(
+            defaulted.half_extents,
+            ReflectionProbe::default().half_extents,
+            "空段 = 组件 Default"
+        );
+        drop(probe);
+        drop(defaulted);
+
+        let out = test_dir().join("probe_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains(r#""probe""#), "probe 段应写出");
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out).expect("重载");
+        for (&a, &b) in entities.iter().zip(&entities_b) {
+            let pa = world.get::<ReflectionProbe>(a).unwrap();
+            let pb = world_b.get::<ReflectionProbe>(b).unwrap();
+            assert_eq!(
+                ProbeSection::from_probe(&pa),
+                ProbeSection::from_probe(&pb),
+                "探针配置应往返位级一致"
+            );
+        }
+
+        // 退化半边长（0 分量）⇒ 加载期 OutOfRange，不落半个世界
+        let mut world_bad = fresh_world();
+        let bad_path = test_dir().join("probe_bad.scene.json");
+        std::fs::write(
+            &bad_path,
+            r#"{ "entities": [ { "probe": { "half_extents": [4.0, 0.0, 4.0] } } ] }"#,
+        )
+        .expect("写坏探针场景");
+        let err = load_scene(&mut world_bad, &bad_path).expect_err("退化探针必须被拒绝");
+        assert!(
+            matches!(err, SceneError::OutOfRange(_)),
+            "应为越界错误，实际 {err:?}"
+        );
     }
 
     /// 同源去重（v2）：同图元参数 / 同材质段 / 同贴图文件在一次加载内

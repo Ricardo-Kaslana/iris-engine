@@ -224,6 +224,9 @@ struct FrameInput {
     toggle_snap: bool,
     place: bool,
     place_light: bool,
+    /// C2：`M` 键摆放反射探针（视觉标记立方 + 组件，见 edit 模块
+    /// 「反射探针编辑入口」）。
+    place_probe: bool,
     /// 微移（单位轴 × 带符号距离，已含 Shift 十倍）。
     nudge: Option<(Vec3, f32)>,
     /// 缩放倍率（PgUp / PgDn）。
@@ -328,6 +331,7 @@ fn read_input(world: &World) -> FrameInput {
         toggle_snap: input.key_pressed(KeyCode::KeyG),
         place: input.key_pressed(KeyCode::KeyP),
         place_light: input.key_pressed(KeyCode::KeyL),
+        place_probe: input.key_pressed(KeyCode::KeyM),
         nudge,
         scale,
         middle_held: input.mouse_button(MouseButton::Middle),
@@ -492,6 +496,25 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
         }
         edit::LightEditMode::Inert => {}
     }
+    // C2 · 探针步进（选中探针实体才生效——命令层自守卫）：`[` `]` =
+    // 过渡带 −/+（让位给 DDGI Budget 模式的射线档循环）、`-` `=` =
+    // 半边长 ÷/×。选中非光非探实体时上方光源块本就是 no-op，无冲突。
+    if edit::probe_selected(world) {
+        if ddgi_mode != edit::DdgiEditMode::Budget {
+            if frame.intensity_up {
+                edit::probe_falloff_step(world, 1);
+            }
+            if frame.intensity_down {
+                edit::probe_falloff_step(world, -1);
+            }
+        }
+        if frame.range_up {
+            edit::probe_size_step(world, 1);
+        }
+        if frame.range_down {
+            edit::probe_size_step(world, -1);
+        }
+    }
     // 摆放与拾取都需要光标射线；无光标位置（无窗口 / 未进视口）则跳过。
     // L 双语义：方向光模式（未选中实体）下 L = 偏航 +（上方已消费），
     // 其余模式回落为摆放点光（R58a 语义）
@@ -502,6 +525,9 @@ fn apply_input(world: &mut World, frame: &FrameInput) {
             }
             if frame.place_light && light_mode != edit::LightEditMode::Directional {
                 edit::place_light_from_ray(world, origin, dir);
+            }
+            if frame.place_probe {
+                edit::place_probe_from_ray(world, origin, dir);
             }
             if frame.left_pressed && edit::begin_drag(world, origin, dir).is_none() {
                 // 点空白处 = 清空选择（拾取未命中）

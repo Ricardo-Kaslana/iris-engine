@@ -1085,6 +1085,8 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 天空盒背景完整成像。整条链路（wasm 模块实例化 → winit canvas →
 WebGPU 适配器/设备 → 全渲染栈 → HUD 叠加）在浏览器主线程上逐帧运行。
 
+- [x] 闭合战役 C2·渲染伪影役（诚实声明清账批次三，路线图 v5 暂停新功能后的清账战役：贴花受光 / 光照贴图 mip / 粒子 v2 序列化 / 探针编辑入口——`DecalLighting` 资源在场时贴花逐片元乘「方向光 Lambert + ambient」因子（逆盒矩阵重建法线、朝相机翻正，缺席 = v1 逐位不变 + 中性光照退化锚）；`MipSettings` 在场时光照贴图上传线性域 2×2 box mip 链 + 三线性采样器（`mip_chain_half_bytes`，缺席 = 单 mip 逐字段一致）；关卡档新增 `particles_v2` 与 `probe` 段（全配置字段往返位级一致、运行态不入档、退化半边长加载期拒绝）；编辑器 `M` 摆放反射探针 + `[ ]`/`- =` 步进 + 探针入 undo 快照（修复声明的 undo 丢失 bug）+ 烘焙回报 `probe_count`；闭合 §8.14/19/31⑤/37⑧/51⑩ 五条诚实声明，全部既有像素锁原值通过）
+
 ## License
 
 MIT OR Apache-2.0

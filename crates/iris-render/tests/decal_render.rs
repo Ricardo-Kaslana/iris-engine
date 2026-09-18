@@ -690,3 +690,87 @@ fn scene_without_decals_matches_pre_decal_stats() {
     assert_eq!(stats.instances, 3, "2 立方体 + 1 贴花");
     assert_eq!(stats.triangles_drawn, 28, "2 × 12 + 贴花端盖 4 三角形");
 }
+
+// ---------------------------------------------------------------------------
+// C2 · 贴花受光（DecalLighting，闭合 §8.19 直射项）
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64 全帧哈希（同款工具函数见 `lightmap_render.rs`）。
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn lit_scene(lighting: bool, intensity: f32, ambient: f32) -> World {
+    let mut world = checker_scene();
+    {
+        let mut light = world.resource_mut::<DirectionalLight>();
+        light.direction = Vec3::new(0.0, -1.0, 0.0);
+        light.color = Vec3::ONE;
+        light.intensity = intensity;
+        light.ambient = Vec3::splat(ambient);
+    }
+    if lighting {
+        world.insert_resource(DecalLighting);
+    }
+    world
+}
+
+/// 中央 32×32 像素 ROI 的 RGB 通道和（棋盘贴花占据俯视画面中心）。
+fn center_roi_sum(px: &[u8], w: usize) -> u64 {
+    let mut sum = 0u64;
+    let c = w / 2;
+    for y in (c - 16)..(c + 16) {
+        for x in (c - 16)..(c + 16) {
+            let i = (y * w + x) * 4;
+            sum += u64::from(px[i]) + u64::from(px[i + 1]) + u64::from(px[i + 2]);
+        }
+    }
+    sum
+}
+
+/// C2 受光双锚：①**中性光照退化锚**——`ambient ≡ 1、intensity = 0` 时
+/// 光照因子恒 (1,1,1)，乘 1.0 为 IEEE 恒等 ⇒ 「资源在场」与「资源缺席」
+/// 全帧逐位一致（在场但无害的严格证据）；②**判别锚**——顶光 intensity 2
+/// 时受光帧必须与关闭态哈希不同，且贴花 ROI 亮度上升（地面是自发光
+/// 材质不受光照影响 ⇒ 差异只能来自贴花的乘性因子）。
+#[test]
+fn decal_lighting_neutral_anchor_and_sun_discriminability() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer) = OffscreenRenderer::new(128, 128) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    // ① 中性锚：off（intensity 0 / ambient 1）vs on（同光照 + 资源）
+    renderer.render(&lit_scene(false, 0.0, 1.0));
+    let neutral_off = renderer.read_pixels();
+    renderer.render(&lit_scene(true, 0.0, 1.0));
+    let neutral_on = renderer.read_pixels();
+    assert_eq!(
+        fnv1a(&neutral_off),
+        fnv1a(&neutral_on),
+        "因子 ≡ 1 时受光开必须与关逐位一致（乘 1.0 恒等退化锚）"
+    );
+    // ② 判别锚：顶光满额（N=+Y 朝相机，dot(N,L)=1 ⇒ 因子 2.0）
+    renderer.render(&lit_scene(false, 2.0, 0.0));
+    let sun_off = renderer.read_pixels();
+    renderer.render(&lit_scene(true, 2.0, 0.0));
+    let sun_on = renderer.read_pixels();
+    assert_ne!(
+        fnv1a(&sun_off),
+        fnv1a(&sun_on),
+        "受光开 / 关在直射光下必须可判别（哈希相同 = 因子没接进像素）"
+    );
+    let (w, _) = renderer.size();
+    let w = w as usize;
+    assert!(
+        center_roi_sum(&sun_on, w) > center_roi_sum(&sun_off, w),
+        "×2 光照因子的贴花 ROI 必须更亮：{} > {}",
+        center_roi_sum(&sun_on, w),
+        center_roi_sum(&sun_off, w)
+    );
+}

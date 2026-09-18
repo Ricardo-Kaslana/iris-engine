@@ -181,7 +181,7 @@ pub mod prelude {
         neutral_depth_moment, neutral_depth_table, plan_layout, probe_relight, relight_fingerprint,
         sh_hysteresis, stride_for_capacity, triangles_bounds,
     };
-    pub use crate::decal::{Decal, DecalInstanceRaw};
+    pub use crate::decal::{Decal, DecalInstanceRaw, DecalLighting, decal_lit_factor};
     pub use crate::environment::{EnvironmentSettings, SkySource, SkySourceKind};
     pub use crate::fog::{
         FOG_STEPS, FogSettings, fog_density_at, fog_dither, fog_phase_hg, fog_transmittance,

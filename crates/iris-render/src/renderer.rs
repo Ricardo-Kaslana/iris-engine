@@ -257,13 +257,18 @@ struct GpuMesh {
 }
 
 /// 一张光照贴图图集的 GPU 资源（R52c）：Rgba16Float 线性 HDR 纹理 +
-/// 视图。采样器全图集共用一份常驻（双线性 + ClampToEdge，与尺寸无关，
-/// 照 `rt_blit_sampler` 的做法）。按句柄懒上传、跨帧持有（照 `GpuTexture`）。
+/// 视图 + **随上传期口径创建的采样器**（C2：MipSettings 在场 = mip 链
+/// 纹理 + 三线性 + 各向异性；缺席 = 与常驻采样器逐字段一致的参数，
+/// 绑定按图集句柄取用，与 `GpuTexture { view, sampler }` 同构。SSS LUT
+/// 经 binding 6 复用本采样器——显式 level 采样不受 mip 过滤影响）。
 struct GpuLightmap {
     /// 纹理本体保活（视图的有效性依赖它）。
     #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    /// 上传期是否生成 mip 链（C2；观测 API `lightmap_has_mips`）。
+    mips: bool,
 }
 
 /// 每具蒙皮的 GPU 资源：关节矩阵 storage 缓冲与对应绑定组。
@@ -3023,6 +3028,7 @@ fn collect_decals(
     world: &iris_core::world::World,
     frustum: &Frustum,
     out: &mut Vec<DecalItem>,
+    lit: bool,
 ) -> u32 {
     out.clear();
     let mut culled = 0u32;
@@ -3057,7 +3063,7 @@ fn collect_decals(
             out.push(DecalItem {
                 texture: decal.texture.0,
                 entity: e.to_bits(),
-                instance: DecalInstanceRaw::from_model(model, decal.tint),
+                instance: DecalInstanceRaw::from_model(model, decal.tint, lit),
             });
         },
     );
@@ -6811,7 +6817,9 @@ impl Renderer {
         //     批内实体 bits 并列序——确定性，与收集顺序无关）。无贴花时
         //     整个 pass 跳过（零开销默认路径）。
         let mut decal_items = std::mem::take(&mut self.decal_scratch);
-        let decal_culled = collect_decals(world, &frustum, &mut decal_items);
+        // C2：贴花受光开关（资源缺席 = 恒 false = v1 逐位不变）
+        let decal_lit = world.contains_resource::<crate::decal::DecalLighting>();
+        let decal_culled = collect_decals(world, &frustum, &mut decal_items, decal_lit);
         decal_items.sort_by(|a, b| a.texture.cmp(&b.texture).then(a.entity.cmp(&b.entity)));
         let decal_total = decal_items.len();
         let total = items.len();
@@ -11088,6 +11096,11 @@ impl Renderer {
             return;
         };
         let size = item.size().max(1);
+        // C2（§8.31⑤ 闭合）：MipSettings 在场 = 线性域 mip 链多级上传 +
+        // 三线性采样器；缺席 = 单 mip + 采样器逐字段与 R52c 常驻份一致
+        // （既有基线逐位不变的兼容形态，与 R66 纹理路径同纪律）。
+        let chain = self.mip_anisotropy.map(|_| item.mip_chain_half_bytes());
+        let levels = chain.as_ref().map_or(1, |c| c.len() as u32);
         let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iris.lightmap.atlas"),
             size: wgpu::Extent3d {
@@ -11095,7 +11108,7 @@ impl Renderer {
                 height: size,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
@@ -11104,34 +11117,95 @@ impl Renderer {
         });
         // queue.write_texture 无 256 字节行对齐要求（那是 copy_buffer_to_texture
         // 的规则），行步长直接给 size × 8 B（与既有 RGBA8 上传同款做法）。
-        self.gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
+        // 逐级上传：级 i 尺寸 = div_ceil 序列（与 downsample_rgb 同口径）。
+        let mut w = size;
+        let mut h = size;
+        match &chain {
+            Some(bytes) => {
+                for (level, data) in bytes.iter().enumerate() {
+                    self.gpu.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: level as u32,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        data,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(w * 8),
+                            rows_per_image: None,
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    w = (w / 2).max(1);
+                    h = (h / 2).max(1);
+                }
+            }
+            None => self.gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &item.half_bytes(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 8),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            ),
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // 采样器（C2）：缺席分支逐字段 = 常驻 lightmap_sampler（双线性 +
+        // ClampToEdge + mip Nearest + 各向异性 1）；在场 = 三线性 +
+        // 各向异性 min(资源值, [1,16] 夹取)，与 ensure_texture 同口径。
+        let sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.lightmap.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: if chain.is_some() {
+                wgpu::MipmapFilterMode::Linear
+            } else {
+                wgpu::MipmapFilterMode::Nearest
             },
-            &item.half_bytes(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size * 8),
-                rows_per_image: None,
-            },
-            wgpu::Extent3d {
-                width: size,
-                height: size,
-                depth_or_array_layers: 1,
+            anisotropy_clamp: self.mip_anisotropy.map_or(1, |a| (a as u16).clamp(1, 16)),
+            ..Default::default()
+        });
+        self.lightmap_gpu.insert(
+            handle,
+            GpuLightmap {
+                texture,
+                view,
+                sampler,
+                mips: chain.is_some(),
             },
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.lightmap_gpu
-            .insert(handle, GpuLightmap { texture, view });
     }
 
     /// 该光照贴图句柄的 GPU 上传是否完成（R52c）。测试与调试观测口径：
     /// 未上传（懒上传未触发）/ 悬垂句柄 / [`NO_LIGHTMAP`] 均为 `false`。
     pub fn lightmap_is_uploaded(&self, handle: LightmapHandle) -> bool {
         self.lightmap_gpu.contains_key(&handle.0)
+    }
+
+    /// 该光照贴图句柄的 GPU 上传是否走 **mip 链**（C2）：仅当上传发生在
+    /// `MipSettings` 在场帧才为 `true`（上传期口径，句柄缓存不追溯——与
+    /// `texture_is_bc1` 同纪律）。未上传 / 悬垂 / `NO_LIGHTMAP` ⇒ `false`。
+    pub fn lightmap_has_mips(&self, handle: LightmapHandle) -> bool {
+        self.lightmap_gpu.get(&handle.0).is_some_and(|lm| lm.mips)
     }
 
     /// 材质绑定组（组 1）的懒构建：材质参数 uniform + base / 法线 / ORM
@@ -11180,9 +11254,11 @@ impl Renderer {
             Some(tex) => &self.texture_gpu[&tex.0].view,
             None => &self.texture_gpu[&0].view,
         };
-        let lightmap_view = match self.lightmap_gpu.get(&lightmap) {
-            Some(gpu_lightmap) => &gpu_lightmap.view,
-            None => &self.lightmap_dummy_view,
+        let (lightmap_view, lightmap_sampler) = match self.lightmap_gpu.get(&lightmap) {
+            // C2：采样器随图集上传期口径（mip 在场 = 三线性；缺席 =
+            // 与常驻份逐字段一致）。
+            Some(gpu_lightmap) => (&gpu_lightmap.view, &gpu_lightmap.sampler),
+            None => (&self.lightmap_dummy_view, &self.lightmap_sampler),
         };
         // 掩码只在图集**确实已上传**时置 1：悬垂句柄（ensure_lightmap 只
         // 告警）保持 0 ⇒ 间接光退回 IBL，而不是被黑纹理抹成零。
@@ -11250,7 +11326,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: wgpu::BindingResource::Sampler(&self.lightmap_sampler),
+                        resource: wgpu::BindingResource::Sampler(lightmap_sampler),
                     },
                     // 预积分 SSS LUT（R63，常驻纹理）：全部材质绑定同一份
                     // ——是否消费由 `material.sss.x > 0` 决定。

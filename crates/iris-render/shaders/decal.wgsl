@@ -13,13 +13,27 @@
 // decal.rs 模块文档），等深必须通过（Less 会因浮点抖动闪烁）；不写深度
 // 则后续透明 pass / 粒子 pass 照常按不透明深度裁决遮挡。
 //
-// v1 无光照：输出 = 纹理 × tint，不参与 PBR / 阴影 / IBL（限制与理由见
-// decal.rs 模块文档）。不进阴影 pass（贴花是表面装饰而非几何）。
+// v1 无光照（默认）：输出 = 纹理 × tint，不参与 PBR / 阴影 / IBL。
+// C2 受光（逐实例 location 10.x = 1，即世界带 DecalLighting 资源）：
+// 法线由逆盒矩阵重建（世界法线 ∝ (M⁻¹)ᵀ e_z = 逆矩阵的 z 行，端盖平面
+// 法线精确；非均匀缩放下仍是正确的法线变换），朝相机一侧翻正后乘
+// 「方向光 Lambert + ambient」因子（standard.wgsl 漫反射项、albedo ≡ 1
+// 口径）。关闭分支的表达式与 v1 逐字不动（FNV 基线的兼容前提）。
 
 // 只用 view_proj——声明精简 Globals（绑定的是同一份全局 uniform 缓冲，
-// 短于缓冲的结构体合法，skybox.wgsl / particle.wgsl 同款做法）
+// 短于缓冲的结构体合法，skybox.wgsl / particle.wgsl 同款做法）。
+// C2 前缀扩到 ambient（= 受光分支的输入；字段序与 standard.wgsl Globals
+// 逐一对齐是**影子契约**，由 pipeline.rs 的源码层看门钉住）。
 struct Globals {
     view_proj: mat4x4<f32>,
+    // xyz: 相机世界坐标
+    eye_pos: vec4<f32>,
+    // xyz: 指向光源的单位方向（表面 -> 光源）
+    light_dir: vec4<f32>,
+    // rgb * intensity
+    light_color: vec4<f32>,
+    // rgb（线性，乘在 albedo 上的环境项）
+    ambient: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -41,6 +55,8 @@ struct DecalInstance {
     @location(7) inv_model2: vec4<f32>,
     @location(8) inv_model3: vec4<f32>,
     @location(9) tint: vec4<f32>,
+    // C2：x = 受光开关（1/0），yzw 保留
+    @location(10) lit: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -54,6 +70,8 @@ struct VertexOutput {
     @location(4) inv_model3: vec4<f32>,
     // tint 乘色（含整体 alpha 缩放）
     @location(5) tint: vec4<f32>,
+    // C2：受光开关（同一批次内恒等值，线性插值取端点无中间态）
+    @location(6) lit: vec4<f32>,
 };
 
 @vertex
@@ -68,6 +86,7 @@ fn vs_main(@location(0) position: vec3<f32>, inst: DecalInstance) -> VertexOutpu
     out.inv_model2 = inst.inv_model2;
     out.inv_model3 = inst.inv_model3;
     out.tint = inst.tint;
+    out.lit = inst.lit;
     return out;
 }
 
@@ -90,5 +109,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = local.xy + vec2<f32>(0.5, 0.5);
     let tex = textureSample(decal_texture, decal_sampler, uv);
     // 乘色含整体 alpha 缩放：输出 alpha = tex.a × tint.a
-    return tex * in.tint;
+    var out_color = tex * in.tint;
+    // C2 受光分支（关闭时表达式与 v1 逐字同——兼容基线的判据）：
+    // 世界法线 ∝ (M⁻¹)ᵀ e_z = 逆矩阵的 z 行（对非均匀缩放仍为正确法线
+    // 变换）；端盖双面 → 朝相机一侧翻正；因子 = 方向光 Lambert + ambient
+    // （standard 漫反射口径、albedo ≡ 1）。
+    if (in.lit.x > 0.5) {
+        var n = normalize(vec3<f32>(
+            in.inv_model0.z, in.inv_model1.z, in.inv_model2.z,
+        ));
+        let to_eye = globals.eye_pos.xyz - in.world_pos;
+        if (dot(n, to_eye) < 0.0) {
+            n = -n;
+        }
+        let sun = max(dot(n, globals.light_dir.xyz), 0.0);
+        let factor = globals.light_color.rgb * sun + globals.ambient.rgb;
+        out_color = vec4<f32>(out_color.rgb * factor, out_color.a);
+    }
+    return out_color;
 }

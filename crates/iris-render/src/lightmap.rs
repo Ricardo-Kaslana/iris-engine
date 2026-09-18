@@ -110,8 +110,13 @@
 //!   无探针时本限制原样成立（R52c 语义与逐位兼容不变）。SSR 仍在路线图；
 //! - 一次烘焙 = 一张图集 = 一份 [`LightmapHandle`]；多图集场景按句柄切段
 //!   绘制（段数上升 ⇒ draw call 上升），无跨图集合并；
-//! - **无 mipmap**（单 mip 上传）⇒ 掠射角 / 远处有 texel 走样（光照贴图
-//!   低频，实测可接受；mip 链 + 按距离选级在路线图）；
+//! - ~~**无 mipmap**（单 mip 上传）⇒ 掠射角 / 远处有 texel 走样~~
+//!   **C2 闭合**：[`LightmapItem::mip_chain_half_bytes`] 生成线性域 2×2
+//!   box 降采样链（光照贴图存线性 HDR ⇒ 线性平均即正确定义，无
+//!   `texture.rs::downsample_rgba8` 自认的「编码空间求均值」失真问题），
+//!   渲染器随 [`MipSettings`](crate::texture::MipSettings) 在场时多级上传 +
+//!   三线性采样器；**MipSettings 缺席 = 单 mip + 采样器逐字段与 R52c
+//!   一致，既有基线逐位不变**（与 R66/R66d 纹理路径同纪律）。
 //! - dilation 是**各向同性 4 邻域均值扩散**、至多
 //!   [`LIGHTMAP_DILATE_ITERATIONS`] 轮 ⇒ 距已覆盖 texel 超过该轮数的空洞
 //!   中心仍为黑（chart 内边距 1 texel、shelf 无间隙 ⇒ 实际 1 轮即闭合，
@@ -258,6 +263,69 @@ impl LightmapItem {
         }
         out
     }
+
+    /// mip 链（C2 · 闭合「单 mip 上传」条）：级 0 = [`Self::half_bytes`]
+    /// 逐位一致；其后逐级 2×2 线性域 box 平均（截断维数序列，奇数维
+    /// clamp 边缘样本，与 `downsample_rgba8` 同口径）直到 1×1。
+    ///
+    /// **线性域求均值即正确定义**：光照贴图存的是线性 HDR 辐照度
+    /// （非 sRGB 编码存储），无 `texture.rs::downsample_rgba8` 自认的
+    /// 「编码空间平均」失真——这也是纹理侧 BC 链要先解码再重编码的同款
+    /// 因果在这里天然免掉。降采样累加序固定（行主序，r 后 c，样本数
+    /// 显式除）⇒ 逐位确定。
+    pub fn mip_chain_half_bytes(&self) -> Vec<Vec<u8>> {
+        let size = self.size() as usize;
+        let mut chain = Vec::new();
+        chain.push(self.half_bytes());
+        let mut current = self.irradiance.clone();
+        let mut w = size.max(1);
+        let mut h = size.max(1);
+        // 级尺寸 = (dim/2).max(1) 截断序列直到 1×1（与 mip_chain_rgba8 /
+        // GPU mip 布局同口径；光照图集实际尺寸为 2 的幂，本分支为防御）
+        while w > 1 || h > 1 {
+            let (next, nw, nh) = downsample_rgb(&current, w, h);
+            let mut bytes = Vec::with_capacity(nw * nh * 8);
+            for texel in &next {
+                for channel in [texel.x, texel.y, texel.z, 1.0] {
+                    bytes.extend_from_slice(&f32_to_f16(channel).to_le_bytes());
+                }
+            }
+            chain.push(bytes);
+            current = next;
+            w = nw;
+            h = nh;
+        }
+        chain
+    }
+}
+
+/// 线性辐照数组的 2×2 box 降采样。返回（结果，新宽，新高）。新维数 =
+/// `(dim/2).max(1)`（截断，与 [`downsample_rgba8`](crate::texture::downsample_rgba8)
+/// / GPU mip 布局同式）；采样窗 `2x+{0,1}` / `2y+{0,1}` 按既有口径
+/// **clamp 边缘**（维数为 1 时边缘样本权重加倍），权重恒 1、除以 4——
+/// 累加序固定（y 行内 x），无浮点重结合自由度，逐位确定。
+pub fn downsample_rgb(values: &[Vec3], w: usize, h: usize) -> (Vec<Vec3>, usize, usize) {
+    let nw = (w / 2).max(1);
+    let nh = (h / 2).max(1);
+    let mut out = Vec::with_capacity(nw * nh);
+    let clamp_x = |i: usize| i.min(w - 1);
+    let clamp_y = |i: usize| i.min(h - 1);
+    for y in 0..nh {
+        let sy0 = clamp_y(2 * y);
+        let sy1 = clamp_y(2 * y + 1);
+        for x in 0..nw {
+            let sx0 = clamp_x(2 * x);
+            let sx1 = clamp_x(2 * x + 1);
+            out.push(
+                (values[sy0 * w + sx0]
+                    + values[sy0 * w + sx1]
+                    + values[sy1 * w + sx0]
+                    + values[sy1 * w + sx1])
+                    / 4.0,
+            );
+        }
+    }
+    (out, nw, nh)
 }
 
 /// 光照贴图目录（World 资源）。GPU 纹理由渲染器按句柄懒上传
@@ -318,6 +386,30 @@ impl LightmapStore {
         self.items
             .iter()
             .map(|item| u64::from(item.size()) * u64::from(item.size()) * 8)
+            .sum()
+    }
+
+    /// 多 mip 口径的 GPU 显存占用（字节，精确值，C2）：Σ 各图集逐 mip 级
+    /// `w×h×8` 求和（级尺寸 = `downsample_rgb` 的截断序列，止于 1×1）。
+    /// `MipSettings` 在场时与实际上传一致；缺席时实际为
+    /// [`Self::gpu_bytes_estimate`]。2 的幂图集链增量为几何级数 ≈ 基级 × 4/3。
+    pub fn gpu_bytes_estimate_mipped(&self) -> u64 {
+        self.items
+            .iter()
+            .map(|item| {
+                let mut w = item.size().max(1);
+                let mut h = item.size().max(1);
+                let mut bytes = 0u64;
+                loop {
+                    bytes += u64::from(w) * u64::from(h) * 8;
+                    if w == 1 && h == 1 {
+                        break;
+                    }
+                    w = (w / 2).max(1);
+                    h = (h / 2).max(1);
+                }
+                bytes
+            })
             .sum()
     }
 }
@@ -1123,5 +1215,104 @@ mod tests {
             entry.mesh = None;
         }
         install_lightmap(&mut world, baked);
+    }
+
+    fn item_atlas(size: u32, irradiance: Vec<Vec3>) -> LightmapItem {
+        LightmapItem {
+            atlas: LightmapAtlas {
+                size,
+                used_height: 0,
+                entries: Vec::new(),
+            },
+            irradiance,
+        }
+    }
+
+    /// mip 链（C2 · 闭合 §8.31⑤）：棋盘辐照 (0|2) 的 4×4 图集——
+    /// 每个 2×2 块恰含两 0 两 2 ⇒ 级 1 恒 1.0、级 2 恒 1.0（f32 精确
+    /// 解析值，无需容差）；链长 = 3、各级字节 = 128/32/8；级 0 与
+    /// `half_bytes` 逐字节一致（兼容形态）；f16 位型 0x3C00 校验。
+    #[test]
+    fn mip_chain_box_averages_match_analytic_values() {
+        let checker: Vec<Vec3> = (0..16)
+            .map(|i| {
+                let (x, y) = (i % 4, i / 4);
+                if (x + y) % 2 == 0 {
+                    Vec3::ZERO
+                } else {
+                    Vec3::splat(2.0)
+                }
+            })
+            .collect();
+        let item = item_atlas(4, checker);
+        let chain = item.mip_chain_half_bytes();
+        assert_eq!(chain.len(), 3, "4×4 链止于 1×1");
+        assert_eq!(
+            chain[0],
+            item.half_bytes(),
+            "级 0 必须逐字节等于单 mip 上传源"
+        );
+        assert_eq!(
+            (chain[1].len(), chain[2].len()),
+            (2 * 2 * 8, 8),
+            "行步长口径 size×8"
+        );
+        for level in [&chain[1], &chain[2]] {
+            for texel in level.chunks(8) {
+                assert_eq!(
+                    texel,
+                    &[0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c],
+                    "棋盘 2×2 块均值 = 1.0 精确（f16 0x3C00 小端），rgb 全通道、a 恒 1"
+                );
+            }
+        }
+        // 奇数维 3×3 全 2.0：截断序列 3 → 1（(3/2).max(1)），单样本 =
+        // clamp 窗四取同值仍恒 2.0；链长 2 = mip_level_count(3,3)
+        let odd = item_atlas(3, vec![Vec3::splat(2.0); 9]);
+        let odd_chain = odd.mip_chain_half_bytes();
+        assert_eq!(odd_chain.len(), 2, "3×3 → 1×1");
+        assert_eq!(odd_chain[1].len(), 8);
+        assert_eq!(&odd_chain[1][0..2], &[0x00, 0x40], "2.0 = f16 0x4000 小端");
+    }
+
+    /// mip 链确定性 + 显存对账（C2）：目录口径 `gpu_bytes_estimate_mipped`
+    /// 恰等于逐图集 mip 链字节和（解析值 4×4 链 168、2×2 链 40），单 mip
+    /// 口径不受波及；链两次生成逐字节一致。
+    #[test]
+    fn mip_chain_is_deterministic_and_estimate_mipped_reconciles() {
+        let mk_baked = |size: u32, v: Vec3| BakedLightmap {
+            atlas: LightmapAtlas {
+                size,
+                used_height: size,
+                entries: Vec::new(),
+            },
+            radiance: vec![v; (size * size) as usize],
+            indirect: vec![v; (size * size) as usize],
+            // 全覆盖 ⇒ dilation 无事可做，辐照数组逐位保持烘焙值
+            covered: vec![true; (size * size) as usize],
+        };
+        let mut store = LightmapStore::new();
+        let h4 = store.insert(mk_baked(4, Vec3::splat(0.5)));
+        let h2 = store.insert(mk_baked(2, Vec3::splat(3.0)));
+        let chain_sum: u64 = store
+            .get(h4)
+            .unwrap()
+            .mip_chain_half_bytes()
+            .iter()
+            .chain(store.get(h2).unwrap().mip_chain_half_bytes().iter())
+            .map(|l| l.len() as u64)
+            .sum();
+        assert_eq!(
+            store.gpu_bytes_estimate_mipped(),
+            chain_sum,
+            "对账：估算 ≡ 链字节和"
+        );
+        assert_eq!(store.gpu_bytes_estimate_mipped(), (128 + 32 + 8) + (32 + 8));
+        assert_eq!(store.gpu_bytes_estimate(), 128 + 32, "单 mip 口径原样");
+        // 确定性：两次生成逐字节一致
+        assert_eq!(
+            store.get(h4).unwrap().mip_chain_half_bytes(),
+            store.get(h4).unwrap().mip_chain_half_bytes()
+        );
     }
 }

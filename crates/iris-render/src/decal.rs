@@ -43,10 +43,14 @@
 //!
 //! ## v1 限制（诚实清单）
 //!
-//! - **无光照**：输出 = 纹理 × tint，不参与 PBR / 方向光 / 阴影 / IBL。
-//!   弹孔、血迹类深色标记语义足够；受光贴花（随表面明暗、接受阴影）需
-//!   要把贴花混合移入光照方程或改写为延迟 decals，v1 不做——半亮环境
-//!   下贴花会比表面「亮一档」，深色标记上不可察觉。
+//! - ~~**无光照**：输出 = 纹理 × tint，不参与 PBR / 方向光 / 阴影 / IBL~~
+//!   **C2 闭合直射项**：[`DecalLighting`] 资源在场 ⇒ 逐片元乘
+//!   「方向光 Lambert + ambient」光照因子（法线由逆盒矩阵重建，见其
+//!   文档），半亮环境「亮一档」病灶随全局照度收敛；**资源缺席 =
+//!   原文语义逐位不变**。仍存边界：不采样阴影贴图、不吃点光 / 聚光 /
+//!   IBL / 探针 / DDGI / GTAO（完整合成 = 延迟 decals 工程，维持拒绝）；
+//!   受光贴花（随表面明暗、接受阴影）要把贴花混合移入光照方程或改写为
+//!   延迟 decals，深色标记类用关闭态即可。
 //! - **平面假设**：端盖是投影平面，被贴表面须在盒内近似共面；深盒贴斜
 //!   面时端盖与表面的偏差上界为 `size.z / 2`（薄盒下不可见）。基于深度
 //!   缓冲重投影的屏幕空间 decals（任意曲面精确贴合）留待后续。
@@ -81,7 +85,7 @@ pub struct Decal {
     pub tint: [f32; 4],
 }
 
-/// GPU 贴花实例数据（144 字节，POD）。
+/// GPU 贴花实例数据（160 字节，POD）。
 ///
 /// `model` 为世界盒矩阵（实体全局矩阵 × size 缩放，列主序）；`inv_model`
 /// 为其逆——**CPU 预计算传入**，着色器不做矩阵求逆（片元需把插值世界位
@@ -92,7 +96,9 @@ pub struct Decal {
 /// 未含 tint 通道；而 tint 是 [`Decal`] 的**逐实例**语义（同纹理不同乘
 /// 色的贴花并存），进实例数据是唯一不破坏「按纹理分批」的承载方式（按
 /// (纹理, tint) 分批则同纹理异色贴花无法合批，且需引入每批 uniform 池）。
-/// 144B = 64 + 64 + 16，9 × `Float32x4` 实例属性（location 1..=9）。
+/// 160B = 64 + 64 + 16 + 16，10 × `Float32x4` 实例属性（location 1..=10）。
+/// location 10（C2）：x = 受光开关（1 = 简化光照合成，见 [`DecalLighting`]
+/// 与 `decal_lit_factor`；0 = v1「纹理 × tint」逐位不变），yzw 保留恒 0。
 ///
 /// `PartialEq` 预留给将来的帧级实例比对（与 [`crate::instance::InstanceRaw`]
 /// 同语义：逐字段 IEEE 相等；NaN 恒判不等 → 退化为重传，不影响正确性）。
@@ -102,11 +108,14 @@ pub struct DecalInstanceRaw {
     pub model: [[f32; 4]; 4],
     pub inv_model: [[f32; 4]; 4],
     pub tint: [f32; 4],
+    /// C2 受光开关位（x = 0/1，yzw 保留 0）——逐帧全量上传，资源切换
+    /// 下一帧生效（与实例数据同节拍，无句柄缓存不追溯问题）。
+    pub lit: [f32; 4],
 }
 
 const _: () = assert!(
-    std::mem::size_of::<DecalInstanceRaw>() == 144,
-    "DecalInstanceRaw 必须为 144 字节（model 64B + inv_model 64B + tint 16B）"
+    std::mem::size_of::<DecalInstanceRaw>() == 160,
+    "DecalInstanceRaw 必须为 160 字节（model 64B + inv_model 64B + tint 16B + lit 16B）"
 );
 
 impl DecalInstanceRaw {
@@ -159,6 +168,11 @@ impl DecalInstanceRaw {
                 shader_location: 9,
                 format: wgpu::VertexFormat::Float32x4,
             },
+            wgpu::VertexAttribute {
+                offset: 144,
+                shader_location: 10,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 
@@ -167,13 +181,43 @@ impl DecalInstanceRaw {
     ///
     /// 注意：`model` 含零缩放分量（如 `size` 出现 0）时不可逆，将产生
     /// NaN——调用方应保证 size 三轴为正（收集路径有 debug 断言）。
-    pub fn from_model(model: Mat4, tint: [f32; 4]) -> Self {
+    pub fn from_model(model: Mat4, tint: [f32; 4], lit: bool) -> Self {
         Self {
             model: model.to_cols_array_2d(),
             inv_model: model.inverse().to_cols_array_2d(),
             tint,
+            lit: [f32::from(lit), 0.0, 0.0, 0.0],
         }
     }
+}
+
+/// 贴花受光（C2 · 闭合 §8.19「无光照」条）：World 资源，**缺席 = v1
+/// 口径逐位不变**（输出 = 纹理 × tint，照旧；在场 = 逐片元乘上简化光照
+/// 因子 [`decal_lit_factor`]）。
+///
+/// 合成语义：贴花仍是「表面装饰的乘色」，受光模式**不重建 GBuffer、
+/// 不换 BSDF**——片元法线由逆世界盒矩阵重建（`(M⁻¹)ᵀ e_z`，端盖平面
+/// 法线，朝向相机一侧翻正），光照因子 = 方向光 Lambert 项 + ambient
+/// （与 `standard.wgsl` 漫反射项同口径、albedo ≡ 1 的形态），最终
+/// `out.rgb = tex.rgb × tint.rgb × factor`，alpha 不变。
+///
+/// 诚实边界（v2 面）：**不采样阴影贴图**（遮蔽区贴花仍按直射亮——与
+/// 「半亮环境亮一档」病灶收敛互补：全局照度对了，阴影内偏差残留）、
+/// 不吃点光 / 聚光 / IBL 镜面 / 探针 / DDGI / GTAO（这些项在乘色因子里
+/// 缺席 = 贴花比被贴面「少几项光」，属声明内的已知偏离）。逐簇受光
+/// 全量入 PBR 是延迟贴花工程（§8.19 原文的「移入光照方程」拒绝项）。
+#[derive(iris_core::Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecalLighting;
+
+/// 受光因子纯函数（CPU 镜像；WGSL 侧同式）：
+/// `factor = light_color × max(N·L, 0) + ambient`。解析可测
+/// （受光对齐 / 背光 / 垂直三档），GPU 侧两条锚在 `tests/decal_render.rs`：
+/// **因子 ≡ 1**（ambient = 1、intensity = 0）时受光开与关逐像素一致
+/// （乘 1.0 是 IEEE 恒等——「在场但中性」的退化锚）；同场景给光后
+/// 哈希必须变化（有效性判别）。
+pub fn decal_lit_factor(normal: Vec3, light_dir: Vec3, light_color: Vec3, ambient: Vec3) -> Vec3 {
+    let sun = light_dir.dot(normal).max(0.0);
+    light_color * sun + ambient
 }
 
 /// 代理几何顶点数（单位盒 ±Z 两块端盖，8 顶点）。
@@ -224,23 +268,63 @@ pub const PROXY_INDICES: [u32; PROXY_INDEX_COUNT] = [
 mod tests {
     use super::*;
 
-    /// 布局断言：144 字节 / 实例，stride 与属性偏移一致（location 1..=9
+    /// 布局断言：160 字节 / 实例，stride 与属性偏移一致（location 1..=10
     /// 每 16 字节一个 Float32x4）。
     #[test]
-    fn instance_layout_is_144_bytes_with_nine_vec4_attributes() {
-        assert_eq!(std::mem::size_of::<DecalInstanceRaw>(), 144);
-        assert_eq!(DecalInstanceRaw::LAYOUT.array_stride, 144);
+    fn instance_layout_is_160_bytes_with_ten_vec4_attributes() {
+        assert_eq!(std::mem::size_of::<DecalInstanceRaw>(), 160);
+        assert_eq!(DecalInstanceRaw::LAYOUT.array_stride, 160);
         assert_eq!(
             DecalInstanceRaw::LAYOUT.step_mode,
             wgpu::VertexStepMode::Instance
         );
         let attrs = DecalInstanceRaw::LAYOUT.attributes;
-        assert_eq!(attrs.len(), 9, "9 × Float32x4 = 144B");
+        assert_eq!(attrs.len(), 10, "10 × Float32x4 = 160B（C2 起）");
         for (i, attr) in attrs.iter().enumerate() {
             assert_eq!(attr.shader_location, (i + 1) as u32, "location 从 1 起");
             assert_eq!(attr.offset, (i * 16) as u64);
             assert_eq!(attr.format, wgpu::VertexFormat::Float32x4);
         }
+    }
+
+    /// C2 开关位构造：`from_model(…, lit)` 写 location 10 的 x 分量
+    /// （1.0 / 0.0 精确值，yzw 恒 0——插值中间态不可能越过 0.5 阈值）；
+    /// model / inv_model / tint 三组不受影响（与 v1 逐字节一致）。
+    #[test]
+    fn from_model_encodes_lit_flag_in_tenth_attribute() {
+        let m = Mat4::from_cols_array_2d(&[
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.5, -1.0, 3.0, 1.0],
+        ]);
+        let on = DecalInstanceRaw::from_model(m, [1.0, 0.5, 0.25, 0.8], true);
+        let off = DecalInstanceRaw::from_model(m, [1.0, 0.5, 0.25, 0.8], false);
+        assert_eq!(on.lit, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(off.lit, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(on.model, m.to_cols_array_2d(), "受光开关不改几何两组字段");
+        assert_eq!(on.inv_model, off.inv_model);
+        assert_eq!(on.tint, off.tint);
+    }
+
+    /// 受光因子纯函数（CPU 镜像，解析三档）：受光面对齐（N=L）⇒
+    /// color + ambient；背光（N = −L）⇒ 仅剩 ambient（Lambert 钳 0）；
+    /// 垂直（N⊥L）⇒ 仅剩 ambient（dot 恰 0）。
+    #[test]
+    fn decal_lit_factor_matches_analytic_three_levels() {
+        let l = Vec3::Y;
+        let color = Vec3::new(2.0, 1.5, 1.0);
+        let amb = Vec3::new(0.1, 0.2, 0.3);
+        let lit = decal_lit_factor(Vec3::Y, l, color, amb);
+        assert_eq!(lit, color + amb, "N=L：直射满额 + 环境");
+        let back = decal_lit_factor(Vec3::NEG_Y, l, color, amb);
+        assert_eq!(back, amb, "背光：Lambert 钳 0，只剩环境项");
+        let side = decal_lit_factor(Vec3::X, l, color, amb);
+        assert_eq!(side, amb, "垂直：dot 恰 0（钳 0 无操作数差）");
+        // 中性档：color 0、ambient 1 ⇒ 因子恒 1（GPU 退化锚的 CPU 侧对应，
+        // 乘 1.0 是 IEEE 恒等）
+        let neutral = decal_lit_factor(Vec3::NEG_Y, l, Vec3::ZERO, Vec3::splat(1.0));
+        assert_eq!(neutral, Vec3::splat(1.0));
     }
 
     /// 代理几何：坐标全在单位盒内、端盖 z = ±0.5、两盖法线朝外（首三角
@@ -287,7 +371,7 @@ mod tests {
             Vec3::new(4.0, -1.0, 2.0),
         );
         let tint = [0.5, 1.0, 0.25, 0.8];
-        let raw = DecalInstanceRaw::from_model(model, tint);
+        let raw = DecalInstanceRaw::from_model(model, tint, false);
         let m = Mat4::from_cols_array_2d(&raw.model);
         let inv = Mat4::from_cols_array_2d(&raw.inv_model);
         let identity = m * inv;

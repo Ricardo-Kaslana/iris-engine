@@ -5,6 +5,60 @@
 
 ## [Unreleased]
 
+### Added（C2 闭合战役 · 渲染伪影役——四项「缺席/默认 = 逐位不变」，两条既有 bug 随修）
+
+路线图 v5 清账战役第三批（C0 文档健康 → C1 原语小件 → 本批）。四条均为
+「在场才生效」的 opt-in 形态，全部既有像素锁原值通过（无基线修订）：
+
+- **贴花受光 v2（§8.19 直射项闭合）**：新资源 `DecalLighting`（缺席 =
+  输出 = 纹理 × tint 逐位不变）。在场时逐实例 location 10 开关置 1，片元
+  法线由逆世界盒矩阵重建（`(M⁻¹)ᵀ e_z` = 逆矩阵 z 行——端盖平面法线对
+  非均匀缩放仍正确，inverse-transpose 性质），朝相机一侧翻正，输出乘
+  「方向光 Lambert + ambient」因子（standard 漫反射口径、albedo ≡ 1）。
+  实例布局 144B → 160B（10 × Float32x4，`lit` 向量的 yzw 保留恒 0——
+  同批次恒等值，插值无中间态）。CPU 镜像 `decal_lit_factor` 解析三档；
+  `decal.wgsl` Globals 前缀（到 ambient 五字段）+ location 10 契约 =
+  **影子契约**，新增 pipeline.rs 源码层看门
+  `decal_globals_prefix_and_lit_attribute_match_standard`（R61 教训的
+  制度化）。GPU 双锚：中性光照（ambient≡1、intensity 0）开/关逐位一致
+  （乘 1.0 IEEE 恒等退化锚）+ 顶光 ×2 判别（哈希差 + ROI 亮度升序——
+  地面自发光不受光 ⇒ 差异只能来自贴花）。诚实边界：不采样阴影贴图、
+  不吃点光/聚光/IBL/探针/DDGI/GTAO（延迟 decals 完整合成维持拒绝）。
+- **光照贴图 mip 链（§8.31⑤ 闭合）**：`MipSettings` 在场 ⇒
+  `LightmapItem::mip_chain_half_bytes` 线性域 2×2 box 链（光照贴图存
+  线性 HDR ⇒ 线性平均即正确定义，无 RGBA8 路径自认的编码空间均值失真；
+  截断维数序列 + clamp 边缘窗与 `downsample_rgba8` 同口径）逐级
+  `write_texture` + 三线性/各向异性采样器随上传期创建、绑进材质组
+  （与 `GpuTexture { view, sampler }` 同构；SSS LUT 经同 binding 显式
+  level 采样不受影响）。缺席 = 单 mip + 采样器逐字段 = R52c（既有基线
+  零漂移实证）；`gpu_bytes_estimate_mipped` 对账口径 + 解析链字节锚 +
+  GPU 判别三件套（观测 API `lightmap_has_mips` / 64×48 缩比哈希差 /
+  同配置逐位确定）。
+- **粒子 v2 序列化（§8.14 修正 + §8.51⑩ 闭合）**：关卡档/场景 JSON 新增
+  `particles_v2` 段（v1 全字段 + `trail_length`/`trail_width`，缺省 =
+  `ParticleEmitterV2::new(Alpha)`；帧队列/池游标/存活批表等运行态不入档
+  ——v1 同哲学）。审计顺带实锤：**§8.14「JSON 场景无粒子段」是 R57 后
+  的过期陈述**（v1 `particles` 段早已在位），本轮一并修正。往返位级
+  一致 + 新鲜态（池游标/存活估计 = 0）断言。
+- **反射探针编辑入口（§8.37⑧ 闭合，含两条既有 bug 修复）**：
+  ① 序列化：`probe` 段（`half_extents`/`falloff`，缺省 = 组件 Default，
+  退化半边长**加载期 OutOfRange 拒绝**——不静默进收集期告警路径）；
+  ② 编辑器：`M` 摆放（单位立方体视觉标记 + 组件，**双写契约**：组件
+  `half_extents` 权威、标记 `Transform.scale = 2×half` 随命令同步，探针
+  采样不读 scale）、选中时 `[ ]` = 过渡带 ∓/+0.5 m（钳 [0,10]）、
+  `- =` = 半边长 ÷/×1.25（钳 [0.05,100]，下限防零体积盒）；
+  ③ **修复 undo 丢失 bug**（§8.37⑧ 声明的「快照组件集不含
+  `ReflectionProbe` ⇒ undo/redo 后探针丢失」——探针进 `EntitySnapshot`
+  字段集，headless 逐步 undo 对账）；④ 烘焙入口回报 `probe_count`
+  warn 提醒重烘（捕获仍属游戏/工具侧 GPU——§8.37③ 立场维持，编辑器
+  命令层保持 headless 可测）。测试：摆放双写 + 步进 + 逐步 undo 全删
+  全建（句柄改变走查询断言）+ 入档往返逐字节稳定 + 钳域封顶托底 +
+  无选中 no-op 守卫，共 3 项 headless。
+
+§8 状态翻转五条：14（含过期修正）/ 19 / 31⑤ / 37⑧（undo 丢失 bug 修复
+计入此条）/ 51⑩。本批无独立 Fixed 条目——唯一的既有缺陷修复（探针
+undo 丢失）属 §8.37⑧ 声明内容的闭合。
+
 ### Added（C1 闭合战役 · 原语小件轮——四件独立小项，全部「缺席 = 逐位不变」形态）
 
 路线图 v5 暂停新功能后的清账战役第二批（计划 = `docs/private/closure-plan-v1.md`，

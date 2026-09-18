@@ -17,6 +17,10 @@ use iris_core::hierarchy::propagate_transforms;
 use iris_core::prelude::{Quat, Transform, Vec3, World};
 use iris_render::prelude::*;
 
+/// 重负载 GPU 套件文件内串行互斥（AGENTS.md 纪律，照 `ssr_render.rs`；
+/// C2 轮随新增用例补齐全文件）。
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// R52b 基线全帧像素 FNV-1a 64（改动落地前以同一场景实跑捕获；
 /// 场景 = 室内盒（地板 + 两墙 + 遮挡柱）+ 侧向暖光 + 默认 IBL，
 /// 480×270，见 [`room_world`]）。
@@ -105,6 +109,7 @@ fn room_world() -> World {
 /// 硬约束锁定：未挂光照贴图的场景与 R52b 基线逐位一致（全帧像素哈希）。
 #[test]
 fn scene_without_lightmap_matches_r52b_baseline_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(480, 270) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -183,6 +188,7 @@ fn luminance_quantile(pixels: &[u8], q: f32) -> u32 {
 /// 6. 确定性：重建同世界再渲一次逐位一致。
 #[test]
 fn lightmap_darkens_occluded_areas_and_keeps_direct_light() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(480, 270) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -306,6 +312,7 @@ fn lightmap_darkens_occluded_areas_and_keeps_direct_light() {
 /// 见 `renderer.rs` 的 `collect_instances` 解析口径）。
 #[test]
 fn binding_without_uv2_falls_back_to_ibl_bitwise() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
     let Some(mut renderer) = OffscreenRenderer::new(480, 270) else {
         eprintln!("跳过：环境无 GPU 适配器");
         return;
@@ -344,5 +351,60 @@ fn binding_without_uv2_falls_back_to_ibl_bitwise() {
         fnv1a(&px_bound),
         fnv1a(&px_plain),
         "网格无 UV2 时必须逐位退回 IBL 路径（绑定不得让间接光变黑）"
+    );
+}
+
+/// C2 mip 链（闭合 §8.31⑤）三件套：
+/// ①观测口径——`lightmap_has_mips` 缺席 = false、`MipSettings` 在场 =
+/// true（上传期决定，与 `texture_is_bc1` 同纪律）；
+/// ②低分辨率小窗（64×48）远视——图集 texel（4 texel/m）远小于屏幕像素
+/// 的地面投影 ⇒ 缩比 LOD>1，三线性取链上中级，帧哈希与单 mip **必须
+/// 不同**（非默认值断言，R89 规约）；
+/// ③同配置双渲染器（跨世界各用独立渲染器——句柄值缓存纪律）帧逐位一致。
+#[test]
+fn lightmap_mip_upload_and_minified_field_are_discriminable() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer_a) = OffscreenRenderer::new(64, 48) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let Some(mut renderer_b) = OffscreenRenderer::new(64, 48) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let (world_plain, handle) = room_world_with_lightmap();
+    let (mut world_mip, handle_mip) = room_world_with_lightmap();
+    world_mip.insert_resource(MipSettings::default());
+
+    renderer_a.render(&world_plain);
+    assert!(
+        renderer_a.renderer().lightmap_is_uploaded(handle),
+        "前提：图集已懒上传"
+    );
+    assert!(
+        !renderer_a.renderer().lightmap_has_mips(handle),
+        "MipSettings 缺席 = 单 mip 上传（兼容形态）"
+    );
+    let hash_plain = fnv1a(&renderer_a.read_pixels());
+
+    renderer_b.render(&world_mip);
+    assert!(
+        renderer_b.renderer().lightmap_has_mips(handle_mip),
+        "MipSettings 在场 = mip 链上传（观测口径）"
+    );
+    let hash_mip = fnv1a(&renderer_b.read_pixels());
+    assert_ne!(
+        hash_plain, hash_mip,
+        "64×48 远视小窗下 mip 三线性必须可判别（哈希不应与单 mip 相同）"
+    );
+
+    // ③同配置确定性：重烘重渲逐位一致
+    let (world_again, handle_again) = room_world_with_lightmap();
+    renderer_a.render(&world_again);
+    assert!(renderer_a.renderer().lightmap_is_uploaded(handle_again));
+    assert_eq!(
+        fnv1a(&renderer_a.read_pixels()),
+        hash_plain,
+        "同配置两世界两渲染器帧必须逐位一致"
     );
 }

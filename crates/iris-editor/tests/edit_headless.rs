@@ -34,10 +34,11 @@ use iris_editor::edit::{
     delete_selected, describe, drag_to, duplicate_selected, editable_entities, end_drag,
     focus_selected, light_edit_mode, light_hue_step, light_intensity_step, light_range_step,
     light_shadow_toggle, nav_blocked_count, nav_bounds_from_statics, nudge_selected, open_level,
-    orbit_camera, panel_text, pick, place_at, place_from_ray, placement_point, rebuild_grid,
-    rebuild_nav, redo, redo_depth, save_level, scale_selected, screen_ray_at, select, snap_value,
-    sun_ambient_step, sun_direction_step, toggle_collider, toggle_nav_viz, toggle_snap, undo,
-    undo_depth, update_gizmo, world_aabb_of,
+    orbit_camera, panel_text, pick, place_at, place_from_ray, place_probe_at, placement_point,
+    probe_falloff_step, probe_selected, probe_size_step, rebuild_grid, rebuild_nav, redo,
+    redo_depth, save_level, scale_selected, screen_ray_at, select, snap_value, sun_ambient_step,
+    sun_direction_step, toggle_collider, toggle_nav_viz, toggle_snap, undo, undo_depth,
+    update_gizmo, world_aabb_of,
 };
 use iris_engine::prelude::*;
 
@@ -2382,4 +2383,182 @@ fn ddgi_section_survives_editor_roundtrip() {
     save_level(&mut reloaded).expect("重存");
     let text3 = std::fs::read_to_string(&path).expect("读");
     assert_eq!(text2, text3, "带 DDGI 档的重存逐字节一致（往返稳定）");
+}
+
+// ---------------------------------------------------------------------------
+// C2：反射探针编辑入口（摆放 / 步进 / undo / 入档）
+// ---------------------------------------------------------------------------
+
+/// 探针入口全链：摆放（双写 scale = 2×half + BakeExcluded + 自动选中）→
+/// 步进（size ×1.25 同写标记、falloff +0.5）→ 逐步 undo 复原组件与标记
+/// （§8.37⑧ 闭合前探针在 undo 后丢失的钉子）→ save_level 的 probe 段
+/// 往返 → 重存逐字节稳定。
+#[test]
+fn probe_place_step_undo_and_level_roundtrip() {
+    let dir = temp_dir("probeedit");
+    let path = dir.join("probe.level.json");
+    let mut world = World::new();
+    open_level(&mut world, &path).expect("新建");
+    let d_initial = dump_world_sorted(&world);
+
+    let probe = place_probe_at(&mut world, Vec3::new(0.0, 0.0, 0.0)).expect("摆放探针");
+    propagate_transforms(&mut world);
+    {
+        let component = world.get::<ReflectionProbe>(probe).expect("组件在位");
+        assert_eq!(
+            component.half_extents,
+            Vec3::splat(2.0),
+            "摆放初值半边长 2 m"
+        );
+    }
+    assert!(
+        world.get::<BakeExcluded>(probe).is_some(),
+        "标记立方不进 GI 收集"
+    );
+    assert_eq!(
+        world.get::<Transform>(probe).unwrap().scale,
+        Vec3::splat(4.0),
+        "标记 scale = 2 × half_extents（双写契约）"
+    );
+    assert!(probe_selected(&world), "摆放后自动选中");
+
+    let half = probe_size_step(&mut world, 1).expect("选中步进");
+    assert_eq!(half, Vec3::splat(2.0 * 1.25), "×1.25 统一步进");
+    assert_eq!(
+        world.get::<Transform>(probe).unwrap().scale,
+        half * 2.0,
+        "步进必须同步标记 scale"
+    );
+    let d_size = dump_world_sorted(&world);
+    let falloff = probe_falloff_step(&mut world, 1).expect("过渡带步进");
+    assert_eq!(falloff.to_bits(), (PROBE_DEFAULT_FALLOFF + 0.5).to_bits());
+
+    // 逐步 undo：falloff → size → 摆放 ⇒ 每步都复原组件（此前探针组件
+    // 不在 undo 快照字段集 = §8.37⑧ 声明的丢失 bug）。**undo 全删全建 ⇒
+    // 实体句柄改变**（§8.34② 既有语义），断言一律经查询取回而非旧句柄。
+    assert!(undo(&mut world));
+    let mut probe_state: Option<(f32, Vec3, Vec3)> = None;
+    world.query::<(&ReflectionProbe, &Transform)>(|(p, t)| {
+        probe_state = Some((p.falloff, p.half_extents, t.scale));
+    });
+    let (falloff, half_now, scale_now) = probe_state.expect("undo 后探针仍在");
+    assert_eq!(
+        falloff.to_bits(),
+        PROBE_DEFAULT_FALLOFF.to_bits(),
+        "undo falloff"
+    );
+    assert_eq!(half_now, Vec3::splat(2.5), "falloff undo 不动 size");
+    assert_eq!(scale_now, half_now * 2.0, "标记与组件同点");
+    assert!(undo(&mut world));
+    let mut probe_state: Option<(Vec3, Vec3)> = None;
+    world.query::<(&ReflectionProbe, &Transform)>(|(p, t)| {
+        probe_state = Some((p.half_extents, t.scale));
+    });
+    let (half_now, scale_now) = probe_state.expect("探针仍在");
+    assert_eq!(half_now, Vec3::splat(2.0), "undo size ⇒ 组件回摆放初值");
+    assert_eq!(scale_now, Vec3::splat(4.0), "标记 scale 同步回退");
+    let _ = d_size;
+    assert!(undo(&mut world));
+    assert_eq!(
+        dump_world_sorted(&world),
+        d_initial,
+        "undo 摆放 ⇒ 世界复原（摆放命令捕获的正是摆放前快照）"
+    );
+    let mut seen = 0usize;
+    world.query::<&ReflectionProbe>(|_| seen += 1);
+    assert_eq!(
+        seen, 0,
+        "摆放 undo 后探针组件必须消失（快照字段集覆盖探针）"
+    );
+
+    // 入档往返：重放摆放 + 步进 ⇒ save_level 带 probe 段 ⇒ 重载组件在位、
+    // 重存逐字节稳定
+    let probe2 = place_probe_at(&mut world, Vec3::new(1.0, 0.0, -1.0)).expect("再摆");
+    probe_size_step(&mut world, 1).expect("步进");
+    let _ = probe2;
+    save_level(&mut world).expect("保存");
+    let text = std::fs::read_to_string(&path).expect("读");
+    assert!(text.contains("\"probe\""), "probe 段必须入档");
+    let mut reloaded = World::new();
+    open_level(&mut reloaded, &path).expect("重载");
+    let mut seen = 0usize;
+    reloaded.query::<&ReflectionProbe>(|p| {
+        assert_eq!(p.half_extents, Vec3::splat(2.5), "重载步进结果");
+        seen += 1;
+    });
+    assert_eq!(seen, 1, "恰一个探针实体");
+    save_level(&mut reloaded).expect("重存");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("重读"),
+        text,
+        "探针档往返逐字节稳定"
+    );
+}
+
+/// 探针命令守卫：无编辑器状态 / 未选中 / 选中非探针实体 ⇒ 全部 no-op
+/// （`None` / `false`），摆放命令需要 EditorState 缺席 no-op。
+#[test]
+fn probe_commands_are_inert_without_selection() {
+    // 无 EditorState 裸世界
+    let mut bare = World::new();
+    assert!(!probe_selected(&bare));
+    assert_eq!(probe_size_step(&mut bare, 1), None);
+    assert_eq!(probe_falloff_step(&mut bare, -1), None);
+    assert!(place_probe_at(&mut bare, Vec3::ZERO).is_none());
+
+    // 编辑器世界但无选中 / 选中普通立方体
+    let dir = temp_dir("probeinert");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("probeinert.level.json")).expect("新建");
+    assert!(!probe_selected(&world));
+    assert_eq!(probe_size_step(&mut world, 1), None);
+    let cube = place_at(&mut world, Vec3::ZERO).expect("摆立方");
+    select(&mut world, Some(cube));
+    assert!(
+        !probe_selected(&world),
+        "选中普通实体 ⇒ 探针命令 no-op（[ ] - = 归各自语义）"
+    );
+    assert_eq!(probe_size_step(&mut world, 1), None);
+}
+
+/// 钳域：半边长连乘封顶 `PROBE_SIZE_MAX`、连除托底 `PROBE_SIZE_MIN`；
+/// 过渡带封底 0（硬边界合法）封顶 10 m（R89 规约的非默认值断言面）。
+#[test]
+fn probe_steps_clamp_at_band_edges() {
+    let dir = temp_dir("probeclamp");
+    let mut world = World::new();
+    open_level(&mut world, &dir.join("probeclamp.level.json")).expect("新建");
+    place_probe_at(&mut world, Vec3::ZERO).expect("摆放");
+    for _ in 0..60 {
+        probe_size_step(&mut world, 1);
+    }
+    assert_eq!(
+        probe_size_step(&mut world, 1),
+        Some(Vec3::splat(100.0)),
+        "半边长封顶 100 m"
+    );
+    for _ in 0..200 {
+        probe_size_step(&mut world, -1);
+    }
+    assert_eq!(
+        probe_size_step(&mut world, -1),
+        Some(Vec3::splat(0.05)),
+        "半边长托底 0.05 m（不退化零体积盒）"
+    );
+    for _ in 0..40 {
+        probe_falloff_step(&mut world, -1);
+    }
+    assert_eq!(
+        probe_falloff_step(&mut world, -1),
+        Some(0.0),
+        "过渡带封底 0 = 硬边界合法值"
+    );
+    for _ in 0..40 {
+        probe_falloff_step(&mut world, 1);
+    }
+    assert_eq!(
+        probe_falloff_step(&mut world, 1),
+        Some(10.0),
+        "过渡带封顶 10 m"
+    );
 }

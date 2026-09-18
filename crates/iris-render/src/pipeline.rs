@@ -2566,7 +2566,7 @@ pub(crate) fn create_pipeline(
     });
 
     // 贴花（R39）：盒投影代理几何（单位盒 ±Z 端盖，位置顶点）× 逐实例
-    // 世界盒矩阵 + 逆矩阵 + tint（144B，DecalInstanceRaw::LAYOUT location
+    // 世界盒矩阵 + 逆矩阵 + tint + 受光开关（160B，DecalInstanceRaw::LAYOUT location
     // 1..=9）。组 0 复用全局布局（着色器只声明 view_proj，精简 Globals，
     // skybox.wgsl 同款做法）；组 1 = 贴花纹理 + 采样器（按纹理分批绑定）。
     // alpha 混合（src α, 1 − src α）；深度 **LessEqual** 只测不写——端盖
@@ -2867,6 +2867,54 @@ mod tests {
                 find(&standard_body, cursor.1, field),
             );
         }
+    }
+
+    /// **贴花受光的影子契约看门（C2）**：`decal.wgsl` 自持的 `Globals`
+    /// 是 standard 的**前缀**（view_proj..ambient 五字段，逐名同序——
+    /// 字段序漂移 = 光照因子读错字节，症状是贴花明暗随机错，像素测试
+    /// 难归因）；且实例布局的 location 10 必须仍是 `lit`（着色器与
+    /// `DecalInstanceRaw::LAYOUT` 的十属性契约双侧钉住）。
+    #[test]
+    fn decal_globals_prefix_and_lit_attribute_match_standard() {
+        let decal = include_str!("../shaders/decal.wgsl");
+        let standard = include_str!("../shaders/standard.wgsl");
+        let body_of = |src: &str| -> String {
+            src.split("struct Globals {")
+                .nth(1)
+                .and_then(|s| s.split('}').next())
+                .expect("着色器应声明 Globals")
+                .to_string()
+        };
+        let decal_body = body_of(decal);
+        let standard_body = body_of(standard);
+        let find = |body: &str, from: usize, name: &str| {
+            body[from..]
+                .find(&format!("{name}:"))
+                .map(|i| from + i)
+                .unwrap_or_else(|| panic!("Globals 缺少字段 {name}"))
+        };
+        let mut cursor = (0usize, 0usize);
+        for field in [
+            "view_proj",
+            "eye_pos",
+            "light_dir",
+            "light_color",
+            "ambient",
+        ] {
+            cursor = (
+                find(&decal_body, cursor.0, field),
+                find(&standard_body, cursor.1, field),
+            );
+        }
+        assert!(
+            decal.contains("@location(10) lit: vec4<f32>"),
+            "decal.wgsl 的受光开关必须是 location(10) vec4（与 \
+             DecalInstanceRaw::LAYOUT 第十属性同契约）"
+        );
+        assert!(
+            decal.contains("in.lit.x > 0.5"),
+            "受光分支必须由 lit.x 门控（关闭态与 v1 逐字同式的判据）"
+        );
     }
 
     /// **meshlet vertex-pull 管线的三重接口看门（R85）**：

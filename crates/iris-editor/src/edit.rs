@@ -71,6 +71,20 @@
 //! 指定），有选中实体时 = 摆放点光（R58a 语义保留，摆放后自动选中 ⇒
 //! 「连按连摆」的主流流程不受影响）。
 //!
+//! # 反射探针编辑入口（C2 · 闭合 §8.37⑧）
+//!
+//! `M` 摆放探针实体（单位立方体**视觉标记** + [`ReflectionProbe`]，
+//! 标记随 [`place_probe_at`] 的 `BakeExcluded` 不进 GI 收集）；选中探针
+//! 时 `[` `]` = 过渡带 `falloff` −/+ 0.5 m（钳 [0, 10]，0 = 硬边界合法），
+//! `-` `=` = 半边长三轴同乘 ÷/× 1.25（钳 [0.05, 100]）。**双写契约**：
+//! 组件 `half_extents` 是权威，标记 `Transform.scale = 2 × half` 只随
+//! 命令同步（探针采样不读 scale）。探针进 undo 快照字段集（修复 §8.37⑧
+//! 「undo/redo 后探针丢失」）与关卡档 `probe` 段（scene 序列化 C2 同轮）。
+//! **边界（诚实声明）**：GPU 捕获重烘不在此触发——`bake_reflection_probe`
+//! 属游戏 / 工具侧能力（§8.37③「无脏标记自动重捕」立场维持），烘焙入口
+//! 仅在 `BakeReport::probe_count` 非零时 warn 提醒；探针槽位不回收
+//! （§8.37⑨）与预算 4 上限同样不在编辑器侧绕过。
+//!
 //! # 烘焙入口（b 阶段，`B` 键）
 //!
 //! [`bake_and_install`]：档内 `level.bake` 参数（缺席 = 引擎默认）→
@@ -925,6 +939,136 @@ pub fn place_light_from_ray(world: &mut World, origin: Vec3, dir: Vec3) -> Optio
     place_light_at(world, point)
 }
 
+// ---------------------------------------------------------------------------
+// 反射探针编辑入口（C2 · 闭合 §8.37⑧；`M` 摆放、选中时 `[ ] - =` 步进）
+// ---------------------------------------------------------------------------
+
+/// 探针摆放初值：半边长 2 m 的正方影响域（与点光初始 range 同量级）。
+pub const PROBE_DEFAULT_EXTENTS: f32 = 2.0;
+/// 半边长统一步进系数（`-` = ÷1.25、`=` = ×1.25，三轴同乘保形）。
+pub const PROBE_SIZE_FACTOR: f32 = 1.25;
+/// 半边长钳域（米）：下限防退化零体积盒（收集期跳过 + 告警不如编辑期
+/// 挡住），上限防手滑跨量级。
+pub const PROBE_SIZE_MIN: f32 = 0.05;
+/// 探针半边长上限（米）。
+pub const PROBE_SIZE_MAX: f32 = 100.0;
+/// 过渡带线性步宽（米；`[` = −0.5、`]` = +0.5，下限 0 = 硬边界）。
+pub const PROBE_FALLOFF_STEP: f32 = 0.5;
+/// 过渡带上限（米）——超界无收益（域外走 env 兜底），防手滑。
+pub const PROBE_FALLOFF_MAX: f32 = 10.0;
+
+/// 在当前摆放点摆一个反射探针实体（单位立方体**视觉标记** +
+/// [`ReflectionProbe`] 组件），返回新实体；摆放后自动选中。
+///
+/// **双写契约**——组件 `half_extents` 是唯一权威（探针采样只读实体位置
+/// 与半边长，probe.rs 影响域语义），`Transform.scale = 2 × half_extents`
+/// 只把标记立方撑到与影响域同体积；步进命令同写两者，undo 快照双字段
+/// 复原 ⇒ 视觉与语义无脱钩窗口。标记绑 `BakeExcluded`（灯泡同款理由：
+/// 会话内视觉记号不进 lightmap / DDGI 三角收集）。
+///
+/// 边界（诚实声明）：探针**捕获不在此触发**——GPU 捕获属游戏 / 工具侧
+/// `Renderer::bake_reflection_probe`（编辑器命令层保持 headless 可测，
+/// §8.37③「无脏标记自动重捕」立场维持；烘焙入口只报数提醒）；探针档
+/// 内序列化走 scene 的 `probe` 段（C2 同轮落地）。
+pub fn place_probe_at(world: &mut World, point: Vec3) -> Option<Entity> {
+    let (snap, snap_size) = {
+        let state = world.try_resource::<EditorState>()?;
+        (state.snap, state.snap_size)
+    };
+    push_undo(world);
+    let mesh = content_mesh(world, &PrimitiveSection::Cube)?;
+    let material = content_material(world, ContentMaterial::Preset(0));
+    let half = Vec3::splat(PROBE_DEFAULT_EXTENTS);
+    let scale = half * 2.0;
+    let position = rest_position(world, point, mesh, scale, snap, snap_size);
+    let name = next_name(world, "probe");
+    let entity = world.spawn((
+        Transform {
+            position,
+            rotation: Quat::IDENTITY,
+            scale,
+        },
+        mesh,
+        material,
+        Name(name.clone()),
+        // 标记立方是会话视觉记号 ⇒ 不进 lightmap / 探针 / DDGI 收集（R89）
+        BakeExcluded,
+        ReflectionProbe::new(half),
+    ));
+    set_status(
+        world,
+        format!(
+            "PLACED {} at {:.2} {:.2} {:.2} half {:.2}",
+            name, position.x, position.y, position.z, PROBE_DEFAULT_EXTENTS
+        ),
+    );
+    select(world, Some(entity));
+    Some(entity)
+}
+
+/// 射线版探针摆放（同 [`place_from_ray`] 的命中规则）。
+pub fn place_probe_from_ray(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
+    let point = placement_point(world, origin, dir)?;
+    place_probe_at(world, point)
+}
+
+/// 当前选中的探针实体（无编辑器状态 / 未选中 / 选中非探针 ⇒ `None`，
+/// 全部探针命令据此 no-op——选中点光 / 普通实体时 `[ ] - =` 归光源语义）。
+fn selected_probe(world: &World) -> Option<(Entity, ReflectionProbe)> {
+    let selected = world.try_resource::<EditorState>()?.selected?;
+    let probe = world.get::<ReflectionProbe>(selected)?;
+    Some((selected, *probe))
+}
+
+/// 选中实体是否为探针（壳层键位路由用只读查询）。
+pub fn probe_selected(world: &World) -> bool {
+    selected_probe(world).is_some()
+}
+
+/// 半边长三轴同乘步进（`dir > 0` = ×[`PROBE_SIZE_FACTOR`]、`dir < 0` =
+/// ÷），钳 [`PROBE_SIZE_MIN`, `PROBE_SIZE_MAX`]；同写标记
+/// `Transform.scale = 2 × half`（双写契约，见 [`place_probe_at`]）。
+/// 返回新半边长；无选中探针时 `None`。
+pub fn probe_size_step(world: &mut World, dir: i32) -> Option<Vec3> {
+    let (entity, probe) = selected_probe(world)?;
+    push_undo(world);
+    let factor = if dir >= 0 {
+        PROBE_SIZE_FACTOR
+    } else {
+        1.0 / PROBE_SIZE_FACTOR
+    };
+    let half = (probe.half_extents * factor).map(|c| c.clamp(PROBE_SIZE_MIN, PROBE_SIZE_MAX));
+    world.insert(
+        entity,
+        ReflectionProbe {
+            half_extents: half,
+            ..probe
+        },
+    );
+    if let Some(mut transform) = world.get_mut::<Transform>(entity) {
+        transform.scale = half * 2.0;
+    }
+    iris_core::hierarchy::propagate_transforms(world);
+    set_status(
+        world,
+        format!("PROBE HALF {:.2} {:.2} {:.2}", half.x, half.y, half.z),
+    );
+    refresh_hud(world);
+    Some(half)
+}
+
+/// 过渡带步进（`dir > 0` = +[`PROBE_FALLOFF_STEP`] m、`dir < 0` = −），
+/// 钳 [0, [`PROBE_FALLOFF_MAX`]]（0 = 硬边界合法值）；返回新宽度。
+pub fn probe_falloff_step(world: &mut World, dir: i32) -> Option<f32> {
+    let (entity, probe) = selected_probe(world)?;
+    push_undo(world);
+    let falloff = (probe.falloff + dir as f32 * PROBE_FALLOFF_STEP).clamp(0.0, PROBE_FALLOFF_MAX);
+    world.insert(entity, ReflectionProbe { falloff, ..probe });
+    set_status(world, format!("PROBE FALLOFF {:.2}", falloff));
+    refresh_hud(world);
+    Some(falloff)
+}
+
 /// 摆放落点：命中点 + 底面抬升（+ 可选 x / z 吸附）。
 fn rest_position(
     world: &World,
@@ -1442,6 +1586,10 @@ struct EntitySnapshot {
     body: Option<RigidBody>,
     light: Option<PointLight>,
     emitter: Option<ParticleEmitter>,
+    /// C2：反射探针组件（§8.37⑧ 闭合的 undo 半边——此前快照组件集不含
+    /// `ReflectionProbe`，探针在 undo/redo 后丢失；步进命令双写的
+    /// `Transform.scale` 随 transform 字段自然覆盖）。
+    probe: Option<ReflectionProbe>,
     /// R89：`BakeExcluded` 标记（编辑器的灯泡视觉等「内容 + 排除 GI 收集」
     /// 实体——undo 重建后标记必须复原，否则同一实体在 GI 里时隐时现）。
     bake_excluded: bool,
@@ -1499,6 +1647,7 @@ fn capture_snapshot(world: &World) -> Option<WorldSnapshot> {
             body: world.get::<RigidBody>(entity).map(|b| *b),
             light: world.get::<PointLight>(entity).map(|l| *l),
             emitter: world.get::<ParticleEmitter>(entity).map(|e| e.clone()),
+            probe: world.get::<ReflectionProbe>(entity).map(|p| *p),
             bake_excluded: world.get::<BakeExcluded>(entity).is_some(),
         });
     }
@@ -1718,6 +1867,9 @@ fn restore_snapshot(world: &mut World, snapshot: &WorldSnapshot) {
         }
         if let Some(emitter) = entry.emitter.clone() {
             world.insert(entity, emitter);
+        }
+        if let Some(probe) = entry.probe {
+            world.insert(entity, probe);
         }
         if entry.bake_excluded {
             world.insert(entity, BakeExcluded);
@@ -2325,6 +2477,10 @@ pub struct BakeReport {
     /// R89：烘焙时 `DdgiGrid` 是否非空（贴图 × DDGI 对同一空间互斥的
     /// 状态提示——只提示，不做自动裁剪，A1 裁决）。
     pub ddgi_grid_present: bool,
+    /// C2：世界内**有效**反射探针数（`is_valid`）。烘焙只处理光照贴图，
+    /// 探针捕获需游戏 / 工具侧对 `Renderer::bake_reflection_probe` 另行
+    /// 触发（§8.37③「无脏标记自动重捕」立场）——非零时状态行提醒重烘。
+    pub probe_count: usize,
 }
 
 /// 烘焙当前静态世界并挂载（`B` 键）：档内 `level.bake` 参数（缺席 =
@@ -2479,6 +2635,13 @@ pub fn bake_and_install(world: &mut World) -> Option<BakeReport> {
     let ddgi_grid_present = world
         .try_resource::<DdgiGrid>()
         .is_some_and(|grid| !grid.is_empty());
+    // C2：有效探针计数（烘焙不触碰探针——只回报数提醒重烘捕获）
+    let mut probe_count = 0usize;
+    world.query::<&ReflectionProbe>(|probe| {
+        if probe.is_valid() {
+            probe_count += 1;
+        }
+    });
     let report = BakeReport {
         texels,
         entities: install.entities,
@@ -2486,6 +2649,7 @@ pub fn bake_and_install(world: &mut World) -> Option<BakeReport> {
         artifact: artifact_path,
         from_level_section: from_section,
         ddgi_grid_present,
+        probe_count,
     };
     set_status(
         world,
@@ -2504,6 +2668,12 @@ pub fn bake_and_install(world: &mut World) -> Option<BakeReport> {
         set_status(
             world,
             "BAKE NOTE lightmap x DDGI mutual exclusion (lm wins)",
+        );
+    }
+    if probe_count > 0 {
+        log::warn!(
+            "世界有 {probe_count} 个有效反射探针：光照贴图烘焙不更新其捕获，\
+             请在游戏 / 工具侧对 Renderer::bake_reflection_probe 重烘（§8.37③）"
         );
     }
     refresh_hud(world);
