@@ -1161,10 +1161,29 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   启动 crossfade、无边硬切换（**无边 = 合法的显式硬切换**，但会打
   `log::debug!` 留线索：含 from / to 状态与边表长度——调试期清空 edges
   导致全部过渡跳变时可由此定位）；两种情况 `looping/speed` 都同步为目标态，
-  states 非空时 `advanced` 的循环/速度以当前状态为准。**条件判定留给
-  游戏侧**：边只带过渡时长，无参数黑板 / 条件求值——何时 request 由
-  调用方按玩法逻辑决定（v1 边界：引擎只做「边 + 过渡时长」，不做状态
-  内行为逻辑）。
+  states 非空时 `advanced` 的循环/速度以当前状态为准。
+- **状态机条件转移 v2（C4b）**：~~「条件判定留给游戏侧」~~ 参数黑板
+  `params`（`set_float` / `set_bool`，`BTreeMap` 固定序）+ 条件转移表
+  `transitions`（`AnimTransition { from, to, duration, guard }`）+
+  `step_state_machine()`（`update_animations` 写回阶段每帧自动步检）。
+  守卫 `AnimGuard` 是**封闭枚举**（浮点阈值 `FloatAtLeast`/`FloatBelow`/
+  `FloatBetween` 闭区间、`BoolIs`、播放器侧 `ClipFinished`、组合 `All`/
+  `Any`/`Not`）——可序列化、可 PartialEq、求值确定（不做闭包，确定性
+  文化）。触发纪律：按**声明序**取首条 `from == current_state` 且守卫
+  成立的转移、**一帧至多一条**（防乒乓/级联）、自环（from==to）不触发、
+  越界目标 = 无条件断言 panic。**`transitions` 空表 = 恒 no-op = v1
+  行为逐位不变**（与 v1 `edges` 并存、共享 `enter_state` 落账口；
+  六游戏自建状态判定自此有引擎承载）。
+- **运行时重定向（C4b）**：`retarget_by_name(target_names,
+  target_entities) -> RetargetReport`——通道不改写（节点下标保持源骨架
+  空间），只把 `node_entities` 整体重绑到目标骨架实体：骨名经
+  `normalize_bone_name`（小写 + 剥 `mixamorig`/`bip01`/`mocap`/
+  `ue4-skel` 前缀 + 空格压 `_`）匹配，目标重名取先出现者。**不猜语义
+  改名**（无编辑距离/内置别名表——猜错的绑定比断绑难排查，alias 表
+  归调用方）：有名未命中断绑为 `None`（通道停写，合流既有 None 语义）、
+  无名节点保留原绑定、空名字表恒 no-op。兑现 §8.35⑨ 拒绝「导入期 GLB
+  重定向」时留的口子——这是**运行期播放器侧**重绑，替代 iris-exp 的
+  离线 Blender 烘焙路线（同骨架命名族的跨角色复用剪辑库）。
 - **动画事件轨道（v2）**：`AnimationClip.events`
   （`AnimationEvent { time, name }`）——事件不在 glTF 标准内，**GLB 解析
   不产事件**，由 API 侧构造（`clip.events.push`）。`update_animations`
@@ -6695,6 +6714,18 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     面部级小位移；⑥meshlet / 地形路径不经手形变（IRML 展开几何无
     morph 表）；⑦`morph_gpu` 逐实体缓冲缓存只增不回收（与 `skin_gpu`
     同寿命口径）；⑧权重是运行期组件、不进场景 / 关卡序列化。
+62. **状态机 v2 + 运行时重定向（C4b）的诚实边界**——①**一帧至多一条**
+    条件转移 + 写回阶段步检 ⇒ 转移生效帧姿势仍来自旧状态采样（一帧
+    软延迟，与游戏侧手调 `request_state` 同款）；多状态级联要逐帧排；
+    ②守卫是封闭枚举（确定性 / 可序列化换来的裁剪）——需要历史 /
+    随机 / 复杂表达式的判定仍在游戏侧（黑板照写，`request_state`
+    手动入口常在）；③`ClipFinished` 粒度 = 「非循环且 `time ≥
+    duration`」，无「末端前 N 秒预回边」概念（要预判用参数守卫自管）；
+    ④`params` / `transitions` 是运行期声明，不进关卡 / 场景序列化；
+    ⑤重定向**只重绑不改剪辑**（节点下标恒为源骨架空间）——源播放器
+    `node_names` 是前提（GLB 实例播放器自带，手写空表恒 no-op）；
+    归一化只处理声明前缀表（`mixamorig`/`bip01`/`mocap`/`ue4-skel`），
+    语义改名不吃 alias 表就断绑，引擎不猜。
 
 ## 9. 关键设计取舍记录
 

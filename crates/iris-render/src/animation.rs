@@ -81,8 +81,21 @@
 //!   复用足部的 [`crate::foot_ik::solve_two_bone_ik`] 纯函数与两阶段
 //!   回写模式，落地查询换成「[`crate::hand_ik::IkTarget`] 实体的全局
 //!   平移」（武器握把位）——与足部「射线打地面」的目标差异见其模块文档。
+//!
+//! v5 扩展（C4b 闭合战役；新字段全中性默认，不启用 = v4 行为逐位不变）：
+//! - **状态机条件转移**：[`AnimationPlayer::params`] 参数黑板 +
+//!   [`AnimationPlayer::transitions`] 条件转移表——[`AnimGuard`] 封闭
+//!   枚举（浮点阈值 / 布尔 / [`AnimGuard::ClipFinished`] 播放末端 /
+//!   And·Or·Not 组合），[`AnimationPlayer::step_state_machine`] 由
+//!   [`update_animations`] 写回阶段每帧步检（声明序首条命中、一帧至多
+//!   一条、空表恒 no-op）——「何时切换由游戏侧判定」的 v1 边界就此
+//!   翻转为「判定可入引擎」，v1 `edges` + `request_state` 原样并存；
+//! - **运行时重定向**：[`AnimationPlayer::retarget_by_name`] 按归一
+//!   骨名（[`normalize_bone_name`]）把 `node_entities` 重绑到另一具
+//!   骨架的实体表——通道与下标不动（源骨架空间语义保留），未命中断绑、
+//!   无名保留（引擎不猜语义改名，alias 表归调用方）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::{Quat, Vec2, Vec3};
 use iris_core::prelude::{Entity, Time, Transform};
@@ -484,12 +497,114 @@ pub struct AnimationState {
 /// v1 边界：边只带「过渡时长」，不带条件表达式——**何时切换由游戏侧
 /// 判定**（调用方按玩法逻辑调用 [`AnimationPlayer::request_state`]，
 /// 引擎不设参数黑板 / 条件求值）。
+///
+/// **v2（C4b）**：条件转移走并行的 [`AnimationPlayer::transitions`]
+/// （[`AnimTransition`]），本类型原样保留——v1 手动 `request_state`
+/// 路径与全部既有构造零改动。二者可共存（同一 `states` 表）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnimationEdge {
     pub from: usize,
     pub to: usize,
     /// 过渡时长（秒）；0 = 硬切换。
     pub duration: f32,
+}
+
+/// 参数黑板的取值（C4b · 状态机 v2）：浮点（速度 / 朝向角这类连续量）
+/// 与布尔（着地 / 受击这类标志）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AnimValue {
+    Float(f32),
+    Bool(bool),
+}
+
+/// 条件转移的守卫（C4b）：对 [`AnimationPlayer::params`] 黑板的纯读求值。
+///
+/// 刻意做成**封闭枚举而非闭包**——可序列化、可 `PartialEq`、求值确定
+/// （无捕获环境），契合本仓确定性文化。缺失参数按类型取默认
+/// （浮点 0.0 / 布尔 false），与「组件缺席 = 中性值」一致。
+#[derive(Clone, Debug, PartialEq)]
+pub enum AnimGuard {
+    /// 恒真（无条件转移；「播完即走」请配 [`AnimGuard::ClipFinished`]）。
+    Always,
+    /// 浮点参数 `key >= n`。
+    FloatAtLeast(String, f32),
+    /// 浮点参数 `key < n`。
+    FloatBelow(String, f32),
+    /// 布尔参数 `key == v`。
+    BoolIs(String, bool),
+    /// 浮点参数落在 `[lo, hi]` 闭区间（混合空间入口的粗粒度门）。
+    FloatBetween(String, f32, f32),
+    /// **播放器侧守卫**（不读黑板）：当前状态的剪辑为非循环且已播到
+    /// 末端（`time ≥ duration`，`duration > 0`）——attack → idle 这类
+    /// 回边的最常见形态；循环状态恒假。
+    ClipFinished,
+    /// 全部子守卫为真（空 `And` = 恒真，合逻辑单位元）。
+    All(Vec<AnimGuard>),
+    /// 任一子守卫为真（空 `Any` = 恒假，合逻辑单位元）。
+    Any(Vec<AnimGuard>),
+    /// 子守卫取反。
+    Not(Box<AnimGuard>),
+}
+
+impl AnimGuard {
+    /// 对参数黑板求值（纯函数，`params` 缺失键按类型默认）。
+    pub fn eval(&self, params: &BTreeMap<String, AnimValue>) -> bool {
+        match self {
+            AnimGuard::Always => true,
+            AnimGuard::FloatAtLeast(key, n) => float_of(params, key) >= *n,
+            AnimGuard::FloatBelow(key, n) => float_of(params, key) < *n,
+            AnimGuard::BoolIs(key, v) => bool_of(params, key) == *v,
+            AnimGuard::FloatBetween(key, lo, hi) => {
+                let x = float_of(params, key);
+                x >= *lo && x <= *hi
+            }
+            // 本函数只有黑板上下文、看不到播放时间 ⇒ 播放器侧叶子恒假。
+            // 正常步检走 `AnimationPlayer::guard_holds`（两层上下文合流
+            // 的求值口），直接调本方法判含 ClipFinished 的守卫是误用。
+            AnimGuard::ClipFinished => false,
+            AnimGuard::All(inner) => inner.iter().all(|g| g.eval(params)),
+            AnimGuard::Any(inner) => inner.iter().any(|g| g.eval(params)),
+            AnimGuard::Not(inner) => !inner.eval(params),
+        }
+    }
+}
+
+/// 取浮点参数（缺失 = 0.0；类型非浮点亦按 0.0——布尔当 0 处理不报错，
+/// 与「中性默认」口径一致）。
+fn float_of(params: &BTreeMap<String, AnimValue>, key: &str) -> f32 {
+    match params.get(key) {
+        Some(AnimValue::Float(v)) => *v,
+        _ => 0.0,
+    }
+}
+
+/// 取布尔参数（缺失 / 非布尔 = false）。
+fn bool_of(params: &BTreeMap<String, AnimValue>, key: &str) -> bool {
+    matches!(params.get(key), Some(AnimValue::Bool(v)) if *v)
+}
+
+/// 一条条件转移（C4b · 状态机 v2）：`from → to` 且守卫成立即过渡。
+///
+/// [`AnimationPlayer::step_state_machine`] 每帧按 `transitions` 声明序
+/// （`Vec` 序确定）取**首条** `from == current_state` 且守卫成立的转移
+/// 触发，**一帧最多一条**（防乒乓 / 级联，多条件同帧满足靠声明序裁决）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimTransition {
+    pub from: usize,
+    pub to: usize,
+    /// 过渡时长（秒）；0 = 硬切换（与 [`AnimationEdge::duration`] 同义）。
+    pub duration: f32,
+    /// 触发守卫。
+    pub guard: AnimGuard,
+}
+
+/// [`AnimationPlayer::retarget_by_name`] 的回报（C4b · 运行时重定向）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetargetReport {
+    /// 成功重绑到目标骨架实体表的节点数。
+    pub bound: usize,
+    /// 未命中（目标骨架无同名骨 / 源无名）而保留原实体（通常 None）的节点数。
+    pub unmatched: usize,
 }
 
 /// 附加动画层（v4）：在主姿势之上叠加「剪辑相对其参考帧的增量」——
@@ -641,6 +756,17 @@ pub struct AnimationPlayer {
     /// 整表覆写**（非消息流，无 drain 语义——查询用
     /// [`Self::parameter`]）。未推进 / 无曲线 = 空。
     pub parameter_values: Vec<(String, f32)>,
+    /// 状态机参数黑板（C4b · v2）：游戏侧经 [`Self::set_float`] /
+    /// [`Self::set_bool`] 写入，`update_animations` 每帧经
+    /// [`Self::step_state_machine`] 消费求值条件转移。
+    /// **空表 + 空 `transitions` = v1 行为逐位不变**（步检恒无触发）。
+    /// `BTreeMap` 固定序（序列化 / 调试输出可复现，同
+    /// [`AnimationMask`] 的选型理由）。
+    pub params: BTreeMap<String, AnimValue>,
+    /// 条件转移表（C4b · v2）：与 v1 `edges` 并存（同一 `states` 表），
+    /// 语义与触发纪律见 [`AnimTransition`] 与 [`Self::step_state_machine`]。
+    /// **空表 = 自动转移关闭**（缺席 = v1 逐位不变）。
+    pub transitions: Vec<AnimTransition>,
 }
 
 impl Default for AnimationPlayer {
@@ -672,6 +798,8 @@ impl Default for AnimationPlayer {
             additive: None,
             mask: None,
             parameter_values: Vec::new(),
+            params: BTreeMap::new(),
+            transitions: Vec::new(),
         }
     }
 }
@@ -836,7 +964,10 @@ impl AnimationPlayer {
     /// `request_state` 只在状态切换时调用、非每帧热点，无条件断言
     /// 让 release 构建同样暴露调用方错误，与世界的尝试型锁冲突
     /// panic 同一哲学）。
-    /// **何时调用由游戏侧判定**（无参数黑板，见 [`AnimationEdge`]）。
+    /// **何时调用由游戏侧判定**——v2（C4b）新增条件自动转移见
+    /// [`AnimationPlayer::transitions`] / [`Self::step_state_machine`]；
+    /// 两条路径共存，时长口径不同：本方法取 v1 边表首条同对边的
+    /// duration，自动步检取命中转移自身的 duration。
     pub fn request_state(&mut self, state: usize) {
         assert!(
             state < self.states.len(),
@@ -847,26 +978,190 @@ impl AnimationPlayer {
             return;
         }
         let from = self.current_state;
-        let target = self.states[state].clone();
         let edge = self
             .edges
             .iter()
             .find(|e| e.from == from && e.to == state)
             .map(|e| e.duration);
+        let duration = match edge {
+            Some(duration) => duration,
+            None => {
+                log::debug!(
+                    "request_state：状态 {from} → {state} 无边（边表 {} 条）——硬切换到新状态",
+                    self.edges.len()
+                );
+                0.0
+            }
+        };
+        self.enter_state(state, duration);
+    }
+
+    /// 进入状态 `state` 并按 `duration` 过渡（v2 抽出的共用落账口：
+    /// `request_state` 与 `step_state_machine` 共享同一套字段同步语义）。
+    /// 越界断言与 [`Self::request_state`] 同款（配置错误必须暴露）。
+    fn enter_state(&mut self, state: usize, duration: f32) {
+        assert!(
+            state < self.states.len(),
+            "enter_state 目标状态越界：{state} / {}",
+            self.states.len()
+        );
+        let target = self.states[state].clone();
         self.current_state = state;
         self.looping = target.looping;
         self.speed = target.speed;
-        match edge {
-            Some(duration) => self.transition(target.clip, duration),
-            None => {
-                log::debug!(
-                    "request_state：状态 {from} → {state} 无边（边表 {} 条）——硬切换到剪辑 {}",
-                    self.edges.len(),
-                    target.clip
-                );
-                self.transition(target.clip, 0.0);
+        self.transition(target.clip, duration);
+    }
+
+    /// 写浮点参数到状态机黑板（C4b · v2）。同名覆盖。
+    pub fn set_float(&mut self, key: impl Into<String>, value: f32) {
+        self.params.insert(key.into(), AnimValue::Float(value));
+    }
+
+    /// 写布尔参数到状态机黑板（C4b · v2）。同名覆盖。
+    pub fn set_bool(&mut self, key: impl Into<String>, value: bool) {
+        self.params.insert(key.into(), AnimValue::Bool(value));
+    }
+
+    /// 读浮点参数（缺失 / 非浮点 = `None`，区别于守卫求值的中性默认）。
+    pub fn param_float(&self, key: &str) -> Option<f32> {
+        match self.params.get(key) {
+            Some(AnimValue::Float(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// 读布尔参数（缺失 / 非布尔 = `None`）。
+    pub fn param_bool(&self, key: &str) -> Option<bool> {
+        match self.params.get(key) {
+            Some(AnimValue::Bool(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// 状态机条件步检（C4b · v2，纯播放器侧，无 World 可单测）：
+    /// 按 `transitions` **声明序**扫描，取首条 `from == current_state`
+    /// 且守卫成立的转移，经 [`Self::enter_state`] 进入目标状态并以该
+    /// 转移的 `duration` 过渡；**一帧至多触发一条**（防乒乓 / 级联——
+    /// 目标状态的出边最早也要下一帧才被评估）。
+    ///
+    /// 返回触发的转移下标（`None` = 本帧无转移）。`transitions` 为空
+    /// ⇒ 恒 `None` 零开销（v1 逐位兼容锚）；同状态自环（`from == to`
+    /// 且守卫成立）不触发（与 [`Self::request_state`] 的同状态忽略
+    /// 同款语义——避免每帧重启循环剪辑）。目标状态越界 ⇒ 断言 panic
+    /// （转移表是作者声明的配置，错误必须暴露，与 `request_state` 同哲学）。
+    pub fn step_state_machine(&mut self) -> Option<usize> {
+        for index in 0..self.transitions.len() {
+            if self.transitions[index].from != self.current_state
+                || self.transitions[index].to == self.current_state
+            {
+                continue;
+            }
+            if !self.guard_holds(&self.transitions[index].guard) {
+                continue;
+            }
+            let transition = &self.transitions[index];
+            assert!(
+                transition.to < self.states.len(),
+                "转移表 #{index} 引用越界状态：{} → {} / {}",
+                transition.from,
+                transition.to,
+                self.states.len()
+            );
+            let duration = transition.duration;
+            let to = transition.to;
+            self.enter_state(to, duration);
+            return Some(index);
+        }
+        None
+    }
+
+    /// 守卫求值（C4b）：黑板类叶子走 [`AnimGuard::eval`]（纯读参数），
+    /// [`AnimGuard::ClipFinished`] 走播放器状态（[`Self::current_clip_finished`]），
+    /// 复合子守卫递归——两层上下文（黑板 / 播放时间）在此合流。
+    fn guard_holds(&self, guard: &AnimGuard) -> bool {
+        match guard {
+            AnimGuard::ClipFinished => self.current_clip_finished(),
+            AnimGuard::All(inner) => inner.iter().all(|g| self.guard_holds(g)),
+            AnimGuard::Any(inner) => inner.iter().any(|g| self.guard_holds(g)),
+            AnimGuard::Not(inner) => !self.guard_holds(inner),
+            other => other.eval(&self.params),
+        }
+    }
+
+    /// 当前状态的剪辑是否已播完（非循环、时长 > 0、time ≥ duration）。
+    fn current_clip_finished(&self) -> bool {
+        let Some(state) = self.states.get(self.current_state) else {
+            return false;
+        };
+        if state.looping {
+            return false;
+        }
+        let Some(clip) = self.clips.get(state.clip) else {
+            return false;
+        };
+        clip.duration > 0.0 && self.time >= clip.duration
+    }
+
+    /// 运行时重定向（C4b，按骨名）：把本播放器的节点绑定表
+    /// （`node_entities`）**整体重绑**到另一具骨架的实体——通道不改写
+    /// （节点下标语义保持源骨架空间），只换「下标 → 实体」指向：
+    /// 节点 i 的新实体 = `target_entities[j]`，j 为 `target_names` 中
+    /// 首个与 `node_names[i]` **骨名匹配**（[`normalize_bone_name`]）
+    /// 的下标。
+    ///
+    /// 用途：同一剪辑库驱动多具命名一致（或仅导入器前缀差异）的骨架
+    /// ——GLB A 的剪辑 + 骨架 B 的实体表即可跑通，替代 iris-exp 的
+    /// 离线 Blender 烘焙路线（§8.35⑨ 拒绝的是**导入期**重定向，本节
+    /// 是运行期播放器侧重绑，不同层面）。
+    ///
+    /// 语义与限制：
+    /// - 源无名节点（`node_names` 短表 / None 项）**不参与重定向**：
+    ///   其绑定原样保留（重定向是显式操作，半途断绑比静默保留更糟）；
+    /// - 有名字但目标骨架无同名骨 ⇒ 该节点断绑为 `None`（通道本帧起
+    ///   不覆写，骨停在当前 `Transform`——与「节点不在 active scene」
+    ///   既有 None 语义合流），计入 [`RetargetReport::unmatched`]；
+    /// - 目标重名取**先出现者**（向量序确定 ⇒ 结果确定）；
+    /// - `node_names` 为空表（手写构造的播放器）⇒ 恒 no-op——重定向
+    ///   以源名字表为前提，GLB 实例的 [`GltfInstance::player`] 自带；
+    /// - 两次 `target_names`/`target_entities` 长度不一致 ⇒ 以短表为准
+    ///   （zip 截断，不 panic——名字表带缺项是资产侧常态）。
+    ///
+    /// [`GltfInstance::player`]: crate::asset::GltfInstance::player
+    pub fn retarget_by_name(
+        &mut self,
+        target_names: &[Option<String>],
+        target_entities: &[Option<Entity>],
+    ) -> RetargetReport {
+        let mut report = RetargetReport::default();
+        // 目标骨架：骨名归一键 → 首个下标（BTreeMap 固定序构建，
+        // 同键重复名取先出现者——与 node_entity_by_name 同口径）
+        let mut first_by_key: BTreeMap<String, usize> = BTreeMap::new();
+        for (index, name) in target_names.iter().enumerate() {
+            if let Some(name) = name {
+                first_by_key
+                    .entry(normalize_bone_name(name))
+                    .or_insert(index);
             }
         }
+        for index in 0..self.node_names.len() {
+            let Some(name) = self.node_names[index].clone() else {
+                continue; // 无名节点不参与（保留原绑定）
+            };
+            let target = first_by_key
+                .get(&normalize_bone_name(&name))
+                .and_then(|&j| target_entities.get(j))
+                .copied()
+                .flatten();
+            if index < self.node_entities.len() {
+                self.node_entities[index] = target;
+            }
+            if target.is_some() {
+                report.bound += 1;
+            } else {
+                report.unmatched += 1;
+            }
+        }
+        report
     }
 
     /// 取走全部待消费事件名（drain 语义）。**每帧调用一次**——
@@ -1440,9 +1735,37 @@ type AnimationJob = (
     Vec<(String, f32)>,
 );
 
+/// 骨名归一键（C4b 运行时重定向的匹配口径）：trim → 小写 → 剥常见
+/// 导入器前缀（`mixamorig` / `bip01` / `mocap` / `ue4-skel`，可叠加，
+/// 无分隔符形态如 `mixamorigHips` 同样剥）→ 剥后残留的头部
+/// 分隔符（`:` `_` `-` 空格）吃掉 → 空格压成 `_`。
+///
+/// 刻意保守：只处理**前缀差异**这一种真实的跨骨架形态（Mixamo 系
+/// `mixamorig:Hips` vs 自产骨架 `Hips`）；不做编辑距离 / 内置别名表——
+/// 语义性改名（`thigh_r` vs `rightThigh`）留给调用方自备映射，
+/// 引擎不猜（猜错的绑定比断绑更难排查）。误伤面（恰以这些前缀
+/// 开头的真实骨名，如假想骨 `mocapTarget`）归一后两边仍一致地指向
+/// 同一目标，匹配语义自反 ⇒ 可接受。纯函数、确定性。
+pub fn normalize_bone_name(name: &str) -> String {
+    const PREFIXES: [&str; 4] = ["mixamorig", "bip01", "mocap", "ue4-skel"];
+    let mut s = name.trim().to_lowercase();
+    // 每轮必剥掉 ≥4 字符前缀 ⇒ 严格递减，循环天然终止
+    while let Some(prefix) = PREFIXES.iter().copied().find(|p| s.starts_with(p)) {
+        s = s[prefix.len()..]
+            .trim_start_matches([':', '_', '-', ' '])
+            .to_string();
+    }
+    s.replace(' ', "_")
+}
+
 /// 每帧动画系统：推进所有 [`AnimationPlayer`]，把采样结果覆写到目标实体的
 /// `Transform`。必须在 `propagate_transforms` 之前执行（DefaultPlugins 已保证）；
 /// `Time` 资源缺席时 dt 视为 0（可手动设置 `player.time` 后调用以定位到指定时刻）。
+///
+/// 状态机 v2（C4b）：写回阶段每帧对每个播放器调用一次
+/// [`AnimationPlayer::step_state_machine`]——`transitions` 空表 ⇒ 恒
+/// `None` 零开销，v1 行为逐位不变（转移生效帧的姿势仍来自旧状态采样，
+/// 过渡自下一帧推进，与游戏侧手调 `request_state` 同款一帧软延迟）。
 ///
 /// 姿势来源三选一（优先级即列出顺序，见各字段文档）：
 /// 1. **混合空间模式**（`blend_space_active` 置位）：按 `blend_param` 采样
@@ -1682,6 +2005,10 @@ pub fn update_animations(world: &iris_core::world::World) {
                     add.time = add.advanced_additive_time(dt, additive_duration);
                 }
             }
+            // 状态机 v2 条件步检（C4b）：本帧已落账的 time / blend 之后
+            // 执行——ClipFinished 守卫看到新时间；触发的 enter_state
+            // 会把 time 归零并开新 blend，下一帧起姿势走新状态过渡。
+            player.step_state_machine();
         }
         for (target, field) in fields {
             let Some(mut transform) = world.get_mut::<Transform>(target) else {
@@ -3377,5 +3704,320 @@ mod tests {
             assert!(!player.window_active("active"), "end=1.0 不含");
             assert_eq!(player.parameter("dmg"), Some(10.0), "越末端钳制");
         }
+    }
+
+    // ---- C4b · 状态机 v2（参数黑板 + 条件自动转移）× 运行时重定向 ----
+
+    /// 双态播放器（idle=clip0 循环 / run=clip1 非循环 speed2），带名字表。
+    fn two_state_player_named() -> AnimationPlayer {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let run = clip("run", vec![constant_translation(0, [3.0, 0.0, 0.0])], 1.0);
+        let mut player = AnimationPlayer::new(vec![idle, run], vec![Some(Entity::from_bits(1))]);
+        player.node_names = vec![Some("Hips".into())];
+        player.states = vec![
+            AnimationState {
+                clip: 0,
+                looping: true,
+                speed: 1.0,
+            },
+            AnimationState {
+                clip: 1,
+                looping: false,
+                speed: 2.0,
+            },
+        ];
+        player
+    }
+
+    /// 条件转移：浮点守卫 `>= 1.0` 恰在阈值触发（边界归触发侧），
+    /// 阈值下方不触发；触发后 `current_state` / `active` / 目标态
+    /// looping+speed 一并落账，非硬切换（duration 0.3 开 crossfade）。
+    #[test]
+    fn guarded_transition_fires_on_float_threshold_inclusive() {
+        let mut player = two_state_player_named();
+        player.transitions.push(AnimTransition {
+            from: 0,
+            to: 1,
+            duration: 0.3,
+            guard: AnimGuard::FloatAtLeast("speed".into(), 1.0),
+        });
+        player.set_float("speed", 0.999);
+        assert_eq!(player.step_state_machine(), None, "阈值下方不触发");
+        assert_eq!(player.current_state, 0);
+        player.set_float("speed", 1.0);
+        assert_eq!(
+            player.step_state_machine(),
+            Some(0),
+            "恰等于阈值应触发（>= 边界归触发侧）"
+        );
+        assert_eq!(player.current_state, 1);
+        assert_eq!(player.active, 1);
+        assert!(!player.looping, "run 态非循环");
+        assert!(player.blend.is_some(), "duration 0.3 开 crossfade");
+        assert!((player.speed - 2.0).abs() < 1e-6, "speed 落账目标态");
+    }
+
+    /// 空转移表 = 恒 no-op（v1 逐位兼容锚：不启用条件转移时步检零影响）。
+    #[test]
+    fn empty_transitions_step_is_noop() {
+        let mut player = two_state_player_named();
+        player.set_float("speed", 100.0);
+        assert_eq!(player.step_state_machine(), None);
+        assert_eq!(player.current_state, 0);
+    }
+
+    /// 声明序裁决 + 一帧至多一条：两条 from=0 都成立时取首条，
+    /// 触发后不再评估后续（防级联）。
+    #[test]
+    fn first_declared_transition_wins_and_only_one_per_step() {
+        let mut player = two_state_player_named();
+        // 第一条（会命中）+ 第二条（from 已被首条改走，本步不再触发）
+        player.transitions.push(AnimTransition {
+            from: 0,
+            to: 1,
+            duration: 0.0,
+            guard: AnimGuard::Always,
+        });
+        player.transitions.push(AnimTransition {
+            from: 1,
+            to: 0,
+            duration: 0.0,
+            guard: AnimGuard::Always,
+        });
+        assert_eq!(player.step_state_machine(), Some(0), "取首条命中");
+        assert_eq!(player.current_state, 1);
+        // 再步一次才会走 1→0（下一帧语义）
+        assert_eq!(player.step_state_machine(), Some(1));
+        assert_eq!(player.current_state, 0);
+    }
+
+    /// 自环守卫（from==to）不触发——避免循环剪辑每帧重启。
+    #[test]
+    fn self_transition_is_skipped() {
+        let mut player = two_state_player_named();
+        player.transitions.push(AnimTransition {
+            from: 0,
+            to: 0,
+            duration: 0.0,
+            guard: AnimGuard::Always,
+        });
+        assert_eq!(player.step_state_machine(), None);
+    }
+
+    /// ClipFinished 守卫：非循环态剪辑未播完不触发，`time ≥ duration` 触发。
+    #[test]
+    fn clip_finished_guard_tracks_playback_end() {
+        let mut player = two_state_player_named();
+        player.current_state = 1; // run 非循环、duration 1.0
+        player.transitions.push(AnimTransition {
+            from: 1,
+            to: 0,
+            duration: 0.0,
+            guard: AnimGuard::ClipFinished,
+        });
+        player.time = 0.5;
+        assert_eq!(player.step_state_machine(), None, "未播完不触发");
+        player.time = 1.0;
+        assert_eq!(player.step_state_machine(), Some(0), "播完触发回 idle");
+        assert_eq!(player.current_state, 0);
+    }
+
+    /// 复合守卫 Not / Any / All + 布尔：`(grounded==true) && !(airborne)`。
+    #[test]
+    fn compound_bool_guard_evaluates() {
+        let mut player = two_state_player_named();
+        player.transitions.push(AnimTransition {
+            from: 0,
+            to: 1,
+            duration: 0.0,
+            guard: AnimGuard::All(vec![
+                AnimGuard::BoolIs("grounded".into(), true),
+                AnimGuard::Not(Box::new(AnimGuard::BoolIs("airborne".into(), true))),
+            ]),
+        });
+        player.set_bool("grounded", true);
+        player.set_bool("airborne", true);
+        assert_eq!(
+            player.step_state_machine(),
+            None,
+            "airborne 为真被 Not 拦下"
+        );
+        player.set_bool("airborne", false);
+        assert_eq!(player.step_state_machine(), Some(0));
+    }
+
+    /// 缺失参数取类型默认（浮点 0.0 / 布尔 false）——不 panic。
+    #[test]
+    fn missing_params_use_neutral_defaults() {
+        let empty = BTreeMap::new();
+        assert!(
+            AnimGuard::FloatBelow("x".into(), 1.0).eval(&empty),
+            "缺浮点默认 0.0"
+        );
+        assert!(
+            AnimGuard::BoolIs("b".into(), false).eval(&empty),
+            "缺布尔默认 false"
+        );
+        assert!(!AnimGuard::BoolIs("b".into(), true).eval(&empty));
+    }
+
+    /// update_animations 端到端：黑板满足后由系统写回阶段步检触发
+    /// （同帧其余播放器无转移 ⇒ 零影响）。
+    #[test]
+    fn update_animations_steps_guarded_machine() {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let run = clip("run", vec![constant_translation(0, [3.0, 0.0, 0.0])], 1.0);
+        let (mut world, root) = blend_world(idle, run);
+        world.insert_resource(Time::default());
+        {
+            let mut player = world.get_mut::<AnimationPlayer>(root).unwrap();
+            player.states = vec![
+                AnimationState {
+                    clip: 0,
+                    looping: true,
+                    speed: 1.0,
+                },
+                AnimationState {
+                    clip: 1,
+                    looping: true,
+                    speed: 1.0,
+                },
+            ];
+            player.transitions.push(AnimTransition {
+                from: 0,
+                to: 1,
+                duration: 0.0,
+                guard: AnimGuard::FloatAtLeast("speed".into(), 1.0),
+            });
+        }
+        step(&world, 1.0 / 60.0);
+        {
+            let player = world.get::<AnimationPlayer>(root).unwrap();
+            assert_eq!(player.current_state, 0, "speed 未设（默认 0）⇒ 不转移");
+        }
+        world
+            .get_mut::<AnimationPlayer>(root)
+            .unwrap()
+            .set_float("speed", 2.0);
+        step(&world, 1.0 / 60.0);
+        let player = world.get::<AnimationPlayer>(root).unwrap();
+        assert_eq!(player.current_state, 1, "系统步检自动进入 run");
+        assert_eq!(player.active, 1);
+        assert!(
+            (world.get::<Transform>(root).unwrap().position.x - 0.0).abs() < 1e-6,
+            "转移生效帧的姿势仍来自旧状态采样（idle 恒值 0）——一帧软延迟口径"
+        );
+    }
+
+    /// 越界目标状态 = 无条件断言 panic（配置错误必须暴露，release 同防）。
+    #[test]
+    #[should_panic(expected = "越界状态")]
+    fn transition_to_out_of_range_state_panics() {
+        let mut player = two_state_player_named();
+        player.transitions.push(AnimTransition {
+            from: 0,
+            to: 99,
+            duration: 0.0,
+            guard: AnimGuard::Always,
+        });
+        player.step_state_machine();
+    }
+
+    /// 确定性：同参数黑板两跑逐步转移，落账序一致（BTreeMap 固定序 + 声明序）。
+    #[test]
+    fn guarded_stepping_is_deterministic() {
+        let build = || {
+            let mut p = two_state_player_named();
+            p.transitions.push(AnimTransition {
+                from: 0,
+                to: 1,
+                duration: 0.0,
+                guard: AnimGuard::FloatAtLeast("speed".into(), 1.0),
+            });
+            p.set_float("speed", 2.0);
+            p
+        };
+        let mut a = build();
+        let mut b = build();
+        let ra = a.step_state_machine();
+        let rb = b.step_state_machine();
+        assert_eq!(ra, rb);
+        assert_eq!(a.current_state, b.current_state);
+        assert_eq!(a.active, b.active);
+        assert_eq!(a.time.to_bits(), b.time.to_bits());
+    }
+
+    /// 运行时重定向：源骨架（Hips / Spine / RightArm）按名重绑到目标骨架
+    /// 实体（前缀差异 Mixamo 归一命中），未命中骨断绑为 None 并计数。
+    #[test]
+    fn retarget_by_name_rebinds_and_severs() {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let mut player = AnimationPlayer::new(vec![idle], vec![None, None, None]);
+        player.node_names = vec![
+            Some("mixamorig:Hips".into()),
+            Some("Spine".into()),
+            Some("RightArm".into()),
+        ];
+        // 目标骨架：Hips（无前缀，经归一与 mixamorig:Hips 命中）、Spine；无 RightArm
+        let hips = Entity::from_bits(0x1000);
+        let spine = Entity::from_bits(0x2000);
+        let report = player.retarget_by_name(
+            &[
+                Some("Hips".into()),
+                Some("Spine".into()),
+                Some("Head".into()),
+            ],
+            &[Some(hips), Some(spine), None],
+        );
+        assert_eq!(player.node_entities, vec![Some(hips), Some(spine), None]);
+        assert_eq!(report.bound, 2, "Hips + Spine 命中");
+        assert_eq!(report.unmatched, 1, "RightArm 目标骨架无同名骨");
+    }
+
+    /// 重定向不猜语义改名：`thigh_r` 在只有 `rightThigh` 的目标骨架上断绑
+    /// （引擎不做编辑距离 / 别名表，猜错比断绑难排查）。
+    #[test]
+    fn retarget_does_not_guess_semantic_renames() {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let mut player = AnimationPlayer::new(vec![idle], vec![None]);
+        player.node_names = vec![Some("thigh_r".into())];
+        let report =
+            player.retarget_by_name(&[Some("rightThigh".into())], &[Some(Entity::from_bits(7))]);
+        assert_eq!(player.node_entities, vec![None], "语义改名不匹配 ⇒ 断绑");
+        assert_eq!(report.unmatched, 1);
+    }
+
+    /// 空名字表（手写构造播放器）⇒ 重定向恒 no-op（无源名可比对）。
+    #[test]
+    fn retarget_with_empty_names_is_noop() {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let e = Entity::from_bits(42);
+        let mut player = AnimationPlayer::new(vec![idle], vec![Some(e)]);
+        // node_names 默认空
+        let report = player.retarget_by_name(&[Some("Hips".into())], &[Some(e)]);
+        assert_eq!(report, RetargetReport::default(), "无源名 ⇒ 无重绑");
+        assert_eq!(player.node_entities, vec![Some(e)], "原绑定保留");
+    }
+
+    /// 无名节点不参与重定向（保留原绑定，半途断绑比保留更糟）。
+    #[test]
+    fn retarget_preserves_unnamed_nodes() {
+        let idle = clip("idle", vec![constant_translation(0, [0.0, 0.0, 0.0])], 1.0);
+        let keep = Entity::from_bits(9);
+        let mut player = AnimationPlayer::new(vec![idle], vec![Some(keep), Some(keep)]);
+        player.node_names = vec![None, Some("Ghost".into())];
+        player.retarget_by_name(&[Some("Hips".into())], &[Some(Entity::from_bits(1))]);
+        assert_eq!(player.node_entities[0], Some(keep), "无名节点保留原绑定");
+        assert_eq!(player.node_entities[1], None, "有名未命中断绑");
+    }
+
+    /// 骨名归一纯函数：前缀 / 大小写 / 空格形态。
+    #[test]
+    fn bone_name_normalization() {
+        assert_eq!(normalize_bone_name("mixamorig:Hips"), "hips");
+        assert_eq!(normalize_bone_name("mixamorigLeftArm"), "leftarm");
+        assert_eq!(normalize_bone_name("Bip01_Head"), "head");
+        assert_eq!(normalize_bone_name("Hips"), "hips");
+        assert_eq!(normalize_bone_name("  Left Arm  "), "left_arm");
     }
 }

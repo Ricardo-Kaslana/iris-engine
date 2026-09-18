@@ -94,6 +94,37 @@ step 集成 1 + 断裂闭环 1 + OBB 纯函数 9 + OBB step 集成 1 + OBB 序�
 - 附带闭合：`iris-assault` `geom.rs` 与四处测试 fixture 的 `MeshData`
   字面量补 `morph: None`（新增枚举侧表的编译面涟漪，零语义）。
 
+### Added（C4b 闭合战役 · 动画役——状态机 v2 条件转移 × 运行时按名重定向）
+
+C4 批次第二项（池 #9）。§8.18 时代的 v1 边界「边只带过渡时长，何时
+切换由游戏侧判定」翻转（四家游戏自建状态管理自此有引擎承载），
+诚实边界新立 §8.62（六条）：
+
+- **参数黑板**：`AnimationPlayer::params`（`BTreeMap<String, AnimValue>`
+  浮点/布尔，`set_float`/`set_bool`/`param_float`/`param_bool`）——
+  BTreeMap 固定序（序列化 / 调试可复现，同 `AnimationMask` 选型理由）。
+- **条件转移**：`transitions: Vec<AnimTransition { from, to, duration,
+  guard }>` 与 v1 `edges` **并存**（AnimationEdge 一字未动，全部既有
+  构造零改动）；守卫 `AnimGuard` 封闭枚举（`FloatAtLeast`/`FloatBelow`/
+  `FloatBetween` 闭区间/`BoolIs`/`ClipFinished`/组合 `All`/`Any`/`Not`）
+  ——不做闭包（确定性 + 可序列化 + PartialEq），缺失参数取类型中性默认。
+- **步检**：`step_state_machine()`（`update_animations` 写回阶段每帧
+  一次）——声明序首条命中、**一帧至多一条**（防乒乓/级联）、自环跳过、
+  越界目标无条件断言；与 `request_state` 共享抽出
+  的 `enter_state` 落账口（字段同步语义单一事实源）。**`transitions`
+  空表 = 恒 no-op = v1 逐位不变**（默认兼容锚）。
+- **运行时重定向**：`retarget_by_name(target_names, target_entities) ->
+  RetargetReport`——通道不改写、只重绑 `node_entities`（节点下标恒
+  源骨架空间）；骨名归一 `normalize_bone_name`（小写 + 剥
+  mixamorig/bip01/mocap/ue4-skel 前缀 + 空格压 `_`，纯函数解析测试
+  钉住）；**不猜语义改名**（有名未命中断绑 None 合流既有语义、无名
+  节点保留、空名表 no-op——alias 表归调用方，猜错的绑定比断绑更难
+  排查）。兑现 §8.35⑨「拒绝导入期重定向」的运行期对偶：iris-exp 的
+  离线 Blender 烘焙路线自此有引擎内替代。
+- 测试 +15（守卫边界 / 声明序裁决 / 一帧一条 / 自环 / ClipFinished /
+  复合守卫 / 中性默认 / 越界 panic / 两跑确定性 / 系统端到端步检 /
+  重定向四形态 / 归一化解析表）。
+
 ### Added（C2 闭合战役 · 渲染伪影役——四项「缺席/默认 = 逐位不变」，两条既有 bug 随修）
 
 路线图 v5 清账战役第三批（C0 文档健康 → C1 原语小件 → 本批）。四条均为

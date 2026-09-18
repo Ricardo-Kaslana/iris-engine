@@ -140,11 +140,12 @@ pub mod water;
 
 pub mod prelude {
     pub use crate::animation::{
-        AdditiveLayer, AnimatedField, AnimationBlend, AnimationChannel, AnimationClip,
-        AnimationEdge, AnimationEvent, AnimationInterpolation, AnimationMask, AnimationPath,
-        AnimationPlayer, AnimationState, BlendSpace, ClipWindow, ParameterTrack, additive_delta,
-        blend_pose, collect_crossings, collect_events, root_motion_delta, sample_track,
-        update_animations, window_active,
+        AdditiveLayer, AnimGuard, AnimTransition, AnimValue, AnimatedField, AnimationBlend,
+        AnimationChannel, AnimationClip, AnimationEdge, AnimationEvent, AnimationInterpolation,
+        AnimationMask, AnimationPath, AnimationPlayer, AnimationState, BlendSpace, ClipWindow,
+        ParameterTrack, RetargetReport, additive_delta, blend_pose, collect_crossings,
+        collect_events, normalize_bone_name, root_motion_delta, sample_track, update_animations,
+        window_active,
     };
     pub use crate::asset::{
         AnimationRegistry, ClipMeta, GltfAnimationLibrary, GltfError, GltfInstance, HdrError,
