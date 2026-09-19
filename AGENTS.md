@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1715 / release 1712）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1733 / release 1730）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -137,9 +137,10 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 - 与规格偏离必须汇报并给理由（历史偏离多有充分依据，如 `&mut World` spawn、rest 姿势显式捕获、上帧深度复用单份 scene_depth）。
 - 文档滞后是 bug：改行为必须同步 ARCHITECTURE 对应章节，_FEATURES 数字（测试数等）过期也要顺手修。
 
-## 当前状态与路线图（2026-09-14 更新）
+## 当前状态与路线图（2026-09-20 更新）
 
-- 测试基线 debug 1715 / release 1712；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- HEAD = R92 降水（`cd06522`），工作树干净。测试基线 debug 1733 / release 1730；全库零 unsafe；native+wasm32 双 target 零警告；ARCHITECTURE §8 诚实清单现 71 条；**无 git 远端、无 tag**（workspace 版本 0.1.1，R56 发布时需用户提供远端）。
+- **下一步待用户裁定**（三个方向）：R93 海洋 v2+水下（第三梯队最后一轮）/ W8 完整 Assault R69–R72（未获「OK」不开工）/ W9 收官 R55 生产化 + R56 发布 0.1。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -207,13 +208,22 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     全按推荐；缺席/全零 = 逐位不变（七套像素锁原值通过）；诚实限制
     §8.71）、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）——第三梯队仅剩 R93 一轮
-  - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /
-    OIT / 贴花 v2 / LOD v2 / 音频 v3 空间化 / 动画压缩 / BC7+KTX2 / 热重载局部 /
-    CCD / RVO 群体
+  - **闭合战役 C0~C7 ✅ 全部收官（2026-09-19，8/8；2026-09-18 用户裁定「暂停新功能先清账」，
+    计划全文 `docs/archive/closure-plan-v1.md`（`d386b60` 起归档入库）**：C0 文档健康 → C1 原语小件 →
+    C2 渲染伪影（贴花受光 v2 / 光照贴图 mip / 粒子 v2 序列化 / 反射探针编辑入口）→
+    C3 物理深化（CCD / 铰链+速率马达 / 可断关节 / C3d OBB×OBB SAT 闭式）→
+    C4 动画（形变目标 v1 / 状态机 v2+运行时按名重定向）→ C5 格式（BC7 Mode 6 / KTX2 /
+    场景参数热重载）→ C6 音频空间化 v3（多普勒 / 二值遮挡 / 逐声音低通）→ C7 大裁决
+    （DDGI v3 同源天空+动态光源进 GI / Weighted Blended OIT）。总账：21 项排期债清算完、
+    **全程零基线打破**（清一色 opt-in「缺席/默认 = 逐位不变」）；按三门裁出回池 HRTF、
+    动画压缩、凸包 GJK/EPA 三项；iris-exp ⑫「引擎光照口径（皮肤泛白）」维持挂账。
+  - 闭合轮池（战役后仍在池，按需穿插）：LOD v2 / RVO 群体 / 凸包 GJK+EPA / 动画压缩 /
+    HRTF 空间化 / 贴花 v2 余项（§8.19 直射项已随 C2 闭合）
   - W8 完整 Assault（游戏七，dogfooding 纪律）：R69–R72（未获用户「OK」不开工）
   - W9 收官：R55 生产化、R56 发布 0.1（语义版本/docs.rs/CHANGELOG 发布段）
 - 实验项目：`games/iris-exp`（外部 GLB 角色 + Mixamo 重定向动作导入验证；
-  引擎侧摩擦独立成档 `docs/private/iris-exp-frictions.md`）。
+  引擎侧摩擦独立成档 `docs/private/iris-exp-frictions.md`；最新一笔 = `3debd8f`
+  中距离朦胧修复：视觉地面 24 m→240 m、天空盒地平线以下渐变不再冒充雾）。
 - 休眠项（可插队）：手柄输入（**用户明确暂缓**）、Android、wasm 深化、载具
   （2026-09-14 裁定维持休眠）、本地化。（GPU 粒子拖尾 / 水面已随路线图 v5 立项为
   R82 / R81，脱离休眠。）
