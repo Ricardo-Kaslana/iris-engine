@@ -220,6 +220,14 @@ impl MaterialStore {
         self.materials.get(handle.0 as usize)
     }
 
+    /// 可变视图（C5b 热重载局部的写入口）：就地改既有句柄的**数值**
+    /// 参数。渲染器每帧从目录现读材质定义（无逐句柄 GPU 缓存），写入
+    /// 下一帧即生效。纹理像素 / 网格顶点等内容级替换仍不提供（句柄
+    /// 内容不可变是既有边界，见 ARCHITECTURE §8.4 / §8.65）。
+    pub fn get_mut(&mut self, handle: MaterialHandle) -> Option<&mut MaterialDef> {
+        self.materials.get_mut(handle.0 as usize)
+    }
+
     /// 已注册材质数（含 0 号默认材质）。
     pub fn len(&self) -> usize {
         self.materials.len()

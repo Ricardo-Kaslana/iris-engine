@@ -120,7 +120,10 @@
 //! - 粒子段只写配置字段，运行期状态（粒子池 / 计数器）不入档；
 //! - `level` 段的格式侧限制（双源常量 / 登记快照语义 / 外置高度场缺席）
 //!   见 [`crate::level`] 模块文档诚实清单；
-//! - 热重载：场景文件为手工编写，加载后与文件的关联即断开；
+//! - 热重载：`load_scene` 本体仍「加载后与文件的关联即断开」；开发期
+//!   关联由 [`crate::hot_reload`] 补接（C5b）——材质数值 / 点光 / 方向光
+//!   **参数子集**经 `build_scene_param_patch` + `apply_scene_param_patch`
+//!   就地写回（无结构编辑、按 Name 匹配，边界 §8.65）；
 //! - wasm32 注意：`load_scene` 的场景 / glTF / HDR / 贴图读取走
 //!   `std::fs`——native 可用，**web 上不可用**；web 场景用 [`load_scene_from`]
 //!   + 嵌入源（R45，文本类场景 JSON + 自包含 GLB 走挂载通路）。
@@ -1715,6 +1718,215 @@ fn load_texture(
         rgba: rgba.into_raw(),
         srgb,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// 热重载局部：材质 / 光照参数补丁（C5b · §8.4 场景半边翻转，诚实边界 §8.65）
+// ---------------------------------------------------------------------------
+
+/// 方向光参数补丁（环境段的数值子集；`shadow_range` 不在补丁内——该字段
+/// v2 起不参与生产渲染路径，改了也无视觉效果）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirectionalPatch {
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub ambient: [f32; 3],
+    pub shadows: bool,
+}
+
+/// 材质**数值**参数补丁。三个纹理槽刻意不在补丁内：换纹理源 = 换句柄 =
+/// 结构级编辑（句柄内容不可变是 §8.4 前半的既有边界），参数热重载只做
+/// 「同一份纹理上调数值」这一编辑器高频动作。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaterialParamPatch {
+    pub color: [f32; 4],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emissive: [f32; 3],
+    pub alpha_mode: AlphaMode,
+    pub double_sided: bool,
+    pub subsurface_strength: f32,
+    pub subsurface_scale: f32,
+}
+
+/// 点光参数补丁（组件四字段直通）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointLightPatch {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub shadows: bool,
+}
+
+/// 单实体参数补丁（两槽皆可选；构建期至少一个 `Some`）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EntityParamPatch {
+    pub material: Option<MaterialParamPatch>,
+    pub point_light: Option<PointLightPatch>,
+}
+
+/// 场景参数补丁表：档内**具名实体**的材质 / 点光数值 + 环境方向光。
+/// `entities` 用 `BTreeMap` ⇒ 应用序 = 名字典序（确定性文化，与
+/// broadphase 同规约）；无名实体与 mesh / transform / 粒子 / 碰撞等
+/// 结构段不进表（v1 边界见 §8.65）。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneParamPatch {
+    pub directional: Option<DirectionalPatch>,
+    pub entities: std::collections::BTreeMap<String, EntityParamPatch>,
+}
+
+/// [`apply_scene_param_patch`] 的落账回报（观测 / 日志用）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamReloadReport {
+    /// 环境方向光补丁已写入资源（档内无该段或世界无该资源 ⇒ false）。
+    pub directional_applied: bool,
+    /// 材质数值补丁应用个数（按实体名逐个计）。
+    pub materials_applied: usize,
+    /// 点光补丁应用个数。
+    pub point_lights_applied: usize,
+    /// 世界内未命中实体的名字（按字典序 = 应用序）。
+    pub unmatched: Vec<String>,
+}
+
+impl From<&DirectionalLightSection> for DirectionalPatch {
+    fn from(s: &DirectionalLightSection) -> Self {
+        Self {
+            direction: s.direction,
+            color: s.color,
+            intensity: s.intensity,
+            ambient: s.ambient,
+            shadows: s.shadows,
+        }
+    }
+}
+
+impl From<&MaterialSection> for MaterialParamPatch {
+    fn from(s: &MaterialSection) -> Self {
+        Self {
+            color: s.color,
+            metallic: s.metallic,
+            roughness: s.roughness,
+            emissive: s.emissive,
+            alpha_mode: s.alpha_mode,
+            double_sided: s.double_sided,
+            subsurface_strength: s.subsurface_strength,
+            subsurface_scale: s.subsurface_scale,
+        }
+    }
+}
+
+impl From<&PointLightSection> for PointLightPatch {
+    fn from(s: &PointLightSection) -> Self {
+        Self {
+            color: s.color,
+            intensity: s.intensity,
+            range: s.range,
+            shadows: s.shadows,
+        }
+    }
+}
+
+/// 从场景档字节提取参数补丁（不触碰 World，可脱离世界单测）。
+///
+/// 解析走与加载同一条 serde + 版本迁移路径（`version` 校验同样生效——
+/// 高版本档在热重载里同样被拒，不出现「加载拒、热重载误读」的双标）。
+/// 同名实体的后出现段覆盖先出现（文件序），无名实体的材质 / 点光段
+/// 静默不入表（无从匹配，§8.65②）。
+pub fn build_scene_param_patch(bytes: &[u8]) -> Result<SceneParamPatch, SceneError> {
+    let mut doc: SceneDoc = serde_json::from_slice(bytes).map_err(SceneError::Json)?;
+    migrate_doc(&mut doc)?;
+    let entities = doc
+        .entities
+        .ok_or_else(|| SceneError::Missing("entities 段缺失".to_string()))?;
+    let mut patch = SceneParamPatch::default();
+    if let Some(env) = &doc.environment {
+        patch.directional = env.directional_light.as_ref().map(DirectionalPatch::from);
+    }
+    for section in &entities {
+        let Some(name) = &section.name else {
+            continue;
+        };
+        let material = section.material.as_ref().map(MaterialParamPatch::from);
+        let point_light = section.point_light.as_ref().map(PointLightPatch::from);
+        if material.is_none() && point_light.is_none() {
+            continue;
+        }
+        patch.entities.insert(
+            name.clone(),
+            EntityParamPatch {
+                material,
+                point_light,
+            },
+        );
+    }
+    Ok(patch)
+}
+
+/// 应用参数补丁到既有世界：只改资源 / 目录里的数值，**不 spawn、不
+/// 销毁、不换句柄**。实体匹配按 `Name`（同名取生成序首个，口径同
+/// [`iris_core::name`] 的 `entity_named`）。
+///
+/// 去重旁证：加载期材质按内容去重共享句柄——热重载写句柄指向的
+/// [`MaterialDef`] ⇒ **共享同句柄的实体同步变色**（「改一处 = 改所有
+/// 引用」的材质实例语义，§8.65④）。
+pub fn apply_scene_param_patch(world: &mut World, patch: &SceneParamPatch) -> ParamReloadReport {
+    let mut report = ParamReloadReport::default();
+    if let Some(dir) = &patch.directional {
+        if let Some(mut light) = world.try_resource_mut::<DirectionalLight>() {
+            light.direction = Vec3::from_array(dir.direction);
+            light.color = Vec3::from_array(dir.color);
+            light.intensity = dir.intensity;
+            light.ambient = Vec3::from_array(dir.ambient);
+            light.shadows = dir.shadows;
+            report.directional_applied = true;
+        } else {
+            log::warn!("热重载：世界无 DirectionalLight 资源，方向光补丁跳过");
+        }
+    }
+    for (name, ent_patch) in &patch.entities {
+        let Some(entity) = world.entity_named(name) else {
+            report.unmatched.push(name.clone());
+            continue;
+        };
+        if let Some(m) = &ent_patch.material {
+            // 句柄先拷出：随后取资源可变借用（两借用不同时活）
+            let handle = world.get::<MaterialHandle>(entity).map(|h| *h);
+            match handle {
+                Some(h) => {
+                    let mut store = world.resource_mut::<MaterialStore>();
+                    if let Some(def) = store.get_mut(h) {
+                        def.base_color = m.color;
+                        def.metallic = m.metallic;
+                        def.roughness = m.roughness;
+                        def.emissive = [m.emissive[0], m.emissive[1], m.emissive[2], 1.0];
+                        def.alpha_mode = m.alpha_mode;
+                        def.double_sided = m.double_sided;
+                        def.subsurface_strength = m.subsurface_strength;
+                        def.subsurface_scale = m.subsurface_scale;
+                        report.materials_applied += 1;
+                    } else {
+                        log::warn!("热重载：实体「{name}」材质句柄 {h:?} 失效，补丁跳过");
+                    }
+                }
+                None => {
+                    log::warn!("热重载：实体「{name}」无材质句柄，材质补丁跳过");
+                }
+            }
+        }
+        if let Some(p) = &ent_patch.point_light {
+            if let Some(mut light) = world.get_mut::<PointLight>(entity) {
+                light.color = Vec3::from_array(p.color);
+                light.intensity = p.intensity;
+                light.range = p.range;
+                light.shadows = p.shadows;
+                report.point_lights_applied += 1;
+            } else {
+                log::warn!("热重载：实体「{name}」无 PointLight 组件，点光补丁跳过");
+            }
+        }
+    }
+    report
 }
 
 // ---------------------------------------------------------------------------

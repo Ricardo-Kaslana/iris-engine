@@ -22,6 +22,7 @@ pub mod camera_rig;
 pub mod daynight;
 pub mod ddgi;
 pub mod gltf_builder;
+pub mod hot_reload;
 pub mod level;
 pub mod manifest;
 pub mod meshlet_builder;
@@ -52,8 +53,8 @@ pub mod prelude {
     pub use crate::pack::{MeshletPackError, PackError, PackReader, PackWriter, read_meshlet};
     pub use crate::plugin::{
         AnimationPlugin, AudioPlugin, CommandsPlugin, DayNightPlugin, DdgiPlugin, DefaultPlugins,
-        HierarchyPlugin, InputPlugin, ParticlePlugin, PhysicsPlugin, Plugin, RenderPlugin,
-        SpatialPlugin, TimePlugin, TimelinePlugin, Viewport, WindowPlugin,
+        HierarchyPlugin, HotReloadPlugin, InputPlugin, ParticlePlugin, PhysicsPlugin, Plugin,
+        RenderPlugin, SpatialPlugin, TimePlugin, TimelinePlugin, Viewport, WindowPlugin,
     };
     pub use crate::vfs::{AssetError, AssetMount, AssetSource};
     // 场景序列化（JSON 双向）：加载 / 保存、登记表与 glTF 内部实体标记；
@@ -64,6 +65,13 @@ pub mod prelude {
         ParticleV2Section, PrimitiveSection, ProbeSection, ProceduralTextureSection,
         SCENE_FORMAT_VERSION, SceneAssetRegistry, SceneError, TextureSourceSection, load_scene,
         load_scene_from, save_scene,
+    };
+    // 场景参数热重载（C5b · §8.4 场景半边闭合）：监听资源 + Update 系统
+    // + 手动单查口；参数子集 = 材质数值 / 点光 / 方向光（§8.65 边界）
+    pub use crate::hot_reload::{SceneHotReload, hot_reload_scene_params, scene_hot_reload_once};
+    pub use crate::scene::{
+        DirectionalPatch, EntityParamPatch, MaterialParamPatch, ParamReloadReport, PointLightPatch,
+        SceneParamPatch, apply_scene_param_patch, build_scene_param_patch,
     };
     // 关卡格式（R57）：level 段（terrain / nav / bake / ddgi）、加载登记与
     // 派生实体标记、光照贴图烘焙产物的外置文件读写（IRISLMAP）

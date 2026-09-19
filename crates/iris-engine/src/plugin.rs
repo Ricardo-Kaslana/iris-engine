@@ -506,6 +506,26 @@ impl Plugin for DdgiPlugin {
     }
 }
 
+/// 场景参数热重载插件（C5b · §8.4 场景半边闭合）：Update 阶段注册
+/// [`hot_reload_scene_params`] 独占系统。
+///
+/// **资源缺席语义**：[`SceneHotReload`] 未插入 ⇒ 系统空转一次资源查询
+/// 即过、**零文件读取**（缺席即逐位不变的兼容形态；生产档不插入即
+/// 零成本）。开发期 `world.insert_resource(SceneHotReload::watch(path))`
+/// 开启「手改场景 JSON → 半秒内材质/光照数值生效」。参数子集边界
+/// （无结构编辑 / 按 Name 匹配 / 基线轮不应用）见 §8.65。
+#[derive(Default)]
+pub struct HotReloadPlugin;
+
+impl Plugin for HotReloadPlugin {
+    fn build(&self, app: &mut App) {
+        app.schedule.add_system(
+            iris_core::prelude::Stage::Update,
+            crate::hot_reload::hot_reload_scene_params,
+        );
+    }
+}
+
 /// 默认插件组：窗口 + 时间 + 输入 + 渲染 + 音频 + 动画 + 物理 + 层级 +
 /// 粒子 + 空间音频 + UI + 命令队列。
 ///
@@ -545,6 +565,10 @@ impl Plugin for DefaultPlugins {
         TimePlugin.build(app);
         InputPlugin.build(app);
         RenderPlugin.build(app);
+        // 场景参数热重载（C5b）：Update 最前——本帧写回材质/光照数值，
+        // 同帧下游系统即消费新值。昼夜循环在场时其当帧写入覆盖热重载
+        // 的方向光值（共存语义：循环为真值源，§8.65⑥）
+        HotReloadPlugin.build(app);
         // 昼夜循环（R80）：默认方向光就位后注册派生系统（缺席 cycle =
         // 零触碰，见 DayNightPlugin 文档）
         DayNightPlugin.build(app);
