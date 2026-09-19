@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1707 / release 1704**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1715 / release 1712**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1707 / release 1704）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1715 / release 1712）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -139,7 +139,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1707 / release 1704；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1715 / release 1712；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -190,8 +190,13 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     扩容）+ fs_shaded 材质 flag 分支（R63 FMA 教训兑现：`pbr_light`/
     `point_light_contrib` 本体零触碰，既有像素锁原值通过））+ AlphaMask
     （glTF MASK 闭合，阴影实心近似）；设计四点裁定全按推荐；缺席 =
-    逐位不变；诚实限制 §8.69）、R91 毛发 v2（风场摆动/LOD/阴影）、
-    R92 降水、R93 海洋 v2+水下（CPU 位移图
+    逐位不变；诚实限制 §8.69）、R91 毛发 v2 ✅（CPU Verlet 风摆
+    （strand_step 纯函数+根部钉扎+单遍距离约束；wind_sample 根位置
+    采样；世界空间模拟局部写回）× alpha 感知毛发阴影（光空间展宽/
+    层比膨胀 + fs_fur 同一判定语义——**§8.69③ 闭合**）× 交叉卡片
+    LOD（同一随机字契约+滞回 20%）；全部 opt-in 缺席 = R90 逐位
+    不变；诚实限制 §8.70）——**第三梯队毛发线 2/2 就此收官**，
+    剩 R92 降水、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）
   - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /
     OIT / 贴花 v2 / LOD v2 / 音频 v3 空间化 / 动画压缩 / BC7+KTX2 / 热重载局部 /

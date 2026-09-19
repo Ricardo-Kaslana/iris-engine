@@ -113,6 +113,15 @@ pub(crate) struct PipelineBundle {
     /// [`crate::fur::SHELL_INSTANCE_LAYOUT`]（InstanceRaw + loc15），
     /// REPLACE + 深度写、Cull Back（跟随原网格朝向）。
     pub shell_pipeline: wgpu::RenderPipeline,
+    /// 发带阴影管线（R91）：VS = `shaders/shadow_hair_vs.wgsl`（光空间
+    /// 屏幕展宽），FS = shadow.wgsl `fs_fur`（base 采样 + cutout——
+    /// 毛发阴影 alpha 感知）。布局 = [cascade, material]（组 1 复用主
+    /// pass 材质 bind group）；R32Float 深度目标 + cull None（阴影
+    /// pass 的绕向实证纪律）。
+    pub shadow_hair_pipeline: wgpu::RenderPipeline,
+    /// 壳层阴影管线（R91）：VS = `shaders/shadow_shell_vs.wgsl`（膨胀 +
+    /// 级联投影），FS 同上——壳层阴影带逐层毛形孔洞。
+    pub shadow_shell_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
@@ -1546,6 +1555,84 @@ pub(crate) fn create_pipeline(
         multiview_mask: None,
         cache: None,
     });
+
+    // 毛发阴影双管线（R91）：alpha 感知 cutout 的毛发深度投影——
+    // VS 独立 module（shadow_hair_vs 光空间屏幕展宽 / shadow_shell_vs
+    // 层比膨胀），FS = shadow.wgsl fs_fur（base 采样 + 与主 pass
+    // fs_shaded 同一判定语义的 max(cutoff, 层比) discard）。布局 =
+    // [cascade, material]——组 1 复用主 pass 的材质 bind group 对象
+    // （同 material_layout）。形态照 shadow_pipeline：R32Float 颜色
+    // 附件 + Depth32Float 双附件 + cull None（光空间绕向实证纪律）。
+    let fur_shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.fur.shadow.pipeline.layout"),
+        bind_group_layouts: &[Some(&cascade_layout), Some(&material_layout)],
+        immediate_size: 0,
+    });
+    let shadow_hair_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.shadow_hair_vs"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadow_hair_vs.wgsl").into()),
+    });
+    let shadow_shell_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.shadow_shell_vs"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadow_shell_vs.wgsl").into()),
+    });
+    let make_fur_shadow_pipeline = |label: &'static str,
+                                    vs_module: &wgpu::ShaderModule,
+                                    buffers: &[Option<wgpu::VertexBufferLayout<'static>>]|
+     -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&fur_shadow_layout),
+            vertex: wgpu::VertexState {
+                module: vs_module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shadow_shader,
+                entry_point: Some("fs_fur"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let shadow_hair_pipeline = make_fur_shadow_pipeline(
+        "iris.pipeline.shadow_hair",
+        &shadow_hair_shader,
+        &[
+            Some(crate::groom::HAIR_VERTEX_LAYOUT),
+            Some(crate::fur::SHELL_INSTANCE_LAYOUT),
+        ],
+    );
+    let shadow_shell_pipeline = make_fur_shadow_pipeline(
+        "iris.pipeline.shadow_shell",
+        &shadow_shell_shader,
+        &[
+            Some(crate::mesh::Vertex::LAYOUT),
+            Some(crate::fur::SHELL_INSTANCE_LAYOUT),
+        ],
+    );
 
     // 阴影蒙皮变体：组 1 绑定关节矩阵，蒙皮几何体的阴影随骨骼变形。
     let skinned_shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3150,6 +3237,8 @@ pub(crate) fn create_pipeline(
         water_pipeline,
         hair_pipeline,
         shell_pipeline,
+        shadow_hair_pipeline,
+        shadow_shell_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,
@@ -3280,6 +3369,62 @@ mod tests {
                 "{name} 的 fur_aux 必须是 @location(6) vec4<f32>"
             );
         }
+    }
+
+    /// **毛发阴影接口影子契约看门（R91）**：`ShadowFurVertexOutput`
+    /// （clip + uv + fur_aux）在 shadow.wgsl（fs_fur 消费端）与两个
+    /// 阴影 VS module（shadow_hair_vs / shadow_shell_vs 生产端）三方
+    /// 并行声明——漏同步症状是阴影贴图读错 varying（cutout 噪点 /
+    /// 阴影错乱），源码层拦截（主 pass 四方看门同款范式）。
+    #[test]
+    fn shadow_fur_vertex_output_matches_three_ways() {
+        let files = [
+            ("shadow.wgsl", include_str!("../shaders/shadow.wgsl")),
+            (
+                "shadow_hair_vs.wgsl",
+                include_str!("../shaders/shadow_hair_vs.wgsl"),
+            ),
+            (
+                "shadow_shell_vs.wgsl",
+                include_str!("../shaders/shadow_shell_vs.wgsl"),
+            ),
+        ];
+        let order = ["clip_position", "uv", "fur_aux"];
+        for (name, src) in files {
+            let body = src
+                .split("struct ShadowFurVertexOutput {")
+                .nth(1)
+                .and_then(|s| s.split('}').next())
+                .unwrap_or_else(|| panic!("{name} 应声明 ShadowFurVertexOutput"));
+            let mut last_pos = 0usize;
+            for field in order {
+                let pos = body
+                    .find(&format!("{field}:"))
+                    .unwrap_or_else(|| panic!("{name} 的 ShadowFurVertexOutput 缺少字段 {field}"));
+                assert!(
+                    pos >= last_pos,
+                    "{name} 的 ShadowFurVertexOutput 字段 {field} 声明乱序"
+                );
+                last_pos = pos;
+            }
+            assert!(
+                body.contains("@location(0) uv: vec2<f32>"),
+                "{name} 的 uv 必须是 @location(0) vec2<f32>"
+            );
+            assert!(
+                body.contains("@location(1) fur_aux: vec4<f32>"),
+                "{name} 的 fur_aux 必须是 @location(1) vec4<f32>"
+            );
+        }
+        // shadow.wgsl 的 MaterialParams 影子契约：80 B 布局 + fur 字段
+        // 在位（与 standard.wgsl 的 MaterialParams 同构——改一侧必须
+        // 另一侧；此处只锁关键存在性，完整布局由 material.rs 的
+        // const 断言钉 Rust 侧）。
+        let shadow = include_str!("../shaders/shadow.wgsl");
+        assert!(
+            shadow.contains("fur: vec4<f32>"),
+            "shadow.wgsl 的 MaterialParams 必须含 fur 字段（cutoff 判定的消费端）"
+        );
     }
 
     /// **贴花受光的影子契约看门（C2）**：`decal.wgsl` 自持的 `Globals`

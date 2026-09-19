@@ -125,3 +125,47 @@ fn fs_point(in: PointShadowVertexOutput) -> @location(0) vec4<f32> {
     let d = length(in.world_pos - point_face.light_pos_range.xyz);
     return vec4<f32>(d / point_face.light_pos_range.w, 0.0, 0.0, 1.0);
 }
+
+// ---- 毛发阴影（R91）：alpha 感知 cutout 的毛发深度投影 ----
+//
+// 毛发 VS 在独立 module（shadow_hair_vs.wgsl / shadow_shell_vs.wgsl——
+// 光空间屏幕展宽 / 法线膨胀），本入口只做与主 pass fs_shaded **同一
+// 判定语义**的 cutout：`base.a < max(材质 cutoff, 层比)` 丢弃——
+// 毛发阴影带毛形孔洞、Mask 材质的实心影近似（§8.69③）一并闭合。
+//
+// 材质组声明在 **group(1)**（shadow_hair/shadow_pipeline 的布局 =
+// [cascade, material]）——与蒙皮入口的 group(1) joint_mats 同点不同
+// 变量（本文件 vs_point 头注释的同款合法形态：无入口同时使用两者）。
+// MaterialParams 是 standard.wgsl 的影子契约（80 B，fur 字段含 cutoff）
+// ——改一侧必须另一侧（看门：material.rs 布局 const 断言）。
+
+struct MaterialParams {
+    base_color: vec4<f32>,
+    emissive: vec4<f32>,
+    surface: vec4<f32>,
+    sss: vec4<f32>,
+    fur: vec4<f32>,
+};
+
+@group(1) @binding(0) var<uniform> shadow_material: MaterialParams;
+@group(1) @binding(1) var shadow_base_texture: texture_2d<f32>;
+@group(1) @binding(2) var shadow_base_sampler: sampler;
+
+// 毛发阴影 VS 的输出（shadow_hair_vs / shadow_shell_vs 的接口契约，
+// 二方同步）
+struct ShadowFurVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) fur_aux: vec4<f32>,
+};
+
+@fragment
+fn fs_fur(in: ShadowFurVertexOutput) -> @location(0) vec4<f32> {
+    let base = shadow_material.base_color
+        * textureSample(shadow_base_texture, shadow_base_sampler, in.uv);
+    if (base.a < max(shadow_material.fur.y, in.fur_aux.x)) {
+        discard;
+    }
+    let d = in.clip_position.z / in.clip_position.w;
+    return vec4<f32>(d, 0.0, 0.0, 1.0);
+}

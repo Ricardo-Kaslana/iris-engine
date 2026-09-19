@@ -5,6 +5,59 @@
 
 ## [Unreleased]
 
+### Added（R91 毛发 v2：风场 Verlet 摆动 × 远景卡片 LOD × alpha 感知毛发阴影）
+
+路线图 v5 第三梯队尾巴 2/2（毛发 2/2 收官）。设计四点裁定（2026-09-19，
+主会话按推荐定稿）：**CPU Verlet**（确定性——`strand_step` 纯函数 +
+同输入序列双跑逐位单测；`wind_sample` 逐束根位置单点采样，粒子 v2
+同款口径；GPU compute 与 gust 哈希链 WGSL 复刻重申拒绝）/ **阴影全接
++ alpha 感知**（壳层 + 发带进方向光 CSM，FS 与主 pass 同一判定语义
+——§8.69③ 实心影近似闭合）/ **交叉卡片 LOD**（`generate_hair_cards`
+与发带同一随机字契约——LOD 切换发束位置不跳变；滞回 20%）/
+**蒙皮继续声明不做**（§8.69① 维持——无 in-repo 消费者）。兼容铁律：
+全部 opt-in，`HairDynamics` / `HairLodSettings` / `card` 字段缺席 =
+R90 行为逐位不变（shadow_v2 / normal 像素锁原值通过）。
+
+- **风场摆动**（`fur.rs::update_hair_dynamics`，`ParticlePlugin` 注册
+  同层）：半隐式 Verlet 积分 → 根部钉扎（rest[0] 随实体变换——发根
+  跟随）→ 刚度回弹（`stiffness × dt` 钳 1）→ 从根到梢单遍距离约束。
+  世界空间模拟、局部空间写回（`inverse(model)`）——实体移动时发梢
+  甩动惯性自然；逐束去相关（mix64 种子，±33% 调制——束间不齐步）。
+  `HairStrandMesh::points_per_strand` 显式声明控制点布局（**顶点数
+  对「束 × 段 × 4」的分解有歧义，不猜**——自定义网格未声明 ⇒ warn
+  跳过）；写回重算中心差分切线（KK 主方向与展宽同步）。
+- **渲染接线**：动态实体每帧 `write_buffer` 重传顶点（morph 范式，
+  建缓冲统一带 COPY_DST）；静态实体 VBO 缓存零触碰（R90 行为）。
+- **alpha 感知毛发阴影**（`shadow_hair_vs` / `shadow_shell_vs` +
+  shadow.wgsl `fs_fur`）：发带 VS 光空间屏幕展宽（主 pass 同式换
+  CascadeParams——正交光空间 `clip.w ≈ 1`，投影常量列长推导同法）；
+  壳层 VS 层比膨胀同式；FS = `base.a < max(材质 cutoff, 层比)`
+  discard（与 fs_shaded 同一判定）——毛形阴影 + Mask 材质阴影孔洞
+  一并闭合。布局 = [cascade, material]（组 1 复用主 pass 材质 bind
+  group）；点光 cubemap 阴影不接（v1 边界 §8.70）。影子契约看门：
+  `ShadowFurVertexOutput` 三方（shadow.wgsl + 两 VS）源码层拦截。
+- **远景卡片 LOD**（`groom.rs::generate_hair_cards` +
+  `HairLodSettings` 资源）：每束两条 60° 交叉卡片（Rodrigues 绕发丝
+  旋转），标准顶点格式走标准不透明管线（KK 材质切线通道照常）；
+  收集期距离裁决（实体原点到 eye，LOD v2 同口径）+ 滞回（远→近
+  0.8× 回切，`hair_lod_memory` 跨帧记忆同款范式）——远档项 merge
+  进普通不透明实例参与排序合批。卡片与发带**同一随机字消费序** ⇒
+  切换时发束位置逐位对应。
+- **测试**（CPU +8 / GPU +3，全部新增）：Verlet 稳态锚（恒风偏移
+  收敛 + 根部钉扎）/ 段长守恒（任意风向 50 步 1e-5）/ 确定性双跑 +
+  满刚度回弹 / 写回往返 + 切线归一 + 邻束隔离；GPU：恒风两帧画面
+  差分 + 无组件双帧逐位（缺席静态锚）/ 毛发阴影差分（壳层毛投影
+  改变画面 > 200 像素）/ LOD 档位切换可判别（近档发带 1 / 远档卡片
+  0 + instances 计入）。
+- **排障记录**：验收图首版「全画布雪崩斜纹」归因为 **PPM 合成行
+  字节数错位**（三面板 + 每面板后缀 GAP ⇒ 每行多 18 字节，下一行
+  数据错位延续到帧尾）——非 GPU 病灶（毛发阴影开关两轮 FNV 完全
+  一致为旁证）；修复合成循环（panel GAP panel GAP panel）。
+- 基线 debug 1707 → 1715 / release 1704 → 1712。六项门禁全绿。
+  验收图 `docs/fur.png` 升级三面板（左：壳层毛 + 地面毛影；中：
+  240 束静止发帘；右：恒风吹 1.5 s——发梢 +X 偏摆、根部钉扎）。
+  诚实限制 §8.70。
+
 ### Added（R90 毛发 v1：双路线——壳层 shell fur × Kajiya-Kay 发带 + AlphaMask cutout）
 
 路线图 v5 第三梯队尾巴首役（毛发 1/2）。设计四点裁定（2026-09-19，

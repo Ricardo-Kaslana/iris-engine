@@ -842,6 +842,11 @@ pub struct Renderer {
     particle_v2_scratch: Vec<ParticleV2Item>,
     /// 毛发 v1（R90）收集暂存（跨帧复用，`std::mem::take` 借出 / 末尾归还）。
     fur_scratch: Vec<FurItem>,
+    /// 毛发 LOD 卡片项暂存（R91——merge 进 items 后归还）。
+    fur_card_scratch: Vec<DrawItem>,
+    /// 发带 LOD 跨帧记忆（R91）：实体位 → 当前是否卡片档（滞回防抖，
+    /// `lod_v2_memory` 同款范式；`HairLodSettings` 缺席 = 恒空表零触碰）。
+    hair_lod_memory: std::collections::BTreeMap<u64, bool>,
     /// meshlet GPU 资源束（R85；首个 meshlet 实例在场时惰性创建，缺席 =
     /// 不创建零开销）。
     meshlet_gpu: Option<MeshletGpu>,
@@ -2679,11 +2684,23 @@ fn collect_instances(
 ///
 /// 探针 / DDGI 载荷：v1 置零（全局 env 兜底）——毛发不进逐实体 GI
 /// 载荷，诚实限制 §8。
+///
+/// R91 增量：发带远景卡片 LOD（`HairLodSettings` 资源 + 组件 `card`
+/// 都在场时距离裁决，滞回 20%——`hair_lod_memory` 跨帧记忆，
+/// `lod_v2_memory` 同款范式）：远档发带项变成**普通不透明项**
+/// （`card_items`，调用方 merge 进 items 参与排序合批——卡片 = 标准
+/// 网格，走标准管线，KK 材质照常）。
+#[allow(clippy::too_many_arguments)]
 fn collect_fur_items(
     world: &iris_core::world::World,
     mesh_store: &MeshStore,
     frustum: &Frustum,
+    eye: Vec3,
+    lod: Option<crate::fur::HairLodSettings>,
+    lod_memory: &mut std::collections::BTreeMap<u64, bool>,
+    material_store: &MaterialStore,
     items: &mut Vec<FurItem>,
+    card_items: &mut Vec<DrawItem>,
 ) -> (u32, u32) {
     items.clear();
     let mut shell_layers = 0u32;
@@ -2728,14 +2745,15 @@ fn collect_fur_items(
             instances: crate::fur::expand_shell_instances(fur, base),
         });
     });
-    // 发带：组件包围球（实体局部）→ 世界
+    // 发带：组件包围球（实体局部）→ 世界；LOD 裁决（R91）
     world.query::<(
         iris_core::prelude::Entity,
         &GlobalTransform,
         &MaterialHandle,
         &crate::fur::HairStrands,
+        Option<&crate::fur::HairDynamics>,
         Option<&Visibility>,
-    )>(|(e, gt, mat, hair, visibility)| {
+    )>(|(e, gt, mat, hair, _dynamics, visibility)| {
         if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
         }
@@ -2750,10 +2768,36 @@ fn collect_fur_items(
         if !frustum.intersects_sphere(center_world, hair.bounds_radius * scale) {
             return;
         }
+        // LOD 裁决：距离（实体原点到相机 eye——LOD v2 同口径）+ 滞回。
+        // 卡片档只对「资源在场 + 组件配了 card」的实体生效。
+        let entity = e.to_bits();
+        let dist = gt.position().distance(eye);
+        let mut use_card = *lod_memory.get(&entity).unwrap_or(&false);
+        if let (Some(settings), Some(card)) = (lod, hair.card.as_ref()) {
+            if use_card {
+                if dist < settings.card_distance * 0.8 {
+                    use_card = false;
+                }
+            } else if dist > settings.card_distance {
+                use_card = true;
+            }
+            lod_memory.insert(entity, use_card);
+            if use_card {
+                // 远档：普通不透明项（标准管线合批，KK 材质照常）
+                card_items.push(DrawItem {
+                    key: ((card.0 as u64) << 32) | mat.0 as u64,
+                    instance: InstanceRaw::from_matrix(model),
+                    lightmap: NO_LIGHTMAP,
+                    entity,
+                    double_sided: double_sided_of(material_store, *mat),
+                });
+                return;
+            }
+        }
         hair_strands += 1;
         items.push(FurItem {
             kind: FurKind::Hair,
-            entity: e.to_bits(),
+            entity,
             mesh: 0,
             material: mat.0,
             instances: vec![crate::fur::ShellInstanceRaw {
@@ -4362,6 +4406,8 @@ impl Renderer {
             meshlet_occ_entity_scratch: Vec::new(),
             particle_v2_scratch: Vec::new(),
             fur_scratch: Vec::new(),
+            fur_card_scratch: Vec::new(),
+            hair_lod_memory: std::collections::BTreeMap::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
                 g: 0.07,
@@ -7009,13 +7055,32 @@ impl Renderer {
         particle_alpha.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let particle_additive_len = particle_instances.len();
         particle_instances.extend(particle_alpha.iter().map(|(_, _, inst)| *inst));
-        // 2c'.5 毛发 v1 收集（R90）：壳层附加层 + 发带（组件缺席 = 空表 =
-        //      零计算零绘制）。发带 GPU 缓存按实体位懒建 + 实例数组全量
-        //      上传专用缓冲（&mut self 须在 hdr 不可变借用之前——与 2c'
-        //      粒子 v2 池同款纪律）。
+        // 2c'.5 毛发收集（R90；R91 增 LOD 卡片 + 动态标志）：壳层附加层
+        //      + 发带（组件缺席 = 空表 = 零计算零绘制）。发带 GPU 缓存按
+        //      实体位懒建（动态实体每帧重传）+ 实例数组全量上传专用缓冲
+        //      （&mut self 须在 hdr 不可变借用之前——与 2c' 粒子 v2 池
+        //      同款纪律）。LOD 远档的卡片项 merge 进 items（随后统一
+        //      排序合批——卡片 = 标准网格走标准管线）。
         let mut fur_items = std::mem::take(&mut self.fur_scratch);
-        let (shell_layers, hair_strands) =
-            collect_fur_items(world, &mesh_store, &frustum, &mut fur_items);
+        let mut fur_card_items = std::mem::take(&mut self.fur_card_scratch);
+        let (shell_layers, hair_strands) = collect_fur_items(
+            world,
+            &mesh_store,
+            &frustum,
+            eye,
+            world
+                .try_resource::<crate::fur::HairLodSettings>()
+                .map(|s| *s),
+            &mut self.hair_lod_memory,
+            &material_store,
+            &mut fur_items,
+            &mut fur_card_items,
+        );
+        if !fur_card_items.is_empty() {
+            items.append(&mut fur_card_items);
+            items.sort_unstable_by_key(|item| item.key);
+            fur_card_items.shrink_to_fit();
+        }
         if !fur_items.is_empty() {
             self.ensure_hair_gpu(world);
             self.upload_fur_instances(&fur_items);
@@ -7584,6 +7649,58 @@ impl Renderer {
                         shadow_pass.set_bind_group(1, &skin.bind_group, &[]);
                         let base = (total + i) as u32;
                         shadow_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                    }
+                }
+                // 毛发（R91）：alpha 感知 cutout 的深度投影——壳层（膨胀 +
+                // 逐层阈值）与发带（光空间屏幕展宽）各一条管线；组 1 复用
+                // 主 pass 的材质 bind group（同 material_layout，base 采样
+                // + max(cutoff, 层比) discard 与 fs_shaded 同一判定语义）。
+                // 缺席 = fur_items 空 = 零绘制（命令流与引入前逐位一致）。
+                // 点光 cubemap 阴影不接（v1 边界，§8——预算化点光阴影里
+                // 毛发自遮挡价值低）。
+                const FUR_SHADOW_ENABLED: bool = true;
+                if !fur_items.is_empty() && FUR_SHADOW_ENABLED {
+                    let fur_buf = self.fur_instance_buf.as_ref().expect("毛发实例缓冲已就绪");
+                    let mut base_instance = 0u32;
+                    for item in &fur_items {
+                        let material =
+                            &self.material_gpu[&material_key(item.material, NO_LIGHTMAP)];
+                        shadow_pass.set_bind_group(0, &self.cascade_bgs[cascade_i], &[]);
+                        shadow_pass.set_bind_group(1, &material.bind_group, &[]);
+                        shadow_pass.set_vertex_buffer(1, fur_buf.slice(..));
+                        if item.kind == FurKind::Shell {
+                            let mesh = &self.mesh_gpu[&item.mesh];
+                            shadow_pass.set_pipeline(&self.bundle.shadow_shell_pipeline);
+                            shadow_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                            shadow_pass.set_index_buffer(
+                                mesh.index_buf.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            let count = item.instances.len() as u32;
+                            shadow_pass.draw_indexed(
+                                0..mesh.num_indices,
+                                0,
+                                base_instance..base_instance + count,
+                            );
+                            base_instance += count;
+                        } else {
+                            let hair = self
+                                .hair_gpu
+                                .get(&item.entity)
+                                .expect("发带 GPU 缓存已就绪（收集期懒建）");
+                            shadow_pass.set_pipeline(&self.bundle.shadow_hair_pipeline);
+                            shadow_pass.set_vertex_buffer(0, hair.vertex_buf.slice(..));
+                            shadow_pass.set_index_buffer(
+                                hair.index_buf.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            shadow_pass.draw_indexed(
+                                0..hair.num_indices,
+                                0,
+                                base_instance..base_instance + 1,
+                            );
+                            base_instance += 1;
+                        }
                     }
                 }
             }
@@ -9591,6 +9708,7 @@ impl Renderer {
         self.particle_alpha_scratch = particle_alpha;
         self.particle_v2_scratch = particle_v2_items;
         self.fur_scratch = fur_items;
+        self.fur_card_scratch = fur_card_items;
     }
 
     /// 实例缓冲容量复用：足够则零开销返回 `false`；不足时按 2 倍扩容
@@ -9617,10 +9735,24 @@ impl Renderer {
     /// 不同字段，析构分别借用后闭包可同时持有。
     fn ensure_hair_gpu(&mut self, world: &iris_core::world::World) {
         let device = &self.gpu.device;
+        let queue = &self.gpu.queue;
         let hair_gpu = &mut self.hair_gpu;
-        world.query::<(iris_core::prelude::Entity, &crate::fur::HairStrands)>(|(e, hair)| {
+        world.query::<(
+            iris_core::prelude::Entity,
+            &crate::fur::HairStrands,
+            Option<&crate::fur::HairDynamics>,
+        )>(|(e, hair, dynamics)| {
             let entity = e.to_bits();
-            if hair_gpu.contains_key(&entity) {
+            // 动态发带（R91）：每帧重传顶点（模拟写回 mesh——write_buffer
+            // 需 COPY_DST，建缓冲时统一携带）；索引不变只重传顶点
+            if let Some(entry) = hair_gpu.get_mut(&entity) {
+                if dynamics.is_some() {
+                    queue.write_buffer(
+                        &entry.vertex_buf,
+                        0,
+                        bytemuck::cast_slice(&hair.mesh.vertices),
+                    );
+                }
                 return;
             }
             if hair.mesh.indices.is_empty() {
@@ -9629,7 +9761,7 @@ impl Renderer {
             let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("iris.hair.vbo"),
                 contents: bytemuck::cast_slice(&hair.mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("iris.hair.ibo"),

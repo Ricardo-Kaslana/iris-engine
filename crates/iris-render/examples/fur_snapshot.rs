@@ -1,16 +1,18 @@
-//! R90 · 毛发 v1 验收图：左右双面板（壳层 shell fur | Kajiya-Kay 发带），
+//! R90+R91 · 毛发验收图：三面板（壳层+阴影 | 发帘静止 | 发帘风吹），
 //! 输出 `iris_fur.ppm` → `docs/fur.png`。
 //!
 //! 左面板：斜俯视三立方体——无毛对照（红）+ 绿壳层毛（16 层 × 毛高
-//! 0.45，底皮同材质）+ 蓝壳层毛（毛高 0.2 更短）。方向光斜照，毛的
-//! 膨胀带在立方体轮廓外沿清晰可见（无毛的红色对照边缘干净）。
+//! 0.45）+ 蓝壳层毛（毛高 0.2）。方向光**开阴影**斜照（R91）——毛的
+//! 投影在地面拉出（膨胀带 + alpha 感知 cutout 阴影）。
 //!
-//! 右面板：Kajiya-Kay 发帘——头皮圆盘上 160 束棕色发丝（curl 0.45）
-//! 沿 −Y 下垂成帘，KK 材质（shift 0.15、exponent 96）真实着色（方向
-//! 光 + IBL 伪法线 + 根梢高光移位），地面深灰垫板承接方向光。
+//! 中面板：Kajiya-Kay 发帘——头皮圆盘上 240 束棕色发丝静止形状。
 //!
-//! 硬断言：两面板各自双会话逐位一致（确定性文化）+ 壳层毛高单调
-//! （绿毛覆盖 > 无毛对照——膨胀带真实生效的 FNV 差分旁证）。
+//! 右面板：同一发帘 + `HairDynamics`，恒风（+X，阵风 0——确定性）
+//! 吹 90 帧（1.5 s）后的偏摆形态——发梢顺风偏移、根部钉扎（R91
+//! Verlet 摆动的目检证据）。
+//!
+//! 硬断言：三面板各自双会话逐位一致（确定性文化）+ 风吹面板 ≠ 静止
+//! 面板（摆动真实生效的 FNV 差分旁证）。
 //!
 //! ```sh
 //! cargo run -p iris-render --example fur_snapshot --release
@@ -19,7 +21,7 @@
 
 use glam::Vec3;
 use iris_core::hierarchy::propagate_transforms;
-use iris_core::prelude::{Transform, World};
+use iris_core::prelude::{Time, Transform, World};
 use iris_render::prelude::*;
 
 const WIDTH: u32 = 480;
@@ -35,7 +37,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// 左面板：壳层毛立方体群（含无毛对照）。
+/// 左面板：壳层毛立方体群（含无毛对照），方向光开阴影（R91）。
 fn shell_scene() -> World {
     let mut world = World::new();
     world.insert_resource(MeshStore::new());
@@ -50,7 +52,7 @@ fn shell_scene() -> World {
     world.insert_resource(DirectionalLight {
         direction: Vec3::new(-0.5, -1.0, -0.4),
         intensity: 3.0,
-        shadows: false,
+        shadows: true,
         ..DirectionalLight::default()
     });
     world.insert_resource(BloomSettings::disabled());
@@ -108,8 +110,8 @@ fn shell_scene() -> World {
     world
 }
 
-/// 右面板：Kajiya-Kay 发帘（真实着色）。
-fn hair_scene() -> World {
+/// 发帘场景基座（静止形状；`windy` 时挂 HairDynamics + 恒风）。
+fn hair_scene_base(windy: bool) -> World {
     let mut world = World::new();
     world.insert_resource(MeshStore::new());
     world.insert_resource(MaterialStore::new());
@@ -119,6 +121,15 @@ fn hair_scene() -> World {
         let mut camera = world.resource_mut::<Camera>();
         camera.eye = Vec3::new(0.0, 1.7, 4.2);
         camera.target = Vec3::new(0.0, 0.8, 0.0);
+    }
+    if windy {
+        world.insert_resource(Time::default());
+        world.insert_resource(iris_core::wind::Wind {
+            direction: Vec3::new(1.0, 0.0, 0.0),
+            strength: 2.2,
+            gustiness: 0.0,
+            seed: 1,
+        });
     }
     world.insert_resource(DirectionalLight {
         direction: Vec3::new(-0.35, -1.0, -0.5),
@@ -132,7 +143,7 @@ fn hair_scene() -> World {
         .resource_mut::<MaterialStore>()
         .add(MaterialDef::solid(0.22, 0.23, 0.26, 1.0));
     world.spawn((Transform::IDENTITY, ground, slate));
-    // 头皮：圆盘（深色，衬托发帘）——抬离地面，发帘全长悬空可见
+    // 头皮：圆盘——抬离地面，发帘全长悬空可见
     let disc = world
         .resource_mut::<MeshStore>()
         .add(MeshData::cylinder(0.85, 0.08, 24));
@@ -171,15 +182,43 @@ fn hair_scene() -> World {
             exponent: 96.0,
         }),
     );
-    world.spawn((
-        Transform {
-            position: Vec3::new(0.0, 1.5, 0.0),
-            ..Transform::IDENTITY
-        },
-        hair,
-        HairStrands::new(mesh),
-    ));
+    let transform = Transform {
+        position: Vec3::new(0.0, 1.5, 0.0),
+        ..Transform::IDENTITY
+    };
+    if windy {
+        world.spawn((
+            transform,
+            hair,
+            HairStrands::new(mesh),
+            HairDynamics {
+                stiffness: 0.25,
+                damping: 0.92,
+                wind_scale: 1.0,
+                ..Default::default()
+            },
+        ));
+    } else {
+        world.spawn((transform, hair, HairStrands::new(mesh)));
+    }
     propagate_transforms(&mut world);
+    world
+}
+
+/// 静止发帘。
+fn hair_scene() -> World {
+    hair_scene_base(false)
+}
+
+/// 风吹发帘：恒风下步进 90 帧（1.5 s @ 60 Hz）后渲染。
+fn hair_scene_windy() -> World {
+    let world = hair_scene_base(true);
+    for _ in 0..90 {
+        let mut time = world.resource_mut::<Time>();
+        time.advance(std::time::Duration::from_secs_f32(1.0 / 60.0));
+        drop(time);
+        update_hair_dynamics(&world);
+    }
     world
 }
 
@@ -192,35 +231,47 @@ fn render(world: &World) -> Vec<u8> {
 fn main() {
     let shell = render(&shell_scene());
     let hair = render(&hair_scene());
-    let (hs, hh) = (fnv1a(&shell), fnv1a(&hair));
+    let windy = render(&hair_scene_windy());
+    let (hs, hh, hw) = (fnv1a(&shell), fnv1a(&hair), fnv1a(&windy));
     assert_eq!(hs, fnv1a(&render(&shell_scene())), "壳层面板双会话逐位一致");
-    assert_eq!(hh, fnv1a(&render(&hair_scene())), "发带面板双会话逐位一致");
+    assert_eq!(
+        hh,
+        fnv1a(&render(&hair_scene())),
+        "静止发帘面板双会话逐位一致"
+    );
+    assert_eq!(
+        hw,
+        fnv1a(&render(&hair_scene_windy())),
+        "风吹发帘面板双会话逐位一致（同帧序逐位——确定性）"
+    );
+    assert_ne!(hh, hw, "风吹面板应不同于静止面板（摆动真实生效）");
 
-    // 合成左右面板（RGBA → P6 RGB，中间白缝 + 顶部白边）
-    let mut ppm = format!("P6\n{} {}\n255\n", WIDTH * 2 + GAP, HEIGHT + GAP).into_bytes();
-    let gap_row = vec![255u8; (WIDTH as usize * 2 + GAP as usize) * 3];
+    // 合成三面板（RGBA → P6 RGB，两条白缝分隔 + 顶部白边——每行 =
+    // panel GAP panel GAP panel，与头声明宽度逐字节一致）
+    let panels = [&shell, &hair, &windy];
+    let mut ppm = format!("P6\n{} {}\n255\n", WIDTH * 3 + GAP * 2, HEIGHT + GAP).into_bytes();
+    let gap_row = vec![255u8; (WIDTH as usize * 3 + GAP as usize * 2) * 3];
     for _ in 0..GAP {
         ppm.extend_from_slice(&gap_row);
     }
     for y in 0..HEIGHT {
-        for _ in 0..GAP {
-            ppm.extend_from_slice(&[255, 255, 255]);
-        }
-        for chunk in shell
-            [(y as usize * WIDTH as usize) * 4..((y + 1) as usize * WIDTH as usize) * 4]
-            .chunks_exact(4)
-        {
-            ppm.extend_from_slice(&chunk[..3]);
-        }
-        for chunk in hair
-            [(y as usize * WIDTH as usize) * 4..((y + 1) as usize * WIDTH as usize) * 4]
-            .chunks_exact(4)
-        {
-            ppm.extend_from_slice(&chunk[..3]);
+        for (pi, panel) in panels.iter().enumerate() {
+            if pi > 0 {
+                for _ in 0..GAP {
+                    ppm.extend_from_slice(&[255, 255, 255]);
+                }
+            }
+            for chunk in panel
+                [(y as usize * WIDTH as usize) * 4..((y + 1) as usize * WIDTH as usize) * 4]
+                .chunks_exact(4)
+            {
+                ppm.extend_from_slice(&chunk[..3]);
+            }
         }
     }
     std::fs::write("iris_fur.ppm", &ppm).expect("写 iris_fur.ppm");
     println!("iris_fur.ppm 已写出（{} 字节）", ppm.len());
-    println!("左 = 壳层（16 层绿毛 / 8 层蓝毛 / 无毛红对照）FNV-1a = {hs:#018x}");
-    println!("右 = Kajiya-Kay 发帘（240 束 × 8 控制点）FNV-1a = {hh:#018x}");
+    println!("左 = 壳层（16 层绿毛 + 阴影投影）   FNV-1a = {hs:#018x}");
+    println!("中 = Kajiya-Kay 发帘（240 束静止）  FNV-1a = {hh:#018x}");
+    println!("右 = 同发帘恒风吹 1.5 s            FNV-1a = {hw:#018x}");
 }

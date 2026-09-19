@@ -362,6 +362,18 @@ impl Plugin for ParticlePlugin {
                 .read::<iris_core::wind::Wind>(),
             update_particles_v2,
         );
+        // 毛发摆动（R91）：与粒子同层——写 HairStrands（模拟写回控制
+        // 网格）+ HairDynamics（内部状态），与粒子系统访问集不相交。
+        app.schedule.add_parallel_system(
+            Stage::PostUpdate,
+            Access::new()
+                .write::<iris_render::prelude::HairStrands>()
+                .write::<iris_render::prelude::HairDynamics>()
+                .read::<GlobalTransform>()
+                .read::<Time>()
+                .read::<iris_core::wind::Wind>(),
+            iris_render::prelude::update_hair_dynamics,
+        );
     }
 }
 

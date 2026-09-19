@@ -5371,6 +5371,44 @@ GPU 5（`fur_render.rs`，GPU_SERIAL 串行：缺席逐位 + 双会话 / 发带
 无毛红对照；右：KK 发帘 160 束真实着色）；快照 example 双面板双
 会话逐位断言。诚实限制 §8.69。
 
+### 4.50 毛发 v2（风场 Verlet 摆动 × 远景卡片 LOD × alpha 感知阴影，iris-render/fur·groom + shadow_hair/shell_vs，R91）
+
+**全部 opt-in**（`HairDynamics` 组件 / `HairLodSettings` 资源 /
+`HairStrands::card` 字段三者独立缺席 = R90 行为逐位不变）；CPU 侧
+确定性锚（`strand_step` 纯函数：同输入序列双跑逐位）+ GPU 差分断言。
+
+**风场摆动**：`update_hair_dynamics`（PostUpdate，`ParticlePlugin`
+同层）逐实体逐束步进——半隐式 Verlet（速度 = pos−prev 的阻尼保留）
+→ 根部钉扎（rest[0] 经实体变换——发根跟随）→ 刚度回弹（stiffness×dt
+钳 1）→ 从根到梢单遍距离约束（发链「根部优先」确定性序）。风力 =
+`wind_sample`（R80 同源）在发束根位置单点采样 × `wind_scale` × 逐束
+mix64 去相关（±33%——束间不齐步）。**世界空间模拟、局部空间写回**
+（逆模型矩阵）——实体移动时发梢惯性甩动自然。**布局声明不猜**：
+`HairStrandMesh::points_per_strand`（groom 产物自带）——顶点数对
+「束 × 段 × 4」的分解有歧义，自定义网格未声明 ⇒ warn 跳过。写回
+重算中心差分切线（展宽与 KK 主方向同步）。渲染侧：动态实体每帧
+`write_buffer` 重传 VBO（morph 范式）；静态实体缓存零触碰。
+
+**alpha 感知毛发阴影（§8.69③ 闭合）**：`shadow_hair_vs.wgsl`（光
+空间屏幕展宽——主 pass 同式换 CascadeParams，正交光空间 clip.w ≈ 1、
+投影常量列长推导同法）与 `shadow_shell_vs.wgsl`（层比膨胀同式）+
+shadow.wgsl `fs_fur`：`base.a < max(材质 cutoff, 层比)` discard——
+**与 fs_shaded 同一判定语义** ⇒ 毛发阴影带毛形孔洞、Mask 材质阴影
+孔洞一并闭合。布局 = [cascade, material]（组 1 复用主 pass 材质
+bind group）；只接方向光 CSM（点光 cubemap 不接，§8.70）。`ShadowFur
+VertexOutput` 三方影子契约看门（shadow.wgsl + 两 VS 源码层拦截）。
+
+**远景卡片 LOD**：`generate_hair_cards`（每束两条 60° 交叉卡片，
+Rodrigues 绕发丝旋转；标准顶点格式 + 切线 = 发丝方向）——**与发带
+同一随机字消费序** ⇒ 切换时发束位置逐位对应（不跳变）。收集期裁决
+（实体原点到 eye 距离 > `card_distance` 切卡片、< 0.8× 回切——滞回
+20%，`hair_lod_memory` 跨帧记忆，`lod_v2_memory` 同款范式）；远档项
+merge 进普通不透明实例（标准管线排序合批，KK 材质照常）。
+
+**测试**：CPU +8（Verlet 稳态 / 段长守恒 / 确定性 + 回弹 / 写回
+往返）/ GPU +3（摆动差分 + 缺席静态锚 / 阴影差分 / LOD 档位切换）。
+验收图 `docs/fur.png` 三面板。诚实限制 §8.70。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -7127,6 +7165,19 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     ——长毛控制即「贴图 alpha 通道即毛长图」的约定；⑧发带视锥剔除用
     组件包围球（groom 派生 AABB 球，自定义网格可显式给保守值）；
     ⑨跨适配器位级不可保（同 §8.51；同适配器双会话逐位由测试钉住）。
+70. **毛发 v2（R91，§4.50）的诚实边界**——①蒙皮不跟随（§8.69① 维持
+    ——发带整体挂 Transform 层级；逐顶点蒙皮无 in-repo 消费者）；
+    ②风摆动的逐控制点位移是**准静态简化**（Verlet 只保「根部优先」
+    单遍约束——发丝自交 / 相邻发丝碰撞不做）；③风采样 = 发束根位置
+    **单点**（粒子 v2 同款口径——逐控制点阵风梯度不做）；④毛发阴影
+    只接方向光 CSM（点光 cubemap 阴影不接——预算化点光阴影里毛发
+    自遮挡价值低）；⑤发带光空间展宽在**正交光空间**退化成立（
+    clip.w ≈ 1——级联矩阵恒正交，本仓 CSM 形态下成立，透视光投影
+    未验证）；⑥卡片 LOD 的法线是「朝 +Y」简化近似（远档画面主导项
+    是剪影与颜色）；⑦`HairDynamics` 的束数 / 点数布局在组件挂载时
+    锁定——运行期改 `points_per_strand` 是结构级编辑（重挂组件）；
+    ⑧动态发带每帧全量重传 VBO（240 束 × 8 点 ≈ 84 KB/帧量级——
+    更高密度需增量脏检，按需再做）。
 
 ## 9. 关键设计取舍记录
 

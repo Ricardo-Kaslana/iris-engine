@@ -117,6 +117,10 @@ pub const HAIR_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBu
 pub struct HairStrandMesh {
     pub vertices: Vec<HairStrandVertex>,
     pub indices: Vec<u32>,
+    /// 每束控制点数（R91 动态模拟的控制点布局——`strand_step` 按束 ×
+    /// 段 × 4 的顶点布局寻址，自定义网格必须如实填写）。0 = 未声明
+    /// （HairDynamics 拒绝模拟并 warn——顶点数分解有歧义，不猜）。
+    pub points_per_strand: usize,
 }
 
 /// 生成发带控制网格。逐束随机字消费序（契约，勿改）：
@@ -203,7 +207,160 @@ pub fn generate_hair_strands(params: &HairGroomParams) -> HairStrandMesh {
         }
     }
 
-    HairStrandMesh { vertices, indices }
+    HairStrandMesh {
+        vertices,
+        indices,
+        points_per_strand: params.points as usize,
+    }
+}
+
+/// 生成**交叉卡片**网格（R91 远景 LOD）：每束发一条折线 × 两向交叉
+/// （相隔 60° 的两个朝向，资产惯例的 X 型卡片堆）——标准顶点格式
+/// （position / normal / uv + 切线 = 发丝方向），走标准不透明管线
+/// （Kajiya-Kay 材质照常生效——切线通道接续发带语义）。
+///
+/// 随机字消费序与 [`generate_hair_strands`] **同一契约**（同参数同
+/// 种子 ⇒ 发带与卡片的发束根位置 / 弯曲相位一致——LOD 切换时发束
+/// 位置不跳变）。卡片宽度 = 该点发丝宽 × `card_scale`（LOD 卡片通常
+/// 比单丝宽以补偿密度损失，典型 3–6×）。
+///
+/// 诚实边界：卡片法线取「垂直于发丝且朝世界 +Y 分量最大的方向」的
+/// 简化近似（LOD 远档的画面主导项是剪影与颜色，法线精度不敏感）。
+pub fn generate_hair_cards(params: &HairGroomParams, card_scale: f32) -> crate::mesh::MeshData {
+    assert!(params.points >= 2, "每束控制点数至少 2（points >= 2）");
+    // 先按发带同款契约生成折线（消费序一致），再展开成卡片
+    let mut vertices: Vec<crate::mesh::Vertex> = Vec::new();
+    let mut tangents: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let segments = (params.points - 1) as usize;
+
+    for strand in 0..params.strands as u64 {
+        let base = params.seed.wrapping_add(strand.wrapping_mul(5));
+        let u_radius = fraction(mix64(base));
+        let u_theta = fraction(mix64(base.wrapping_add(1)));
+        let u_phase = fraction(mix64(base.wrapping_add(2)));
+        let u_waves = fraction(mix64(base.wrapping_add(3)));
+        let u_curl_dir = fraction(mix64(base.wrapping_add(4)));
+
+        let root_r = params.scalp_radius * u_radius.sqrt();
+        let root_theta = u_theta * std::f32::consts::TAU;
+        let root = [root_r * root_theta.cos(), 0.0, root_r * root_theta.sin()];
+        let curl_theta = u_curl_dir * std::f32::consts::TAU;
+        let curl_dir = [curl_theta.cos(), 0.0, curl_theta.sin()];
+        let phase = u_phase * std::f32::consts::TAU;
+        let waves = 1.0 + u_waves * 2.0;
+
+        let mut points = Vec::with_capacity(params.points as usize);
+        for j in 0..params.points as usize {
+            let s = j as f32 / (params.points - 1) as f32;
+            let swing =
+                params.curl * params.length * (phase + s * waves * std::f32::consts::TAU).sin() * s;
+            points.push([
+                root[0] + curl_dir[0] * swing,
+                root[1] - params.length * s,
+                root[2] + curl_dir[2] * swing,
+            ]);
+        }
+        // 逐控制点切线（中心差分，与发带同式）
+        let mut dirs = Vec::with_capacity(points.len());
+        for j in 0..points.len() {
+            let prev = points[j.saturating_sub(1)];
+            let next = points[(j + 1).min(points.len() - 1)];
+            let d = [next[0] - prev[0], next[1] - prev[1], next[2] - prev[2]];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            dirs.push([d[0] / len, d[1] / len, d[2] / len]);
+        }
+        // 两向交叉卡片：朝向 0° 与 60°（世界 Y 轴为参考）
+        for orientation in [0.0f32, std::f32::consts::FRAC_PI_3] {
+            for j in 0..segments {
+                let s0 = j as f32 / segments as f32;
+                let s1 = (j + 1) as f32 / segments as f32;
+                let w0 = (params.width_root + (params.width_tip - params.width_root) * s0)
+                    * card_scale
+                    * 0.5;
+                let w1 = (params.width_root + (params.width_tip - params.width_root) * s1)
+                    * card_scale
+                    * 0.5;
+                // 卡片横向方向 = 垂直于发丝切线、绕发丝旋转 orientation
+                //（参考向量 +Y 与切线的差积正交化）
+                let t0 = dirs[j];
+                let t1 = dirs[j + 1];
+                let side_of = |t: [f32; 3], w: f32| -> [f32; 3] {
+                    // n1 = cross(t, Y)（退化时用 X）
+                    let mut n = [t[2], 0.0, -t[0]];
+                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    if len < 1e-6 {
+                        n = [1.0, 0.0, 0.0];
+                    } else {
+                        n = [n[0] / len, n[1] / len, n[2] / len];
+                    }
+                    // 绕发丝方向旋转 orientation：Rodrigues（n 为单位、
+                    // t 为单位 ⇒ n' = n·cos + cross(t,n)·sin）
+                    let cos = orientation.cos();
+                    let sin = orientation.sin();
+                    let ctn = [
+                        t[1] * n[2] - t[2] * n[1],
+                        t[2] * n[0] - t[0] * n[2],
+                        t[0] * n[1] - t[1] * n[0],
+                    ];
+                    [
+                        (n[0] * cos + ctn[0] * sin) * w,
+                        (n[1] * cos + ctn[1] * sin) * w,
+                        (n[2] * cos + ctn[2] * sin) * w,
+                    ]
+                };
+                let a0 = side_of(t0, w0);
+                let a1 = side_of(t1, w1);
+                // 简化法线（朝 +Y 分量最大）：卡片面法线 = cross(side, t)
+                let normal_of = |side: [f32; 3], t: [f32; 3]| -> [f32; 3] {
+                    let mut n = [
+                        side[1] * t[2] - side[2] * t[1],
+                        side[2] * t[0] - side[0] * t[2],
+                        side[0] * t[1] - side[1] * t[0],
+                    ];
+                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    if len < 1e-8 {
+                        return [0.0, 1.0, 0.0];
+                    }
+                    n = [n[0] / len, n[1] / len, n[2] / len];
+                    if n[1] < 0.0 { [-n[0], -n[1], -n[2]] } else { n }
+                };
+                let n0 = normal_of(a0, t0);
+                let idx_base = vertices.len() as u32;
+                let quad = [
+                    (points[j], a0, n0, [s0, 0.0], t0),
+                    (points[j], [-a0[0], -a0[1], -a0[2]], n0, [s0, 1.0], t0),
+                    (points[j + 1], [-a1[0], -a1[1], -a1[2]], n0, [s1, 1.0], t1),
+                    (points[j + 1], a1, n0, [s1, 0.0], t1),
+                ];
+                for (p, off, normal, uv, tan) in quad {
+                    vertices.push(crate::mesh::Vertex {
+                        position: [p[0] + off[0], p[1] + off[1], p[2] + off[2]],
+                        normal,
+                        uv,
+                    });
+                    tangents.push([tan[0], tan[1], tan[2], 1.0]);
+                }
+                indices.extend_from_slice(&[
+                    idx_base,
+                    idx_base + 1,
+                    idx_base + 2,
+                    idx_base,
+                    idx_base + 2,
+                    idx_base + 3,
+                ]);
+            }
+        }
+    }
+
+    crate::mesh::MeshData {
+        vertices,
+        indices,
+        skin: None,
+        tangents: Some(tangents),
+        uv2: None,
+        morph: None,
+    }
 }
 
 #[cfg(test)]
