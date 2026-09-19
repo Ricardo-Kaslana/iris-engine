@@ -108,9 +108,12 @@ pub mod environment;
 pub mod fog;
 pub mod foot_ik;
 pub mod frustum;
+pub mod fur;
+pub mod groom;
 pub mod hand_ik;
 pub mod instance;
 pub mod irradiance;
+pub mod kajiya_kay;
 pub mod light;
 pub mod light_bins;
 pub mod lightmap;
@@ -193,7 +196,15 @@ pub mod prelude {
         FOG_STEPS, FogSettings, fog_density_at, fog_dither, fog_phase_hg, fog_transmittance,
     };
     pub use crate::foot_ik::{FootIk, IkRig, solve_two_bone_ik, update_foot_ik};
+    // 毛发 v1（R90）：发带 groom + 壳层 + Kajiya-Kay 材质参数
     pub use crate::frustum::Frustum;
+    pub use crate::fur::{
+        HairStrands, ShellFur, ShellInstanceRaw, expand_shell_instances, shell_layer_ratios,
+    };
+    pub use crate::groom::{
+        HAIR_VERTEX_LAYOUT, HairGroomParams, HairStrandMesh, HairStrandVertex,
+        generate_hair_strands,
+    };
     pub use crate::hand_ik::{HandIk, IkTarget, update_hand_ik};
     pub use crate::instance::InstanceRaw;
     pub use crate::irradiance::{
@@ -223,7 +234,7 @@ pub mod prelude {
         LIGHTMAP_DILATE_ITERATIONS, LightmapBinding, LightmapHandle, LightmapInstall, LightmapItem,
         LightmapStore, NO_LIGHTMAP, build_uv2_mesh, dilate_atlas, f32_to_f16, install_lightmap,
     };
-    pub use crate::material::{AlphaMode, MaterialDef, MaterialHandle, MaterialStore};
+    pub use crate::material::{AlphaMode, KajiyaKay, MaterialDef, MaterialHandle, MaterialStore};
     pub use crate::mesh::{
         LodMesh, LodSettings, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex,
         primitives,

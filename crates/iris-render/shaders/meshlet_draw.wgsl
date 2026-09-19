@@ -87,6 +87,9 @@ struct VertexOutput {
     @location(3) tangent: vec4<f32>,
     @location(4) uv2: vec2<f32>,
     @location(5) probe: vec4<f32>,
+    // 毛发辅助通道（R90，影子契约——四方同步见 standard.wgsl 同名结构）：
+    // meshlet 路径恒写 0（不进壳层裁剪语义）
+    @location(6) fur_aux: vec4<f32>,
 };
 
 @vertex
@@ -119,6 +122,7 @@ fn vs_main(
         degenerate.tangent = vec4<f32>(0.0);
         degenerate.uv2 = vec2<f32>(0.0);
         degenerate.probe = vec4<f32>(0.0);
+        degenerate.fur_aux = vec4<f32>(0.0);
         return degenerate;
     }
 
@@ -146,5 +150,6 @@ fn vs_main(
     out.tangent = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     out.uv2 = vec2<f32>(0.0, 0.0);
     out.probe = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    out.fur_aux = vec4<f32>(0.0);
     return out;
 }

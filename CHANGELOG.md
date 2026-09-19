@@ -5,6 +5,76 @@
 
 ## [Unreleased]
 
+### Added（R90 毛发 v1：双路线——壳层 shell fur × Kajiya-Kay 发带 + AlphaMask cutout）
+
+路线图 v5 第三梯队尾巴首役（毛发 1/2）。设计四点裁定（2026-09-19，
+主会话按推荐定稿）：**相机面向展宽带**（路线图原文「相机面向条带」
+的忠实落地，粒子 v2 ribbon 同范式）/ **fs_shaded 材质 flag 分支**
+（单一事实源，光源循环零复制）/ **实例化壳层**（instance_index 布局
+同族、层比进实例数据）/ **本轮补 AlphaMask**（glTF MASK 规范缺口
+顺手闭合）。兼容硬约束：毛发组件与 KK/cutout 材质参数全部缺席 =
+逐位不变——既有全部 FNV 基线零改动原值通过（normal / transparent /
+shadow_v2 / sss 等像素锁实测，R63 式 ±1 LSB 编译器 FMA 漂移未出现
+——KK 走独立贡献函数 `kk_light` + uniform 门，`pbr_light` /
+`point_light_contrib` 本体零触碰的兑现）。
+
+- **程序化 groom 生成器**（`groom.rs`）：`generate_hair_strands`
+  纯函数——头皮圆盘面积均匀采样 + −Y 下垂 + 逐束随机方位正弦弯曲
+  （Scheuermann 简化），随机性全部来自 mix64 无状态哈希流
+  （`particles.rs` 同款），**逐束随机字消费序即契约**（同参数同种子
+  ⇒ 同网格逐字节，单测锁定）。发带控制网格 = 逐控制点「位置 + 中心
+  差分切线 + 线性宽度 + 沿丝参数」，相邻段共享控制点顶点 ⇒ hair_vs
+  展宽后关节无缝（发带是 cutout 不是软边 alpha——无缝必须由数据共享
+  保证，单测钉死）。
+- **发带管线**（`hair_vs.wgsl` + standard.wgsl `fs_main` 复用）：
+  相机面向屏幕空间展宽——投影常量从 **view_proj 列长推导**
+  （`length(view_proj[1].xyz)` = 1/tan(fov/2)，宽高比同法——零
+  Globals 扩容、零新 uniform，skybox 并行布局陷阱零触碰）；伪法线
+  （视线在垂直发丝平面上的投影）逐顶点算好走 world_normal 通道 ⇒
+  fs_shaded 的 n 零改动；cull None（屏幕展宽绕向随相机变化）+
+  REPLACE + 深度写（cutout 语义）。
+- **Kajiya-Kay 着色**（`kajiya_kay.rs` CPU 镜像 + WGSL `kk_light` /
+  `kk_point_contrib`）：漫反射 = max(0, sin(T·L)) KK 原式；高光 =
+  sin(T'·H)^exponent，T' = normalize(T + N·shift·(2t−1)) 根梢移位；
+  高光颜色 = mix(白, albedo, 0.5) 固定式（无旋钮不设——R89 铁律）；
+  sin 一律 sqrt(1−cos²)（libm asin/acos 无位级保证）。间接项（IBL /
+  探针 / 光照贴图）维持各向同性伪法线路径（v1 边界）。CPU 镜像
+  `kk_lobe` 解析锚单测（垂直峰 / 平行零 / 移位峰值角差 ≈ 4·shift /
+  exponent 半宽单调）+ WGSL 源码层看门（改公式漏同步即挂）。
+- **壳层管线**（`shell_vs.wgsl` + fs_main 复用）：单网格 N 实例一次
+  draw，层比 t = k/N 进实例数据（`ShellInstanceRaw` = InstanceRaw +
+  loc15，144 B），VS 沿法线膨胀 t × height、fur_aux varying 传层比；
+  FS 统一 cutout 判定 `base.a < max(材质 cutoff, fur_aux.x)`——
+  密度贴图即毛长图（值 d 处毛长 = d × height，毛尖渐隐）。底皮照常
+  走普通不透明路径（壳层实体 = Mesh+Material 实体挂 `ShellFur` 组件，
+  缺席 = 只画底皮 = 现状）。
+- **AlphaMask**（glTF MASK 语义闭合）：`AlphaMode::Mask` +
+  `MaterialDef::alpha_cutoff`（缺省 0.5 = 规范默认）——不透明分区
+  （深度写 / 批处理 / 剔除语义与 Opaque 全同），fs_shaded 开头逐像素
+  discard；glTF `alphaMode:"MASK"` + `alphaCutoff` 接线；场景 JSON
+  `alpha_mode:"Mask"` + `alpha_cutoff`（缺省省略 ⇒ 旧档往返字节级
+  不变）；热重载参数补丁纳入两字段。**阴影为实心近似**（深度 pass
+  不感知 alpha），alpha 感知阴影与毛发阴影一起留 R91。
+- **VertexOutput 影子契约扩展**：`fur_aux`（@location(6)）在四个 VS
+  module 并行声明（standard / meshlet_draw / hair_vs / shell_vs），
+  看门测试 `vertex_output_fur_aux_matches_standard_layout` 源码层
+  拦截（skybox Globals 前缀先例；既有路径恒写 0 ⇒ fs_shaded 只在
+  > 0 时进壳层裁剪语义）。
+- **测试**（CPU 17 + GPU 5）：groom 确定性双跑逐位 / 数量公式 / 几何
+  解析锚（y 单调、宽度线性、根部贴头皮）/ 关节共享 / 切线归一；KK
+  镜像五件套；壳层层比公式 / 展开保真；材质 Mask/KK 缺省与 builder
+  clamp；GPU（`fur_render.rs`，GPU_SERIAL 串行）：缺席逐位 + 双会话 /
+  发带可见性（高密度帘覆盖中心）/ 壳层毛高单调 + **毛高 0 零点锚**
+  （与不挂壳层整帧逐位）/ Mask 三档阈值（纯垫板参考渲染法）/ 复合
+  场景双会话逐位。验收图 `docs/fur.png`（左壳层 16 层绿毛 + 8 层蓝
+  毛 + 无毛红对照 / 右 KK 发帘 160 束真实着色）；快照
+  `examples/fur_snapshot.rs` 双面板双会话逐位断言。
+- **排障记录（本仓铁律兑现）**：`MeshStore::add` 从 0 起（与
+  MaterialStore 的 0 号预留不同）——首版用 mesh 句柄 0 当发带哨兵，
+  壳层拿到句柄 0 的网格被误判成发带项（GPU panic + 逐项打印定位）；
+  改显式 `FurKind` 判别。教训入档：**跨 store 的句柄值语义不一致，
+  判别位不得借用句柄值**。
+
 ### Fixed（iris-exp：中距离朦胧——视觉地面 24 m → 240 m，天空盒地平线以下渐变不再冒充雾）
 
 用户报 iris-exp 中距离画面「略微朦胧」并附截图。逐像素归因（左缘条带

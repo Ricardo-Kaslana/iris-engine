@@ -99,6 +99,14 @@ struct MaterialParams {
     // y: 曲率包裹参数 t ∈ [0, 1]（CPU 侧 sss::wrap_param 换算好），
     // z/w: 保留。与 Rust 侧 MaterialRaw 逐字段对齐（64 B）。
     sss: vec4<f32>,
+    // 毛发参数（R90，与 Rust 侧 MaterialRaw.fur 逐字段对齐，80 B）：
+    // x: Kajiya-Kay 开关（1 = 直射光换各向异性瓣；0 = 标准 PBR，
+    //    **分支整段不执行**——R63「把逐位不变交给语言语义」铁律），
+    // y: alpha cutout 阈值（0 = 不裁剪；Mask 模式与壳层层比取 max，
+    //    见 fs_shaded 开头的统一判定），
+    // z: KK 切线偏移幅度 shift（根梢高光移位），
+    // w: KK 高光锐度指数 exponent。
+    fur: vec4<f32>,
 };
 
 // ---- 阴影偏移 v2 的着色器侧常量（R61，与 light.rs 同名常量一一对应）----
@@ -315,13 +323,21 @@ struct VertexOutput {
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     // 世界空间切线：xyz = 法线矩阵变换后的切线方向（未归一化，片元
-    // 正交化），w = 手性符号（±1，插值保号——凸组合不越过 0）
+    // 正交化），w = 手性符号（±1，插值保号——凸组合不越过 0）。
+    // 发带管线（R90）把发丝方向写入 xyz——Kajiya-Kay 瓣的主方向。
     @location(3) tangent: vec4<f32>,
     // 光照贴图图集坐标（R52c，插值后直接采样——图集坐标是仿射量，
     // 透视正确插值由硬件的 1/w 校正照常处理）
     @location(4) uv2: vec2<f32>,
     // 光照探针载荷（R64）：逐实例常数，插值天然不变（四个顶点同值）
     @location(5) probe: vec4<f32>,
+    // 毛发辅助通道（R90）：x = 壳层层比 t ∈ (0, 1]（膨胀比例与逐层
+    // alpha 阈值，shell_vs.wgsl 写入）；既有路径与发带管线恒写 0
+    // （fs_shaded 只在 > 0 时进入壳层裁剪语义）。**影子契约**：本结构
+    // 在 meshlet_draw.wgsl / hair_vs.wgsl / shell_vs.wgsl 有逐字段同构的
+    // 并行声明，改动必须四方同步（看门：pipeline.rs::
+    // vertex_output_fur_aux_matches_standard_layout）。
+    @location(6) fur_aux: vec4<f32>,
 };
 
 @vertex
@@ -337,6 +353,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.tangent = vec4<f32>(normal_mat * in.tangent.xyz, in.tangent.w);
     out.uv2 = in.uv2;
     out.probe = in.probe;
+    out.fur_aux = vec4<f32>(0.0);
     return out;
 }
 
@@ -382,6 +399,7 @@ fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     out.tangent = vec4<f32>(normal_mat * (skin_nrm * in.tangent.xyz), in.tangent.w);
     out.uv2 = in.uv2;
     out.probe = in.probe;
+    out.fur_aux = vec4<f32>(0.0);
     return out;
 }
 
@@ -436,6 +454,39 @@ fn pbr_light(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
     // 能量守恒：漫反射扣除菲涅尔反射占比，金属无漫反射
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
     return (kd * albedo / 3.14159265 + specular) * radiance * nol;
+}
+
+// ---- Kajiya-Kay 各向异性毛发瓣（R90）----
+//
+// 与 Rust 侧 `iris_render::kajiya_kay` 的 `kk_lobe` **逐式同序**（CPU
+// 镜像契约：改一处必须另一处，看门 = kajiya_kay.rs 单测对 WGSL 源码的
+// 常数/公式字符串比对 + GPU 方向性断言）。v1 边界：单级高光（无
+// primary/secondary 双带）、无 Scheuermann 根梢漫反射混合、间接项
+// （IBL/探针/光照贴图）维持各向同性伪法线路径（诚实限制 §8）。
+//
+// t_strand / n_pseudo / l / v 必须已归一（调用方保证）。sin(θ) 一律用
+// `sqrt(1 − cos²)` 计算（libm 的 asin/acos 无位级保证——仓库确定性文化，
+// 同 `sqrt` 优于 `hypot` 条目）。
+//
+// 漫反射 = max(0, sin(T·L))（KK 1989 原式）；
+// 高光 = sin(T'·H)^exponent，T' = normalize(T + N·shift·(2t−1))——
+// 沿伪法线偏移切线，t = 沿发丝参数（发带 UV.x，根 0 梢 1），偏移量
+// 线性渐变产生根梢高光移位（发丝高光带倾斜的来源）；
+// 高光颜色 = mix(白, albedo, 0.5) 固定式——无独立强度旋钮（R89：不设
+// 无断言看管的旋钮）。
+fn kk_light(t_strand: vec3<f32>, n_pseudo: vec3<f32>, t_along: f32,
+            v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
+            albedo: vec3<f32>, shift: f32, exponent: f32) -> vec3<f32> {
+    let t_shift = normalize(t_strand
+        + n_pseudo * (shift * (2.0 * t_along - 1.0)));
+    let ctl = dot(t_strand, l);
+    let diffuse = sqrt(max(1.0 - ctl * ctl, 0.0));
+    let h = normalize(v + l);
+    let cth = dot(t_shift, h);
+    let sin_th = sqrt(max(1.0 - cth * cth, 0.0));
+    let spec = pow(sin_th, exponent);
+    let spec_color = mix(vec3<f32>(1.0), albedo, 0.5);
+    return (albedo * diffuse + spec_color * spec) * radiance;
 }
 
 // ---- 预积分皮肤次表面散射（R63，Penner 2011 预积分近似的引擎实现）----
@@ -925,6 +976,56 @@ fn point_light_contrib(
     }
 }
 
+// Kajiya-Kay 点光贡献（R90）：阴影采样 + 距离窗口衰减段与上方
+// `point_light_contrib` **逐式同步**（同步契约：改一处必须另一处——
+// 阴影 bias 公式 / 窗口形状的任何修订都要双边落）。不复用调用
+// （point_light_contrib 本体零触碰）的原因：在既有函数体内加 KK 分支
+// 会改变其编译器内联 / FMA 收缩决策，R63 实测以 ±1 LSB 基线漂移的
+// 形式付出过代价（见 sss_diffuse 头注释的教训记录）。
+fn kk_point_contrib(
+    color: ptr<function, vec3<f32>>,
+    world_pos: vec3<f32>, n_pseudo: vec3<f32>, t_strand: vec3<f32>,
+    t_along: f32, v: vec3<f32>, n_geo: vec3<f32>,
+    light_pos: vec3<f32>, light_rgb: vec3<f32>, light_range: f32,
+    light_shadow: vec4<f32>,
+    albedo: vec3<f32>, shift: f32, exponent: f32,
+) {
+    let to_light = light_pos - world_pos;
+    let dist = length(to_light);
+    let lp = to_light / max(dist, 1e-4);
+
+    var shadow = 1.0;
+    if (light_shadow.x > 0.5) {
+        let nol = max(dot(n_geo, lp), 0.0);
+        let texel_w = dist * POINT_SHADOW_TEXEL_SCALE;
+        let bias_m = clamp(
+            globals.point_shadow_params.y
+                + globals.point_shadow_params.z * texel_w * slope_tan(nol),
+            globals.point_shadow_params.y,
+            POINT_SHADOW_BIAS_MAX,
+        );
+        let n_off = min(
+            globals.point_shadow_params.w * texel_w * (1.0 - nol),
+            POINT_SHADOW_NORMAL_MAX,
+        );
+        let dir = (world_pos + n_geo * n_off - light_pos)
+            / max(dist, 1e-4);
+        let range = max(light_range, 1e-4);
+        let stored = textureSampleLevel(point_shadow_cube, shadow_sampler, dir,
+                                        i32(light_shadow.y), 0.0).r;
+        shadow = select(0.0, 1.0, stored >= dist / range - bias_m / range);
+    }
+
+    if (dist < light_range) {
+        let t = dist / light_range;
+        let window = 1.0 - t * t;
+        let atten = (window * window) / max(dist * dist, 0.01);
+        let pl = light_rgb * atten * shadow;
+        *color = *color + kk_light(t_strand, n_pseudo, t_along, v, lp,
+                                   pl, albedo, shift, exponent);
+    }
+}
+
 // ---- GI 探针三阶 SH（R83）----
 //
 // 实球谐归一化常数（L0–L2）。**与 Rust 侧 irradiance.rs 的 SH_Y0 / SH_Y1 /
@@ -1199,6 +1300,16 @@ fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>, env_fallback: vec3<f32>) 
 // 先例），既有全部像素基线即共享体的逐位锁。
 fn fs_shaded(in: VertexOutput) -> vec4<f32> {
     let base = material.base_color * textureSample(base_texture, base_sampler, in.uv);
+    // alpha cutout 统一判定（R90）：有效阈值 = max(材质 cutoff, 壳层层比
+    // fur_aux.x)。两个开关都关闭（= 0）时分支整段不执行——既有像素不
+    // 引入任何算术（R63「把逐位不变交给语言语义」铁律）。Mask 模式与
+    // 壳层共用这一个比较点：壳层片元的阈值 = 本层膨胀比例 t，密度
+    // （base.a）不足的片元丢弃——毛尖渐隐的来源。
+    if (material.fur.y > 0.0 || in.fur_aux.x > 0.0) {
+        if (base.a < max(material.fur.y, in.fur_aux.x)) {
+            discard;
+        }
+    }
     let albedo = base.rgb;
     // ORM 打包（线性采样）：R = AO、G = 粗糙度、B = 金属度；标量因子
     // 作倍率相乘（glTF factor × texel 语义）。中性 ORM = (1,1,1) 时
@@ -1223,11 +1334,22 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
     let l = normalize(globals.light_dir.xyz);
     let sun = shadow_factor(in.world_pos, n_geo, l);
     let radiance = globals.light_color.rgb * sun;
-    var color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
-    // 预积分 SSS 补项（R63）：radiance 已含 CSM 阴影因子 ⇒ 阴影内补项为 0。
-    if (material.sss.x > 0.0) {
-        color = color + sss_diffuse(n, l, radiance, albedo, metallic,
-                                    material.sss.x, material.sss.y);
+    // Kajiya-Kay 各向异性直射（R90）：材质 uniform 门（fur.x）二选一——
+    // 关闭时 else 支的语句序与引入前逐条相同（pbr_light + SSS 补项），
+    // 既有像素逐位不变；开启时整条贡献换成 KK 瓣（漫反射 sin(T·L) +
+    // 移位切线高光），发丝方向 = 插值切线（发带 VS 写入 tangent.xyz），
+    // 伪法线 = 发带 VS 预计算的视图投影法线（world_normal 通道）。
+    var color: vec3<f32>;
+    if (material.fur.x > 0.5) {
+        color = kk_light(normalize(in.tangent.xyz), n, in.uv.x, v, l,
+                         radiance, albedo, material.fur.z, material.fur.w);
+    } else {
+        color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
+        // 预积分 SSS 补项（R63）：radiance 已含 CSM 阴影因子 ⇒ 阴影内补项为 0。
+        if (material.sss.x > 0.0) {
+            color = color + sss_diffuse(n, l, radiance, albedo, metallic,
+                                        material.sss.x, material.sss.y);
+        }
     }
 
     // 点光：物理平方衰减 + range 平滑窗口；投影灯（预算内多盏）各自受
@@ -1240,11 +1362,21 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
     if (bins_params.counts.x < 0.5) {
         for (var i = 0u; i < count; i = i + 1u) {
             let light = globals.point_lights[i];
-            point_light_contrib(&color, in.world_pos, n, v, n_geo,
-                                light.position.xyz, light.color.rgb, light.color.w,
-                                light.shadow,
-                                albedo, f0, metallic, roughness,
-                                material.sss.x, material.sss.y);
+            // KK 材质门（R90，uniform 条件）：两支调用同一灯表同一序，
+            // 只是贡献函数二选一——else 支语句序与 R78 逐条相同。
+            if (material.fur.x > 0.5) {
+                kk_point_contrib(&color, in.world_pos, n,
+                                 normalize(in.tangent.xyz), in.uv.x, v, n_geo,
+                                 light.position.xyz, light.color.rgb, light.color.w,
+                                 light.shadow,
+                                 albedo, material.fur.z, material.fur.w);
+            } else {
+                point_light_contrib(&color, in.world_pos, n, v, n_geo,
+                                    light.position.xyz, light.color.rgb, light.color.w,
+                                    light.shadow,
+                                    albedo, f0, metallic, roughness,
+                                    material.sss.x, material.sss.y);
+            }
         }
     }
 
@@ -1276,11 +1408,21 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
                 light_rgb = light_rgb
                     * spot_cone_factor(cos_theta, light.cone.w, light.outer.x);
             }
-            point_light_contrib(&color, in.world_pos, n, v, n_geo,
-                                light.pos_type.xyz, light_rgb, light.color_range.w,
-                                light.shadow,
-                                albedo, f0, metallic, roughness,
-                                material.sss.x, material.sss.y);
+            // KK 材质门（R90）：与均匀门循环同款二选一（else 支 = R78
+            // 分箱路径原语句序）。
+            if (material.fur.x > 0.5) {
+                kk_point_contrib(&color, in.world_pos, n,
+                                 normalize(in.tangent.xyz), in.uv.x, v, n_geo,
+                                 light.pos_type.xyz, light_rgb, light.color_range.w,
+                                 light.shadow,
+                                 albedo, material.fur.z, material.fur.w);
+            } else {
+                point_light_contrib(&color, in.world_pos, n, v, n_geo,
+                                    light.pos_type.xyz, light_rgb, light.color_range.w,
+                                    light.shadow,
+                                    albedo, f0, metallic, roughness,
+                                    material.sss.x, material.sss.y);
+            }
         }
     }
 

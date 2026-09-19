@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1685 / release 1682**（C4a 形变目标 +12 / C4b 状态机 v2 与运行时重定向 +15 / C5a-1 BC7 Mode 6 编码器 +13 / C5a-2 KTX2 容器 +11（解析 6 含拒收五类与 mipPadding 剥离 / 目录侧表 2 / GPU 端到端 2 含硬件解码保真兜底闸 / 场景 `.ktx2` 装载 1）/ C5b 热重载局部 +5（端到端参数应用与纹理句柄不动 / 缺席零触碰 / 节流与坏内容消费两旋钮 / 未命中收集 / 去重共享旁证，全 CPU headless）/ C6 空间化 v3 +11（iris-audio 8：多普勒静止逐位锚 / 双向径向解析值 / 钳界病态 / muffle 系数解析 / 阶跃爬坡跨调用持久 / 旁路三型逐位 / 端到端过零率升频 / 句柄卫生与声速旋钮；iris-engine 3：帧差分速度解析 / 遮挡二值与 opt-in / 自碰撞体豁免，全 headless）；C7a DDGI 同源役 +14（iris-render ddgi 9：缺席档逐位锚 / WGSL↔Rust 常数双看门 / 程序化解析向 / HDR nearest 映射解析 / 点光窗口解析值 / 遮板硬影逐位零 / 锥门控与点光逐位等 / 指纹行为组 / 滚动脏-收敛-判别全链；iris-engine 4：收集口径 / 快照优先级链 / 火把端到端+空集锚 / 天空方向性双向证据；GPU 1：火把 ROI 抬亮+稳态逐位+天空可判别）；C7b OIT 役 +9（iris-render oit CPU 6：权重地板/饱和/窗口域退化/单层兼容锚/无覆盖逐位恒等/交换序逐位 + transparent_render GPU 3：顺序无关主测（交换 spawn 序 painter 变、OIT 整帧逐位）/缺席逐位+无覆盖护栏+单层锚/双会话逐位）；BC7 永不自动、KTX2 仅未压缩 + mip 级、HRTF 按三门裁出回池、C4c 动画压缩同前裁出；全部 opt-in「缺席 = 逐位不变」，既有物理/渲染/游戏/音频快照测试零改动原值通过；**C6 收官、C7 收官 ⇒ 闭合战役 C0~C7 全部完成**；新功能批次（W8/R90 等）待用户重启裁定；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1707 / release 1704**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1685 / release 1682）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1707 / release 1704）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -139,7 +139,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1685 / release 1682；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1707 / release 1704；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -183,7 +183,14 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     （贴图互斥/覆盖度混合/ambient 分摊/捕获零阶/SSR 一致性）× 覆盖度连续化
     `cov` 修 §8.57⑬⑱ × 编辑器入口（BakeExcluded + 参数步进 + 可视化 +
     level.ddgi 入档）× Fixed 两条既有 bug（SSR 强度死旋钮 26 轮 / reset_taa
-    漏清时域状态）；诚实限制 §8.58，闭合 frictions ⑬）、R90/R91 毛发、
+    漏清时域状态）；诚实限制 §8.58，闭合 frictions ⑬）、R90 毛发 v1 ✅
+    （双路线：实例化壳层 shell fur（层比进实例数据 + FS 统一 cutout，
+    base 贴图 alpha 即毛长图）× Kajiya-Kay 相机面向发带（groom 程序化
+    生成 + hair_vs 屏幕展宽（投影常量从 view_proj 列长推导，零 Globals
+    扩容）+ fs_shaded 材质 flag 分支（R63 FMA 教训兑现：`pbr_light`/
+    `point_light_contrib` 本体零触碰，既有像素锁原值通过））+ AlphaMask
+    （glTF MASK 闭合，阴影实心近似）；设计四点裁定全按推荐；缺席 =
+    逐位不变；诚实限制 §8.69）、R91 毛发 v2（风场摆动/LOD/阴影）、
     R92 降水、R93 海洋 v2+水下（CPU 位移图
     折衷，裁定接受）
   - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /

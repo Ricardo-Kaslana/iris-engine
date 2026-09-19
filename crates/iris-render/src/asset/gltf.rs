@@ -195,10 +195,14 @@ struct GltfMaterial {
     #[serde(default)]
     occlusion_texture: Option<GltfTextureInfo>,
     /// glTF `alphaMode`：`"OPAQUE"`（默认）/ `"MASK"` / `"BLEND"`。
-    /// `"BLEND"` 映射 [`AlphaMode::Blend`]（透明 pass）；`"MASK"` 需要
-    /// alpha cutoff 逐像素裁剪，v1 按不透明处理（与数值直通约定一致）。
+    /// `"BLEND"` 映射 [`AlphaMode::Blend`]（透明 pass）；`"MASK"` 映射
+    /// [`AlphaMode::Mask`]（R90：不透明分区 + 逐像素 cutoff 裁剪）。
     #[serde(default)]
     alpha_mode: String,
+    /// glTF `alphaCutoff`（`alphaMode: "MASK"` 时的裁剪阈值，规范默认
+    /// 0.5）。只在 MASK 模式消费；缺省值与 glTF 规范一致。
+    #[serde(default = "default_alpha_cutoff")]
+    alpha_cutoff: f32,
     /// glTF `doubleSided`（缺省 false = 单面）：`true` 映射
     /// [`MaterialDef::double_sided`]（R66d，管线关闭背面剔除）——发片 /
     /// 叶片类资产两朝向可见的规范声明，历史版本丢弃该字段导致顶视角
@@ -231,6 +235,11 @@ struct GltfPbr {
 
 fn default_metallic() -> f32 {
     1.0
+}
+
+/// glTF 规范的 alphaCutoff 默认值（`alphaMode: "MASK"`）。
+fn default_alpha_cutoff() -> f32 {
+    0.5
 }
 
 fn default_base_color() -> [f32; 4] {
@@ -1075,12 +1084,19 @@ impl GltfLoader {
                     metallic: pbr.metallic_factor.clamp(0.0, 1.0),
                     roughness: pbr.roughness_factor.clamp(0.0, 1.0),
                     texture,
-                    // alphaMode "BLEND" → 透明 pass；OPAQUE / MASK（v1）→ 不透明
+                    // alphaMode（R90 起三态全接）："BLEND" → 透明 pass；
+                    // "MASK" → cutout（不透明分区 + 逐像素 discard，阈值
+                    // = alphaCutoff，规范默认 0.5）；OPAQUE → 不透明。
                     alpha_mode: if mat.alpha_mode.eq_ignore_ascii_case("BLEND") {
                         AlphaMode::Blend
+                    } else if mat.alpha_mode.eq_ignore_ascii_case("MASK") {
+                        AlphaMode::Mask
                     } else {
                         AlphaMode::Opaque
                     },
+                    // glTF alphaCutoff 直通（MASK 时消费；gltf crate 缺席
+                    // 值 = 规范默认 0.5，与引擎缺省一致）
+                    alpha_cutoff: mat.alpha_cutoff,
                     // glTF doubleSided 直通（R66d）：缺省 false = 单面剔除
                     double_sided: mat.double_sided,
                     normal_texture: None,
@@ -1091,6 +1107,9 @@ impl GltfLoader {
                     // 需要 SSS 的调用方在导入后覆写 MaterialDef 字段。
                     subsurface_strength: MaterialDef::default().subsurface_strength,
                     subsurface_scale: MaterialDef::default().subsurface_scale,
+                    // Kajiya-Kay（R90）：glTF 无毛发着色标准，导入恒关；
+                    // 发带材质由调用方以 with_kajiya_kay 组装。
+                    kajiya_kay: None,
                 };
                 // 法线贴图（R42）：线性数据贴图
                 if let Some(info) = &mat.normal_texture {

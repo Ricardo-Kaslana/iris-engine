@@ -156,7 +156,7 @@ use iris_render::asset::{
     spawn_gltf_instance_from_bytes,
 };
 use iris_render::prelude::{
-    AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, MaterialDef,
+    AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, KajiyaKay, MaterialDef,
     MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, ParticleBlend, ParticleEmitter,
     ParticleEmitterV2, PointLight, ReflectionProbe, SkySource, SkySourceKind, TextureHandle,
     TextureStore, Visibility, grass_textures,
@@ -686,6 +686,18 @@ pub struct MaterialSection {
     /// 已调好的尺度参数，重新开启时观感连续）。
     #[serde(skip_serializing_if = "sss_scale_is_default")]
     pub subsurface_scale: f32,
+    /// alpha cutout 阈值（R90，glTF `alphaCutoff` 语义）：`alpha_mode =
+    /// Mask` 时消费。**缺省 0.5 时省略** ⇒ v2 旧档（无该字段）反序列化
+    /// 得缺省、重存后仍不含该字段（往返逐字节不变，与 SSS 字段同款
+    /// 可选增量形态）；`Opaque` / `Blend` 模式不消费该字段（序列化仍按
+    /// 独立判定省略）。
+    #[serde(skip_serializing_if = "alpha_cutoff_is_default")]
+    pub alpha_cutoff: f32,
+    /// Kajiya-Kay 各向异性毛发着色（R90）：`None`（缺省）= 标准 PBR，
+    /// **序列化省略**；`Some` = 直通两个参数（`shift` / `exponent`）。
+    /// 发带材质的关卡格式入口。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kajiya_kay: Option<KajiyaKay>,
 }
 
 impl Default for MaterialSection {
@@ -702,8 +714,15 @@ impl Default for MaterialSection {
             double_sided: false,
             subsurface_strength: MaterialDef::default().subsurface_strength,
             subsurface_scale: MaterialDef::default().subsurface_scale,
+            alpha_cutoff: MaterialDef::default().alpha_cutoff,
+            kajiya_kay: None,
         }
     }
+}
+
+/// `alpha_cutoff` 的序列化省略条件：引擎缺省 0.5（glTF 规范默认）。
+fn alpha_cutoff_is_default(cutoff: &f32) -> bool {
+    *cutoff == MaterialDef::default().alpha_cutoff
 }
 
 /// `alpha_mode` 序列化省略条件：不透明（与引擎默认一致）。
@@ -743,6 +762,8 @@ impl MaterialSection {
             double_sided: self.double_sided,
             subsurface_strength: self.subsurface_strength,
             subsurface_scale: self.subsurface_scale,
+            alpha_cutoff: self.alpha_cutoff,
+            kajiya_kay: self.kajiya_kay,
         }
     }
 
@@ -778,6 +799,8 @@ impl MaterialSection {
             double_sided: def.double_sided,
             subsurface_strength: def.subsurface_strength,
             subsurface_scale: def.subsurface_scale,
+            alpha_cutoff: def.alpha_cutoff,
+            kajiya_kay: def.kajiya_kay,
         }
     }
 }
@@ -1748,6 +1771,8 @@ pub struct MaterialParamPatch {
     pub double_sided: bool,
     pub subsurface_strength: f32,
     pub subsurface_scale: f32,
+    pub alpha_cutoff: f32,
+    pub kajiya_kay: Option<iris_render::material::KajiyaKay>,
 }
 
 /// 点光参数补丁（组件四字段直通）。
@@ -1812,6 +1837,8 @@ impl From<&MaterialSection> for MaterialParamPatch {
             double_sided: s.double_sided,
             subsurface_strength: s.subsurface_strength,
             subsurface_scale: s.subsurface_scale,
+            alpha_cutoff: s.alpha_cutoff,
+            kajiya_kay: s.kajiya_kay,
         }
     }
 }
@@ -1904,6 +1931,8 @@ pub fn apply_scene_param_patch(world: &mut World, patch: &SceneParamPatch) -> Pa
                         def.double_sided = m.double_sided;
                         def.subsurface_strength = m.subsurface_strength;
                         def.subsurface_scale = m.subsurface_scale;
+                        def.alpha_cutoff = m.alpha_cutoff;
+                        def.kajiya_kay = m.kajiya_kay;
                         report.materials_applied += 1;
                     } else {
                         log::warn!("热重载：实体「{name}」材质句柄 {h:?} 失效，补丁跳过");

@@ -223,7 +223,7 @@ const _: () = assert!(
 /// 阴影暗部保留的光照比例（0 = 全黑阴影，1 = 无阴影）。
 const SHADOW_STRENGTH: f32 = 0.45;
 
-/// 与 WGSL `MaterialParams` 结构对齐（64 字节，POD）。
+/// 与 WGSL `MaterialParams` 结构对齐（80 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialRaw {
@@ -233,13 +233,17 @@ struct MaterialRaw {
     surface: [f32; 4],
     // x: 预积分 SSS 强度（R63，0 = 关闭——着色器分支整段跳过），
     // y: 曲率包裹参数 t ∈ [0, 1]（CPU 由 sss::wrap_param 换算好，
-    //    着色器不做除法），z/w: 保留
+    //    着色器不做除法）， z/w: 保留
     sss: [f32; 4],
+    // 毛发参数（R90，与 WGSL MaterialParams.fur 逐字段对齐）：
+    // x: KK 开关（0/1）、y: alpha cutout 阈值（0 = 不裁；仅 Mask 模式
+    // 与壳层写入非零值）、z: KK shift、w: KK exponent
+    fur: [f32; 4],
 }
 
 const _: () = assert!(
-    std::mem::size_of::<MaterialRaw>() == 64,
-    "MaterialParams 必须与 WGSL 布局一致（R63 起 64 B）"
+    std::mem::size_of::<MaterialRaw>() == 80,
+    "MaterialParams 必须与 WGSL 布局一致（R90 起 80 B）"
 );
 
 struct GpuMesh {
@@ -319,6 +323,40 @@ struct MorphGpu {
     capacity_bytes: u64,
     /// 上次上传的权重位图案（一致 ⇒ 不重混合、不重上传）。
     last_weights: Vec<u32>,
+}
+
+/// 发带控制网格的 GPU 缓冲（R90）：键 = 发带实体位（`hair_gpu`）。
+/// 生命周期同 `GpuSkin`——只增缓存、销毁不回收（有界垃圾）。
+struct HairGpu {
+    vertex_buf: wgpu::Buffer,
+    index_buf: wgpu::Buffer,
+    num_indices: u32,
+}
+
+/// 毛发项的路线判别（R90）。**不能用 mesh 句柄 0 当发带哨兵**：
+/// `MeshStore::add` 从 0 起（0 号不预留），合法网格句柄可以是 0。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FurKind {
+    /// 壳层：底皮网格顶点 + 层比实例区间。
+    Shell,
+    /// 发带：控制网格（`hair_gpu` 缓存）+ 单实例。
+    Hair,
+}
+
+/// 一帧内收集到的毛发绘制项（R90）。壳层项 = 底皮之外的附加膨胀层
+///（底皮照常走普通不透明路径）；发带项 = 独立控制网格 draw。
+/// 收集序 = 壳层全部项后发带全部项（各自 query 内实体位升序，
+/// 查询序无关的确定性）。
+struct FurItem {
+    kind: FurKind,
+    /// 实体位标识（发带 GPU 缓存键 + 绘制序并列键）。
+    entity: u64,
+    /// 网格句柄值（壳层 = 底皮网格；发带 = 不消费）。
+    mesh: u32,
+    /// 材质句柄值。
+    material: u32,
+    /// 展开后的壳层实例（发带 = 单实例、shell 分量恒零）。
+    instances: Vec<crate::fur::ShellInstanceRaw>,
 }
 
 /// 一帧内收集到的透明绘制项：不透明项额外携带视深排序键。
@@ -550,6 +588,17 @@ pub struct Renderer {
     /// [`MorphWeights`](crate::morph::MorphWeights) 且网格有 morph 表的
     /// 实体进入，缺席路径零触碰）。
     morph_gpu: HashMap<u64, MorphGpu>,
+    /// 毛发 v1（R90）：发带实体位 → 控制网格 GPU 缓冲（顶点 + 索引）。
+    /// 按实体位缓存、跨帧持有——**运行期改 `HairStrands.mesh` 不生效**
+    /// （需新实体；句柄值缓存纪律同 mesh_gpu / skin_gpu，R53/R62 跨世界
+    /// 对照必须独立渲染器）。销毁不回收（有界垃圾，随世代位复用自愈）。
+    hair_gpu: HashMap<u64, HairGpu>,
+    /// 毛发实例缓冲（R90）：壳层 + 发带共用一份 `ShellInstanceRaw`
+    /// 数组（发带实例 shell 分量恒零，管线 slot 布局统一 144 B），
+    /// 每帧全量上传（实例量级小，贴花 / 粒子同款口径，**不进**
+    /// 主实例缓冲的增量比对）。容量不足时重建。
+    fur_instance_buf: Option<wgpu::Buffer>,
+    fur_instance_capacity: usize,
     /// 形变顶点缓冲的实际上传帧次累计（观测口径：脏检生效时不增长，
     /// 供测试断言「静态权重 ⇒ 零重上传」）。
     morph_uploads: u64,
@@ -791,6 +840,8 @@ pub struct Renderer {
     particle_v2_pools: Vec<ParticleV2Pool>,
     /// 粒子 v2 收集暂存（跨帧复用）。
     particle_v2_scratch: Vec<ParticleV2Item>,
+    /// 毛发 v1（R90）收集暂存（跨帧复用，`std::mem::take` 借出 / 末尾归还）。
+    fur_scratch: Vec<FurItem>,
     /// meshlet GPU 资源束（R85；首个 meshlet 实例在场时惰性创建，缺席 =
     /// 不创建零开销）。
     meshlet_gpu: Option<MeshletGpu>,
@@ -1877,6 +1928,12 @@ pub struct FrameStats {
     /// 缺席；`k`（= `DdgiSettings::probes_per_frame`）= 滚动窗口满载。
     /// 收敛进度可由「连续非零帧数 × k」对账（= `⌈n_dirty / k⌉`）。
     pub ddgi_updated: u32,
+    /// 本帧发带 draw 数（R90，观测字段，**不进任何排序键**）：= 可见
+    /// `HairStrands` 实体数（每实体一次 draw）。0 = 无发带组件。
+    pub hair_strands_drawn: u32,
+    /// 本帧壳层毛提交的膨胀层数（R90，观测字段，不进排序键）：
+    /// = 各可见 `ShellFur` 实体的 `layers` 之和（每实体一次 draw）。
+    pub shell_layers_drawn: u32,
 }
 
 /// 变化实例数超过实例总数的该比例时，放弃碎段增量、回退整段全量上传——
@@ -2606,6 +2663,106 @@ fn collect_instances(
         visible: items.len() + skinned.len() + transparent.len() + transparent_skinned.len(),
         culled,
     }
+}
+
+/// 毛发 v1（R90）收集：壳层附加膨胀层 + 发带控制网格。
+///
+/// 壳层底皮**不在此列**——`ShellFur` 实体的普通实例照常由
+/// `collect_instances` 收集（不透明段画底皮）；此处只展开附加壳层
+/// （[`crate::fur::expand_shell_instances`]）。发带走独立管线（发带
+/// 实体不挂 `MeshHandle` 时不进普通收集；挂了则两者并存——底皮 +
+/// 发带各画各的）。剔除口径与普通项同款（包围球 + 最大列缩放），
+/// 壳层半径额外加毛高（膨胀后的毛在底皮球之外）。
+///
+/// 缺席语义：无 `ShellFur` / `HairStrands` 组件 = 两个查询空转、返回
+/// 空表——零计算零绘制（与引入前逐位一致）。
+///
+/// 探针 / DDGI 载荷：v1 置零（全局 env 兜底）——毛发不进逐实体 GI
+/// 载荷，诚实限制 §8。
+fn collect_fur_items(
+    world: &iris_core::world::World,
+    mesh_store: &MeshStore,
+    frustum: &Frustum,
+    items: &mut Vec<FurItem>,
+) -> (u32, u32) {
+    items.clear();
+    let mut shell_layers = 0u32;
+    let mut hair_strands = 0u32;
+    // 壳层：底皮网格 bounds 球 + 毛高扩半径（保守）
+    world.query::<(
+        iris_core::prelude::Entity,
+        &GlobalTransform,
+        &MaterialHandle,
+        &MeshHandle,
+        &crate::fur::ShellFur,
+        Option<&Visibility>,
+    )>(|(e, gt, mat, mesh, fur, visibility)| {
+        if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
+            return;
+        }
+        let model = gt.matrix();
+        let bounds = mesh_store.get(*mesh).and_then(|data| data.bounds());
+        if let Some((min, max)) = bounds {
+            let min = Vec3::from(min);
+            let max = Vec3::from(max);
+            let center_world = model.transform_point3((min + max) * 0.5);
+            let radius_local = (max - min).length() * 0.5 + fur.height;
+            let scale = model
+                .x_axis
+                .truncate()
+                .length()
+                .max(model.y_axis.truncate().length())
+                .max(model.z_axis.truncate().length());
+            if !frustum.intersects_sphere(center_world, radius_local * scale) {
+                return;
+            }
+        }
+        // 无 bounds：不剔除（宁可多画，普通项同款退化）
+        let base = InstanceRaw::from_matrix(model);
+        shell_layers += fur.layers;
+        items.push(FurItem {
+            kind: FurKind::Shell,
+            entity: e.to_bits(),
+            mesh: mesh.0,
+            material: mat.0,
+            instances: crate::fur::expand_shell_instances(fur, base),
+        });
+    });
+    // 发带：组件包围球（实体局部）→ 世界
+    world.query::<(
+        iris_core::prelude::Entity,
+        &GlobalTransform,
+        &MaterialHandle,
+        &crate::fur::HairStrands,
+        Option<&Visibility>,
+    )>(|(e, gt, mat, hair, visibility)| {
+        if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
+            return;
+        }
+        let model = gt.matrix();
+        let center_world = model.transform_point3(Vec3::from(hair.bounds_center));
+        let scale = model
+            .x_axis
+            .truncate()
+            .length()
+            .max(model.y_axis.truncate().length())
+            .max(model.z_axis.truncate().length());
+        if !frustum.intersects_sphere(center_world, hair.bounds_radius * scale) {
+            return;
+        }
+        hair_strands += 1;
+        items.push(FurItem {
+            kind: FurKind::Hair,
+            entity: e.to_bits(),
+            mesh: 0,
+            material: mat.0,
+            instances: vec![crate::fur::ShellInstanceRaw {
+                base: InstanceRaw::from_matrix(model),
+                shell: [0.0; 4],
+            }],
+        });
+    });
+    (shell_layers, hair_strands)
 }
 
 /// 材质绑定组的复合缓存键（R52c）：`(材质句柄 << 32) | 图集槽位`。
@@ -4075,6 +4232,9 @@ impl Renderer {
             rt_post_params_buf,
             skin_gpu: HashMap::new(),
             morph_gpu: HashMap::new(),
+            hair_gpu: HashMap::new(),
+            fur_instance_buf: None,
+            fur_instance_capacity: 0,
             morph_uploads: 0,
             shadow_map,
             shadow_map_view,
@@ -4201,6 +4361,7 @@ impl Renderer {
             meshlet_occ_aabb_scratch: Vec::new(),
             meshlet_occ_entity_scratch: Vec::new(),
             particle_v2_scratch: Vec::new(),
+            fur_scratch: Vec::new(),
             clear_color: wgpu::Color {
                 r: 0.055,
                 g: 0.07,
@@ -6848,6 +7009,17 @@ impl Renderer {
         particle_alpha.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let particle_additive_len = particle_instances.len();
         particle_instances.extend(particle_alpha.iter().map(|(_, _, inst)| *inst));
+        // 2c'.5 毛发 v1 收集（R90）：壳层附加层 + 发带（组件缺席 = 空表 =
+        //      零计算零绘制）。发带 GPU 缓存按实体位懒建 + 实例数组全量
+        //      上传专用缓冲（&mut self 须在 hdr 不可变借用之前——与 2c'
+        //      粒子 v2 池同款纪律）。
+        let mut fur_items = std::mem::take(&mut self.fur_scratch);
+        let (shell_layers, hair_strands) =
+            collect_fur_items(world, &mesh_store, &frustum, &mut fur_items);
+        if !fur_items.is_empty() {
+            self.ensure_hair_gpu(world);
+            self.upload_fur_instances(&fur_items);
+        }
         // 2c'. 粒子 v2 收集（R82）：排水待消费模拟帧 + 构建拖尾渲染
         //      uniform + 池对齐（新实体建池 / reset 检测 / uniform 槽位
         //      按需增长——建池需要 &mut self，必须在 hdr 借用之前，与 4c
@@ -7213,6 +7385,22 @@ impl Renderer {
                 MaterialHandle(item.material),
                 item.lightmap,
             );
+        }
+        // 4a'.5 毛发资源（R90）：材质绑定组懒建（发带实体不挂 MeshHandle、
+        // 不进普通收集——4 段的 ensure 不会覆盖它；壳层底皮虽在 items 内
+        // 已 ensure 过，此处幂等重入保持毛发段自足）。图集槽位恒
+        // NO_LIGHTMAP（毛发 v1 不进光照贴图，§8）。
+        for item in &fur_items {
+            self.ensure_material(
+                &material_store,
+                texture_store.as_deref(),
+                lightmap_store.as_deref(),
+                MaterialHandle(item.material),
+                NO_LIGHTMAP,
+            );
+            if item.kind == FurKind::Shell {
+                self.ensure_mesh(&mesh_store, MeshHandle(item.mesh));
+            }
         }
         let mut joint_bytes: Vec<u8> = Vec::new();
         for item in skinned
@@ -7907,6 +8095,55 @@ impl Renderer {
                     instances += plan.draw_count;
                     triangles_drawn += plan.triangles;
                     meshlet_surviving = plan.draw_count;
+                }
+            }
+            // 毛发 v1（R90）：主 pass 内、meshlet 之后——壳层与发带都是
+            // REPLACE + 深度写（cutout 语义），z-buffer 裁决与顺序无关，
+            // 对无毛发像素零交互。缺席 = fur_items 空 = 零绘制（命令流
+            // 与引入前逐位一致）。绘制序：壳层（逐项切网格，实例区间在
+            // 毛发专用缓冲内连续）→ 发带（逐实体一次 draw）。
+            if !fur_items.is_empty() {
+                let fur_buf = self.fur_instance_buf.as_ref().expect("毛发实例缓冲已就绪");
+                let mut base_instance = 0u32;
+                for item in &fur_items {
+                    let material = &self.material_gpu[&material_key(item.material, NO_LIGHTMAP)];
+                    pass.set_bind_group(0, &self.globals_bg, &[]);
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_vertex_buffer(1, fur_buf.slice(..));
+                    if item.kind == FurKind::Shell {
+                        // 壳层：底皮网格顶点 + 壳层实例区间（一次 draw）
+                        let mesh = &self.mesh_gpu[&item.mesh];
+                        pass.set_pipeline(&self.bundle.shell_pipeline);
+                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        let count = item.instances.len() as u32;
+                        pass.draw_indexed(
+                            0..mesh.num_indices,
+                            0,
+                            base_instance..base_instance + count,
+                        );
+                        draw_calls += 1;
+                        instances += count;
+                        // 壳层逐层累计：索引数 / 3 × 层数（膨胀不增几何）
+                        triangles_drawn += mesh_store
+                            .get(MeshHandle(item.mesh))
+                            .map_or(0, |data| data.indices.len() as u32 / 3 * count);
+                        base_instance += count;
+                    } else {
+                        // 发带：控制网格顶点 + 单实例
+                        let hair = self
+                            .hair_gpu
+                            .get(&item.entity)
+                            .expect("发带 GPU 缓存已就绪（收集期懒建）");
+                        pass.set_pipeline(&self.bundle.hair_pipeline);
+                        pass.set_vertex_buffer(0, hair.vertex_buf.slice(..));
+                        pass.set_index_buffer(hair.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..hair.num_indices, 0, base_instance..base_instance + 1);
+                        draw_calls += 1;
+                        instances += 1;
+                        triangles_drawn += hair.num_indices / 3;
+                        base_instance += 1;
+                    }
                 }
             }
         }
@@ -9337,6 +9574,8 @@ impl Renderer {
         self.stats.triangles_drawn = triangles_drawn;
         self.stats.particles_drawn = particles_drawn;
         self.stats.meshlet_surviving = meshlet_surviving;
+        self.stats.hair_strands_drawn = hair_strands;
+        self.stats.shell_layers_drawn = shell_layers;
         self.stats.taa_reset = u32::from(taa_on && taa_reset_frame);
         self.scratch = items;
         self.skinned_scratch = skinned;
@@ -9351,6 +9590,7 @@ impl Renderer {
         self.particle_scratch = particle_instances;
         self.particle_alpha_scratch = particle_alpha;
         self.particle_v2_scratch = particle_v2_items;
+        self.fur_scratch = fur_items;
     }
 
     /// 实例缓冲容量复用：足够则零开销返回 `false`；不足时按 2 倍扩容
@@ -9369,6 +9609,69 @@ impl Renderer {
         self.instance_capacity = capacity;
         log::debug!("实例缓冲扩容至 {capacity} 实例");
         true
+    }
+
+    /// 发带控制网格 GPU 缓存懒建（R90）：按实体位只建一次（句柄值缓存
+    /// 纪律——运行期改 `HairStrands.mesh` 不生效，销毁不回收）。在查询
+    /// 闭包内直接 `entry().or_insert_with`——device / hair_gpu 是 self 的
+    /// 不同字段，析构分别借用后闭包可同时持有。
+    fn ensure_hair_gpu(&mut self, world: &iris_core::world::World) {
+        let device = &self.gpu.device;
+        let hair_gpu = &mut self.hair_gpu;
+        world.query::<(iris_core::prelude::Entity, &crate::fur::HairStrands)>(|(e, hair)| {
+            let entity = e.to_bits();
+            if hair_gpu.contains_key(&entity) {
+                return;
+            }
+            if hair.mesh.indices.is_empty() {
+                log::warn!("发带实体 {entity:#x} 控制网格为空，建零索引哨兵（零面积绘制）");
+            }
+            let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.hair.vbo"),
+                contents: bytemuck::cast_slice(&hair.mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.hair.ibo"),
+                contents: bytemuck::cast_slice(&hair.mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            hair_gpu.insert(
+                entity,
+                HairGpu {
+                    num_indices: hair.mesh.indices.len() as u32,
+                    vertex_buf,
+                    index_buf,
+                },
+            );
+        });
+    }
+
+    /// 毛发实例数组全量上传（R90）：壳层 + 发带共用一份
+    /// `ShellInstanceRaw` 缓冲（每帧全量——量级小，贴花 / 粒子同款）。
+    fn upload_fur_instances(&mut self, fur_items: &[FurItem]) {
+        let total: usize = fur_items.iter().map(|i| i.instances.len()).sum();
+        if total == 0 {
+            return;
+        }
+        if self.fur_instance_capacity < total {
+            let capacity = (total * 2).max(64);
+            self.fur_instance_buf = Some(self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("iris.fur.instances"),
+                size: (capacity * std::mem::size_of::<crate::fur::ShellInstanceRaw>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.fur_instance_capacity = capacity;
+        }
+        let buf = self.fur_instance_buf.as_ref().expect("刚确保容量");
+        // 逐项分段写（write_buffer 的 offset 4 对齐天然满足：144 = 4×36）
+        let mut offset = 0u64;
+        for item in fur_items {
+            let bytes = bytemuck::cast_slice::<crate::fur::ShellInstanceRaw, u8>(&item.instances);
+            self.gpu.queue.write_buffer(buf, offset, bytes);
+            offset += bytes.len() as u64;
+        }
     }
 
     /// 探针捕获实例缓冲容量复用（R62a）：独立于主帧实例缓冲——主缓冲带
@@ -11908,6 +12211,18 @@ impl Renderer {
                 crate::sss::wrap_param(def.subsurface_scale),
                 0.0,
                 0.0,
+            ],
+            // 毛发参数（R90）：KK 开关与 shift/exponent 由材质字段直通；
+            // cutout 阈值只在 Mask 模式写入（Opaque/Blend 保持 0 =
+            // 着色器 cutout 分支整段不进入——R63 铁律）
+            fur: [
+                f32::from(def.kajiya_kay.is_some()),
+                match def.alpha_mode {
+                    crate::material::AlphaMode::Mask => def.alpha_cutoff.clamp(0.0, 1.0),
+                    _ => 0.0,
+                },
+                def.kajiya_kay.map_or(0.0, |kk| kk.shift),
+                def.kajiya_kay.map_or(0.0, |kk| kk.exponent),
             ],
         };
         let params_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {

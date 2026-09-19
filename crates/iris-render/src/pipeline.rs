@@ -102,6 +102,17 @@ pub(crate) struct PipelineBundle {
     /// MSAA alpha 混合、深度只测不写、cull None，见 `shaders/water.wgsl`
     /// 与 water.rs 的 WaterSurface。
     pub water_pipeline: wgpu::RenderPipeline,
+    /// 发带管线（R90）：VS = `shaders/hair_vs.wgsl`（相机面向屏幕展宽），
+    /// FS = standard.wgsl `fs_main`（Kajiya-Kay 与 cutout 都在 fs_shaded，
+    /// 光照数学零复制）；REPLACE + 深度写（cutout 语义）、cull None
+    /// （屏幕展宽四边形绕向随相机变化——粒子 v2 同纪律）。不进 RT
+    /// 相机与阴影 pass（v1 边界，§8）。
+    pub hair_pipeline: wgpu::RenderPipeline,
+    /// 壳层管线（R90）：VS = `shaders/shell_vs.wgsl`（层比 × 毛高沿法线
+    /// 膨胀 + fur_aux 传层比），FS 同上；实例布局 =
+    /// [`crate::fur::SHELL_INSTANCE_LAYOUT`]（InstanceRaw + loc15），
+    /// REPLACE + 深度写、Cull Back（跟随原网格朝向）。
+    pub shell_pipeline: wgpu::RenderPipeline,
     /// 2D UI 叠加层管线（像素坐标顶点 + 字形图集采样，alpha 混合）。
     pub ui_pipeline: wgpu::RenderPipeline,
     /// 渲染目标（RT，R40）单采样几何管线：与主管线同源（PBR / 蒙皮 /
@@ -744,6 +755,83 @@ pub(crate) fn create_pipeline(
         true,
         sample_count,
         false,
+    );
+    // 毛发 v1（R90）双管线：VS 独立 module（hair_vs 相机面向展宽 /
+    // shell_vs 层比膨胀），FS 复用 standard.wgsl 的 fs_main——着色数学
+    // （含 Kajiya-Kay 分支与 cutout 判定）单一事实源，零复制。两者
+    // REPLACE + 深度写（cutout 语义）；发带 cull None（屏幕展宽绕向随
+    // 相机变化），壳层跟随原网格 Cull Back。管线布局沿用普通 mesh
+    // 布局（fs_main 静态用量 = 组 0 全局 + 组 1 材质）。
+    let make_fur_pipeline = |label: &'static str,
+                             vs_module: &wgpu::ShaderModule,
+                             buffers: &[Option<wgpu::VertexBufferLayout<'static>>],
+                             cull: Option<wgpu::Face>|
+     -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: vs_module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: cull,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let hair_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.hair_vs"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/hair_vs.wgsl").into()),
+    });
+    let shell_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.shell_vs"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shell_vs.wgsl").into()),
+    });
+    let hair_pipeline = make_fur_pipeline(
+        "iris.pipeline.hair",
+        &hair_shader,
+        &[
+            Some(crate::groom::HAIR_VERTEX_LAYOUT),
+            Some(crate::instance::InstanceRaw::LAYOUT),
+        ],
+        None,
+    );
+    let shell_pipeline = make_fur_pipeline(
+        "iris.pipeline.shell",
+        &shell_shader,
+        &[
+            Some(crate::mesh::Vertex::LAYOUT),
+            Some(crate::fur::SHELL_INSTANCE_LAYOUT),
+        ],
+        Some(wgpu::Face::Back),
     );
     // 蒙皮主管线：顶点输入 = [常规顶点, 蒙皮属性, 实例]，
     // 绑定组 = [全局, 材质, 关节矩阵 storage]；顶点着色器 vs_skinned。
@@ -3060,6 +3148,8 @@ pub(crate) fn create_pipeline(
         ao_pipeline,
         fog_pipeline,
         water_pipeline,
+        hair_pipeline,
+        shell_pipeline,
         globals_layout,
         cascade_layout,
         point_shadow_layout,
@@ -3134,6 +3224,60 @@ mod tests {
             cursor = (
                 find(&skybox_body, cursor.0, field),
                 find(&standard_body, cursor.1, field),
+            );
+        }
+    }
+
+    /// **毛发 VertexOutput 影子契约看门（R90）**：`fur_aux`（@location(6)）
+    /// 在四个 VS module 有逐字段同构的并行声明——standard.wgsl（vs_main /
+    /// vs_skinned）、meshlet_draw.wgsl、hair_vs.wgsl、shell_vs.wgsl。任何
+    /// 一方改 VertexOutput 布局漏同步，症状是跨管线 varying 错位（像素
+    /// 级错乱），本测试在源码层拦截（skybox Globals 前缀看门同款范式）。
+    #[test]
+    fn vertex_output_fur_aux_matches_standard_layout() {
+        let files = [
+            ("standard.wgsl", include_str!("../shaders/standard.wgsl")),
+            (
+                "meshlet_draw.wgsl",
+                include_str!("../shaders/meshlet_draw.wgsl"),
+            ),
+            ("hair_vs.wgsl", include_str!("../shaders/hair_vs.wgsl")),
+            ("shell_vs.wgsl", include_str!("../shaders/shell_vs.wgsl")),
+        ];
+        // VertexOutput 字段序（@location 0..6 + builtin）——四方逐名同序
+        let order = [
+            "clip_position",
+            "world_pos",
+            "world_normal",
+            "uv",
+            "tangent",
+            "uv2",
+            "probe",
+            "fur_aux",
+        ];
+        for (name, src) in files {
+            let body = src
+                .split("struct VertexOutput {")
+                .nth(1)
+                .and_then(|s| s.split('}').next())
+                .unwrap_or_else(|| panic!("{name} 应声明 VertexOutput"));
+            // 字段位置必须单调递增（声明序一致；从头 find——字段名带
+            // 冒号后缀，uv/uv2 不互串）。不切子串推进游标：WGSL 注释是
+            // 中文，字节游标 +1 可能切进多字节字符内。
+            let mut last_pos = 0usize;
+            for field in order {
+                let pos = body
+                    .find(&format!("{field}:"))
+                    .unwrap_or_else(|| panic!("{name} 的 VertexOutput 缺少字段 {field}"));
+                assert!(
+                    pos >= last_pos,
+                    "{name} 的 VertexOutput 字段 {field} 声明乱序"
+                );
+                last_pos = pos;
+            }
+            assert!(
+                body.contains("@location(6) fur_aux: vec4<f32>"),
+                "{name} 的 fur_aux 必须是 @location(6) vec4<f32>"
             );
         }
     }

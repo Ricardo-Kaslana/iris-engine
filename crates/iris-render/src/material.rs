@@ -54,7 +54,14 @@ pub struct MaterialHandle(pub u32);
 /// - `Opaque`（默认）：走不透明主 pass——REPLACE 写入 + 深度写入，
 ///   参与阴影投射；
 /// - `Blend`：走透明 pass——标准 alpha 混合（`src α, 1 − src α`）+
-///   深度只测不写，按视深降序（远 → 近）绘制，**不投影**。
+///   深度只测不写，按视深降序（远 → 近）绘制，**不投影**；
+/// - `Mask`（R90）：alpha cutout——仍走不透明分区（深度写、批处理键、
+///   剔除语义与 `Opaque` 完全一致），片元侧在着色前按
+///   [`MaterialDef::alpha_cutoff`] 逐像素 `discard`（glTF `alphaMode:
+///   "MASK"` 的引擎等价物）。**阴影为实心近似**：阴影深度 pass 不感知
+///   alpha（cutout 孔洞在投影中闭合）——alpha 感知阴影与发带 / 壳层
+///   毛发阴影一起留待 R91（诚实限制 §8）。发带 / 壳层管线独立于实例
+///   区间绘制，天然不投影。
 ///
 /// 混合系数取 `base_color.a`（与着色器输出 alpha 一致）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -62,6 +69,30 @@ pub enum AlphaMode {
     #[default]
     Opaque,
     Blend,
+    Mask,
+}
+
+/// Kajiya-Kay 各向异性毛发着色参数（R90）。
+///
+/// 发丝方向取顶点切线（发带管线的 VS 写入 `VertexOutput.tangent.xyz`，
+/// 普通网格则取 glTF tangent——两条通路同一消费点）。v1 模型（声明边界，
+/// 详见 `kajiya_kay.rs` 模块文档）：
+///
+/// - 漫反射 = `max(0, sin(T·L))`（KK 1989 原式，无 Scheuermann 根梢
+///   混合）；
+/// - 高光 = `pow(sin(T'·H), exponent)`，`T' = normalize(T + N·shift·(2t−1))`
+///   沿伪法线偏移切线，`t` = 沿发丝参数（UV.x），产生根梢高光移位；
+/// - 高光颜色 = `mix(白, albedo, 0.5)` 固定式，**无独立强度旋钮**
+///   （R89「旋钮必须有非默认断言」——不开的旋钮不设）；
+/// - 伪法线 = 视线在垂直于 T 平面上的投影（片元侧重算），保证
+///   NdotV/NdotL 域良好，同时供 IBL / 探针间接项消费。
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KajiyaKay {
+    /// 切线沿伪法线的偏移幅度（根梢高光移位）。0 = 不移位；典型
+    /// |shift| ∈ [0.05, 0.3]。符号翻转 = 高光带反向倾斜。
+    pub shift: f32,
+    /// 高光锐度指数（越大高光带越窄）。典型 ∈ [20, 200]。
+    pub exponent: f32,
 }
 
 /// 材质定义（CPU 侧）。GPU 侧 uniform 由渲染器按需创建。
@@ -110,6 +141,16 @@ pub struct MaterialDef {
     /// [`crate::sss::wrap_param`] 的调参表）。缺省 0.1 m = 头 / 前臂
     /// 量级（t = 0.5）。只在 `subsurface_strength > 0` 时被消费。
     pub subsurface_scale: f32,
+    /// alpha cutout 阈值（R90，glTF `alphaCutoff` 语义）：`alpha_mode =
+    /// Mask` 时，着色前 `base.a < alpha_cutoff` 的片元整段丢弃。缺省
+    /// 0.5 = glTF 规范默认值；`Opaque` / `Blend` 模式下**不消费**该字段
+    /// （着色器 cutoff 分支不进入）。
+    pub alpha_cutoff: f32,
+    /// Kajiya-Kay 各向异性着色参数（R90）。`None`（缺省）= 标准
+    /// Cook-Torrance PBR——着色器 KK 分支整段不执行，既有像素逐位不变；
+    /// `Some` = 直射光（方向光 + 点光 + 聚光）换 KK 瓣，间接项（IBL /
+    /// 探针 / 光照贴图）仍走各向同性伪法线路径。见 [`KajiyaKay`]。
+    pub kajiya_kay: Option<KajiyaKay>,
 }
 
 impl Default for MaterialDef {
@@ -126,6 +167,8 @@ impl Default for MaterialDef {
             double_sided: false,
             subsurface_strength: 0.0,
             subsurface_scale: crate::sss::SSS_DEFAULT_SCALE,
+            alpha_cutoff: 0.5,
+            kajiya_kay: None,
         }
     }
 }
@@ -187,6 +230,23 @@ impl MaterialDef {
     pub fn with_subsurface(mut self, strength: f32, scale: f32) -> Self {
         self.subsurface_strength = strength.clamp(0.0, 1.0);
         self.subsurface_scale = scale;
+        self
+    }
+
+    /// 开启 alpha cutout（builder 风格，R90）：`alpha_mode` 置 `Mask`，
+    /// 片元 `base.a < cutoff` 整段丢弃。`cutoff` 自动 clamp 到 [0, 1]
+    /// （0 = 恒不裁、1 = 全透明贴图裁光）。分区 / 深度 / 批处理语义与
+    /// `Opaque` 完全一致（不透明段），只是多了逐像素 discard。
+    pub fn with_alpha_mask(mut self, cutoff: f32) -> Self {
+        self.alpha_mode = AlphaMode::Mask;
+        self.alpha_cutoff = cutoff.clamp(0.0, 1.0);
+        self
+    }
+
+    /// 开启 Kajiya-Kay 各向异性毛发着色（builder 风格，R90）。发带 /
+    /// 毛发材质用；参数语义见 [`KajiyaKay`]。
+    pub fn with_kajiya_kay(mut self, params: KajiyaKay) -> Self {
+        self.kajiya_kay = Some(params);
         self
     }
 }
@@ -354,5 +414,70 @@ mod tests {
             0.0,
             "负强度必须 clamp 到 0（= 关闭，绝不产生负光）"
         );
+    }
+
+    /// alpha cutout（R90）：缺省 cutoff = 0.5（glTF 规范默认）但不被
+    /// Opaque/Blend 消费；builder 置 Mask 且 cutoff clamp 到 [0,1]；
+    /// 全部便捷构造器保持 Opaque（Mask 只能显式开启）。
+    #[test]
+    fn alpha_mask_defaults_and_builder_clamps() {
+        let def = MaterialDef::default();
+        assert_eq!(def.alpha_mode, AlphaMode::Opaque);
+        assert_eq!(def.alpha_cutoff, 0.5, "缺省 cutoff = glTF 规范默认");
+        for d in [
+            MaterialDef::solid(1.0, 1.0, 1.0, 0.5),
+            MaterialDef::metal(1.0, 1.0, 1.0, 0.2),
+            MaterialDef::glass(0.6, 0.8, 1.0, 0.35),
+        ] {
+            assert_ne!(d.alpha_mode, AlphaMode::Mask, "便捷构造器不携带 Mask");
+        }
+        let masked = MaterialDef::solid(0.2, 0.5, 0.15, 1.0).with_alpha_mask(0.66);
+        assert_eq!(masked.alpha_mode, AlphaMode::Mask);
+        assert_eq!(masked.alpha_cutoff, 0.66);
+        assert_eq!(
+            MaterialDef::solid(1.0, 1.0, 1.0, 1.0)
+                .with_alpha_mask(1.7)
+                .alpha_cutoff,
+            1.0,
+            "cutoff 越界必须 clamp 到 1（全透明贴图裁光）"
+        );
+        assert_eq!(
+            MaterialDef::solid(1.0, 1.0, 1.0, 1.0)
+                .with_alpha_mask(-0.3)
+                .alpha_cutoff,
+            0.0,
+            "负 cutoff 必须 clamp 到 0（恒不裁 = Mask 的空操作）"
+        );
+    }
+
+    /// Kajiya-Kay 参数（R90）：缺省 None（标准 PBR，着色器分支整段不进）；
+    /// builder 链式设定且不改写其他字段；全部便捷构造器不携带 KK。
+    #[test]
+    fn kajiya_kay_defaults_none_and_builder_sets() {
+        assert_eq!(MaterialDef::default().kajiya_kay, None);
+        for d in [
+            MaterialDef::solid(0.1, 0.08, 0.05, 1.0),
+            MaterialDef::metal(1.0, 1.0, 1.0, 0.2),
+            MaterialDef::glass(0.6, 0.8, 1.0, 0.35),
+        ] {
+            assert_eq!(d.kajiya_kay, None, "便捷构造器不携带 KK");
+        }
+        let hair = MaterialDef::solid(0.12, 0.09, 0.06, 1.0).with_kajiya_kay(KajiyaKay {
+            shift: 0.15,
+            exponent: 96.0,
+        });
+        assert_eq!(
+            hair.kajiya_kay,
+            Some(KajiyaKay {
+                shift: 0.15,
+                exponent: 96.0
+            })
+        );
+        assert_eq!(
+            hair.alpha_mode,
+            AlphaMode::Opaque,
+            "builder 不得改写其他字段"
+        );
+        assert_eq!(hair.roughness, 0.5);
     }
 }

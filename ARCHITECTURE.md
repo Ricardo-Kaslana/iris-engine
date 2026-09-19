@@ -5297,6 +5297,80 @@ A1 = WBOIT 公式照抄原文、A2/A3 = 仅主透明 pass）。开关资源
   `docs/oit.png`（左 painter 中心偏蓝 = 实体序主导、右 OIT 中心灰白 =
   加权平均，肉眼可辨）。诚实边界 §8.68（八条）。
 
+### 4.49 毛发 v1（壳层 shell fur × Kajiya-Kay 发带 × AlphaMask，iris-render/groom·fur·kajiya_kay·hair_vs·shell_vs，R90）
+
+**双路线架构（设计四点裁定 2026-09-19）**：壳层（动物 / 草地，挂
+`ShellFur` 组件到任意 Mesh+Material 实体）与发带（角色头发，挂
+`HairStrands` 组件 + KK 材质）并存互不感知；glTF 无毛发标准 ⇒ 程序化
+groom 起步（`groom.rs::generate_hair_strands`——头皮圆盘面积均匀采样
++ −Y 下垂 + 逐束随机方位正弦弯曲，mix64 无状态哈希流，**逐束随机字
+消费序即契约**）。**缺席语义**：两组件缺席 = 零计算零绘制（收集查询
+空转，命令流与引入前逐位一致——GPU 测试锁）。
+
+**发带（camera-facing ribbon）**：顶点 = 控制点（位置 + 中心差分切线
++ 线性宽度 + 沿丝参数），`hair_vs.wgsl` 相机面向屏幕空间展宽——
+投影常量从 **view_proj 列长推导**（`length(view_proj[1].xyz)` =
+1/tan(fov/2)，view 旋转块列单位长 ⇒ 复合列长 = 投影对角元；TAA 抖动
+在平移列不污染）——零 Globals 扩容。**关节无缝由数据共享保证**：
+相邻段共享控制点顶点（位置 / 方向 / 宽度 / 侧别全同）⇒ 逐顶点独立
+展宽结果逐位一致（与粒子 v2 拖尾的「软边 alpha 掩盖关节」不同——
+发带是 cutout，无缝是硬要求，groom 单测钉死）。伪法线（视线在垂直
+发丝平面上的投影）VS 逐顶点算好走 `world_normal` ⇒ fs_shaded 的 n
+计算零改动。cull None（屏幕展宽绕向随相机变化）+ REPLACE + 深度写。
+
+**Kajiya-Kay 着色**：材质 flag（`MaterialDef::kajiya_kay: Option<
+KajiyaKay{shift, exponent}>`）门控——`fs_shaded` 内方向光 if/else
+二选一（else 支语句序与引入前逐条相同）、点光两路循环（均匀门 +
+分箱）的贡献点换调 `kk_point_contrib`（阴影 / 衰减段与
+`point_light_contrib` 逐式同步的**复制**——不改既有函数本体的理由 =
+R63 教训：函数体内加分支会改编译器内联 / FMA 决策，以 ±1 LSB 基线
+漂移的形式付出过代价；实测本轮 shadow_v2 / sss 像素锁原值通过）。
+模型：漫反射 max(0, sin(T·L))、高光 sin(T'·H)^e（T' 沿伪法线偏移
+shift·(2t−1) 根梢移位）、高光颜色 mix(白, albedo, 0.5) 固定式；
+间接项（IBL / 探针 / 光照贴图）各向同性伪法线（v1 边界）。CPU 镜像
+`kajiya_kay.rs::kk_lobe` 解析锚 + WGSL 源码看门双轨。
+
+**壳层**：`ShellInstanceRaw`（InstanceRaw + loc15 = 层比 / 毛高，
+144 B）独立实例缓冲每帧全量上传（不进主实例缓冲的增量比对——量级
+小，贴花 / 粒子同款）。层比 t = k/N（k = 1..=N，顶皮满膨胀）；VS
+沿法线膨胀 t × height + fur_aux 传层比；FS 统一 cutout：`base.a <
+max(材质 cutoff, fur_aux.x)` 丢弃——**密度贴图即毛长图**（base 的
+alpha 通道，值 d 处毛长 = d × height）。底皮照常走普通不透明路径。
+绘制段在主 pass meshlet 之后（REPLACE + 深度写，z-buffer 裁决顺序
+无关）。
+
+**AlphaMask（glTF MASK 语义闭合）**：`AlphaMode::Mask` +
+`alpha_cutoff`（缺省 0.5）——不透明分区全同（深度写 / 批处理 /
+剔除），fs_shaded 开头 discard（两个开关都 0 时分支整段不进——R63
+铁律）；glTF `alphaMode:"MASK"` / `alphaCutoff` 直通；场景 JSON +
+热重载补丁纳入。**阴影实心近似**（深度 pass 不感知 alpha），R91 与
+毛发阴影一起接。
+
+**VertexOutput 影子契约（四方）**：`fur_aux` @location(6) 在
+standard（vs_main / vs_skinned）/ meshlet_draw / hair_vs / shell_vs
+并行声明——既有路径恒写 0；看门 `pipeline.rs::
+vertex_output_fur_aux_matches_standard_layout`（字段序单调 + 类型
+断言；**中文注释的字节游标陷阱**：+1 游标可切进多字节字符，测试用
+全局 find 位置单调断言规避）。
+
+**FrameStats 观测**：`hair_strands_drawn`（发带 draw 数 = 可见发带
+实体数）/ `shell_layers_drawn`（= Σ 可见壳层 layers）——不进排序键。
+
+**排障教训（句柄值语义）**：`MeshStore::add` 从 0 起（0 号不预留，
+与 MaterialStore 的 0 号默认材质不同）——判别位不得借用句柄值
+（首版 mesh==0 发带哨兵与合法网格句柄 0 相撞，GPU panic；改显式
+`FurKind`）。
+
+**测试**：CPU 17（groom 确定性 / 数量 / 几何锚 / 关节共享；KK 镜像
+五件套；壳层公式 / 展开保真；材质缺省 / clamp；影子契约看门）+
+GPU 5（`fur_render.rs`，GPU_SERIAL 串行：缺席逐位 + 双会话 / 发带
+可见性 / 壳层毛高单调 + **毛高 0 零点锚**（与不挂壳层整帧逐位——
+膨胀零点 = 路径无外溢的 GPU 锚）/ Mask 三档阈值（纯垫板参考渲染法
+——垫板 IBL 镜面残余 ≈ 37/通道是非零解析底值，不是暗零）/ 复合
+双会话逐位）。验收图 `docs/fur.png`（左：16 层绿毛 + 8 层蓝毛 +
+无毛红对照；右：KK 发帘 160 束真实着色）；快照 example 双面板双
+会话逐位断言。诚实限制 §8.69。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -5549,7 +5623,9 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
    （逐像素需 OIT 方案）~~ **C7b 已交付 opt-in Weighted Blended OIT
    （§4.48：`OrderedIndependentTransparency` 资源在场 ⇒ 主透明 pass 逐像素
    顺序无关；painter 原路 = 资源缺席逐位不变；近似算法性质与覆盖范围
-   边界见 §8.68）**；glTF `"MASK"` alpha 裁剪按不透明处理（§4.6）。
+   边界见 §8.68）**；~~glTF `"MASK"` alpha 裁剪按不透明处理（§4.6）~~
+   **R90 已闭合（§4.49：`AlphaMode::Mask` 逐像素 cutoff discard，阴影
+   实心近似见 §8.69③）**。
 4. ~~**无热重载**~~ **参数子集热重载已闭合（C5b，§4.46 / §8.65）**：
    场景 / 关卡 JSON 的材质数值 + 点光 + 方向光段可经 `SceneHotReload`
    资源热应用（std-only 内容指纹轮询，不重建实体、不动游戏状态）。
@@ -7034,6 +7110,23 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     序列化未接（宿主代码级 `insert_resource` 启用——消费方需求出现
     再接线，与探针表持久化同立场）；⑧跨适配器位级不可保（GPU 混合
     与 f16 舍入自由，同 §8.51 边界；同适配器双会话逐位由测试钉住）。
+69. **毛发 v1（R90，§4.49）的诚实边界**——①**蒙皮不跟随**：发带与
+    壳层均不随骨骼变形（发带挂静态实体 / 壳层实体不蒙皮），角色头发
+    跟头骨 + 风场摆动 + 远景 LOD + **毛发阴影**（发带 / 壳层独立于
+    实例区间绘制，天然不投影）全部留 R91；②KK 着色 v1 = 单级高光带
+    （无 primary/secondary 双带）、漫反射 KK 1989 原式（无 Scheuermann
+    根梢混合，背光侧偏暗）、间接项各向同性伪法线近似、高光颜色固定式
+    无独立旋钮（不设无断言看管的旋钮——R89 铁律）；③**AlphaMask 阴影
+    为实心近似**（深度 pass 不感知 alpha，cutout 孔洞在投影中闭合）；
+    ④发带 GPU 缓存按实体位只建一次——运行期改 `HairStrands.mesh`
+    不生效（需新实体；句柄值缓存纪律，跨世界对照须独立渲染器）；
+    ⑤毛发不进逐实体 GI 载荷（探针 / DDGI 的 instance payload 恒零 =
+    全局 env 兜底）与光照贴图（材质键图集槽位恒 NO_LIGHTMAP）；
+    ⑥RT 相机不画毛发（与天空盒 / 贴花 / 粒子同款 RT 边界）；⑦壳层
+    密度 = base 贴图 alpha × base_color.a 的复合（无独立密度贴图槽）
+    ——长毛控制即「贴图 alpha 通道即毛长图」的约定；⑧发带视锥剔除用
+    组件包围球（groom 派生 AABB 球，自定义网格可显式给保守值）；
+    ⑨跨适配器位级不可保（同 §8.51；同适配器双会话逐位由测试钉住）。
 
 ## 9. 关键设计取舍记录
 
