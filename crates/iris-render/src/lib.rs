@@ -93,6 +93,16 @@
 //!   法线，CPU 纯函数与 WGSL 逐式镜像）+ 反射 / 折射半分辨率捕获
 //!   （镜像相机 / 主相机，探针同款最低配组装）+ Fresnel + 深度吸收 +
 //!   太阳镜面，主 pass 后 HDR 合成；无水体实体 = 像素与命令流逐位不变。
+//! - 海洋 v2 + 浮力（R93，`ocean` 模块 + `iris_core::buoyancy`）：
+//!   `OceanSurface` 组件 = **相机跟随的无限海面**——CPU 频谱合成（整数波数
+//!   圆形格点 + Phillips 型振幅谱 + 哈希相位）预烘 16 张关键帧位移图
+//!   （角频率量化到 2π/T ⇒ 层号取模无缝回绕；通道含解析梯度），GPU 只做
+//!   重心式时间插值；双层网格（近场吃细节位移 + 远场只涌浪）锚点量化到
+//!   本环步距整数格。池塘路径（`water_pipeline` / `vs_main`）一字未动，
+//!   海洋走独立管线与独立组 0，两路同挂时海洋优先并忽略池塘。
+//!   `BuoyancyPlane` 资源 = 浮力开关（浸没体积逐形状解析闭式，含 OBB 的
+//!   三次 box spline；缺席 / 零浸没 = 轨迹逐位不变）。见 ARCHITECTURE
+//!   §4.52 / §8.72 与 `tests/ocean_render.rs`。
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer»）。
 
 pub mod animation;
@@ -123,6 +133,7 @@ pub mod meshlet;
 pub mod meshlet_stream;
 pub mod morph;
 pub mod occlusion;
+pub mod ocean;
 pub mod offscreen;
 pub mod oit;
 pub mod particles;
@@ -257,6 +268,11 @@ pub mod prelude {
     pub use crate::morph::{MorphData, MorphTarget, MorphWeights, blend_morph_vertices};
     pub use crate::occlusion::OcclusionCulling;
     // C7b · Weighted Blended OIT（开关资源 + 权重/合成 CPU 镜像）
+    pub use crate::ocean::{
+        OCEAN_FRAME_COUNT, OCEAN_LOOP_SECONDS, OCEAN_TILE_PERIOD_M, OceanRing, OceanSurface,
+        ocean_bake, ocean_bake_slice, ocean_detail_fade, ocean_field_at, ocean_frame_pair,
+        ocean_rings, ocean_spectral_planes,
+    };
     pub use crate::offscreen::OffscreenRenderer;
     pub use crate::oit::{OrderedIndependentTransparency, oit_resolve_color, oit_weight};
     pub use crate::particles::{

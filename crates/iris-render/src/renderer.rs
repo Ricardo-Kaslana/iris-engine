@@ -807,6 +807,16 @@ pub struct Renderer {
     water: Option<WaterGpu>,
     /// 水体捕获图尺寸（半分辨率，复用判定键）。
     water_size: (u32, u32),
+    /// 海洋 v2（R93）常驻资源：`OceanSurface` 首次在场时创建、随窗口尺寸重建
+    ///（绑定组含 scene_depth / 反射视图）；无海洋帧恒 `None` ⇒ 零像素零命令流
+    /// 变化（与水体同款的零开销默认路径）。
+    ocean: Option<OceanGpu>,
+    /// 海洋绑定组的重建键（半分辨率口径，与 `water_size` 同值——两环绑定组
+    /// 用的就是水体那两张捕获视图，键必须同步）。
+    ocean_size: (u32, u32),
+    /// 关键帧位移图的 CPU 烘结果（f16 位；**与窗口尺寸无关** ⇒ 一次烘终身用，
+    /// 上传发生在每次 `ensure_ocean_targets`）。`None` = 尚未烘。
+    ocean_bake: Option<Vec<u16>>,
     /// 反射捕获的收集暂存（跨帧复用；收集视锥 = 镜像相机 VP）。
     water_items: Vec<DrawItem>,
     water_skinned: Vec<SkinnedItem>,
@@ -1474,6 +1484,41 @@ const _: () = assert!(
     "WaterParams 必须与 WGSL 布局一致（256B：2×mat4 + 9×vec4，R92 扩容 +天气通道）"
 );
 
+/// 海洋 v2（R93）的 pass 参数（272 B POD；与 `water.wgsl` 的 `OceanParams`
+/// 逐字段对齐——字段序看门在 `pipeline.rs` 的源码层测试）。**每环一份**（两环
+/// 各一只 uniform 缓冲、各一个绑定组，绑同一批纹理 ⇒ 着色器内无分支选择）。
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OceanParamsRaw {
+    /// 主相机 VP（含 TAA 抖动）。
+    view_proj: [[f32; 4]; 4],
+    /// 镜像相机 VP（反射捕获图的屏幕投影）。
+    refl_view_proj: [[f32; 4]; 4],
+    /// xyz: 主相机眼点，w 保留。
+    eye: [f32; 4],
+    /// xyz: 表面 → 光源单位方向。
+    light_dir: [f32; 4],
+    /// rgb: 方向光色 × 强度。
+    light_color: [f32; 4],
+    /// x 主波振幅, y 主波波长, z 相速度, w 陡度 Q（Gerstner 档）。
+    wave_a: [f32; 4],
+    /// x 本环半边长, y 本环网格步距, z 波形时间 t, w 吸收特征深度。
+    wave_b: [f32; 4],
+    /// x/z 本环锚点世界 XZ（量化到步距整数格），y 保留，w 细节 RMS 波高（米）。
+    ocean_a: [f32; 4],
+    /// x 关键帧 a, y 帧间权重 u, z 几何细节权重, w 法线细节权重。
+    ocean_b: [f32; 4],
+    /// rgb 浅水色。
+    shallow: [f32; 4],
+    /// rgb 深水色。
+    deep: [f32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<OceanParamsRaw>() == 272,
+    "OceanParams 必须与 WGSL 布局一致（272B：2×mat4 + 9×vec4）"
+);
+
 /// 平面水体（R81）的 GPU 侧资源：反射 / 折射两张**半分辨率**捕获图
 /// （Rgba16Float——与探针捕获同格式，可过滤供波纹扰动后的亚纹素采样；
 /// 半分辨率的理由 = 反射 / 折射都是低频近似内容，全分辨率带宽翻倍无观
@@ -1522,6 +1567,27 @@ struct WaterGpu {
     grid_vertex_buf: wgpu::Buffer,
     grid_index_buf: wgpu::Buffer,
     grid_index_count: u32,
+}
+
+/// 海洋 v2（R93）常驻 GPU 资源：关键帧位移图（`texture_2d_array<Rgba16Float>`，
+/// 层 = 帧）+ Repeat / ClampToEdge 两把采样器 + **两环各一份** params 缓冲与
+/// 绑定组（同一批纹理，只 params 不同——避开 WGSL uniform 数组的动态索引）。
+///
+/// 水面网格与反射捕获复用 [`WaterGpu`] 的产物（`surface_on` 时必已创建），
+/// 本结构零重复资源。绑定组内含 scene_depth 与反射视图 ⇒ 随 `ocean_size` 重建。
+struct OceanGpu {
+    #[allow(dead_code)]
+    map: wgpu::Texture,
+    /// 数组视图（层 = 关键帧）。绑定组创建后 wgpu 自持引用，本字段只作
+    /// 所有权留痕（与 `WaterGpu::refl_color` 同款）。
+    #[allow(dead_code)]
+    map_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    sampler_wrap: wgpu::Sampler,
+    #[allow(dead_code)]
+    sampler_clamp: wgpu::Sampler,
+    params_buf: [wgpu::Buffer; 2],
+    bind_group: [wgpu::BindGroup; 2],
 }
 
 /// 构建 blit 合成绑定组。初建（`ensure_hdr_targets`，源 = 主解析缓冲）
@@ -4376,6 +4442,9 @@ impl Renderer {
             ao_depth_frame: None,
             water: None,
             water_size: (0, 0),
+            ocean: None,
+            ocean_size: (0, 0),
+            ocean_bake: None,
             water_items: Vec::new(),
             water_skinned: Vec::new(),
             water_transparent: Vec::new(),
@@ -5989,6 +6058,173 @@ impl Renderer {
         );
     }
 
+    /// 海洋位移图烘图（R93）：单位 RMS 谱 → `M` 关键帧 × `64²` 纹素 × RGBA
+    /// f16。**与窗口尺寸无关** ⇒ 首帧一次、之后只读（换尺寸不重烘）。同输入
+    /// 逐位一致（纯函数链，锚点在 `ocean.rs` 单测）。
+    fn ensure_ocean_bake(&mut self) {
+        if self.ocean_bake.is_some() {
+            return;
+        }
+        // 烘图用**默认谱斜率**（`OCEAN_SLOPE` 常量）：谱斜率改变波形基，
+        // 但组件上的 `spectral_slope` 只作声明口（改它需要重烘 ⇒ 当前按
+        // 烘图键恒等处理，见 §8.72「谱斜率是烘期参数」）。
+        let planes = crate::ocean::ocean_spectral_planes(
+            1.0,
+            crate::ocean::OCEAN_TEXEL_SIZE_M,
+            crate::ocean::OCEAN_SLOPE,
+        );
+        let data = crate::ocean::ocean_bake(&planes, crate::ocean::OCEAN_FRAME_COUNT);
+        let f16 = crate::ocean::ocean_bake_f16(&data);
+        log::debug!(
+            "海洋位移图已烘（{} 平面 × {} 帧 × {}² 纹素，f16 {} B）",
+            planes.len(),
+            crate::ocean::OCEAN_FRAME_COUNT,
+            crate::ocean::OCEAN_TEXELS,
+            f16.len() * 2
+        );
+        self.ocean_bake = Some(f16);
+    }
+
+    /// 海洋 GPU 资源（R93）：位移图纹理 + 两把采样器 + 两环各自的 params
+    /// 缓冲与绑定组。键 = 水体的半分辨率捕获尺寸（绑定组引用水体的反射视图
+    /// 与本帧 scene_depth 视图 ⇒ 二者必须同键重建）。
+    fn ensure_ocean_targets(&mut self, width: u32, height: u32) {
+        let size = ((width / 2).max(1), (height / 2).max(1));
+        if self.ocean.is_some() && self.ocean_size == size && self.water_size == size {
+            return;
+        }
+        self.ensure_ocean_bake();
+        let baked: Vec<u16> = self.ocean_bake.clone().expect("烘图应先于资源创建");
+        let water = self
+            .water
+            .as_ref()
+            .expect("海洋资源须在水体捕获资源之后创建（共用反射图与网格）");
+        let sd = self
+            .scene_depth
+            .as_ref()
+            .expect("海洋需要 scene_depth 做深度吸收");
+        let n = crate::ocean::OCEAN_TEXELS as u32;
+        let layers = crate::ocean::OCEAN_FRAME_COUNT as u32;
+        let device = &self.gpu.device;
+        let map = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iris.ocean.map"),
+            size: wgpu::Extent3d {
+                width: n,
+                height: n,
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // 可过滤（双线性是纹素间高度的定义的一部分）；Rgba16Float 在
+            // WebGPU 核心即支持过滤（R32Float 不支持，故捕获图与探针同选它）。
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let map_view = map.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("iris.ocean.map.view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            array_layer_count: Some(layers),
+            ..Default::default()
+        });
+        // bytes_per_row = 64 纹素 × 4 通道 × 2 B = 512（256 对齐天然满足）。
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &map,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&baked),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(n * (crate::ocean::OCEAN_CHANNELS as u32) * 2),
+                rows_per_image: Some(n),
+            },
+            wgpu::Extent3d {
+                width: n,
+                height: n,
+                depth_or_array_layers: layers,
+            },
+        );
+        let sampler_wrap = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.ocean.sampler_wrap"),
+            // Repeat = 图样周期平铺（ClampToEdge 会把 16 m 接缝画成一条直线）
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let sampler_clamp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.ocean.sampler_clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let make_params = |label: &'static str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<OceanParamsRaw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let params_buf = [
+            make_params("iris.ocean.params.near"),
+            make_params("iris.ocean.params.far"),
+        ];
+        let make_bg = |i: usize| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: if i == 0 {
+                    Some("iris.ocean.bg.near")
+                } else {
+                    Some("iris.ocean.bg.far")
+                },
+                layout: &self.bundle.water_ocean_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf[i].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&water.refl_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&map_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&sd.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&sampler_clamp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&sampler_wrap),
+                    },
+                ],
+            })
+        };
+        let bind_group = [make_bg(0), make_bg(1)];
+        self.ocean_size = size;
+        self.ocean = Some(OceanGpu {
+            map,
+            map_view,
+            sampler_wrap,
+            sampler_clamp,
+            params_buf,
+            bind_group,
+        });
+    }
+
     /// 水体反射捕获实例缓冲容量复用（与主实例缓冲同款——容量不足时
     /// 2 倍扩容整体重建）。捕获每帧全量上传（视锥结果常变，帧级比对
     /// 无增量价值）。
@@ -6425,10 +6661,34 @@ impl Renderer {
         world.query::<(Entity, &crate::water::WaterSurface)>(|(e, ws)| {
             water_candidates.push((e.to_bits(), *ws));
         });
-        let water_selected: Option<crate::water::WaterSurface> = {
+        let mut water_selected: Option<crate::water::WaterSurface> = {
             let bits: Vec<u64> = water_candidates.iter().map(|c| c.0).collect();
             crate::water::select_water_surface(&bits).map(|i| water_candidates[i].1)
         };
+        // 海洋 v2（R93）：同一确定性选择键（`select_water_surface` 收的是
+        // 实体位模式切片，与组件类型无关 ⇒ 直接复用，两路语义同锚）。
+        // **互斥裁定**：海洋在场 ⇒ 池塘整段不选（下方 `water_on` 恒 false），
+        // 于是 R81 的全部池塘代码路径零改动、零执行——包括逐位不变性。
+        let mut ocean_candidates: Vec<(u64, crate::ocean::OceanSurface)> = Vec::new();
+        world.query::<(Entity, &crate::ocean::OceanSurface)>(|(e, os)| {
+            ocean_candidates.push((e.to_bits(), *os));
+        });
+        let ocean_selected: Option<crate::ocean::OceanSurface> = {
+            let bits: Vec<u64> = ocean_candidates.iter().map(|c| c.0).collect();
+            crate::water::select_water_surface(&bits).map(|i| ocean_candidates[i].1)
+        };
+        if ocean_candidates.len() > 1 {
+            log::warn!(
+                "检测到 {} 个 OceanSurface 实体，v1 仅支持单海面，                 已按（实体位模式升序）选择键取首个，其余忽略",
+                ocean_candidates.len()
+            );
+        }
+        if ocean_selected.is_some() && !water_candidates.is_empty() {
+            log::warn!(
+                "OceanSurface 与 WaterSurface 同挂：v1 单海面语义下海洋接管，                 池塘水面被忽略（两路各有独立 pass 与配色，混排留后续）"
+            );
+            water_selected = None;
+        }
         if water_candidates.len() > 1 {
             log::warn!(
                 "检测到 {} 个 WaterSurface 实体，v1 仅支持单水面，\
@@ -6437,9 +6697,16 @@ impl Renderer {
             );
         }
         let water_on = water_selected.is_some();
-        if water_on {
+        let ocean_on = ocean_selected.is_some();
+        // 两路共用的机器：scene_depth（池塘深度吸收 / 海洋的近岸吸收都要）、
+        // 半分辨率反射捕获（海洋只用反射，折射是池塘专属）、以及水面网格缓冲。
+        let surface_on = water_on || ocean_on;
+        if surface_on {
             self.ensure_scene_depth(width, height);
             self.ensure_water_targets(width, height);
+        }
+        if ocean_on {
+            self.ensure_ocean_targets(width, height);
         }
         // Weighted Blended OIT（C7b）：标记资源在场 = 开。A-buffer 与
         // 两份绑定组在 hdr 不可变借用建立之前分配（TAA/SSR/AO 同款
@@ -6581,13 +6848,16 @@ impl Renderer {
         // **M 行列式为负 ⇒ 三角形环绕方向反转**——捕获管线用 cull None
         // 吸收（R62a 教训的「cull None 吸收」分支，与阴影 pass 同款）。
         // 抖动与主相机同款作用于纯投影（与 vp 的组装一致）。
-        let (water_refl_view, water_refl_vp, water_refl_eye) = match water_selected {
-            Some(ws) => {
+        let surface_height = ocean_selected
+            .map(|o| o.height)
+            .or_else(|| water_selected.map(|w| w.height));
+        let (water_refl_view, water_refl_vp, water_refl_eye) = match surface_height {
+            Some(height) => {
                 let mirror = Mat4::from_cols_array_2d(&[
                     [1.0, 0.0, 0.0, 0.0],
                     [0.0, -1.0, 0.0, 0.0],
                     [0.0, 0.0, 1.0, 0.0],
-                    [0.0, 2.0 * ws.height, 0.0, 1.0],
+                    [0.0, 2.0 * height, 0.0, 1.0],
                 ]);
                 let refl_view = view * mirror;
                 let refl_vp = crate::post::jitter_projection(proj, taa_jitter_ndc) * refl_view;
@@ -7906,7 +8176,7 @@ impl Renderer {
         //（view × 反射矩阵），折射 = 主相机视角；捕获内容 = 不透明几何
         // + 天空（探针捕获同款最低配组装），**不含水体自身**（无递归）。
         // 内部捕获不占用户的 RT 相机预算（§4.21/§8.20 的 R81 修订）。
-        if water_on {
+        if surface_on {
             self.encode_water_captures(
                 world,
                 &mut encoder,
@@ -7923,6 +8193,9 @@ impl Renderer {
                 &items,
                 &skinned,
                 total,
+                // 折射图只服务池塘（水面下的池底）；无限海没有可折射的池底
+                // ⇒ 海洋帧省掉整趟额外场景绘制。
+                water_on,
             );
         }
         // 4c. 粒子实例上传（独立缓冲，每帧全量——粒子逐帧全变，帧级比对
@@ -8517,7 +8790,7 @@ impl Renderer {
         // 即便不透明实例为空也要执行（Clear 支把副本刷成远平面哨兵 ⇒
         // 「无遮挡」，gather 不因新纹理未定义内容饿死透明几何）。
         if oit_on
-            || ((dof_on || mb_on || taa_on || ssr_on || ao_on || fog_on || water_on)
+            || ((dof_on || mb_on || taa_on || ssr_on || ao_on || fog_on || surface_on)
                 && opaque_total > 0)
         {
             self.ao_depth_frame = Some(self.occ_frame);
@@ -9069,6 +9342,104 @@ impl Renderer {
             pass.draw_indexed(0..water.grid_index_count, 0, 0..1);
             draw_calls += 1;
             triangles_drawn += water.grid_index_count / 3;
+        }
+        // 海洋 v2（R93）：链位与池塘同构（scene_depth 之后、TAA / 后处理链
+        // 之前；HDR MSAA Load + resolve、深度只测不写）。**两环两次
+        // `draw_indexed`**（近场 ±24 m 吃细节位移、远场 ±192 m 只有涌浪），
+        // 共用同一份归一化网格缓冲与同一张反射捕获图——每环一份 params 缓冲
+        // 与绑定组，故循环内只换 `set_bind_group`。
+        // **缺席语义**：无 `OceanSurface` ⇒ 本段零执行（零 write_buffer、
+        // 零 draw、零像素与命令流变化）。
+        if let Some(os) = ocean_selected {
+            let ocean = self.ocean.as_ref().expect("ocean_on 时海洋资源应已创建");
+            let grid = self.water.as_ref().expect("海洋复用体的捕获资源与水面网格");
+            // 波形时间：与池塘同源（Time.elapsed_secs，缺席 = 0 ⇒ 停在第 0
+            // 关键帧；不引入渲染器内部时钟）。
+            let wave_t = world
+                .try_resource::<iris_core::time::Time>()
+                .map(|t| t.elapsed_secs())
+                .unwrap_or(0.0);
+            let light_dir_w = (-light.direction).normalize_or_zero();
+            let rings = crate::ocean::ocean_rings(eye, os.near_extent, os.far_extent);
+            let (frame_a, _frame_b, frame_u) = crate::ocean::ocean_frame_pair(wave_t);
+            for (ri, ring) in rings.iter().enumerate() {
+                self.gpu.queue.write_buffer(
+                    &ocean.params_buf[ri],
+                    0,
+                    bytemuck::bytes_of(&OceanParamsRaw {
+                        view_proj: vp.to_cols_array_2d(),
+                        refl_view_proj: water_refl_vp.to_cols_array_2d(),
+                        eye: [eye.x, eye.y, eye.z, 0.0],
+                        light_dir: [light_dir_w.x, light_dir_w.y, light_dir_w.z, 0.0],
+                        light_color: [
+                            light.color.x * light.intensity,
+                            light.color.y * light.intensity,
+                            light.color.z * light.intensity,
+                            0.0,
+                        ],
+                        wave_a: [
+                            os.wave_amplitude,
+                            os.wave_length,
+                            os.wave_speed,
+                            os.choppiness,
+                        ],
+                        wave_b: [
+                            ring.half_extent,
+                            ring.grid_step,
+                            wave_t,
+                            os.absorb_depth.max(1e-3),
+                        ],
+                        ocean_a: [ring.anchor.x, ring.anchor.y, 0.0, os.detail_amplitude],
+                        ocean_b: [
+                            frame_a as f32,
+                            frame_u,
+                            ring.vertex_detail,
+                            ring.normal_detail,
+                        ],
+                        shallow: [
+                            os.shallow_color.x,
+                            os.shallow_color.y,
+                            os.shallow_color.z,
+                            0.0,
+                        ],
+                        deep: [os.deep_color.x, os.deep_color.y, os.deep_color.z, 0.0],
+                    }),
+                );
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.ocean"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &hdr.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&hdr.resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.bundle.water_ocean_pipeline);
+            pass.set_vertex_buffer(0, grid.grid_vertex_buf.slice(..));
+            pass.set_index_buffer(grid.grid_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            // 远场先画、近场后画（两环在同一深度测试下重叠，近处细节盖住
+            // 远处的粗网格边缘——先远后近让边缘接缝被后续片元覆盖）。
+            for ri in (0..2).rev() {
+                pass.set_bind_group(0, &ocean.bind_group[ri], &[]);
+                pass.draw_indexed(0..grid.grid_index_count, 0, 0..1);
+                draw_calls += 1;
+                triangles_drawn += grid.grid_index_count / 3;
+            }
         }
         // TAA pass（R60，链首）：抖动色 + 深度副本 + 上帧历史 → 3×3
         // 邻域钳制混合 → 写入本帧历史槽（ping-pong 半边按 TAA 帧号奇偶
@@ -11321,6 +11692,7 @@ impl Renderer {
         main_items: &[DrawItem],
         main_skinned: &[SkinnedItem],
         main_total: usize,
+        refraction: bool,
     ) {
         // ---- 反射捕获收集：镜像相机自己的视锥（镜像视角能看到主视锥外
         // 的物体——如相机身后的岸壁，必须独立收集而不是复用主视锥列表）
@@ -11521,8 +11893,8 @@ impl Renderer {
         }
         // 折射 pass（主相机视角；实例直接复用主实例缓冲的不透明区间
         // [0, opaque_total)——同一相机同一 VP，内容与主 pass 不透明结果
-        // 一致，零额外上传）
-        {
+        // 一致，零额外上传）。**海洋帧跳过**（无池底可折射）。
+        if refraction {
             let water = self.water.as_ref().expect("水体资源应已创建");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.water_refr"),

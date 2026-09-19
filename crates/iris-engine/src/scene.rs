@@ -149,7 +149,7 @@ use crate::level::{
 use crate::vfs::AssetMount;
 use iris_core::name::Name;
 use iris_core::physics::{BodyType, Collider, ColliderShape, RigidBody};
-use iris_core::prelude::{Entity, Quat, Transform, Vec3, World};
+use iris_core::prelude::{BuoyancyPlane, Entity, Quat, Transform, Vec3, World};
 use iris_core::{Component, Resource};
 use iris_render::asset::{
     GltfError, GltfInstance, HdrError, HdrImage, load_hdr, parse_hdr, spawn_gltf_instance,
@@ -157,9 +157,9 @@ use iris_render::asset::{
 };
 use iris_render::prelude::{
     AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, KajiyaKay, MaterialDef,
-    MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, ParticleBlend, ParticleEmitter,
-    ParticleEmitterV2, PointLight, ReflectionProbe, SkySource, SkySourceKind, TextureHandle,
-    TextureStore, Visibility, grass_textures,
+    MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, OceanSurface, ParticleBlend,
+    ParticleEmitter, ParticleEmitterV2, PointLight, ReflectionProbe, SkySource, SkySourceKind,
+    TextureHandle, TextureStore, Visibility, WaterSurface, grass_textures,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -406,6 +406,53 @@ struct EnvironmentSection {
     directional_light: Option<DirectionalLightSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sky_source: Option<String>,
+    /// 浮力平面（R93，`iris_core::buoyancy::BuoyancyPlane`）：**缺席 = 无浮力**
+    /// （组件/资源缺席语义与渲染侧一致——旧档零语义变化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    buoyancy: Option<BuoyancySection>,
+}
+
+/// 浮力资源段：全字段可选，缺省 = [`BuoyancyPlane::default`]（水密度 +
+/// 水面 y = 0 + `follow_water = false`）。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+struct BuoyancySection {
+    height: f32,
+    fluid_density: f32,
+    linear_drag: f32,
+    follow_water: bool,
+}
+
+impl Default for BuoyancySection {
+    fn default() -> Self {
+        Self::from_plane(&BuoyancyPlane::default())
+    }
+}
+
+impl BuoyancySection {
+    fn to_plane(self) -> Result<BuoyancyPlane, SceneError> {
+        if !self.height.is_finite() || !self.fluid_density.is_finite() {
+            return Err(SceneError::OutOfRange(format!(
+                "buoyancy.height / fluid_density 须有限（height={}, density={}）",
+                self.height, self.fluid_density
+            )));
+        }
+        Ok(BuoyancyPlane {
+            height: self.height,
+            fluid_density: self.fluid_density,
+            linear_drag: self.linear_drag.max(0.0),
+            follow_water: self.follow_water,
+        })
+    }
+
+    fn from_plane(p: &BuoyancyPlane) -> Self {
+        Self {
+            height: p.height,
+            fluid_density: p.fluid_density,
+            linear_drag: p.linear_drag,
+            follow_water: p.follow_water,
+        }
+    }
 }
 
 /// 方向光段：各字段缺省 = [`DirectionalLight::default`]。
@@ -497,6 +544,14 @@ struct EntitySection {
     collider: Option<ColliderSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rigidbody: Option<RigidBodySection>,
+    /// 平面水体段（R93 补账：R81 起 `WaterSurface` 一直只能代码侧装配）：
+    /// 全字段可选，缺省 = 组件 `Default`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    water: Option<WaterSurfaceSection>,
+    /// 无限海面段（R93 新组件 [`OceanSurface`]）：与 `water` 同挂时海洋优先
+    /// （渲染器侧的互斥裁定，见 iris-render `ocean` 模块文档）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ocean: Option<OceanSurfaceSection>,
 }
 
 /// 变换段：全缺省 = [`Transform::IDENTITY`]。四元数为 (x, y, z, w)（glam 序）。
@@ -1153,6 +1208,139 @@ impl Default for RigidBodySection {
     }
 }
 
+/// 平面水体段（R81 组件，R93 补进档面）：全字段可选，缺省 =
+/// [`WaterSurface::default`]。`half_extent` 须为正的有限数（半边长 ≤ 0 的
+/// 水面不可见也不该存在——按加载错误拒绝，与探针段同口径）。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+struct WaterSurfaceSection {
+    height: f32,
+    half_extent: [f32; 2],
+    wave_amplitude: f32,
+    wave_length: f32,
+    wave_speed: f32,
+    choppiness: f32,
+    shallow_color: [f32; 3],
+    deep_color: [f32; 3],
+    absorb_depth: f32,
+}
+
+impl Default for WaterSurfaceSection {
+    fn default() -> Self {
+        Self::from_water(&WaterSurface::default())
+    }
+}
+
+impl WaterSurfaceSection {
+    fn to_water(self) -> Result<WaterSurface, SceneError> {
+        if !self.half_extent.iter().all(|v| v.is_finite() && *v > 0.0) {
+            return Err(SceneError::OutOfRange(format!(
+                "water.half_extent = {:?} 须为正的有限数",
+                self.half_extent
+            )));
+        }
+        Ok(WaterSurface {
+            height: self.height,
+            half_extent: glam::Vec2::from_array(self.half_extent),
+            wave_amplitude: self.wave_amplitude,
+            wave_length: self.wave_length.max(1e-3),
+            wave_speed: self.wave_speed,
+            choppiness: self.choppiness,
+            shallow_color: glam::Vec3::from_array(self.shallow_color),
+            deep_color: glam::Vec3::from_array(self.deep_color),
+            absorb_depth: self.absorb_depth,
+        })
+    }
+
+    fn from_water(w: &WaterSurface) -> Self {
+        Self {
+            height: w.height,
+            half_extent: w.half_extent.to_array(),
+            wave_amplitude: w.wave_amplitude,
+            wave_length: w.wave_length,
+            wave_speed: w.wave_speed,
+            choppiness: w.choppiness,
+            shallow_color: w.shallow_color.to_array(),
+            deep_color: w.deep_color.to_array(),
+            absorb_depth: w.absorb_depth,
+        }
+    }
+}
+
+/// 无限海面段（R93）：全字段可选，缺省 = [`OceanSurface::default`]。
+/// `near_extent ≤ far_extent` 不强制（渲染器侧 `ocean_rings` 会钳合并告警），
+/// 但两值必须是正的有限数，且近场步距不得小于一个位移图纹素。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+struct OceanSurfaceSection {
+    height: f32,
+    detail_amplitude: f32,
+    spectral_slope: f32,
+    wave_amplitude: f32,
+    wave_length: f32,
+    wave_speed: f32,
+    choppiness: f32,
+    near_extent: f32,
+    far_extent: f32,
+    shallow_color: [f32; 3],
+    deep_color: [f32; 3],
+    absorb_depth: f32,
+}
+
+impl Default for OceanSurfaceSection {
+    fn default() -> Self {
+        Self::from_ocean(&OceanSurface::default())
+    }
+}
+
+impl OceanSurfaceSection {
+    fn to_ocean(self) -> Result<OceanSurface, SceneError> {
+        let extents = [self.near_extent, self.far_extent];
+        if !extents.iter().all(|v| v.is_finite() && *v > 0.0) {
+            return Err(SceneError::OutOfRange(format!(
+                "ocean.near_extent / far_extent = {extents:?} 须为正的有限数"
+            )));
+        }
+        if !self.detail_amplitude.is_finite() || self.detail_amplitude < 0.0 {
+            return Err(SceneError::OutOfRange(format!(
+                "ocean.detail_amplitude = {} 须为非负有限数",
+                self.detail_amplitude
+            )));
+        }
+        Ok(OceanSurface {
+            height: self.height,
+            detail_amplitude: self.detail_amplitude,
+            spectral_slope: self.spectral_slope.max(0.5),
+            wave_amplitude: self.wave_amplitude,
+            wave_length: self.wave_length.max(1e-3),
+            wave_speed: self.wave_speed,
+            choppiness: self.choppiness,
+            near_extent: self.near_extent,
+            far_extent: self.far_extent,
+            shallow_color: glam::Vec3::from_array(self.shallow_color),
+            deep_color: glam::Vec3::from_array(self.deep_color),
+            absorb_depth: self.absorb_depth,
+        })
+    }
+
+    fn from_ocean(o: &OceanSurface) -> Self {
+        Self {
+            height: o.height,
+            detail_amplitude: o.detail_amplitude,
+            spectral_slope: o.spectral_slope,
+            wave_amplitude: o.wave_amplitude,
+            wave_length: o.wave_length,
+            wave_speed: o.wave_speed,
+            choppiness: o.choppiness,
+            near_extent: o.near_extent,
+            far_extent: o.far_extent,
+            shallow_color: o.shallow_color.to_array(),
+            deep_color: o.deep_color.to_array(),
+            absorb_depth: o.absorb_depth,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // load
 // ---------------------------------------------------------------------------
@@ -1591,6 +1779,9 @@ fn apply_environment(
         // 登记原始路径字符串：save 时原样写出（roundtrip 稳定）
         world.resource_mut::<SceneAssetRegistry>().sky_source = Some(rel);
     }
+    if let Some(buoyancy) = environment.buoyancy {
+        world.insert_resource(buoyancy.to_plane()?);
+    }
     Ok(())
 }
 
@@ -1673,6 +1864,12 @@ fn spawn_section(
         world.insert(entity, probe);
     }
 
+    if let Some(water) = section.water {
+        world.insert(entity, water.to_water()?);
+    }
+    if let Some(ocean) = section.ocean {
+        world.insert(entity, ocean.to_ocean()?);
+    }
     if let Some(collider) = section.collider {
         world.insert(
             entity,
@@ -2042,6 +2239,9 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     if let Some(light) = world.try_resource::<DirectionalLight>() {
         environment.directional_light = Some(DirectionalLightSection::from_light(&light));
     }
+    if let Some(plane) = world.try_resource::<BuoyancyPlane>() {
+        environment.buoyancy = Some(BuoyancySection::from_plane(&plane));
+    }
     if let Some(sky) = world.try_resource::<SkySource>() {
         if matches!(sky.kind, SkySourceKind::EquirectHdr(_)) {
             match &registry.sky_source {
@@ -2053,8 +2253,9 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
             }
         }
     }
-    let has_environment =
-        environment.directional_light.is_some() || environment.sky_source.is_some();
+    let has_environment = environment.directional_light.is_some()
+        || environment.sky_source.is_some()
+        || environment.buoyancy.is_some();
 
     // level 段：加载时快照原样回写（空段省略）；`ddgi` 子段是例外——
     // 从**活动资源**回写（R89，照 `DirectionalLight` 的资源回写先例）：
@@ -2161,6 +2362,13 @@ fn build_entity_section(
     // 反射探针（C2）：纯配置组件，全字段往返
     if let Some(probe) = world.get::<ReflectionProbe>(entity) {
         section.probe = Some(ProbeSection::from_probe(&probe));
+    }
+
+    if let Some(water) = world.get::<WaterSurface>(entity) {
+        section.water = Some(WaterSurfaceSection::from_water(&water));
+    }
+    if let Some(ocean) = world.get::<OceanSurface>(entity) {
+        section.ocean = Some(OceanSurfaceSection::from_ocean(&ocean));
     }
 
     if let Some(collider) = world.get::<Collider>(entity) {
@@ -3988,5 +4196,120 @@ mod tests {
             collider.shape,
             "OBB 段往返位级一致"
         );
+    }
+
+    /// 水面 / 海面 / 浮力三段（R93 序列化补账）：加载进组件与资源、save →
+    /// 重载位级一致、退化参数在加载期拒绝、**旧档（无这三段）零语义变化**。
+    #[test]
+    fn water_ocean_buoyancy_sections_roundtrip_and_reject_degenerate() {
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "water.scene.json",
+            r#"{
+                "environment": { "buoyancy": { "height": 0.5, "follow_water": true } },
+                "entities": [
+                    { "name": "pond", "water": {
+                        "height": 0.5, "half_extent": [12.0, 9.0], "wave_speed": 2.5 } },
+                    { "name": "sea", "ocean": {
+                        "height": -1.25, "detail_amplitude": 0.2, "far_extent": 250.0 } }
+                ]
+            }"#,
+        );
+        let plane = *world
+            .try_resource::<BuoyancyPlane>()
+            .expect("buoyancy 段应插资源");
+        assert_eq!(plane.height.to_bits(), 0.5f32.to_bits());
+        assert!(plane.follow_water, "follow_water 必须可入档");
+        assert_eq!(
+            plane.fluid_density,
+            BuoyancyPlane::default().fluid_density,
+            "未写出的字段走组件 Default"
+        );
+        let pond = *world
+            .get::<WaterSurface>(entities[0])
+            .expect("water 段应进组件");
+        assert_eq!(pond.half_extent.to_array(), [12.0f32, 9.0]);
+        assert_eq!(pond.wave_speed.to_bits(), 2.5f32.to_bits());
+        assert_eq!(
+            pond.wave_length,
+            WaterSurface::default().wave_length,
+            "空字段走 Default（旧档兼容的同一套缺省）"
+        );
+        let sea = *world
+            .get::<OceanSurface>(entities[1])
+            .expect("ocean 段应进组件");
+        assert_eq!(sea.height.to_bits(), (-1.25f32).to_bits());
+        assert_eq!(sea.detail_amplitude.to_bits(), 0.2f32.to_bits());
+        assert_eq!(sea.far_extent.to_bits(), 250.0f32.to_bits());
+        assert_eq!(sea.near_extent, OceanSurface::default().near_extent);
+
+        let out = test_dir().join("water_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        for key in ["\"water\"", "\"ocean\"", "\"buoyancy\""] {
+            assert!(text.contains(key), "{key} 段应写出");
+        }
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out).expect("重载");
+        assert_eq!(
+            WaterSurfaceSection::from_water(&world_b.get::<WaterSurface>(entities_b[0]).unwrap()),
+            WaterSurfaceSection::from_water(&pond),
+            "水面配置往返位级一致"
+        );
+        assert_eq!(
+            OceanSurfaceSection::from_ocean(&world_b.get::<OceanSurface>(entities_b[1]).unwrap()),
+            OceanSurfaceSection::from_ocean(&sea),
+            "海面配置往返位级一致"
+        );
+        assert_eq!(
+            world_b.try_resource::<BuoyancyPlane>().map(|p| p.height),
+            Some(0.5),
+            "浮力资源往返"
+        );
+
+        // 退化参数：半边长含 0 / 环范围为负 / 细节幅值为负 ⇒ 加载期 OutOfRange
+        for (label, body) in [
+            (
+                "water 零半边长",
+                r#"{ "entities": [ { "water": { "half_extent": [0.0, 4.0] } } ] }"#,
+            ),
+            (
+                "ocean 负环范围",
+                r#"{ "entities": [ { "ocean": { "near_extent": -1.0 } } ] }"#,
+            ),
+            (
+                "ocean 负细节幅值",
+                r#"{ "entities": [ { "ocean": { "detail_amplitude": -0.1 } } ] }"#,
+            ),
+        ] {
+            let mut w = fresh_world();
+            let path = test_dir().join(format!("water_bad_{}.json", label.len()));
+            std::fs::write(&path, body).expect("写坏档");
+            let err = load_scene(&mut w, &path).expect_err(&format!("{label} 必须被拒绝"));
+            assert!(
+                matches!(err, SceneError::OutOfRange(_)),
+                "{label} 应为越界错误，实际 {err:?}"
+            );
+        }
+
+        // 旧档零语义变化：不含三段的场景，重存后也不得冒出这三段。
+        let mut legacy = fresh_world();
+        let (ents, _) = load_str(
+            &mut legacy,
+            "water_legacy.scene.json",
+            r#"{ "entities": [ { "name": "box", "collider": { "shape": { "sphere": { "radius": 0.5 } } } } ] }"#,
+        );
+        assert_eq!(ents.len(), 1);
+        assert!(
+            legacy.try_resource::<BuoyancyPlane>().is_none(),
+            "无 buoyancy 段 = 无浮力（缺席语义）"
+        );
+        let out2 = test_dir().join("water_legacy_out.json");
+        save_scene(&mut legacy, &out2).expect("保存旧档");
+        let text2 = std::fs::read_to_string(&out2).unwrap();
+        for key in ["\"water\"", "\"ocean\"", "\"buoyancy\""] {
+            assert!(!text2.contains(key), "旧档重存不得凭空多出 {key} 段");
+        }
     }
 }

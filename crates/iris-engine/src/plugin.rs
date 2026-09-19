@@ -287,6 +287,60 @@ impl Plugin for TimelinePlugin {
 /// 与物理分批，避免读到半求解状态）；与 [`AnimationPlugin`] 的访问集
 /// 重叠（都写 Transform、读 Time），调度器自动分批并保持注册顺序
 /// （动画先、物理后）。
+/// 水面 ↔ 浮力平面的跨界同步系统（R93）。
+///
+/// **为什么在 iris-engine**：水面组件在 `iris_render`（渲染侧）、浮力资源在
+/// `iris_core`（零渲染依赖），只有引擎编排层同时依赖两者——跨界搬运放这里
+/// 是唯一不破依赖方向的落点（裁定 7）。
+///
+/// **语义**：仅当 `BuoyancyPlane` 资源在场**且** `follow_water == true` 时，
+/// 把世界内的水面高度灌进资源的 `height`——海洋优先于池塘（与渲染器的互斥
+/// 裁定同序：两路同挂时渲染的是海，物理也得跟着海）；同类的多实体按
+/// `select_water_surface`（实体位模式升序取首盏）选，与渲染侧同一确定性键。
+///
+/// **缺席 = 逐位不变**：资源缺席 / `follow_water == false` ⇒ 整段零写入，
+/// 游戏手设的 `height` 永不被引擎改写（默认 `false`，opt-in 才跟随）。
+pub fn sync_buoyancy_water_surface(world: &mut iris_core::world::World) {
+    use iris_core::buoyancy::BuoyancyPlane;
+    // 只读探测（`ResourceRef` 不可写，写之前必须释放该借用）：资源缺席或
+    // 显式关闭跟随 ⇒ 零触碰（两条缺席路径在这里合并）。
+    let follow = world
+        .try_resource::<BuoyancyPlane>()
+        .is_some_and(|p| p.follow_water);
+    if !follow {
+        return;
+    }
+    let mut best_ocean: Option<(u64, f32)> = None;
+    world.query::<(iris_core::entity::Entity, &iris_render::ocean::OceanSurface)>(
+        |(entity, ocean)| {
+            let bits = entity.to_bits();
+            if best_ocean.is_none_or(|(b, _)| bits < b) {
+                best_ocean = Some((bits, ocean.height));
+            }
+        },
+    );
+    let surface = match best_ocean {
+        Some((_, height)) => Some(height),
+        None => {
+            let mut best_pond: Option<(u64, f32)> = None;
+            world.query::<(iris_core::entity::Entity, &iris_render::water::WaterSurface)>(
+                |(entity, water)| {
+                    let bits = entity.to_bits();
+                    if best_pond.is_none_or(|(b, _)| bits < b) {
+                        best_pond = Some((bits, water.height));
+                    }
+                },
+            );
+            best_pond.map(|(_, height)| height)
+        }
+    };
+    if let Some(height) = surface {
+        // 水面在别处（编辑器 / 脚本）刚挪动 ⇒ 本帧物理跟着走；同值写入是
+        // 恒等操作（f32 赋值逐位相同），不引入任何数值扰动。
+        world.resource_mut::<BuoyancyPlane>().height = height;
+    }
+}
+
 #[derive(Default)]
 pub struct PhysicsPlugin;
 
@@ -302,6 +356,10 @@ impl Plugin for PhysicsPlugin {
         app.world.register_event::<CollisionStarted>();
         app.world.register_event::<CollisionEnded>();
         app.world.insert_resource(ContactTracker::default());
+        // 水面同步（R93）：独占系统，注册在 `step_physics` **之前**
+        //（调度器按注册序分批 ⇒ 本系统先跑，物理当帧就用到新水面高度）。
+        app.schedule
+            .add_system(Stage::Update, sync_buoyancy_water_surface);
         app.schedule.add_parallel_system(
             Stage::Update,
             Access::new()
@@ -309,7 +367,9 @@ impl Plugin for PhysicsPlugin {
                 .write::<Collider>()
                 .write::<RigidBody>()
                 .read::<Time>()
-                .read::<iris_core::physics::ContactSolverV2>(),
+                .read::<iris_core::physics::ContactSolverV2>()
+                // 浮力平面（R93）：`step_physics` 现在读它——缺席同样合法。
+                .read::<iris_core::buoyancy::BuoyancyPlane>(),
             step_physics,
         );
         // 可断关节（C3）：断裂兑现——step_physics 只入队（&World 无法
@@ -638,6 +698,111 @@ mod tests {
             (viewport.width, viewport.height),
             (800, 600),
             "Viewport 应以窗口初始尺寸插入"
+        );
+    }
+
+    // ---- 浮力水面同步（R93）----
+
+    /// 跨界同步系统：`follow_water` 三档（资源缺席 / 显式关 / 开）+ 海洋优先
+    /// + 池塘按实体位模式首盏 + 无水时零触碰。
+    #[test]
+    fn buoyancy_sync_follows_ocean_then_pond_and_respects_opt_in() {
+        use iris_core::buoyancy::BuoyancyPlane;
+        use iris_core::prelude::World;
+        use iris_render::{ocean::OceanSurface, water::WaterSurface};
+
+        // 1) 资源缺席：不报错也不凭空插入（缺席 = 无浮力）。
+        let mut world = World::new();
+        sync_buoyancy_water_surface(&mut world);
+        assert!(
+            world.try_resource::<BuoyancyPlane>().is_none(),
+            "同步系统不得替游戏创建资源"
+        );
+
+        // 2) 在场但 follow_water = false（默认）：手设高度逐位不被覆盖。
+        let mut world = World::new();
+        world.insert_resource(BuoyancyPlane {
+            height: -7.25,
+            ..BuoyancyPlane::default()
+        });
+        world.spawn((OceanSurface::new(3.0),));
+        sync_buoyancy_water_surface(&mut world);
+        assert_eq!(
+            world
+                .try_resource::<BuoyancyPlane>()
+                .unwrap()
+                .height
+                .to_bits(),
+            (-7.25f32).to_bits(),
+            "opt-in 未开 ⇒ 引擎不得改写游戏手设的水位"
+        );
+
+        // 3) 开跟随 + 海洋在场 ⇒ 用海平面。
+        world.resource_mut::<BuoyancyPlane>().follow_water = true;
+        sync_buoyancy_water_surface(&mut world);
+        assert_eq!(
+            world
+                .try_resource::<BuoyancyPlane>()
+                .unwrap()
+                .height
+                .to_bits(),
+            3.0f32.to_bits(),
+            "follow_water ⇒ 取 OceanSurface.height"
+        );
+
+        // 4) 海与池塘同挂 ⇒ 仍取海（与渲染器的互斥裁定同序）。
+        world.spawn((WaterSurface::new(1.0, glam::Vec2::new(8.0, 8.0)),));
+        sync_buoyancy_water_surface(&mut world);
+        assert_eq!(
+            world
+                .try_resource::<BuoyancyPlane>()
+                .unwrap()
+                .height
+                .to_bits(),
+            3.0f32.to_bits(),
+            "两路同挂时物理必须跟渲染走（海洋优先）"
+        );
+
+        // 5) 只有池塘 ⇒ 多水面按实体位模式升序取首盏（与 select_water_surface 同键）。
+        let mut world2 = World::new();
+        world2.insert_resource(BuoyancyPlane {
+            height: 0.0,
+            follow_water: true,
+            ..BuoyancyPlane::default()
+        });
+        let first = world2.spawn((WaterSurface::new(1.5, glam::Vec2::splat(4.0)),));
+        world2.spawn((WaterSurface::new(9.0, glam::Vec2::splat(4.0)),));
+        assert!(
+            first.index() < 9_000_000,
+            "位模式首盏判据前提（先 spawn 者位模式更小）"
+        );
+        sync_buoyancy_water_surface(&mut world2);
+        assert_eq!(
+            world2
+                .try_resource::<BuoyancyPlane>()
+                .unwrap()
+                .height
+                .to_bits(),
+            1.5f32.to_bits(),
+            "多池塘时取位模式首盏"
+        );
+
+        // 6) 开跟随但世界无水 ⇒ 保持原值（不写 0、不 NaN）。
+        let mut world3 = World::new();
+        world3.insert_resource(BuoyancyPlane {
+            height: 2.5,
+            follow_water: true,
+            ..BuoyancyPlane::default()
+        });
+        sync_buoyancy_water_surface(&mut world3);
+        assert_eq!(
+            world3
+                .try_resource::<BuoyancyPlane>()
+                .unwrap()
+                .height
+                .to_bits(),
+            2.5f32.to_bits(),
+            "无水时零写入"
         );
     }
 }

@@ -102,6 +102,12 @@ pub(crate) struct PipelineBundle {
     /// MSAA alpha 混合、深度只测不写、cull None，见 `shaders/water.wgsl`
     /// 与 water.rs 的 WaterSurface。
     pub water_pipeline: wgpu::RenderPipeline,
+    /// 海洋 v2 管线（R93）：**同一 `water.wgsl` 模块**的 `vs_ocean` /
+    /// `fs_ocean` entry point + 独立组 0（`water_ocean_layout`）。池塘的
+    /// `water_pipeline` 一字不动 ⇒ R81 全部像素锁原值通过；Gerstner 大波
+    /// 复用同文件的 `water_evaluate`（零公式复制），细节层来自 CPU 预烘的
+    /// 关键帧位移图（`iris_render::ocean`）。目标 / 深度 / 环绕与池塘同构。
+    pub water_ocean_pipeline: wgpu::RenderPipeline,
     /// 发带管线（R90）：VS = `shaders/hair_vs.wgsl`（相机面向屏幕展宽），
     /// FS = standard.wgsl `fs_main`（Kajiya-Kay 与 cutout 都在 fs_shaded，
     /// 光照数学零复制）；REPLACE + 深度写（cutout 语义）、cull None
@@ -225,6 +231,12 @@ pub(crate) struct PipelineBundle {
     /// 可过滤）、3 = scene_depth（R32Float 非过滤）、4 = 过滤采样器。
     /// 独立组不扩 globals（R61/R77/R78 先例）。
     pub water_layout: wgpu::BindGroupLayout,
+    /// 海洋 v2 组布局（R93）：0 = OceanParams uniform（272B，
+    /// vertex|fragment）、1 = 反射捕获图、2 = 关键帧位移图
+    /// （`texture_2d_array<Rgba16Float>`，可过滤，层号 = 关键帧）、
+    /// 3 = scene_depth（R32Float 非过滤）、4 = ClampToEdge 采样器、
+    /// 5 = Repeat 采样器（图样周期平铺是构造的一部分）。
+    pub water_ocean_layout: wgpu::BindGroupLayout,
     /// TAA 组布局（R60）：`post_depth_layout` 的基础上再多一路
     /// binding 4 = 上帧历史纹理（Rgba16Float，可过滤——历史重投影采样
     /// 在亚纹素位置，线性过滤是其定义的一部分）。
@@ -2206,9 +2218,29 @@ pub(crate) fn create_pipeline(
     // 深度附件，与「水像素不写 scene_depth」同语义）；cull None（波形
     // 会倾斜面片，水下视角从背面看亦可见——相机入水无特殊处理是 v1
     // 限制，见 §8.50）。
+    // 水体 / 海洋两个 shader module 在 Rust 侧**拼接**而成：
+    // `water_common.wgsl`（Gerstner 求和 + 归一化 + 波形常量 + 顶点输入）是
+    // 两路的单一事实源。WGSL 没有 include，仓库既有范式是「双份拷贝 + 源码
+    // 层看门」（R92 涟漪），本轮对水体改用拼接——同一份求和逻辑同时进两个
+    // module，重复按构造不存在，也就不需要看门守着两副本不漂移；两个 module
+    // 各自只声明自己那一份 `@group(0)`，故海洋可以有自己的绑定布局而池塘
+    // 路径一字不动（R81 像素锁原值通过）。
+    let water_common: &str = include_str!("../shaders/water_common.wgsl");
     let water_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("iris.shader.water"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/water.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(
+            format!("{water_common}{}", include_str!("../shaders/water.wgsl")).into(),
+        ),
+    });
+    let water_ocean_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.water_ocean"),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                "{water_common}{}",
+                include_str!("../shaders/water_ocean.wgsl")
+            )
+            .into(),
+        ),
     });
     let water_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("iris.layout.water"),
@@ -2285,6 +2317,120 @@ pub(crate) fn create_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: &water_shader,
             entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // ---- 海洋 v2（R93）：同模块不同 entry point + 独立组 0 ----
+    let water_ocean_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.layout.water_ocean"),
+        entries: &[
+            // 0：OceanParams uniform（288B；VS 取锚点 / 范围 / 帧号做
+            // 位移，FS 取配色 / 光照做合成）
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1：反射捕获图（与池塘同一张半分辨率镜像相机产物）
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            // 2：关键帧位移图（数组层 = 帧；VS 与 FS 都要采——近场几何
+            // 位移在 VS，亚格镜面闪点在 FS）
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            // 3：scene_depth 副本（R32Float 非过滤，与池塘深度吸收同款）
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                },
+                count: None,
+            },
+            // 4 / 5：ClampToEdge（反射扰动的出界钳边）与 Repeat
+            //（位移图的周期平铺）两把过滤采样器
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let water_ocean_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.water.ocean.pipeline.layout"),
+            bind_group_layouts: &[Some(&water_ocean_layout)],
+            immediate_size: 0,
+        });
+    let water_ocean_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.water_ocean"),
+        layout: Some(&water_ocean_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &water_ocean_shader,
+            entry_point: Some("vs_ocean"),
+            compilation_options: Default::default(),
+            // 与池塘共用同一份归一化 [−1,1]² 静态网格（`WaterVertex`
+            // 布局，uv 属性闲置——图采样坐标由世界 XZ 推出）
+            buffers: &[Some(crate::water::WaterVertex::LAYOUT)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &water_ocean_shader,
+            entry_point: Some("fs_ocean"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: HDR_FORMAT,
@@ -3251,6 +3397,7 @@ pub(crate) fn create_pipeline(
         ao_pipeline,
         fog_pipeline,
         water_pipeline,
+        water_ocean_pipeline,
         hair_pipeline,
         shell_pipeline,
         shadow_hair_pipeline,
@@ -3267,6 +3414,7 @@ pub(crate) fn create_pipeline(
         ao_layout,
         sky_layout,
         water_layout,
+        water_ocean_layout,
         ui_layout,
         particle_layout,
         particle_v2_sim_layout,

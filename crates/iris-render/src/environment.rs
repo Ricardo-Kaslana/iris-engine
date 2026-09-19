@@ -101,7 +101,7 @@ pub(crate) fn bake_environment(gpu: &Gpu) -> EnvironmentMaps {
 
 /// f32 → f16 位模式（舍入到最近偶数）。wgpu 未重导出 half crate，
 /// 而环境贴图上传只需要这一处转换——手写位操作并配单测锁定。
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let abs = bits & 0x7fff_ffff;

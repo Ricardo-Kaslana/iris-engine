@@ -23,8 +23,11 @@
 //!   世界 `Time` 资源的 `elapsed_secs`（资源缺席 = t = 0，波形静止在
 //!   初始相位——不引入任何渲染器内部时钟）。无 rand、无全局状态。
 //! - **WGSL 镜像契约**：[`gerstner_single_wave`] / [`gerstner_evaluate`]
-//!   与 `shaders/water.wgsl` 的 `water_single_wave` / `water_evaluate`
-//!   **逐式镜像（同式同序，两侧必须同步修改）**——CPU 单测即着色器波形
+//!   与 `shaders/water_common.wgsl` 的 `water_single_wave` / `water_evaluate`
+//!   **逐式镜像（同式同序，两侧必须同步修改）**——R93 起波形段抽进
+//!   `water_common.wgsl`，由 `pipeline.rs` 分别拼进池塘（`water.wgsl`）与
+//!   海洋（`water_ocean.wgsl`）两个 shader module ⇒ 两路共用同一份求和逻辑
+//!   （见 ARCHITECTURE §4.52）——CPU 单测即着色器波形
 //!   的解析锚点（与 `fog.rs` / `fog.wgsl` 同款纪律；CPU↔GPU 不做位级
 //!   等价声明——sin/cos 的库实现不同，位级一致只对「同侧同输入」成立）。
 

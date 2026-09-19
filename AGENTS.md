@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1733 / release 1730**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；R92 降水 +18：iris-render CPU 12（weather 8：湿/雪端点逐位（重心式——mix 非规范保证且线性插值式 a=1 实测 2 ULP 残差）/坡度门单调/格哈希散布/涟漪有界确定间歇/geometry 覆盖/源码看门；particles_v2 4：阻尼终端速度 g/k 解析收敛+零阻尼逐位恒等/体积门逐位还原原点+散布满幅/雨雪预设字段与稳态预算 ≤ 池容量/advance 携带三旋钮）+ GPU `weather_render.rs` 6（GPU_SERIAL：缺席与全零资源逐位同构/湿 0-0.5-1 单调暗化（俯视机位——掠射 Fresnel 天空镜面会抵消变暗）/积雪墙地增量比 ~7%/雨渲染+移动+双会话逐位/雪渲染+双会话逐位/涟漪 wave_speed=0 隔离判别）；**排障教训：降水可见性的三重光度学下限**（256px 视口 + alpha 软边 + 色调映射——诊断链：draw call 与三角数照常但零像素 ⇒ 逐旋钮二分（fountain+微体积 6373 px 定位到大体积覆盖率）⇒ 加法混合 1724 vs alpha 145 定位到暗剪影对比度 ⇒ 深色化预设 + 测试放大丝宽至 0.45）；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1776 / release 1773**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；R92 降水 +18：iris-render CPU 12（weather 8：湿/雪端点逐位（重心式——mix 非规范保证且线性插值式 a=1 实测 2 ULP 残差）/坡度门单调/格哈希散布/涟漪有界确定间歇/geometry 覆盖/源码看门；particles_v2 4：阻尼终端速度 g/k 解析收敛+零阻尼逐位恒等/体积门逐位还原原点+散布满幅/雨雪预设字段与稳态预算 ≤ 池容量/advance 携带三旋钮）+ GPU `weather_render.rs` 6（GPU_SERIAL：缺席与全零资源逐位同构/湿 0-0.5-1 单调暗化（俯视机位——掠射 Fresnel 天空镜面会抵消变暗）/积雪墙地增量比 ~7%/雨渲染+移动+双会话逐位/雪渲染+双会话逐位/涟漪 wave_speed=0 隔离判别）；**排障教训：降水可见性的三重光度学下限**（256px 视口 + alpha 软边 + 色调映射——诊断链：draw call 与三角数照常但零像素 ⇒ 逐旋钮二分（fountain+微体积 6373 px 定位到大体积覆盖率）⇒ 加法混合 1724 vs alpha 145 定位到暗剪影对比度 ⇒ 深色化预设 + 测试放大丝宽至 0.45）；R93 海洋 v2 + 浮力 +43：iris-core CPU 21（buoyancy 14：球冠三锚点 / 平放盒线性闭式 / **OBB 三次 box spline 闭式 vs 16³ 中点积分收敛** / OBB 恒等姿态 ≡ Box / 90° 三轴互异取轴硬锚（专治旋转矩阵列 vs 行的静默转置）/ 过中心平面任意姿态精确对半分 / 端点 0-1 逐位 / 中性浮力体积判据 / to_bits 双跑；physics::buoyancy_tests 7：**净加速度按密度比解析对照** / 中性体 2 s 不动 / 半密盒收敛到一半吃水 / **缺席与零浸没轨迹逐位 ≡ legacy**（含「水位落在轨迹上时必须改位型」的判别力旁证）/ 无碰撞体飞行体不参与 / **浮力不改旋转位型**（无扶正力矩））+ iris-render CPU 14（ocean：平面表确定 + Nyquist 界 / RMS 归一化与带限能量单调 / ω 量化到 2π/T 格点 + 误差有界 / 时间 Nyquist 余量**上下界** / 烘图逐位 + 末帧回绕 0 + 通道布局锚 / f16 同量 / 重心式端点逐位 / 帧对全循环 + 负时间 / 环步距与细节权重 + 亚步吸收 + 越步换格 / 淡出单调 / 峰高与均值界 / **谱斜率搬能量到短波且不改 RMS** / WGSL 影子契约看门）+ GPU `ocean_render.rs` 6（GPU_SERIAL：在场改哈希 + 覆盖面积 / 无海洋帧可复现 / **海+池塘 ≡ 只有海**（互斥不是画了再盖）/ detail_amplitude 活旋钮 + 近场条带差分 / **far_extent 收缩让 100 m 落点从海翻成天空 + 环带差分** / 双会话逐帧逐位 + 时间改哈希）+ iris-engine 2（三段序列化往返 + 退化拒绝 + 旧档零变化 / 同步系统六档 opt-in）。**排障教训入档：① 掠射海面不能用「比天空暗」做判据**（3 m 机位看 100 m 外俯角几度 ⇒ Fresnel 趋 1，海就是天空的镜子，实测海 [214,222,230] vs 天空 [215,220,225] 反而略亮——判别改走几何落点 + 环带差分）；**② 谱斜率是观感量不是物理量**（Phillips 档振幅 ∝ k⁻² 使**斜率谱 ∝ k⁻²**、法线扰动全被最长波吃光，验收图细节开/关亮度差 < 1/255 目检不过 ⇒ `spectral_slope` 默认 1.5）；**③ 同一 WGSL module 是一个全局命名空间**（两路 `@group(0)` 同 binding 号不同类型 = naga 直接拒绝，「同文件加 entry point」不成立 ⇒ 改 Rust 侧拼接 common 段，见 §4.52）；**④ 快照里 Time 必须插进世界再推进**（留在局部变量 ⇒ step_physics 的 dt = 0，浮体全冻在出生高度）。每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1733 / release 1730）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1776 / release 1773）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -139,8 +139,8 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-20 更新）
 
-- HEAD = R92 降水（`cd06522`），工作树干净。测试基线 debug 1733 / release 1730；全库零 unsafe；native+wasm32 双 target 零警告；ARCHITECTURE §8 诚实清单现 71 条；**无 git 远端、无 tag**（workspace 版本 0.1.1，R56 发布时需用户提供远端）。
-- **下一步待用户裁定**：R93 海洋 v2 + 浮力【**进行中**——2026-09-20 设计定稿，等外部 Agent 汇报】/ W8 完整 Assault R69–R72（未获「OK」不开工）/ W9 收官 R55 生产化 + R56 发布 0.1。
+- HEAD = R93 海洋 v2 + 浮力。测试基线 debug 1776 / release 1773；全库零 unsafe；native+wasm32 双 target 零警告；ARCHITECTURE §8 诚实清单现 72 条；**无 git 远端、无 tag**（workspace 版本 0.1.1，R56 发布时需用户提供远端）。
+- **下一步待用户裁定**：R94 水下 + 焦散（第三梯队收官役下半，设计定稿待出）/ W8 完整 Assault R69–R72（未获「OK」不开工）/ W9 收官 R55 生产化 + R56 发布 0.1。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65
@@ -206,11 +206,20 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     墙地增量比 ~7% GPU 可判）；binding 21 uniform（不扩 Globals 先例，
     主相机/捕获/RT 共享一只缓冲——天气是世界状态）；设计四点裁定
     全按推荐；缺席/全零 = 逐位不变（七套像素锁原值通过）；诚实限制
-    §8.71）、**R93 海洋 v2 + 浮力（进行中，2026-09-20 设计定稿：CPU Phillips
-    频谱合成预烘关键帧位移图 × 相机跟随双层无限海面 × iris-core `BuoyancyPlane`
-    浮力 opt-in × 水体序列化补账；设计定稿与提示词
-    `docs/private/r93-ocean-v2.md`）**、**R94 水下 + 焦散（裁定 5 新立，待开工）**
-    ——第三梯队按 2026-09-20 追加裁定由 1 轮拆为 2 轮
+    §8.71）、**R93 海洋 v2 + 浮力 ✅**（2026-09-20 收官，主会话直接实现；CPU
+    Phillips 型格点谱合成 + ω 量化到 2π/T ⇒ 16 关键帧无缝回绕的
+    `texture_2d_array` 位移图（通道含**解析梯度**）× 相机锚点量化双层网格
+    （近 ±24 m 吃细节位移 / 远 ±320 m 只涌浪，淡出终点 = 远场起点 ⇒ 无竖直
+    台阶，天然闭合 §8.50⑧）× iris-core `BuoyancyPlane` opt-in 浮力（球冠 /
+    AABB / **OBB 三次 box spline 闭式**浸没体积，缺席与零浸没 = 轨迹逐位
+    不变）× 水体/海面/浮力三段序列化补账（R81 起从未入档）；池塘
+    `vs_main`/`water_pipeline` 一字未动，海洋走 `water_common.wgsl` **Rust 侧
+    拼接**出的独立 module + 独立组 0（同 module 两路 group(0) 会撞 binding
+    号——实测 naga 拒绝）；设计三点裁定全按推荐（拆两轮 / 预烘关键帧 /
+    浮力落 core + engine 同步）；六条实现偏离声明见 CHANGELOG；R81 四套 +
+    R92 六套像素锁与六游戏轨迹锁**原值通过**；诚实限制 §8.72 十四条）、
+    **R94 水下 + 焦散（裁定 5 拆出的下半，待开工）**——第三梯队按 2026-09-20
+    追加裁定由 1 轮拆为 2 轮，上半已交付
   - **闭合战役 C0~C7 ✅ 全部收官（2026-09-19，8/8；2026-09-18 用户裁定「暂停新功能先清账」，
     计划全文 `docs/archive/closure-plan-v1.md`（`d386b60` 起归档入库）**：C0 文档健康 → C1 原语小件 →
     C2 渲染伪影（贴花受光 v2 / 光照贴图 mip / 粒子 v2 序列化 / 反射探针编辑入口）→

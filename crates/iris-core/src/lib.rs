@@ -16,6 +16,7 @@ extern crate self as iris_core;
 
 pub mod behavior;
 pub mod broadphase;
+pub mod buoyancy;
 pub mod character;
 pub mod commands;
 pub mod component;
@@ -55,6 +56,10 @@ pub mod prelude {
     };
     pub use crate::commands::{Command, CommandQueue, apply_commands};
     pub use crate::component::Component;
+    // 浮力（R93）：水平面资源 + 浸没体积解析（opt-in，缺席 = 逐位不变）
+    pub use crate::buoyancy::{
+        BuoyancyPlane, WATER_DENSITY, neutral_buoyancy_volume, shape_volume, submerged_volume,
+    };
     // 昼夜循环（R80）：相位资源 + 太阳方向 / 光照包络纯函数
     pub use crate::daynight::{DayNightCycle, ambient_envelope, is_night, sun_direction};
     pub use crate::entity::Entity;

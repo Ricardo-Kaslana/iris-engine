@@ -3251,6 +3251,16 @@ pub fn step_physics(world: &World) {
     } else {
         Vec::new()
     };
+    // 浮力平面（R93）：`Option<BuoyancyPlane>`——资源缺席 = `None` = 下面积分
+    // 循环的浮力分支整段死码（与 `solver_v2` 同款 `try_resource().map(*r)`
+    // 范式）。`fluid_density ≤ 0` 直接归入 `None`（无介质 = 无浮力，且不浪费
+    // 每帧每体一次浸没体积计算）。
+    let buoyancy = world
+        .try_resource::<crate::buoyancy::BuoyancyPlane>()
+        .map(|p| *p)
+        .filter(|p| p.fluid_density > 0.0);
+    // 重力幅值（升力与重力同源于 `PHYSICS_GRAVITY`，不留第二个常数）。
+    let gravity_mag = -PHYSICS_GRAVITY.y;
     for index in 0..n {
         if is_static[index] || is_kinematic[index] {
             continue;
@@ -3258,7 +3268,37 @@ pub fn step_physics(world: &World) {
         let rigid = collected[index].2.expect("非静态实体必有 RigidBody");
         let mut velocity = rigid.velocity;
         velocity += PHYSICS_GRAVITY * rigid.gravity_scale * dt;
+        // 浮力（R93，`BuoyancyPlane` 资源 opt-in）：资源缺席或本体零浸没时，
+        // 下面除了既有两行外**不进任何新算术**（水阻单列第二段指数而非与
+        // `linear_damping` 合并成一次乘子——合并式会给无浸没档也添一次加法，
+        // R92「select 门」与 R63「FMA 收缩」两条教训的联合兑现）。升力只作用
+        // 在质心：无扶正力矩，姿态不参与（v1 诚实限制，§8.72）。
+        let mut water_drag = 0.0;
+        if let Some(plane) = buoyancy {
+            let shape = &collected[index].1.shape;
+            let sub = crate::buoyancy::submerged_volume(
+                shape,
+                positions[index],
+                rotations[index],
+                plane.height,
+            );
+            if sub > 0.0 {
+                velocity.y += crate::buoyancy::buoyancy_acceleration(
+                    sub,
+                    rigid.mass,
+                    plane.fluid_density,
+                    gravity_mag,
+                ) * dt;
+                let total = crate::buoyancy::shape_volume(shape);
+                if total > 0.0 {
+                    water_drag = plane.linear_drag * (sub / total).clamp(0.0, 1.0);
+                }
+            }
+        }
         velocity *= (-rigid.linear_damping * dt).exp();
+        if water_drag > 0.0 {
+            velocity *= (-water_drag * dt).exp();
+        }
         let displacement = velocity * dt;
         let start = positions[index];
         positions[index] += match ccds[index] {
@@ -10360,5 +10400,352 @@ mod solver_v2_tests {
             Some(1),
             "重叠出生 ⇒ 恰一条 started"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 浮力集成测试（R93）：`BuoyancyPlane` 资源接入 `step_physics` 的兼容与解析锚。
+// 与 `solver_v2_tests` 同族——**资源缺席 / 零浸没 = 逐位不变**是这一轮的铁律，
+// 纯函数侧的几何锚点在 `crate::buoyancy` 自己的单测里。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod buoyancy_tests {
+    use super::{Collider, ColliderShape, Entity, RigidBody, step_physics};
+    use crate::buoyancy::{BuoyancyPlane, shape_volume};
+    use crate::physics::PHYSICS_GRAVITY;
+    use crate::prelude::{Transform, World};
+    use crate::time::Time;
+    use glam::{Quat, Vec3, vec3};
+    use std::time::Duration;
+
+    const DT: f32 = 1.0 / 60.0;
+    const RHO_WATER: f32 = 1000.0;
+
+    fn world_with_plane(plane: Option<BuoyancyPlane>) -> World {
+        let mut world = World::new();
+        world.insert_resource(Time::default());
+        if let Some(p) = plane {
+            world.insert_resource(p);
+        }
+        world
+    }
+
+    fn step_n(world: &World, n: usize) {
+        for _ in 0..n {
+            world
+                .resource_mut::<Time>()
+                .advance(Duration::from_secs_f64(DT as f64));
+            step_physics(world);
+        }
+    }
+
+    /// 只挂刚体（不铺地面、无对撞）的投放体。
+    fn spawn_body(world: &mut World, shape: ColliderShape, pos: Vec3, mass: f32) -> Entity {
+        world.spawn((
+            Transform::from_translation(pos),
+            Collider {
+                shape,
+                is_static: false,
+                restitution: 0.0,
+                is_sensor: false,
+                groups: u32::MAX,
+                mask: u32::MAX,
+            },
+            RigidBody {
+                mass,
+                ..RigidBody::default()
+            },
+        ))
+    }
+
+    fn body_pos(world: &World, e: Entity) -> Vec3 {
+        world
+            .get::<Transform>(e)
+            .expect("实体应有 Transform")
+            .position
+    }
+
+    fn body_vel(world: &World, e: Entity) -> Vec3 {
+        world
+            .get::<RigidBody>(e)
+            .expect("实体应有 RigidBody")
+            .velocity
+    }
+
+    /// `Vec3` 的位型（glam 没有 `Vec3::to_bits`，逐分量取）。
+    fn bits(v: Vec3) -> [u32; 3] {
+        [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]
+    }
+
+    /// 球 r=0.5 完全没入水中（无阻力、无对撞）：升加速度 = ρ_f·V·g/m，
+    /// 净加速度解析可算 ⇒ 一步速度直接对照（把「接入点正确」与「数值正确」
+    /// 分在同一个断言里：方向向上、幅值按密度比）。
+    #[test]
+    fn submerged_sphere_net_acceleration_matches_density_ratio() {
+        let radius = 0.5;
+        let sphere = ColliderShape::Sphere { radius };
+        let volume = shape_volume(&sphere);
+        // 物体密度 = 2ρ_f ⇒ 净加速度 = g(1 − ρ_f/ρ_b) = g/2 向下（沉）。
+        let mass = 2.0 * RHO_WATER * volume;
+        let mut world = world_with_plane(Some(BuoyancyPlane {
+            height: 10.0,
+            linear_drag: 0.0,
+            ..BuoyancyPlane::default()
+        }));
+        let e = spawn_body(&mut world, sphere, vec3(0.0, 0.0, 0.0), mass);
+        step_n(&world, 1);
+        let expect = PHYSICS_GRAVITY.y + RHO_WATER * volume * (-PHYSICS_GRAVITY.y) / mass;
+        let got = body_vel(&world, e).y;
+        assert!(
+            (got - expect * DT).abs() < 1e-5,
+            "一步后 v_y 应为净加速度 × dt = {}，实测 {got}",
+            expect * DT
+        );
+        assert!(got < 0.0, "密度 2ρ_f 的球应下沉");
+        // 同场景但密度 = ρ_f/2 ⇒ 净向上（同一公式的另一侧，非默认值断言）。
+        let mut world2 = world_with_plane(Some(BuoyancyPlane {
+            height: 10.0,
+            linear_drag: 0.0,
+            ..BuoyancyPlane::default()
+        }));
+        let e2 = spawn_body(&mut world2, sphere, Vec3::ZERO, 0.5 * RHO_WATER * volume);
+        step_n(&world2, 1);
+        let got2 = body_vel(&world2, e2).y;
+        assert!(got2 > 0.0, "密度 ρ_f/2 的球应上浮，实测 {got2}");
+        let expect2 = PHYSICS_GRAVITY.y + 2.0 * (-PHYSICS_GRAVITY.y);
+        assert!(
+            (got2 - expect2 * DT).abs() < 1e-5,
+            "半密物体净加速度应 ≈ +g，实测 v_y {} vs {}",
+            got2,
+            expect2 * DT
+        );
+    }
+
+    /// 中性浮力：m = ρ_f·V 且全浸 ⇒ 升力恰抵重力，速度长期 ~0（不漂不移）。
+    #[test]
+    fn neutral_density_body_hovers_in_place() {
+        let sphere = ColliderShape::Sphere { radius: 1.0 };
+        let mass = RHO_WATER * shape_volume(&sphere);
+        let mut world = world_with_plane(Some(BuoyancyPlane {
+            height: 5.0,
+            linear_drag: 0.0,
+            ..BuoyancyPlane::default()
+        }));
+        let e = spawn_body(&mut world, sphere, Vec3::ZERO, mass);
+        step_n(&world, 120);
+        let drift = body_pos(&world, e).length();
+        let speed = body_vel(&world, e).length();
+        assert!(
+            drift < 1e-3 && speed < 1e-3,
+            "中性浮力体 2 秒后应几乎不动（drift {drift}, speed {speed}）"
+        );
+    }
+
+    /// 平衡吃水：ρ_b = ρ_f/2 的**平放盒**最终稳定在「中心齐水面」（浸没一半）。
+    /// 这是浮力可用的正面证据——不是「动了」而是「停在该停的水线」。
+    #[test]
+    fn half_density_box_settles_at_half_draft() {
+        let half = vec3(0.5, 1.0, 0.5);
+        let box_shape = ColliderShape::Box { half_extents: half };
+        let volume = shape_volume(&box_shape);
+        let mut world = world_with_plane(Some(BuoyancyPlane {
+            height: 0.0,
+            linear_drag: 3.0,
+            ..BuoyancyPlane::default()
+        }));
+        // 从完全没入（中心 y = −4）释放，应当上浮并在水线附近收敛。
+        let e = spawn_body(
+            &mut world,
+            box_shape,
+            vec3(0.0, -4.0, 0.0),
+            0.5 * RHO_WATER * volume,
+        );
+        step_n(&world, 600); // 10 s
+        let y = body_pos(&world, e).y;
+        assert!(
+            y.abs() < 0.15,
+            "半密盒平衡吃水应为浸没一半（中心齐水面 y=0），实测 {y}"
+        );
+        assert!(body_vel(&world, e).length() < 0.05, "10 秒后应已随水阻停稳");
+        // 方向锚：起步必是向上加速（否则「升力符号反了」也能靠振荡蒙到 0）。
+        let mut world2 = world_with_plane(Some(BuoyancyPlane {
+            height: 0.0,
+            linear_drag: 3.0,
+            ..BuoyancyPlane::default()
+        }));
+        let e2 = spawn_body(
+            &mut world2,
+            ColliderShape::Box { half_extents: half },
+            vec3(0.0, -4.0, 0.0),
+            0.5 * RHO_WATER * volume,
+        );
+        step_n(&world2, 1);
+        assert!(body_vel(&world2, e2).y > 0.0, "深水中的半密盒第一步必上浮");
+    }
+
+    /// **铁律 1**：资源缺席 ⇒ 与引入前逐位一致。
+    /// **铁律 2**：资源在场但零浸没（水面远在下方）⇒ 同样逐位一致
+    /// （浮力分支不得给无水路径添一行算术）。
+    #[test]
+    fn absent_or_dry_body_trajectory_is_bitwise_identical_to_legacy() {
+        let mk = |plane: Option<BuoyancyPlane>| {
+            let mut world = world_with_plane(plane);
+            let e = spawn_body(
+                &mut world,
+                ColliderShape::Sphere { radius: 0.4 },
+                vec3(0.0, 8.0, 0.0),
+                3.0,
+            );
+            step_n(&world, 45);
+            (bits(body_pos(&world, e)), bits(body_vel(&world, e)))
+        };
+        let a = mk(None);
+        let b = mk(Some(BuoyancyPlane {
+            height: -100.0,
+            ..BuoyancyPlane::default()
+        }));
+        let c = mk(Some(BuoyancyPlane {
+            height: 0.0,
+            fluid_density: 0.0,
+            ..BuoyancyPlane::default()
+        }));
+        assert_eq!(a, b, "水面远在下方（零浸没）必须与无资源逐位一致");
+        assert_eq!(a, c, "fluid_density = 0 应归入「无介质」，与无资源逐位一致");
+        // 判别力旁证：把水面抬到落体路径上，同一段模拟的位型必须改变。
+        let wet = {
+            // 水面 6 m：球 0.75 s 内落到中心 ≈ 5.24（底 4.84），确实入水
+            // （判据不是「抬了水位」而是「水位落在轨迹上」——首稿写 4.0
+            // 时球全程在水上，这条判别力旁证立刻以「左右相等」自曝）。
+            let mut world = world_with_plane(Some(BuoyancyPlane {
+                height: 6.0,
+                ..BuoyancyPlane::default()
+            }));
+            let e = spawn_body(
+                &mut world,
+                ColliderShape::Sphere { radius: 0.4 },
+                vec3(0.0, 8.0, 0.0),
+                3.0,
+            );
+            step_n(&world, 45);
+            (bits(body_pos(&world, e)), bits(body_vel(&world, e)))
+        };
+        assert_ne!(a, wet, "入门测试若无判别力（水位改了也逐位相同）即为假绿");
+    }
+
+    /// 只挂 `RigidBody` 无 `Collider` 的飞行体：没有形状就没有体积，
+    /// 浮力整段跳过 ⇒ 与自由落体逐位一致（诚实限制在案）。
+    #[test]
+    fn flyer_without_collider_gets_no_buoyancy() {
+        let mk = |plane: Option<BuoyancyPlane>| {
+            let mut world = world_with_plane(plane);
+            let e = world.spawn((
+                Transform::from_xyz(0.0, 20.0, 0.0),
+                RigidBody {
+                    mass: 2.0,
+                    ..RigidBody::default()
+                },
+            ));
+            step_n(&world, 30);
+            world.get::<Transform>(e).expect("有 Transform").position.y
+        };
+        let dry = mk(None);
+        let wet = mk(Some(BuoyancyPlane {
+            height: 100.0,
+            ..BuoyancyPlane::default()
+        }));
+        assert_eq!(dry, wet, "无碰撞体的刚体不参与浮力（无体积可言）");
+    }
+
+    /// 双跑逐位：同输入两次模拟，位置/速度 `to_bits()` 全等。
+    #[test]
+    fn buoyant_simulation_is_bitwise_deterministic() {
+        let run = || {
+            let mut world = world_with_plane(Some(BuoyancyPlane {
+                height: 0.0,
+                linear_drag: 2.0,
+                ..BuoyancyPlane::default()
+            }));
+            let a = spawn_body(
+                &mut world,
+                ColliderShape::OrientedBox {
+                    half_extents: vec3(0.6, 0.3, 1.1),
+                },
+                vec3(0.0, -1.2, 0.0),
+                900.0,
+            );
+            let b = spawn_body(
+                &mut world,
+                ColliderShape::Sphere { radius: 0.7 },
+                vec3(0.4, -0.3, 0.0),
+                1500.0,
+            );
+            step_n(&world, 90);
+            (
+                bits(body_pos(&world, a)),
+                bits(body_pos(&world, b)),
+                bits(body_vel(&world, a)),
+                bits(body_vel(&world, b)),
+            )
+        };
+        let first = run();
+        let second = run();
+        assert_eq!(first, second, "同输入两次浮力模拟必须逐位一致");
+        // 判别力旁证：两体确实各自动起来了（否则四条等式是恒等式假绿）。
+        assert_ne!(first.0, first.1);
+        assert_ne!(first.2, [0u32; 3]);
+    }
+
+    /// 姿态参与浸没但不参与升力臂（无扶正力矩）：倾斜 OBB 的角速度恒为初值
+    /// （浮力不产生任何力矩 ⇒ 不做回正）。
+    #[test]
+    fn buoyancy_exerts_no_righting_torque() {
+        let mut world = world_with_plane(Some(BuoyancyPlane {
+            height: 0.0,
+            linear_drag: 0.0,
+            ..BuoyancyPlane::default()
+        }));
+        let rot = Quat::from_axis_angle(vec3(0.3, 0.5, 0.8).normalize(), 0.6);
+        let e = world.spawn((
+            Transform {
+                position: vec3(0.0, -0.6, 0.0),
+                rotation: rot,
+                ..Transform::IDENTITY
+            },
+            Collider {
+                shape: ColliderShape::OrientedBox {
+                    half_extents: vec3(1.0, 0.2, 0.6),
+                },
+                is_static: false,
+                restitution: 0.0,
+                is_sensor: false,
+                groups: u32::MAX,
+                mask: u32::MAX,
+            },
+            RigidBody {
+                mass: 100.0,
+                ..RigidBody::default()
+            },
+        ));
+        step_n(&world, 20);
+        // 位置确实动了（否则「旋转没变」是恒等式假绿）。
+        assert!(
+            body_pos(&world, e).y != -0.6,
+            "倾斜 OBB 应受浮力位移，否则本测试无判别力"
+        );
+        let after = world.get::<Transform>(e).expect("有 Transform").rotation;
+        let want = rot;
+        for (i, (a, b)) in after
+            .to_array()
+            .iter()
+            .zip(want.to_array().iter())
+            .enumerate()
+        {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "浮力不得改旋转（v1 无扶正力矩，§8.72）——四元数分量 {i} 变了"
+            );
+        }
     }
 }
