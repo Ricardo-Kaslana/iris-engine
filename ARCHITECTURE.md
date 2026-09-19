@@ -5251,6 +5251,52 @@ opaque-only / 无软件光栅回退）；**本轮兑现两笔欠账**——R84/R
   `ddgi_render.rs` GPU +1（火把 ROI 抬亮 + 稳态逐位不动 + 天空档可判别）。
   诚实边界 §8.67（八条）。
 
+### 4.48 Weighted Blended OIT：逐像素顺序无关透明（iris-render/oit·pipeline·renderer + standard/oit WGSL，C7b · §8.3 逐像素粒度闭合）
+
+闭合战役大裁决役下半（设计稿 `docs/private/c7-design-v1.md` 裁定：
+A1 = WBOIT 公式照抄原文、A2/A3 = 仅主透明 pass）。开关资源
+`OrderedIndependentTransparency`（标记型、v1 无旋钮）**缺席 = painter
+原路逐位不变**——普查实锤全仓硬 FNV 基线场景均不含 Blend 材质，本批
+与 C7a 同口径「全部既有基线零改动原值通过」，`docs/oit.png` 为新增
+验收图。
+
+- **算法（McGuire & Bavoil, HPG 2013，取证件在设计稿第 5 节）**：两遍
+  A-buffer——**gather** 任意序累进 accum RGBA16F（`Σ(color·α·w, α·w)`，
+  blend `(ONE, ONE)`）+ reveal R16F（`Π(1−α)`，blend
+  `(ZERO, ONE_MINUS_SRC_COLOR)` 让逐像素连乘由固定功能完成）；
+  **resolve** 全屏三角合成 `out = avg·(1−reveal) + bg·reveal` 写回 HDR
+  MSAA 并解析回 resolved_view（下游粒子 / 水体 / TAA 的不变式原样）。
+  自适应权重在窗口深度域 z∈[0,1] 内 scale 恒贴 3e3 上限（如实入档：
+  前优先倾向保留、深度带不起作用——CPU 镜像单测钉住该形态）。
+- **单一事实源**：`fs_main` 整段提取为 `fs_shaded` 共享体，painter 入口
+  与 gather 入口都是薄壳（R78 双路径位等价先例）——全部既有像素基线
+  即共享体的逐位锁。权重式 CPU 镜像 `oit_weight` / 合成镜像
+  `oit_resolve_color` 供解析单测（单层 ≡ 经典 src-alpha 混合的兼容锚、
+  无覆盖 = `out = bg` 逐位恒等的护栏锚）。
+- **深度真值**：gather 无深度附件，片元对 **scene_depth 副本**手动线性
+  测深（ε = 2 mm）⇒ 副本 pass 提前编码到透明 pass 之前（仍在主 pass 与
+  贴花之后——SSR/GTAO「读上帧」语义不变；副本只重画不透明 + 蒙皮，
+  内容与移动前逐位一致，DOF/MB/TAA/雾/水体全链既有测试原值背书）。
+  `oit_on` 时无条件跑（无几何帧 Clear 到远平面哨兵 = 「无遮挡」）。
+- **resolve 的 hazard 绕行**：resolve pass 的 resolve_target 写
+  resolved_view，同 pass 不能再读它 ⇒ 帧内一次 `copy_texture_to_texture`
+  到专属 bg_copy，三路输入 1:1 对齐全走 `textureLoad`（零采样器、
+  零过滤语义）。
+- **管线族**：gather 4 变体（普通 / 双面 × 蒙皮 / 普通）复用
+  globals / material / joints 布局 + 新增 `oit_depth_layout`（普通挂组 2、
+  蒙皮挂组 3 的 binding 1——与 joint_mats 编号错开）；resolve 独立布局
+  三纹理。A-buffer 随渲染尺寸与 HDR / scene_depth 同键惰性重建。
+- **测试学**：本债主测 = **顺序无关性**的精确判别——同几何同颜色只
+  交换 spawn 序（视深并列 ⇒ 绘制序翻转）：painter 两帧必然不同（排序
+  误差在场）、OIT 两帧**整帧逐位一致**（加法/乘法交换 + 同值集浮点
+  精确）；不拿 WBOIT 近似值冒充解析参考（近似声明 §8.68①）。另
+  单层兼容锚（±6）、无覆盖块逐位护栏、无透明世界整帧逐位、双会话
+  逐位，共 GPU 3 + CPU 6。
+- **验收**：`transparent_render.rs` 5 → 8 项（既有 5 项零改动原值 =
+  缺席逐位锁）+ `oit.rs` CPU 6；快照 `examples/oit_snapshot.rs` →
+  `docs/oit.png`（左 painter 中心偏蓝 = 实体序主导、右 OIT 中心灰白 =
+  加权平均，肉眼可辨）。诚实边界 §8.68（八条）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -5498,9 +5544,12 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
 2. **层级传播为递归实现**：层级深度受栈深限制（游戏场景足够）；每次传播为
    全量重建，海量静态实体场景可考虑脏标记增量传播。
 3. **批处理粒度**：不透明按 (网格, 材质) 合批，无深度排序（不透明物体绘制
-   顺序无关紧要）；半透明已按视深排序独立 pass 处理（§4.16），但排序粒度
+   顺序无关紧要）；~~半透明已按视深排序独立 pass 处理（§4.16），但排序粒度
    是包围球中心而非逐像素——凹体 / 交叠体积的自遮挡排序误差在路线图
-   （逐像素需 OIT 方案）；glTF `"MASK"` alpha 裁剪按不透明处理（§4.6）。
+   （逐像素需 OIT 方案）~~ **C7b 已交付 opt-in Weighted Blended OIT
+   （§4.48：`OrderedIndependentTransparency` 资源在场 ⇒ 主透明 pass 逐像素
+   顺序无关；painter 原路 = 资源缺席逐位不变；近似算法性质与覆盖范围
+   边界见 §8.68）**；glTF `"MASK"` alpha 裁剪按不透明处理（§4.6）。
 4. ~~**无热重载**~~ **参数子集热重载已闭合（C5b，§4.46 / §8.65）**：
    场景 / 关卡 JSON 的材质数值 + 点光 + 方向光段可经 `SceneHotReload`
    资源热应用（std-only 内容指纹轮询，不重建实体、不动游戏状态）。
@@ -6966,6 +7015,25 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     `spot_cone_factor` CPU 函数、但 GI 侧无分箱（8 盏线性扫，容量内
     无须）；⑧`sky_from_source` 与作者显式 `sky_color = Some` 同时在场 ⇒
     **覆盖恒胜**（同源不生效，warn 缺席——这是优先级语义不是 bug）。
+68. **Weighted Blended OIT（C7b，§4.48）的诚实边界**——①WBOIT 是**近似
+    算法**：多层叠色 = 加权平均 × 覆盖度，不是精确 back-to-front 合成
+    （能量有偏、极薄极浓边界不收敛到精确值）；它给出的精确性质是
+    **顺序无关性**（加法/乘法交换 ⇒ 逐位与绘制序无关），主测按此判别、
+    不拿近似值冒充解析参考；②覆盖范围 = 主透明 pass（`AlphaMode::Blend`
+    几何，含双面与蒙皮变体）；水体 / 粒子 / 贴花 / RT 相机各有独立管线
+    与混合语义，维持 painter（RT 相机透明族零触碰）；③透明覆盖区背景的
+    MSAA 子采样细节被 resolve 的全样元同值写入替代（边缘抗锯齿局部
+    退化为解析中心值）；④resolve 帧多一次全分辨率背景拷贝
+    （`copy_texture_to_texture` → bg_copy）——同 pass 读写 resolved_view
+    的 hazard 代价；⑤遮挡测试从 MSAA 深度附件的硬件 Less 改为对
+    scene_depth 副本的**手动线性比较**（ε = 2 mm）：副本是 1× 重画、
+    不含贴花表面，掠射 / 轮廓边缘的判定与硬件路径可差一像素带；
+    ⑥scene_depth 副本 pass 为此提前编码到透明 pass 之前（仍在主 pass
+    与贴花之后）——副本内容与全部既有消费者的读法逐位不变，整链 GPU
+    套件原值背书；⑦无细调旋钮（标记资源在场 = 全开），场景 / 关卡
+    序列化未接（宿主代码级 `insert_resource` 启用——消费方需求出现
+    再接线，与探针表持久化同立场）；⑧跨适配器位级不可保（GPU 混合
+    与 f16 舍入自由，同 §8.51 边界；同适配器双会话逐位由测试钉住）。
 
 ## 9. 关键设计取舍记录
 

@@ -43,6 +43,24 @@ pub(crate) struct PipelineBundle {
     pub transparent_double_sided_pipeline: wgpu::RenderPipeline,
     /// 透明双面蒙皮变体。
     pub transparent_double_sided_skinned_pipeline: wgpu::RenderPipeline,
+    /// C7b · OIT gather 管线（普通）：双附件（accum RGBA16F 加和混合 +
+    /// reveal R16F 连乘混合）、无深度附件（片元手动对 scene_depth 副本
+    /// 测深）、单采样。片元入口 `fs_oit_gather` = `fs_shaded` 共享体薄壳。
+    pub oit_gather_pipeline: wgpu::RenderPipeline,
+    /// OIT gather 双面变体（cull None）。
+    pub oit_gather_double_sided_pipeline: wgpu::RenderPipeline,
+    /// OIT gather 蒙皮变体（组 2 关节矩阵、组 3 深度副本）。
+    pub oit_gather_skinned_pipeline: wgpu::RenderPipeline,
+    /// OIT gather 双面蒙皮变体。
+    pub oit_gather_double_sided_skinned_pipeline: wgpu::RenderPipeline,
+    /// OIT resolve 管线：全屏三角读 accum/reveal/已解析背景 → 写回
+    /// HDR MSAA（4 采样同值、REPLACE）。着色器 `shaders/oit.wgsl`。
+    pub oit_resolve_pipeline: wgpu::RenderPipeline,
+    /// gather 的深度副本布局（binding 1 = R32Float 非过滤纹理；挂
+    /// 普通管线组 2 / 蒙皮管线组 3——同一布局对象两处复用）。
+    pub oit_depth_layout: wgpu::BindGroupLayout,
+    /// resolve 的绑定布局（accum + reveal + 背景 + 采样器）。
+    pub oit_resolve_layout: wgpu::BindGroupLayout,
     pub sky_pipeline: wgpu::RenderPipeline,
     /// 反射探针捕获的天空盒变体（R62a）：与 [`Self::sky_pipeline`] 同
     /// 着色器 / 同布局，仅采样数为 1（单采样立方体面目标）。
@@ -886,6 +904,250 @@ pub(crate) fn create_pipeline(
         1,
         true,
     );
+
+    // ---- C7b · Weighted Blended OIT（McGuire & Bavoil HPG 2013）----
+    //
+    // gather 双附件混合态（公式取证见 oit.rs 模块文档）：
+    // - accum RGBA16F：(ONE, ONE) 加法累进；
+    // - reveal R16F：(ZERO, ONE_MINUS_SRC_COLOR) ⇒ dst ×= (1−src)，
+    //   逐像素连乘 Π(1−α) 由固定功能完成——**绘制序无关**的实现根基。
+    // 无深度附件：片元对 scene_depth 副本手动测深（painter 的 MSAA 深度
+    // 测试换成 1× 线性距离比较，掠射边缘口径差 = 声明边界 §8.68⑤）。
+    let oit_depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.oit.depth.layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            // binding 1（非 0）：与蒙皮组的 joint_mats（group 2 binding 0）
+            // 在标准模块全局声明中共存，编号错开避免歧义
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                // R32Float 非过滤（DOF 同款；gather 用 textureLoad 精确读）
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            },
+            count: None,
+        }],
+    });
+    let oit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("iris.oit.gather.layout"),
+        bind_group_layouts: &[
+            Some(&globals_layout),
+            Some(&material_layout),
+            Some(&oit_depth_layout),
+        ],
+        immediate_size: 0,
+    });
+    let oit_skinned_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.oit.gather_skinned.layout"),
+            bind_group_layouts: &[
+                Some(&globals_layout),
+                Some(&material_layout),
+                Some(&joints_layout),
+                Some(&oit_depth_layout),
+            ],
+            immediate_size: 0,
+        });
+    let make_oit_gather_pipeline = |label: &'static str,
+                                    vs_entry: &'static str,
+                                    layout: &wgpu::PipelineLayout,
+                                    skinned: bool,
+                                    double_sided: bool|
+     -> wgpu::RenderPipeline {
+        let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
+            &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::mesh::SkinVertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+                Some(crate::mesh::TANGENT_LAYOUT),
+                Some(crate::mesh::UV2_LAYOUT),
+            ]
+        } else {
+            &[
+                Some(crate::mesh::Vertex::LAYOUT),
+                Some(crate::instance::InstanceRaw::LAYOUT),
+                Some(crate::mesh::TANGENT_LAYOUT),
+                Some(crate::mesh::UV2_LAYOUT),
+            ]
+        };
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(vs_entry),
+                compilation_options: Default::default(),
+                buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(if skinned {
+                    "fs_oit_gather_skinned"
+                } else {
+                    "fs_oit_gather"
+                }),
+                compilation_options: Default::default(),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R16Float,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: if double_sided {
+                    None
+                } else {
+                    Some(wgpu::Face::Back)
+                },
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let oit_gather_pipeline = make_oit_gather_pipeline(
+        "iris.pipeline.oit_gather",
+        "vs_main",
+        &oit_pipeline_layout,
+        false,
+        false,
+    );
+    let oit_gather_double_sided_pipeline = make_oit_gather_pipeline(
+        "iris.pipeline.oit_gather_double_sided",
+        "vs_main",
+        &oit_pipeline_layout,
+        false,
+        true,
+    );
+    let oit_gather_skinned_pipeline = make_oit_gather_pipeline(
+        "iris.pipeline.oit_gather_skinned",
+        "vs_skinned",
+        &oit_skinned_pipeline_layout,
+        true,
+        false,
+    );
+    let oit_gather_double_sided_skinned_pipeline = make_oit_gather_pipeline(
+        "iris.pipeline.oit_gather_double_sided_skinned",
+        "vs_skinned",
+        &oit_skinned_pipeline_layout,
+        true,
+        true,
+    );
+    let oit_resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("iris.oit.resolve.layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                },
+                count: None,
+            },
+        ],
+    });
+    let oit_resolve_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("iris.oit.resolve.pipeline.layout"),
+            bind_group_layouts: &[Some(&oit_resolve_layout)],
+            immediate_size: 0,
+        });
+    let oit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.oit.resolve"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/oit.wgsl").into()),
+    });
+    let oit_resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("iris.pipeline.oit_resolve"),
+        layout: Some(&oit_resolve_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &oit_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &oit_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        // 目标 = HDR MSAA 附件（全屏三角覆盖每像素全部样元）
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    });
 
     // 反射探针捕获管线族（R62a）：单采样 + **front_face: Cw**。捕获的面矩阵
     // 含 NDC y 翻转（Cube 采样约定要求，见 `light::cube_face_view_proj`），
@@ -2748,6 +3010,13 @@ pub(crate) fn create_pipeline(
         double_sided_skinned_pipeline,
         transparent_double_sided_pipeline,
         transparent_double_sided_skinned_pipeline,
+        oit_gather_pipeline,
+        oit_gather_double_sided_pipeline,
+        oit_gather_skinned_pipeline,
+        oit_gather_double_sided_skinned_pipeline,
+        oit_resolve_pipeline,
+        oit_depth_layout,
+        oit_resolve_layout,
         sky_pipeline,
         probe_sky_pipeline,
         shadow_pipeline,

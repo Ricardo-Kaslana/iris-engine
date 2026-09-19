@@ -121,6 +121,7 @@ pub mod meshlet_stream;
 pub mod morph;
 pub mod occlusion;
 pub mod offscreen;
+pub mod oit;
 pub mod particles;
 pub mod particles_v2;
 pub mod pipeline;
@@ -242,7 +243,9 @@ pub mod prelude {
     };
     pub use crate::morph::{MorphData, MorphTarget, MorphWeights, blend_morph_vertices};
     pub use crate::occlusion::OcclusionCulling;
+    // C7b · Weighted Blended OIT（开关资源 + 权重/合成 CPU 镜像）
     pub use crate::offscreen::OffscreenRenderer;
+    pub use crate::oit::{OrderedIndependentTransparency, oit_resolve_color, oit_weight};
     pub use crate::particles::{
         AdvanceStats, Particle, ParticleBlend, ParticleEmitter, ParticleInstance, update_particles,
     };

@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### Added（C7b 闭合战役 · 大裁决役下半——Weighted Blended OIT：逐像素顺序无关透明）
+
+路线图 v5 清账战役批次八下半（池 #5）：§8.3 半透明排序条目按逐像素粒度
+闭合。设计稿四点裁定（2026-09-19）：**A1 = WBOIT（McGuire & Bavoil
+HPG 2013，公式取证照抄、禁凭记忆）**；**A2/A3 = 仅主透明 pass**（水体 /
+粒子 / 贴花 / RT 相机维持 painter，声明边界）。开关资源
+`OrderedIndependentTransparency` 缺席 = painter 原路逐位不变；与 C7a 同
+口径「全部既有基线零改动原值通过」（普查实锤硬 FNV 场景均无 Blend 材质）。
+
+- **两遍 A-buffer**：gather 任意序累进 accum RGBA16F（`(ONE,ONE)`）+
+  reveal R16F（`(ZERO,ONE_MINUS_SRC_COLOR)` 固定功能连乘 Π(1−α)）；
+  resolve 全屏三角 `out = avg·(1−reveal) + bg·reveal` 写回 HDR MSAA 并
+  解析回 resolved_view（下游不变式原样）。自适应权重在窗口深度域恒贴
+  scale 上限（前优先保留、深度带不作用——如实入档 + CPU 镜像钉住）。
+- **单一事实源**：`fs_main` 整段提取 `fs_shaded` 共享体，painter 与
+  gather 入口皆薄壳（R78 先例）；权重/合成 CPU 镜像 `oit_weight` /
+  `oit_resolve_color`（单层 ≡ 经典混合兼容锚 + 无覆盖 = bg 逐位恒等
+  护栏锚）。
+- **深度真值**：gather 无深度附件，片元对 scene_depth 副本手动线性测深
+  （ε=2mm）；副本 pass 提前编码到透明 pass 之前（内容逐位不变——SSR
+  读上帧语义保持，DOF/MB/TAA/雾/水体既有 GPU 锁原值 = 移动零外溢的
+  整链背书）；`oit_on` 时无条件跑（空几何帧 Clear 远平面哨兵）。
+- **hazard 绕行**：resolve 读写 resolved_view 冲突 ⇒ 帧内一次
+  `copy_texture_to_texture` 到 bg_copy，三路 1:1 全 `textureLoad`。
+- 测试学修正记录：首版主测用「对称场景左右镜像相等」——**理论错误**
+  （painter 全局单一先后本就对称）；改「同几何交换 spawn 序：painter
+  两帧必不同、OIT 整帧逐位一致」——顺序无关性的精确判别，不拿近似
+  值冒充解析参考。
+- 诚实边界 §8.68 八条（近似算法 / 覆盖范围 / MSAA 子采样退化 / bg 拷贝
+  成本 / 手动测深口径 / 副本前移 / 无旋钮无序列化 / 跨适配器不保）。
+- 测试 +9（`oit.rs` CPU 6 + `transparent_render.rs` GPU 3：顺序无关主测 /
+  缺席逐位 + 无覆盖护栏 + 单层锚 / 双会话逐位）；验收图
+  `docs/oit.png`（左 painter 实体序主导、右 OIT 加权平均）；
+  快照 `examples/oit_snapshot.rs` 双断言（画面不同 + 各自逐位稳）。
+  基线 debug 1676 → 1685 / release 1673 → 1682（门禁对账后确认）。
+  **C7 就此收官 = 闭合战役 8/8 全部完成。**
+
 ### Added（C7a 闭合战役 · 大裁决役上半——DDGI v3：同源天空 × 动态光源进 GI）
 
 路线图 v5 清账战役批次八上半（池 #21）：§8.57①② 两条自认候选翻转。

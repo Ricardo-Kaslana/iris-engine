@@ -469,3 +469,241 @@ fn transparent_run_batches_same_key() {
         "蓝色透明板应可见，实际 r={r} g={g} b={b}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// C7b · Weighted Blended OIT（§8.3 逐像素粒度的闭合判别）
+// ---------------------------------------------------------------------------
+
+/// 本债判别主测「顺序无关性」的精确形态：两块 α=0.5 自发光板绕 Y 轴
+/// ±45° 交叉（板心同在原点 ⇒ 视深并列，绘制序 = 实体位模式升序 =
+/// spawn 序）。几何与颜色**完全不变**，只交换两板的 spawn 先后：
+///
+/// - painter：全局单一先后 ⇒ 交叠像素的「谁压谁」随绘制序翻转，
+///   两帧画面必然不同（r−g 角色互换）——这正是 §8.3 声明的
+///   「包围球中心排序对交叠体积给不出逐像素正确序」本体；
+/// - WBOIT：accum 是加法交换序、reveal 是乘法交换序（逐像素同值集 ⇒
+///   任意交换浮点逐位相等）、post 链输入不变 ⇒ **整帧逐位一致**。
+///
+/// 判别力来源：断言不依赖 WBOIT 的两层近似值与任何解析参考相等
+/// （那是被 §8.68① 明拒的过度声明），只钉「顺序无关」这一条精确性质。
+#[test]
+fn oit_is_independent_of_draw_order() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let fnv = |bytes: &[u8]| -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    };
+    let build = |oit: bool, swap: bool| -> Option<Vec<u8>> {
+        let mut renderer = OffscreenRenderer::new(256, 256)?;
+        let mut world = base_world();
+        let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let black = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(0.0, 0.0, 0.0, 1.0, false));
+        world.spawn((
+            Transform {
+                position: Vec3::new(0.0, 0.0, -4.0),
+                scale: Vec3::new(6.0, 6.0, 0.1),
+                ..Transform::IDENTITY
+            },
+            cube,
+            black,
+        ));
+        let red = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(E, 0.0, 0.0, A, true));
+        let green = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(0.0, E, 0.0, A, true));
+        // (旋转, 材质) 对固定：几何不动，仅 spawn 先后交换
+        let pair = [(45.0f32, red), (-45.0, green)];
+        for (deg, mat) in if swap {
+            pair.into_iter().rev().collect::<Vec<_>>()
+        } else {
+            pair.to_vec()
+        } {
+            world.spawn((
+                Transform {
+                    position: Vec3::ZERO,
+                    rotation: glam::Quat::from_rotation_y(deg.to_radians()),
+                    scale: Vec3::new(6.0, 6.0, 0.1),
+                },
+                cube,
+                mat,
+            ));
+        }
+        propagate_transforms(&mut world);
+        if oit {
+            world.insert_resource(OrderedIndependentTransparency);
+        }
+        renderer.render(&world);
+        Some(renderer.read_pixels())
+    };
+    let (Some(p0), Some(p1)) = (build(false, false), build(false, true)) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    assert_ne!(
+        fnv(&p0),
+        fnv(&p1),
+        "前提：painter 帧随绘制序翻转而变（交叠区排序误差在场——本债本体）"
+    );
+    let (o0, o1) = (build(true, false), build(true, true));
+    let (Some(o0), Some(o1)) = (o0, o1) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    assert_eq!(
+        o0, o1,
+        "WBOIT 整帧逐位与绘制序无关（加法/乘法交换 + 同值集浮点精确）"
+    );
+    // 有效性护栏：OIT 帧确实画了交叠（中心带双通道亮），且与 painter
+    // 任一帧不同（两层近似 ≢ 精确 over 合成——差异本身是 §8.68① 的
+    // 声明对象，此处只断言「非恒等旁路」）
+    let pick = |buf: &[u8], x: u32, y: u32| {
+        let i = ((y * 256 + x) * 4) as usize;
+        [buf[i] as i32, buf[i + 1] as i32, buf[i + 2] as i32]
+    };
+    let oc = pick(&o0, 108, 128);
+    assert!(oc[0] > 60 && oc[1] > 60, "OIT 交叠像素双通道留痕：{oc:?}");
+    assert_ne!(
+        fnv(&o0),
+        fnv(&p0),
+        "两层带内 OIT 与 painter 合成不同（近似声明面）"
+    );
+}
+
+/// 护栏 + 逐位锚：
+/// (a) **无透明几何的世界**：OIT 开 / 关整帧逐位一致（gather/resolve
+///     一个 draw 不发——资源在场 = 仅深度副本多跑一次，零像素影响）；
+/// (b) **有透明几何的世界**：远离透明轮廓的背景块逐位一致
+///     （reveal=1、accum=0 ⇒ `out = bg` 精确恒等 + 该块内 MSAA 样元
+///     同值 ⇒ resolve 重写不改变内容）；
+/// (c) 透明板中心像素：OIT 与 painter 的**单层**结果一致（±6 = f16
+///     往返与窗口深度带量化——单层兼容锚在真管线上的形态）。
+#[test]
+fn oit_absent_paths_are_bitwise_pristine() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let fnv = |bytes: &[u8]| -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    };
+    let pick = |buf: &[u8], x: u32, y: u32| {
+        let i = ((y * 256 + x) * 4) as usize;
+        [buf[i] as i32, buf[i + 1] as i32, buf[i + 2] as i32]
+    };
+    let render = |oit: bool, transparent: bool| -> Option<Vec<u8>> {
+        let mut renderer = OffscreenRenderer::new(256, 256)?;
+        let mut world = base_world();
+        let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let mat = world.resource_mut::<MaterialStore>().add(if transparent {
+            emissive_mat(E, 0.0, 0.0, A, true)
+        } else {
+            emissive_mat(E, 0.0, 0.0, 1.0, false)
+        });
+        world.spawn((
+            Transform {
+                position: Vec3::ZERO,
+                scale: Vec3::new(1.6, 1.6, 0.1),
+                ..Transform::IDENTITY
+            },
+            cube,
+            mat,
+        ));
+        propagate_transforms(&mut world);
+        if oit {
+            world.insert_resource(OrderedIndependentTransparency);
+        }
+        renderer.render(&world);
+        Some(renderer.read_pixels())
+    };
+    let (Some(a), Some(b)) = (render(false, false), render(true, false)) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    assert_eq!(
+        a, b,
+        "无透明几何：OIT 资源在场也必须整帧逐位一致（缺席 = 关的 GPU 级形态）"
+    );
+    let (Some(c), Some(d)) = (render(false, true), render(true, true)) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    assert_ne!(fnv(&c), fnv(&d), "前提：透明板与不透明对照画面不同");
+    // 背景块：中心板轮廓之外的大块（y 40..80、x 180..220 纯天空/背景）
+    for y in 40u32..80 {
+        for x in 180u32..220 {
+            let i = ((y * 256 + x) * 4) as usize;
+            assert_eq!(
+                &c[i..i + 4],
+                &d[i..i + 4],
+                "无覆盖像素 ({x},{y}) 必须逐位不动"
+            );
+        }
+    }
+    let pc = pick(&c, 128, 128);
+    let oc = pick(&d, 128, 128);
+    assert_pixel_near(oc, pc, 6, "单层像素 OIT ≡ 经典混合（管线级兼容锚）");
+}
+
+/// 双会话逐帧逐位（确定性文化：OIT 无时域状态，两独立渲染器同世界
+/// 单帧必须逐字节一致）。
+#[test]
+fn oit_sessions_are_bitwise_deterministic() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let build = || -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut world = base_world();
+        let cube = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let red = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(E, 0.0, 0.0, A, true));
+        let green = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(0.0, E, 0.0, A, true));
+        for (i, mat) in [(0u32, red), (1, green)] {
+            let deg: f32 = if i == 0 { 45.0 } else { -45.0 };
+            world.spawn((
+                Transform {
+                    position: Vec3::ZERO,
+                    rotation: glam::Quat::from_rotation_y(deg.to_radians()),
+                    scale: Vec3::new(2.4, 2.4, 0.1),
+                },
+                cube,
+                mat,
+            ));
+        }
+        let black = world
+            .resource_mut::<MaterialStore>()
+            .add(emissive_mat(0.0, 0.0, 0.0, 1.0, false));
+        world.spawn((
+            Transform {
+                position: Vec3::new(0.0, 0.0, -4.0),
+                scale: Vec3::new(3.0, 3.0, 0.1),
+                ..Transform::IDENTITY
+            },
+            cube,
+            black,
+        ));
+        propagate_transforms(&mut world);
+        world.insert_resource(OrderedIndependentTransparency);
+        let mut r1 = OffscreenRenderer::new(256, 256)?;
+        r1.render(&world);
+        let p1 = r1.read_pixels();
+        let mut r2 = OffscreenRenderer::new(256, 256)?;
+        r2.render(&world);
+        Some((p1, r2.read_pixels()))
+    };
+    let Some((p1, p2)) = build() else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    assert_eq!(p1, p2, "双会话逐帧逐位一致");
+}

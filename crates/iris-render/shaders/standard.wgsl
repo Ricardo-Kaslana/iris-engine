@@ -1194,11 +1194,10 @@ fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>, env_fallback: vec3<f32>) 
     return vec4<f32>(env_fallback, cov);
 }
 
-@fragment
-// 注：VertexOutput 的 @builtin(position)（字段名 clip_position 沿用顶点
-// 侧语义）作为片元入口输入时，WGSL 规定其值为**帧缓冲像素坐标**——
-// 下文的 in.clip_position.xy 即 frag coord。
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+// **fs_shaded 共享体（C7b）**：整段着色数学原样提取，`fs_main` 与
+// OIT gather 入口都是它的薄壳——算术逐式同序不改（R78 双路径位等价
+// 先例），既有全部像素基线即共享体的逐位锁。
+fn fs_shaded(in: VertexOutput) -> vec4<f32> {
     let base = material.base_color * textureSample(base_texture, base_sampler, in.uv);
     let albedo = base.rgb;
     // ORM 打包（线性采样）：R = AO、G = 粗糙度、B = 金属度；标量因子
@@ -1437,4 +1436,69 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           + material.emissive.rgb;
 
     return vec4<f32>(color, base.a);
+}
+
+// ---- C7b · Weighted Blended OIT gather 入口（McGuire & Bavoil HPG 2013）----
+//
+// 入口注：VertexOutput 的 @builtin(position) 在片元侧 = **帧缓冲像素
+// 坐标**（.z 为窗口深度 ∈ [0,1]，DirectX 约定）。
+//
+// 遮挡测试改走**手动线性比较**：gather pass 无深度附件，比较对象 =
+// scene_depth 副本的线性视距（不透明几何重画，透明/贴花/粒子不进——
+// 与主深度附件在同一帧内的内容差仅为掠射/边缘的采样点数口径，
+// 已声明边界 §8.68⑤）。
+//
+// 权重式与合成式照抄设计稿第 5 节存档（禁凭记忆纪律）；CPU 镜像
+// `iris_render::oit::oit_weight` / `oit_resolve_color` 单测钉解析值。
+
+@group(2) @binding(1) var oit_depth: texture_2d<f32>;
+@group(3) @binding(1) var oit_depth_skinned: texture_2d<f32>;
+
+/// 手动深度测深的容差（米）——两侧视距都是插值量（副本 = 透视校正
+/// 的 clip.w，本侧 = world_pos 距离），fp 误差 + 掠射三角形采样点差
+/// 落进该带宽；与透明 pass 的「只测不写」语义同向（宁可多画不漏画）。
+const OIT_DEPTH_EPS: f32 = 0.002;
+
+fn oit_weight(c: vec3<f32>, a: f32, z: f32) -> f32 {
+    let lum = max(max(c.r, c.g), c.b);
+    return max(
+        min(1.0, lum * a) * clamp(0.03 / (1e-5 + pow(z / 200.0, 4.0)), 1e-2, 3e3),
+        a);
+}
+
+struct OitGatherOut {
+    @location(0) accum: vec4<f32>,
+    @location(1) reveal: f32,
+};
+
+fn oit_gather_body(in: VertexOutput, depth_tex: texture_2d<f32>) -> OitGatherOut {
+    let dist = distance(in.world_pos, globals.eye_pos.xyz);
+    let opaque = textureLoad(depth_tex, vec2<i32>(in.clip_position.xy), 0).r;
+    if (dist > opaque + OIT_DEPTH_EPS) {
+        discard;
+    }
+    let c = fs_shaded(in);
+    let a = clamp(c.a, 0.0, 1.0);
+    let w = oit_weight(c.rgb, a, in.clip_position.z);
+    var out: OitGatherOut;
+    out.accum = vec4<f32>(c.rgb * a, a) * w;
+    // reveal 附件混合态 (ZERO, ONE_MINUS_SRC_COLOR)：写 α、dst ×= (1−α)
+    // ⇒ 连乘 Π(1−α) 由固定功能完成，无逐像素顺序依赖
+    out.reveal = a;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return fs_shaded(in);
+}
+
+@fragment
+fn fs_oit_gather(in: VertexOutput) -> OitGatherOut {
+    return oit_gather_body(in, oit_depth);
+}
+
+@fragment
+fn fs_oit_gather_skinned(in: VertexOutput) -> OitGatherOut {
+    return oit_gather_body(in, oit_depth_skinned);
 }

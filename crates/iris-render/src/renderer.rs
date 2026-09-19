@@ -760,6 +760,11 @@ pub struct Renderer {
     water_transparent: Vec<TransparentItem>,
     water_transparent_skinned: Vec<TransparentSkinnedItem>,
     water_instance_scratch: Vec<InstanceRaw>,
+    /// C7b · OIT A-buffer 组（仅 `OrderedIndependentTransparency` 资源
+    /// 在场时创建；缺席 = painter 原路、一张纹理都不分配——零开销默认
+    /// 路径）。随渲染尺寸与 HDR / scene_depth 同键重建。
+    oit: Option<OitTargets>,
+    oit_size: (u32, u32),
     /// UI 字形图集纹理（初始化时一次性构建；字段仅为保持 view 存活）。
     #[allow(dead_code)]
     ui_atlas: wgpu::Texture,
@@ -949,6 +954,30 @@ struct SceneDepthTargets {
     /// 64B 相机矩阵 uniform（CascadeParams 同布局，cascade_layout 复用）。
     params: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+/// C7b · OIT A-buffer 组（`OrderedIndependentTransparency` 在场才创建，
+/// 随渲染尺寸与 HDR / scene_depth 同键重建）。
+///
+/// - `accum` RGBA16F：`Σ(color·α·w, α·w)`，gather `(ONE, ONE)` 累进；
+/// - `reveal` R16F：`Π(1−α)`，gather `(ZERO, ONE_MINUS_SRC_COLOR)` 连乘；
+/// - `bg_copy` Rgba16Float：HDR 解析视图的**帧内拷贝**（resolve pass 把
+///   msaa 解析写回 resolved_view，同 pass 读写同纹理撞 wgpu hazard 检查
+///   ⇒ 读拷贝、写 msaa，一次全分辨率 copy_texture_to_texture 换零 hazard）；
+/// - `depth_bg`：gather 的手动测深输入（scene_depth 副本色视图，
+///   textureLoad 非过滤）；`resolve_bg`：resolve 三路 textureLoad 输入。
+struct OitTargets {
+    #[allow(dead_code)]
+    accum: wgpu::Texture,
+    accum_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    reveal: wgpu::Texture,
+    reveal_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    bg_copy: wgpu::Texture,
+    #[allow(dead_code)]
+    depth_bg: wgpu::BindGroup,
+    resolve_bg: wgpu::BindGroup,
 }
 
 /// FXAA 中间 LDR 缓冲（R53）：开启时色调映射 blit 改写这里（同格式的
@@ -4119,6 +4148,8 @@ impl Renderer {
             water_transparent: Vec::new(),
             water_transparent_skinned: Vec::new(),
             water_instance_scratch: Vec::new(),
+            oit: None,
+            oit_size: (0, 0),
             ui_atlas,
             ui_bind_group,
             ui_sampler,
@@ -5359,6 +5390,94 @@ impl Renderer {
         true
     }
 
+    /// C7b · OIT A-buffer 按需资源：`OrderedIndependentTransparency`
+    /// 在场时在 `draw` 开头（hdr 不可变借用建立之前）调用；随渲染尺寸
+    /// 与 HDR / scene_depth 同键重建（三方视图引用同帧一致）。
+    /// `depth_view` = scene_depth 副本色纹理视图（gather 手动测深输入），
+    /// `bg_view` = hdr.resolved_view（每帧 copy 进 bg_copy 后供 resolve 读）。
+    fn ensure_oit_targets(&mut self, width: u32, height: u32, depth_view: &wgpu::TextureView) {
+        if self.oit.is_some() && self.oit_size == (width, height) {
+            return;
+        }
+        let size = wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let mk = |label: &'static str, format, usage| {
+            self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let accum = mk(
+            "iris.oit.accum",
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let reveal = mk(
+            "iris.oit.reveal",
+            wgpu::TextureFormat::R16Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let bg_copy = mk(
+            "iris.oit.bg_copy",
+            crate::pipeline::HDR_FORMAT,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let accum_view = accum.create_view(&wgpu::TextureViewDescriptor::default());
+        let reveal_view = reveal.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg_view = bg_copy.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_bg = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.oit.depth.bg"),
+                layout: &self.bundle.oit_depth_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                }],
+            });
+        let resolve_bg = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iris.oit.resolve.bg"),
+                layout: &self.bundle.oit_resolve_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&accum_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&reveal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&bg_view),
+                    },
+                ],
+            });
+        self.oit_size = (width.max(1), height.max(1));
+        self.oit = Some(OitTargets {
+            accum,
+            accum_view,
+            reveal,
+            reveal_view,
+            bg_copy,
+            depth_bg,
+            resolve_bg,
+        });
+    }
+
     /// SSR 上帧颜色副本的按需资源（R62b）：主 HDR 解析缓冲的同尺寸副本
     /// 纹理（COPY_DST | TEXTURE_BINDING），`SsrSettings` 首次开启时创建、
     /// 分辨率变化时重建。返回本次是否（重）建——重建即「无上帧」（新
@@ -6063,6 +6182,23 @@ impl Renderer {
         if water_on {
             self.ensure_scene_depth(width, height);
             self.ensure_water_targets(width, height);
+        }
+        // Weighted Blended OIT（C7b）：标记资源在场 = 开。A-buffer 与
+        // 两份绑定组在 hdr 不可变借用建立之前分配（TAA/SSR/AO 同款
+        // 纪律）；深度副本必保（gather 手动测深的真值源）。**缺席
+        // 语义**：资源缺席 ⇒ 本段零执行、下方透明 pass 走 painter 原路
+        // （gather/resolve 一个 draw 不发、A-buffer 一张不分配），
+        // 命令流与像素逐位不变。
+        let oit_on = world.contains_resource::<crate::oit::OrderedIndependentTransparency>();
+        if oit_on {
+            self.ensure_scene_depth(width, height);
+            let depth_view = self
+                .scene_depth
+                .as_ref()
+                .expect("OIT 开启帧深度副本已按需创建")
+                .view
+                .clone();
+            self.ensure_oit_targets(width, height, &depth_view);
         }
         // 天空大气（R79）：只读开关（参数缓冲恒存在，缺席/关闭帧不写）。
         let sky_settings = world.try_resource::<crate::post::SkySettings>().map(|s| *s);
@@ -7944,6 +8080,124 @@ impl Renderer {
                 d += count;
             }
         }
+        // 主相机场景深度副本 pass（R43）：仅 DOF / MB / TAA / SSR 启用时
+        // 编码。把不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件
+        // 存线性视距（clip.w，见 scene_depth.wgsl 的插值推导），自带
+        // Depth32Float 附件做最近面裁决——阴影的「深度写颜色 + 双附件」
+        // 既有方案（主 pass 的深度附件是 MSAA 且无 TEXTURE_BINDING，
+        // 不可直接采样，DX12 下 depth-only 采样另有写入异常的教训）。
+        // 透明 / 贴花 / 粒子不进副本（半透明深度无定义，ARCHITECTURE §8）。
+        // TAA（R60）与 DOF/MB 共用同一份副本与本帧同一抖动矩阵。
+        // SSR（R62b）同样消费它：本 pass 编码在主 pass **之后**，主 pass
+        // 的 SSR 步进读到的恒为上一帧内容（同编码器按序执行，§4.31 裁决
+        // 2 的「不 ping-pong」偏离）；SSR 开启但本帧无几何 ⇒ 副本没跑，
+        // 「上帧深度」作废（ssr_prev_valid 记账，下帧跳过）。深度着色只
+        // 用顶点变换，SSR 是否活跃不影响副本内容。
+        // GTAO（R77）是副本的第四个消费者（主 pass **之前**读上一帧）：
+        // `ao_depth_frame` 记录本帧副本已跑——下一帧编号恰好 +1 才允许
+        // 编码 AO pass（首帧启用 / 上帧无几何的帧自然落进中性路径）。
+        // 体积雾（R79）是第五个消费者（链头读深度——链上同帧：副本在
+        // 雾 pass 之前编码，读到本帧内容；无记账门）。
+        // 平面水体（R81）是第六个消费者（同雾的链上同帧：水体 pass 编码
+        // 在本 pass 之后，读到的恒为本帧深度——水下厚度 =
+        // scene_depth − 水面片元视距）。
+        // OIT gather（C7b）是第七个消费者，也是**移动编码位置的唯一动因**：
+        // 本 pass 从「粒子之后」提前到「透明 pass 之前」（仍在主 pass 与
+        // 贴花之后）——gather 的手动测深以副本为真值源，必须先于 gather
+        // 编码。副本内容零变化可归因：只重画不透明 + 蒙皮实例（透明 /
+        // 贴花 / 粒子从不进副本，主深度附件在贴花后也不再被写），SSR /
+        // GTAO 的「读上帧」语义只依赖「本 pass 在主 pass 之后」这一条，
+        // 移动前后均满足；DOF / MB / TAA / 雾 / 水体全部在原消费者位置
+        // 之后编码，读到的仍是同一帧同一份内容。oit_on 时无条件跑：
+        // 即便不透明实例为空也要执行（Clear 支把副本刷成远平面哨兵 ⇒
+        // 「无遮挡」，gather 不因新纹理未定义内容饿死透明几何）。
+        if oit_on
+            || ((dof_on || mb_on || taa_on || ssr_on || ao_on || fog_on || water_on)
+                && opaque_total > 0)
+        {
+            self.ao_depth_frame = Some(self.occ_frame);
+            let sd = self
+                .scene_depth
+                .as_ref()
+                .expect("深度副本消费者在场时应已按需创建");
+            self.gpu.queue.write_buffer(
+                &sd.params,
+                0,
+                bytemuck::bytes_of(&CascadeParamsRaw {
+                    view_proj: vp.to_cols_array_2d(),
+                }),
+            );
+            let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+            let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.scene_depth"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &sd.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // 天空 / 无几何像素 = 远平面视距（DOF 视为最远
+                        // 模糊带；MB 反投影到远平面点）
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: z_far as f64,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &sd.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // 普通不透明批（区间 [0, total)）：与阴影 pass 同款逐批 draw
+            depth_pass.set_pipeline(&self.bundle.scene_depth_pipeline);
+            depth_pass.set_bind_group(0, &sd.bind_group, &[]);
+            depth_pass.set_vertex_buffer(1, instance_buf.slice(..));
+            let mut d = 0usize;
+            while d < total {
+                let key = items[d].key;
+                let mut count = 1;
+                while d + count < total && items[d + count].key == key {
+                    count += 1;
+                }
+                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                depth_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                depth_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                depth_pass.draw_indexed(0..mesh.num_indices, 0, d as u32..(d + count) as u32);
+                d += count;
+            }
+            // 蒙皮：深度随骨骼变形（组 1 关节矩阵，与蒙皮阴影管线同构）
+            if !skinned.is_empty() {
+                depth_pass.set_pipeline(&self.bundle.scene_depth_skinned_pipeline);
+                depth_pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, item) in skinned.iter().enumerate() {
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    depth_pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
+                    depth_pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    depth_pass
+                        .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    depth_pass.set_bind_group(1, &skin.bind_group, &[]);
+                    let base = (total + i) as u32;
+                    depth_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
+                }
+            }
+        }
         // 透明 pass：主 pass（天空 + 不透明 + 蒙皮）与贴花 pass 之后、
         // 泛光 / 后处理之前，
         // 写同一 HDR MSAA 颜色目标——LoadOp::Load 载入主 pass（含贴花
@@ -7953,7 +8207,7 @@ impl Renderer {
         // 保留不透明几何的深度做遮挡测试（透明被墙挡住仍不可见），
         // 管线侧深度只测不写（见 pipeline.rs 透明管线注释）。
         // 无透明实例时整个 pass 跳过（零开销）。
-        if transparent_total + transparent_skinned.len() > 0 {
+        if transparent_total + transparent_skinned.len() > 0 && !oit_on {
             let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iris.pass.transparent"),
@@ -8065,6 +8319,164 @@ impl Renderer {
                 }
             }
         }
+        // C7b · OIT 支路（与上方 painter 支路互斥，`oit_on` 且本帧有透明
+        // 实例才执行）：gather = 任意序累进 A-buffer（实例区间 / 合批口径
+        // 与 painter 完全一致——排序保留只为统计口径统一，正确性不依赖
+        // 它）；resolve = 逐像素合成写回 HDR MSAA 并解析回 resolved_view
+        // （下游粒子 / 水体 / TAA 消费 resolved_view 的不变式原样保持）。
+        if oit_on && transparent_total + transparent_skinned.len() > 0 {
+            let oit_gpu = self.oit.as_ref().expect("oit_on 时 A-buffer 应已创建");
+            let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.oit_gather"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &oit_gpu.accum_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &oit_gpu.reveal_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // revealage 初值 1（背景全透出），(ZERO,
+                            // ONE_MINUS_SRC_COLOR) 逐像素连乘 Π(1−α)
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 1.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                // 无深度附件：遮挡裁决 = 片元对 scene_depth 副本的手动
+                // 线性测深（standard.wgsl::oit_gather_body；口径差声明
+                // §8.68⑤）
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_vertex_buffer(1, instance_buf.slice(..));
+            let base = opaque_total as u32;
+            let mut t = 0usize;
+            while t < transparent_total {
+                let key = transparent[t].key;
+                let mut count = 1;
+                while t + count < transparent_total && transparent[t + count].key == key {
+                    count += 1;
+                }
+                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
+                let material = &self.material_gpu[&material_key(key as u32, NO_LIGHTMAP)];
+                pass.set_pipeline(if transparent[t].double_sided {
+                    &self.bundle.oit_gather_double_sided_pipeline
+                } else {
+                    &self.bundle.oit_gather_pipeline
+                });
+                pass.set_bind_group(1, &material.bind_group, &[]);
+                pass.set_bind_group(2, &oit_gpu.depth_bg, &[]);
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+                pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(
+                    0..mesh.num_indices,
+                    0,
+                    base + t as u32..base + (t + count) as u32,
+                );
+                draw_calls += 1;
+                instances += count as u32;
+                triangles_drawn += mesh_store
+                    .get(MeshHandle((key >> 32) as u32))
+                    .map_or(0, |data| data.indices.len() as u32 / 3)
+                    * count as u32;
+                t += count;
+            }
+            // 透明蒙皮 gather：同款双附件混合态，组 2 关节矩阵、组 3 深度
+            if !transparent_skinned.is_empty() {
+                pass.set_vertex_buffer(2, instance_buf.slice(..));
+                for (i, titem) in transparent_skinned.iter().enumerate() {
+                    let item = &titem.skinned;
+                    let mesh = &self.mesh_gpu[&item.mesh];
+                    let material = &self.material_gpu[&material_key(item.material, item.lightmap)];
+                    let skin = &self.skin_gpu[&item.skin_entity];
+                    pass.set_pipeline(if item.double_sided {
+                        &self.bundle.oit_gather_double_sided_skinned_pipeline
+                    } else {
+                        &self.bundle.oit_gather_skinned_pipeline
+                    });
+                    pass.set_bind_group(1, &material.bind_group, &[]);
+                    pass.set_bind_group(2, &skin.bind_group, &[]);
+                    pass.set_bind_group(3, &oit_gpu.depth_bg, &[]);
+                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
+                    pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+                    pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
+                    pass.set_vertex_buffer(
+                        1,
+                        mesh.skin_buf
+                            .as_ref()
+                            .expect("蒙皮网格应有蒙皮属性缓冲")
+                            .slice(..),
+                    );
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    let start = (opaque_total + transparent_total + i) as u32;
+                    pass.draw_indexed(0..mesh.num_indices, 0, start..start + 1);
+                    draw_calls += 1;
+                    instances += 1;
+                    triangles_drawn += mesh_store
+                        .get(MeshHandle(item.mesh))
+                        .map_or(0, |data| data.indices.len() as u32 / 3);
+                }
+            }
+            drop(pass);
+            // resolve 前置拷贝：贴花后的解析结果 → bg_copy（resolve pass
+            // 的 resolve_target 也写 resolved_view，同 pass 读写同纹理会
+            // 撞 hazard ⇒ 读拷贝、写附件，见 OitTargets 文档）
+            let oit_w = self.oit_size.0;
+            let oit_h = self.oit_size.1;
+            encoder.copy_texture_to_texture(
+                hdr.resolved.as_image_copy(),
+                oit_gpu.bg_copy.as_image_copy(),
+                wgpu::Extent3d {
+                    width: oit_w,
+                    height: oit_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("iris.pass.oit_resolve"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &hdr.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&hdr.resolved_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.bundle.oit_resolve_pipeline);
+            rpass.set_bind_group(0, &oit_gpu.resolve_bg, &[]);
+            rpass.draw(0..3, 0..1);
+            drop(rpass);
+        }
         // 粒子 pass：透明 pass 之后、泛光之前——
         // 1) 顺序理由：粒子叠加在玻璃等透明几何的**混合结果**之上（火焰 /
         //    火花应浮在玻璃前面时的合成结果上），与 R23 透明同处 HDR 链路
@@ -8159,112 +8571,6 @@ impl Renderer {
                 instances += item.alive;
                 triangles_drawn += item.alive * item.trail_length * 2;
                 particles_drawn += item.alive;
-            }
-        }
-        // 主相机场景深度副本 pass（R43）：仅 DOF / MB / TAA / SSR 启用时
-        // 编码。把不透明 + 蒙皮实例从相机视角重画一遍，R32Float 颜色附件
-        // 存线性视距（clip.w，见 scene_depth.wgsl 的插值推导），自带
-        // Depth32Float 附件做最近面裁决——阴影的「深度写颜色 + 双附件」
-        // 既有方案（主 pass 的深度附件是 MSAA 且无 TEXTURE_BINDING，
-        // 不可直接采样，DX12 下 depth-only 采样另有写入异常的教训）。
-        // 透明 / 贴花 / 粒子不进副本（半透明深度无定义，ARCHITECTURE §8）。
-        // TAA（R60）与 DOF/MB 共用同一份副本与本帧同一抖动矩阵。
-        // SSR（R62b）同样消费它：本 pass 编码在主 pass **之后**，主 pass
-        // 的 SSR 步进读到的恒为上一帧内容（同编码器按序执行，§4.31 裁决
-        // 2 的「不 ping-pong」偏离）；SSR 开启但本帧无几何 ⇒ 副本没跑，
-        // 「上帧深度」作废（ssr_prev_valid 记账，下帧跳过）。深度着色只
-        // 用顶点变换，SSR 是否活跃不影响副本内容。
-        // GTAO（R77）是副本的第四个消费者（主 pass **之前**读上一帧）：
-        // `ao_depth_frame` 记录本帧副本已跑——下一帧编号恰好 +1 才允许
-        // 编码 AO pass（首帧启用 / 上帧无几何的帧自然落进中性路径）。
-        // 体积雾（R79）是第五个消费者（链头读深度——链上同帧：副本在
-        // 雾 pass 之前编码，读到本帧内容；无记账门）。
-        // 平面水体（R81）是第六个消费者（同雾的链上同帧：水体 pass 编码
-        // 在本 pass 之后，读到的恒为本帧深度——水下厚度 =
-        // scene_depth − 水面片元视距）。
-        if (dof_on || mb_on || taa_on || ssr_on || ao_on || fog_on || water_on) && opaque_total > 0
-        {
-            self.ao_depth_frame = Some(self.occ_frame);
-            let sd = self
-                .scene_depth
-                .as_ref()
-                .expect("DOF/MB 开启时应已创建深度副本");
-            self.gpu.queue.write_buffer(
-                &sd.params,
-                0,
-                bytemuck::bytes_of(&CascadeParamsRaw {
-                    view_proj: vp.to_cols_array_2d(),
-                }),
-            );
-            let instance_buf = self.instance_buf.as_ref().expect("实例缓冲已就绪");
-            let mut depth_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("iris.pass.scene_depth"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &sd.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // 天空 / 无几何像素 = 远平面视距（DOF 视为最远
-                        // 模糊带；MB 反投影到远平面点）
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: z_far as f64,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &sd.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            // 普通不透明批（区间 [0, total)）：与阴影 pass 同款逐批 draw
-            depth_pass.set_pipeline(&self.bundle.scene_depth_pipeline);
-            depth_pass.set_bind_group(0, &sd.bind_group, &[]);
-            depth_pass.set_vertex_buffer(1, instance_buf.slice(..));
-            let mut d = 0usize;
-            while d < total {
-                let key = items[d].key;
-                let mut count = 1;
-                while d + count < total && items[d + count].key == key {
-                    count += 1;
-                }
-                let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
-                depth_pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                depth_pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                depth_pass.draw_indexed(0..mesh.num_indices, 0, d as u32..(d + count) as u32);
-                d += count;
-            }
-            // 蒙皮：深度随骨骼变形（组 1 关节矩阵，与蒙皮阴影管线同构）
-            if !skinned.is_empty() {
-                depth_pass.set_pipeline(&self.bundle.scene_depth_skinned_pipeline);
-                depth_pass.set_vertex_buffer(2, instance_buf.slice(..));
-                for (i, item) in skinned.iter().enumerate() {
-                    let mesh = &self.mesh_gpu[&item.mesh];
-                    let skin = &self.skin_gpu[&item.skin_entity];
-                    depth_pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                    depth_pass.set_vertex_buffer(
-                        1,
-                        mesh.skin_buf
-                            .as_ref()
-                            .expect("蒙皮网格应有蒙皮属性缓冲")
-                            .slice(..),
-                    );
-                    depth_pass
-                        .set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    depth_pass.set_bind_group(1, &skin.bind_group, &[]);
-                    let base = (total + i) as u32;
-                    depth_pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
-                }
             }
         }
         // 平面水体 pass（R81）：scene_depth 之后（深度吸收读本帧深度——
