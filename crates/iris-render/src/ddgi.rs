@@ -1,4 +1,5 @@
-//! DDGI 动态全局光照（R88 v1 + R89 v2）：**规则探针网格** + **CPU 光线追踪
+//! DDGI 动态全局光照（R88 v1 + R89 v2 + **C7a v3：同源天空与 GI 灯集**）：
+//! **规则探针网格** + **CPU 光线追踪
 //! 的时间片滚动重照明** + **深度感知混合**（chebyshev 单侧上界权重）+
 //! **覆盖度合成**（env 兜底连续羽化 + ambient 去双计，R89）。
 //!
@@ -36,6 +37,15 @@
 //!    `× (1 − cov)`（修 §8.57⑬：`sky_color` 默认取 ambient ⇒ 同源天空底色
 //!    不再双计，按覆盖度分摊）。`cov = 1` 内区逐位等于 R88
 //!    （`mix(x, y, 1.0) = y` 精确恒等）。
+//! 5. **同源天空与 GI 灯集**（C7a v3，[`RelightInputs`]）：重照明的两个
+//!    外源输入——`sky_from_source` ⇒ **未命中射线**按方向取天空辐亮度
+//!    （程序化渐变 CPU 镜像 [`procedural_sky_radiance`] + 源码双看门 /
+//!    SkySource HDR 全景 [`hdr_sky_radiance`] nearest-texel 采样，Arc 快照
+//!    零拷贝）；`lights_in_gi` ⇒ 点/聚光进命中点入射（衰减窗/锥因子/
+//!    硬影单射线逐式镜像主渲染 `standard.wgsl::point_light_contrib`）。
+//!    两旋钮默认全关 ⇒ [`RelightInputs::default()`]（空集）经旁路分支
+//!    **逐位 = R89 口径**（薄壳 [`probe_relight`] / [`DdgiGrid::tick`] 即
+//!    其公开形态，`to_bits` 锚 + `ddgi_render` 既有定值 FNV 原值通过）。
 //!
 //! # 深度表的数据形态（决策 5 / 6 / 7）
 //!
@@ -92,8 +102,13 @@
 //!
 //! # 诚实限制（§8.57）
 //!
-//! 1. 单色天空，不吃 `SkySource`（渐变 / HDR 全景被平均成常量）。
-//! 2. 无点光 / 聚光 / emissive 参与重照明（[`BakeParams`] 无此输入）。
+//! 1. ~~单色天空，不吃 `SkySource`（渐变 / HDR 全景被平均成常量）~~
+//!    **C7a 已按方向同源**（[`DdgiSettings::sky_from_source`]，未命中射线
+//!    逐向求值）。维持的半边：`SkySettings.atmosphere = true` 场景不吃
+//!    （CPU 镜像未实现，拒绝冒充）；命中点的反弹天空底仍是均值常数。
+//! 2. ~~无点光 / 聚光参与重照明~~ **C7a 已闭合**
+//!    （[`DdgiSettings::lights_in_gi`]，逐灯硬影单射线；§8.67 边界清单）。
+//!    **emissive 仍缺席**（材质自发光不进 GI，v1 语义不变）。
 //! 3. 1 次反弹上限（`BakeParams.bounces ≤ 1` 现断言）。
 //! 4. 几何变化靠宿主 `geometry_generation` **显式宣告**（不自动侦测：自动
 //!    侦测要每帧全量收集三角形（ms 级）或遍历算指纹；照 `SkySource.generation`
@@ -139,6 +154,10 @@
 //!     从「整片切到 env」变成 25% 半径宽的连续过渡）。残留：羽化带宽是
 //!     固定常量 25%，不随探针密度自适应；且 `bounds` 覆盖不到的表面仍然
 //!     只有 env 天空兜底（羽化让过渡平滑，不凭空补光）。
+//! 20. C7a 扩展的完整边界清单（逐向化只及未命中射线 / atmosphere 场景维持
+//!     ①、灯集 8 盏收集序裁剪与主渲染选取可不同 / 贴灯病态影线豁免 /
+//!     成本口径）见 ARCHITECTURE §8.67——①② 的翻转句只到「闭合 +
+//!     半边维持」为止，细节不复读。
 //!
 //! [`ShProbeRaw`]: crate::irradiance::ShProbeRaw
 //! [`PROBE_AXES`]: crate::irradiance::PROBE_AXES
@@ -152,7 +171,7 @@ use crate::bake::{BakeParams, BakeTriangle, Bvh, build_bvh};
 use crate::irradiance::{
     MAX_IRRADIANCE_PROBES, PROBE_RADIUS_NEIGHBOR_FACTOR, SH_BLEND_EPS, SH_COEFFS, SH_CUBE_FACES,
     ShCoeffs, ShProbeRaw, cube_face_direction, cube_texel_solid_angle, probe_influence_weight,
-    probe_ray_radiance_depth, sh_basis, sh_blend_l0, sh_eval, sh_lambert_convolve,
+    sh_basis, sh_blend_l0, sh_eval, sh_lambert_convolve,
 };
 
 // ---------------------------------------------------------------------------
@@ -307,6 +326,29 @@ pub struct DdgiSettings {
     /// 天空辐射率覆盖。`None` ⇒ 取 `DirectionalLight.ambient`（R80 昼夜免费
     /// 联动；已知代价 = ambient 双计，见模块文档限制⑬）。
     pub sky_color: Option<Vec3>,
+    /// **天空同源开关（C7a，§8.57① 的闭合旋钮）**：`true` ⇒ 重照明的
+    /// **未命中射线**按方向求天空辐亮度（程序化渐变 CPU 镜像 / SkySource
+    /// HDR 全景 nearest-texel 采样），不再吃 `sky_color` 常量。
+    /// 默认 `false` = 现口径逐位不变。
+    ///
+    /// 优先级（C7a 裁决）：`sky_color = Some` 是作者显式覆盖 ⇒ **恒胜**
+    /// （本开关不生效）；`SkySettings.atmosphere = true` 的帧本开关**不生效**
+    /// （大气散射 CPU 镜像未实现，拒绝用渐变冒充——§8.57① 对该场景维持）。
+    /// 命中点的反弹天空底维持 `sky_color` 均值常数（逐向化只作用于
+    /// 未命中射线，见限制⑳）。
+    pub sky_from_source: bool,
+    /// **点光/聚光进 GI 总开关（C7a，§8.57② 的闭合旋钮）**：`true` ⇒
+    /// 宿主把动态灯集喂进重照明（`probe_ray_radiance_depth_gi` 的命中点
+    /// 追加入射）。默认 `false` = 灯不进 GI，现口径逐位不变。
+    ///
+    /// 缺席语义链：本开关关 **或** 场景无灯 ⇒ [`RelightInputs::lights`]
+    /// 为空 ⇒ 重照明一帧额外算术都不做（旁路分支）。
+    pub lights_in_gi: bool,
+    /// 点光/聚光进 GI 时是否逐灯发**硬影单射线**（C7a，与方向光的
+    /// `allow_soft = false` 分支同口径）。`true`（默认）= 墙后火把不进 GI；
+    /// `false` = 无遮挡直通（漏光，换每命中点零额外射线的成本档）。
+    /// 仅当重照明输入带灯（[`RelightInputs::lights`] 非空）时被消费。
+    pub point_light_shadows: bool,
     /// 间接反弹次数（0 = 只天空）；受 [`BakeParams`] 的 `≤ 1` 断言约束。
     pub bounces: u32,
     /// 宿主递增 = 宣告场景几何变化（⇒ 重建 BVH + 全表标脏 + 重新粗填）。
@@ -322,6 +364,9 @@ impl Default for DdgiSettings {
             rays_per_face: 16,
             hysteresis: 0.0,
             sky_color: None,
+            sky_from_source: false,
+            lights_in_gi: false,
+            point_light_shadows: true,
             bounces: 1,
             geometry_generation: 0,
         }
@@ -372,6 +417,211 @@ impl DdgiSettings {
             return 0.0;
         }
         self.hysteresis.clamp(0.0, 1.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 重照明扩展输入：GI 灯集 + 同源天空（C7a，§8.57①② 的闭合件）
+// ---------------------------------------------------------------------------
+
+/// 参与重照明的单盏动态灯（点光或聚光）。
+///
+/// 字段口径与主渲染灯表**逐项镜像**（`renderer.rs` 的 Globals/binned 组装）：
+/// `color` 已含强度（`color × intensity`，与 `light_rgb` 同口径）；聚光的
+/// `cos_inner/cos_outer` 来自 `inner.min(outer)` 钳制后的余弦（`inner ≥ outer`
+/// 落入 [`crate::light_bins::spot_cone_factor`] 的硬边分支——同一 CPU 函数，
+/// 不复制锥公式）；`axis` 已归一化（零长度方向 = 不发光，由收集侧把
+/// `color` 置零镜像，主渲染同款）。
+///
+/// **`shadows` 是逐灯硬影标志**：C7a 口径 = 全局 `DdgiSettings::
+/// point_light_shadows` 扇入逐灯（引擎收集时填），翻转 ⇒ 指纹变 ⇒ 全表标脏。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GiLight {
+    /// 世界空间位置。
+    pub position: Vec3,
+    /// 辐照度颜色（已含强度，线性空间）。
+    pub color: Vec3,
+    /// 有效半径（米）；`dist ≥ range` 零贡献（衰减窗同式主渲染）。
+    pub range: f32,
+    /// 是否聚光（`false` = 点光，`axis/cos_*` 不消费）。
+    pub is_spot: bool,
+    /// 锥轴（聚光朝向，归一化；点光为 `Vec3::ZERO` 占位）。
+    pub axis: Vec3,
+    /// 锥内切余弦（`is_spot` 消费）。
+    pub cos_inner: f32,
+    /// 锥外切余弦（`is_spot` 消费）。
+    pub cos_outer: f32,
+    /// 逐灯硬影单射线开关（见结构体文档）。
+    pub shadows: bool,
+}
+
+impl GiLight {
+    /// 点光（硬影开关 `shadows`）。
+    pub fn point(position: Vec3, color: Vec3, range: f32, shadows: bool) -> Self {
+        Self {
+            position,
+            color,
+            range,
+            is_spot: false,
+            axis: Vec3::ZERO,
+            cos_inner: 0.0,
+            cos_outer: 0.0,
+            shadows,
+        }
+    }
+    /// 聚光（`axis` 归一化锥轴 + 钳后内/外切余弦）。
+    pub fn spot(
+        position: Vec3,
+        color: Vec3,
+        range: f32,
+        axis: Vec3,
+        cos_inner: f32,
+        cos_outer: f32,
+        shadows: bool,
+    ) -> Self {
+        Self {
+            position,
+            color,
+            range,
+            is_spot: true,
+            axis,
+            cos_inner,
+            cos_outer,
+            shadows,
+        }
+    }
+}
+
+/// 同源天空的 CPU 逐向求值器（C7a 裁决 B1 甲）。
+#[derive(Clone, Debug)]
+pub enum DdgiSky {
+    /// 程序化渐变天空：[`environment.wgsl::sky_color`] 的 CPU 镜像
+    /// （[`procedural_sky_radiance`]，源码层看门钉常数表）。
+    Procedural,
+    /// 外部 equirectangular 全景（第 0 行 = +Y 天顶）：方向 → 全景 uv
+    /// （[`environment.wgsl::dir_to_equirect_uv`] 同式）+ **nearest-texel**
+    /// 采样（与 §8.57⑥ 的 nearest 查表立场一致；GPU 捕获路径是线性滤波，
+    /// 差异声明进 §8.67②）。`generation` 随 [`SkySource::generation`]
+    /// 入指纹（换图必标脏，即便像素巧合相同）。
+    Hdr {
+        /// 全景图像（Arc 快照，零拷贝逐帧传递）。
+        image: std::sync::Arc<crate::asset::hdr::HdrImage>,
+        /// 天空源代数（`SkySource::generation`）。
+        generation: u64,
+    },
+}
+
+impl DdgiSky {
+    /// 方向 `dir`（无需预归一化）的天空辐亮度。口径：mode = 0 天空盒采样
+    /// env cubemap **不乘 `EnvironmentSettings.intensity`**（skybox.wgsl
+    /// :151-153），本求值器同为裸辐射率。
+    pub fn radiance(&self, dir: Vec3) -> Vec3 {
+        match self {
+            DdgiSky::Procedural => procedural_sky_radiance(dir),
+            DdgiSky::Hdr { image, .. } => hdr_sky_radiance(image, dir),
+        }
+    }
+}
+
+/// 程序化渐变天空常数（`environment.wgsl::sky_color` 的镜像）。
+const SKY_ZENITH: Vec3 = Vec3::new(0.10, 0.36, 0.94);
+/// 地平线色（WGSL 字面镜像）。
+const SKY_HORIZON: Vec3 = Vec3::new(0.70, 0.80, 0.94);
+/// 地面回弹底色基值（WGSL 在着色时乘 0.55，此处逐式保留）。
+const SKY_GROUND_BASE: Vec3 = Vec3::new(0.30, 0.24, 0.18);
+/// 程序化太阳光方向（WGSL `SUN_DIR` 镜像，非昼夜太阳——它是渐变天空几何的一部分）。
+const SKY_SUN_DIR: Vec3 = Vec3::new(0.4, 0.8, 0.45);
+
+/// [`environment.wgsl::sky_color`] 的 **CPU 镜像**（同式同常数）。
+///
+/// 逐位对照对象是 WGSL 侧**不**成立的：本函数产物只进 DDGI 表（CPU 求值
+/// 即真值），可见天空走 env cubemap 的 f16 捕获（量化差 ≤ f16 步长）——
+/// 「同源」指**同一公式同一常数**，看门单测
+/// [`procedural_sky_constants_match_environment_wgsl`] 以源码层比对钉住
+/// 常数表漂移（照 `pipeline.rs::skybox_globals_prefix…` 先例）。
+pub fn procedural_sky_radiance(d: Vec3) -> Vec3 {
+    let dir = match d.try_normalize() {
+        Some(v) => v,
+        None => return SKY_HORIZON,
+    };
+    let t = dir.y;
+    let ground = SKY_GROUND_BASE * 0.55;
+    let c = if t >= 0.0 {
+        let s = t.clamp(0.0, 1.0).powf(0.45);
+        SKY_HORIZON.lerp(SKY_ZENITH, s)
+    } else {
+        let s = (-t).clamp(0.0, 1.0).powf(0.5);
+        SKY_HORIZON.lerp(ground, s)
+    };
+    // WGSL 侧是 `normalize(SUN_DIR)`（常量归一化在着色器里做），镜像同式。
+    let sun = SKY_SUN_DIR
+        .try_normalize()
+        .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let sd = dir.dot(sun).max(0.0);
+    let disc = smoothstep_f(0.9993, 0.9997, sd);
+    let halo = sd.powf(350.0) * 0.12;
+    c + Vec3::new(30.0, 26.0, 18.0) * disc + Vec3::new(1.0, 0.85, 0.6) * halo
+}
+
+/// WGSL `smoothstep(e0, e1, x)` 的 CPU 镜像（钳 + 三次 Hermite）。
+fn smoothstep_f(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 外部全景的 nearest-texel 逐向采样（`environment.wgsl::dir_to_equirect_uv`
+/// 的 uv 式镜像；u 环绕、v 钳边）。
+pub fn hdr_sky_radiance(image: &crate::asset::hdr::HdrImage, dir: Vec3) -> Vec3 {
+    let d = match dir.try_normalize() {
+        Some(v) => v,
+        None => return Vec3::ZERO,
+    };
+    let pi = std::f32::consts::PI;
+    let u = 0.5 + d.z.atan2(d.x) / (2.0 * pi);
+    let v = 0.5 - d.y.clamp(-1.0, 1.0).asin() / pi;
+    let w = image.width.max(1) as i64;
+    let h = image.height.max(1) as i64;
+    let x = (u * w as f32).floor().rem_euclid(w as f32) as i64;
+    let y = ((v * h as f32).floor() as i64).clamp(0, h - 1);
+    Vec3::from_array(image.pixel(x as u32, y as u32))
+}
+
+/// GI 灯集容量（C7a）：与主渲染 `MAX_POINT_LIGHTS` 同容量的显式镜像常量
+/// （超过按收集序截断并 warn——主渲染的分箱支持 512 盏是像素侧事实源，
+/// GI 侧受射线预算约束独立封顶，见 §8.67③）。
+pub const DDGI_MAX_GI_LIGHTS: usize = 8;
+
+/// 每帧重照明的扩展输入（C7a）。
+///
+/// **缺席语义（API 的一部分）**：`default()`（空灯集 + 无同源天空）⇒
+/// 重照明算术与 R88/R89 口径**逐位一致**（[
+/// `probe_ray_radiance_depth_gi`] 的旁路分支，`to_bits` 锚测试钉住）；
+/// 既有 [`DdgiGrid::tick`] / [`DdgiGrid::install`] / [`probe_relight`] 即
+/// 该缺席档的薄壳。
+#[derive(Clone, Debug, Default)]
+pub struct RelightInputs {
+    /// 本帧参与 GI 的动态灯（收集序 = 点光查询序 → 聚光查询序追加，
+    /// 总量 ≤ [`DDGI_MAX_GI_LIGHTS`]，宿主负责裁剪）。
+    pub lights: Vec<GiLight>,
+    /// 同源天空求值器；`None` = 未命中射线吃 `params.sky_color` 常量（现口径）。
+    pub sky: Option<DdgiSky>,
+}
+
+impl RelightInputs {
+    /// 合法性（宿主系统体每帧调用；与 [`DdgiSettings::validate`] 同风格的
+    /// 快断言）。
+    pub fn validate(&self) {
+        assert!(
+            self.lights.len() <= DDGI_MAX_GI_LIGHTS,
+            "GI 灯集容量 {DDGI_MAX_GI_LIGHTS} 盏，收到 {} 盏（裁剪是宿主的活）",
+            self.lights.len()
+        );
+        for l in &self.lights {
+            assert!(
+                l.position.is_finite() && l.color.is_finite() && l.range.is_finite(),
+                "GI 灯参数须有限：{l:?}"
+            );
+        }
     }
 }
 
@@ -637,6 +887,56 @@ pub fn relight_fingerprint(params: &BakeParams, rays_per_face: u32) -> u64 {
     h
 }
 
+/// C7a 扩展输入的指纹：灯集（数量 + 逐灯固定序全字段 bits）+ 天空快照。
+///
+/// 空灯集与「无天空」都各有确定值 ⇒ 「输入不变 ⇒ 指纹不变」的行为可判
+/// （指纹数值本身不设逐位锁，锁的是**变化语义**）。
+pub fn gi_inputs_fingerprint(inputs: &RelightInputs) -> u64 {
+    let mut h = mix64(0);
+    h = mix64(h ^ inputs.lights.len() as u64);
+    for l in &inputs.lights {
+        let values = [
+            l.position.x,
+            l.position.y,
+            l.position.z,
+            l.color.x,
+            l.color.y,
+            l.color.z,
+            l.range,
+            l.axis.x,
+            l.axis.y,
+            l.axis.z,
+            l.cos_inner,
+            l.cos_outer,
+        ];
+        for v in values {
+            h = mix64(h ^ u64::from(v.to_bits()));
+        }
+        h = mix64(h ^ (l.is_spot as u64) ^ (l.shadows as u64) << 1);
+    }
+    match &inputs.sky {
+        None => h = mix64(h),
+        Some(DdgiSky::Procedural) => h = mix64(h ^ 1),
+        Some(DdgiSky::Hdr { image, generation }) => {
+            h = mix64(h ^ 2);
+            h = mix64(h ^ *generation);
+            h = mix64(h ^ u64::from(image.width));
+            h = mix64(h ^ u64::from(image.height));
+        }
+    }
+    h
+}
+
+/// 完整重照明指纹 = [`relight_fingerprint`] × [`gi_inputs_fingerprint`] 的
+/// 位组合（C7a：[`DdgiGrid::tick_with`] / [`DdgiGrid::install_with`] 消费）。
+pub fn relight_fingerprint_with_inputs(
+    params: &BakeParams,
+    rays_per_face: u32,
+    inputs: &RelightInputs,
+) -> u64 {
+    mix64(relight_fingerprint(params, rays_per_face) ^ gi_inputs_fingerprint(inputs))
+}
+
 /// 网格布局指纹：对 (`spacing`, `bounds`) 的 `to_bits` 做固定序位组合。
 ///
 /// 变化 ⇒ 重建网格（位置 / 半径 / 粗填 / 全表标脏 / `structure_generation`
@@ -715,11 +1015,31 @@ pub fn depth_cell_of_ray(index: u32, grid: u32) -> u32 {
 /// 返回 `(SH 系数, 深度矩)`，深度矩长度恒 [`DDGI_DEPTH_TEXELS`]（= 384）。
 ///
 /// [`PROBE_AXES`]: crate::irradiance::PROBE_AXES
+/// [`probe_relight_with`] 的**缺席档薄壳**（`RelightInputs::default()`：
+/// 空灯集 + 无同源天空）——R88/R89 口径的公开入口，逐位不变由旁路分支
+/// 保证（见 [`RelightInputs`] 文档）。
 pub fn probe_relight(
     bvh: &Bvh,
     position: Vec3,
     params: &BakeParams,
     grid: u32,
+) -> (ShCoeffs, Vec<[f64; 2]>) {
+    probe_relight_with(bvh, position, params, grid, &RelightInputs::default())
+}
+
+/// 单探针重照明（C7a 扩展档）：`inputs.lights` 非空 ⇒ 每个**命中点**追加
+/// 逐灯漫反射入射（衰减窗/锥因子/硬影单射线均镜像主渲染口径，见
+/// [`crate::irradiance::probe_ray_radiance_depth_gi`]）；`inputs.sky`
+/// 在场 ⇒ **未命中射线**按方向取天空辐亮度（命中点的天空底仍为
+/// `params.sky_color` 均值常数——限制⑳）。
+///
+/// 其余口径与 [`probe_relight`] 薄壳完全一致（同批射线、同累加序）。
+pub fn probe_relight_with(
+    bvh: &Bvh,
+    position: Vec3,
+    params: &BakeParams,
+    grid: u32,
+    inputs: &RelightInputs,
 ) -> (ShCoeffs, Vec<[f64; 2]>) {
     assert!(position.is_finite(), "探针位置非有限：{position:?}");
     assert!(grid >= 1, "方向网格至少 1，收到 {grid}");
@@ -744,7 +1064,9 @@ pub fn probe_relight(
                 let u = (0.5 * (u0 + u1)) as f32;
                 let dw = cube_texel_solid_angle(u0, u1, v0, v1);
                 let dir = cube_face_direction(face, u, v);
-                let (l, t) = probe_ray_radiance_depth(bvh, position, dir, params);
+                let (l, t) = crate::irradiance::probe_ray_radiance_depth_gi(
+                    bvh, position, dir, params, inputs,
+                );
                 let y = sh_basis(dir);
                 for (k, c) in acc.iter_mut().enumerate() {
                     c[0] += f64::from(l.x) * f64::from(y[k]) * dw;
@@ -1277,13 +1599,26 @@ impl DdgiGrid {
         params: &BakeParams,
         triangles: Vec<BakeTriangle>,
     ) {
+        self.install_with(settings, params, triangles, &RelightInputs::default());
+    }
+
+    /// [`Self::install`] 的 C7a 扩展档：粗填与指纹同步消费 `inputs`
+    /// （安装帧即带灯/带同源天空，无「第一帧旧口径」空窗）。
+    pub fn install_with(
+        &mut self,
+        settings: &DdgiSettings,
+        params: &BakeParams,
+        triangles: Vec<BakeTriangle>,
+        inputs: &RelightInputs,
+    ) {
         settings.validate();
+        inputs.validate();
         self.installed = true;
         self.tick_count += 1;
         self.structure_generation += 1;
         self.geometry_generation = settings.geometry_generation;
         self.grid_fp = grid_fingerprint(settings);
-        self.relight_fp = relight_fingerprint(params, settings.rays_per_face);
+        self.relight_fp = relight_fingerprint_with_inputs(params, settings.rays_per_face, inputs);
         self.rays_per_face = settings.rays_per_face;
         self.cursor = 0;
         self.bvh = build_bvh(triangles.clone());
@@ -1321,7 +1656,7 @@ impl DdgiGrid {
         let bvh = std::mem::take(&mut self.bvh);
         let mut sh = vec![ZERO_SH; n];
         for (i, p) in positions.iter().enumerate() {
-            sh[i] = probe_relight(&bvh, *p, params, DDGI_PREFILL_GRID).0;
+            sh[i] = probe_relight_with(&bvh, *p, params, DDGI_PREFILL_GRID, inputs).0;
         }
         self.bvh = bvh;
         self.positions = positions;
@@ -1367,7 +1702,20 @@ impl DdgiGrid {
     ///
     /// 未安装 / 空网格 ⇒ 0（宿主应先 [`Self::install`]）。
     pub fn tick(&mut self, settings: &DdgiSettings, params: &BakeParams) -> usize {
+        self.tick_with(settings, params, &RelightInputs::default())
+    }
+
+    /// [`Self::tick`] 的 C7a 扩展档（灯集 + 同源天空）。指纹换成
+    /// [`relight_fingerprint_with_inputs`]：灯/天空快照变 ⇒ 全表标脏
+    /// （不清空旧值，无闪烁语义与光照指纹一致）。
+    pub fn tick_with(
+        &mut self,
+        settings: &DdgiSettings,
+        params: &BakeParams,
+        inputs: &RelightInputs,
+    ) -> usize {
         settings.validate();
+        inputs.validate();
         self.tick_count += 1;
         let n = self.positions.len();
         if n == 0 {
@@ -1375,7 +1723,7 @@ impl DdgiGrid {
             self.stats.last_updated = 0;
             return 0;
         }
-        let fp = relight_fingerprint(params, settings.rays_per_face);
+        let fp = relight_fingerprint_with_inputs(params, settings.rays_per_face, inputs);
         if fp != self.relight_fp {
             self.relight_fp = fp;
             self.dirty.iter_mut().for_each(|d| *d = true);
@@ -1398,7 +1746,8 @@ impl DdgiGrid {
         // Vec 的胖指针，零内存拷贝）
         let bvh = std::mem::take(&mut self.bvh);
         for &i in &updated {
-            let (fresh, moments) = probe_relight(&bvh, self.positions[i], params, grid);
+            let (fresh, moments) =
+                probe_relight_with(&bvh, self.positions[i], params, grid, inputs);
             self.sh[i] = sh_hysteresis(&self.sh[i], &fresh, alpha);
             let base = i * DDGI_DEPTH_TEXELS;
             for (t, m) in moments.iter().enumerate() {
@@ -3721,8 +4070,12 @@ mod tests {
         // 深度口径的直证：`hit.t` 从**偏移后的射线原点**起算，加回偏移量才与
         // 「从探针位置起算」的着色器侧 `distance(x, p)` 同原点 ⇒ 垂直向下到
         // 地板的深度必须恰为 h（偏移往返精确抵消，不是「差 2 mm 也无所谓」）
-        let (radiance, depth_down) =
-            probe_ray_radiance_depth(&bvh, Vec3::new(0.0, h, 0.0), Vec3::NEG_Y, &params);
+        let (radiance, depth_down) = crate::irradiance::probe_ray_radiance_depth(
+            &bvh,
+            Vec3::new(0.0, h, 0.0),
+            Vec3::NEG_Y,
+            &params,
+        );
         assert!(
             (depth_down - h).abs() < 1e-5,
             "垂直向下的深度必须 = h = {h}（bias 往返抵消），实得 {depth_down}"
@@ -3807,5 +4160,401 @@ mod tests {
             "L0 必须为正（有天空与地板反光）：{:?}",
             sh[0]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ㉑ C7a · 同源天空与 GI 灯集（docs/private/c7-design-v1.md 裁定甲案）
+    // ------------------------------------------------------------------
+
+    /// 无方向光（`light_dir` 天顶 ⇒ 地面向上的 `ndotl ≤ 0` 零贡献）、
+    /// 无天空底（`sky_color = 0`）的「裸口径」参数——灯贡献测试的唯一
+    /// 变量就是灯本身。
+    fn dark_params() -> BakeParams {
+        BakeParams {
+            light_dir: Vec3::Y,
+            sky_color: Vec3::ZERO,
+            ..test_params()
+        }
+    }
+
+    fn floor_only() -> Bvh {
+        build_bvh(quad(
+            Vec3::new(-10.0, 0.0, -10.0),
+            Vec3::new(-10.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, -10.0),
+            Vec3::splat(0.5),
+        ))
+    }
+
+    #[test]
+    fn shell_and_default_inputs_relight_bitwise_identical() {
+        // 缺席档薄壳 ≡ 扩展档 default()：SH 与深度矩 to_bits 逐位（旁路分支的硬证据）
+        let bvh = build_bvh(room_triangles());
+        let params = test_params();
+        for p in [
+            Vec3::new(-3.0, 1.5, 2.0),
+            Vec3::new(3.0, 1.5, -2.0),
+            Vec3::new(0.0, 2.5, 0.0),
+        ] {
+            let (a, da) = probe_relight(&bvh, p, &params, 8);
+            let (b, db) = probe_relight_with(&bvh, p, &params, 8, &RelightInputs::default());
+            assert_eq!(sh_bits(&a), sh_bits(&b), "缺席档 SH 漂移：{p:?}");
+            let bits = |m: &Vec<[f64; 2]>| -> Vec<u64> {
+                m.iter()
+                    .flat_map(|x| x.iter().map(|f| f.to_bits()))
+                    .collect()
+            };
+            assert_eq!(bits(&da), bits(&db), "缺席档深度矩漂移：{p:?}");
+        }
+    }
+
+    #[test]
+    fn procedural_sky_constants_match_environment_wgsl() {
+        // 双源看门（照 `pipeline.rs::skybox_globals_prefix…` 先例）：
+        // WGSL 侧字面量与本文件 Rust 侧字面量各自在源码文本中钉同一组常数，
+        // 任一侧独改 ⇒ 另一侧断言失败。
+        const WGSL: &str = include_str!("../shaders/environment.wgsl");
+        const SELF: &str = include_str!("ddgi.rs");
+        for lit in [
+            "vec3<f32>(0.10, 0.36, 0.94)",
+            "vec3<f32>(0.70, 0.80, 0.94)",
+            "vec3<f32>(0.30, 0.24, 0.18) * 0.55",
+            "vec3<f32>(0.4, 0.8, 0.45)",
+            "smoothstep(0.9993, 0.9997, sd)",
+            "pow(sd, 350.0) * 0.12",
+            "vec3<f32>(30.0, 26.0, 18.0)",
+            "vec3<f32>(1.0, 0.85, 0.6)",
+        ] {
+            assert!(
+                WGSL.contains(lit),
+                "environment.wgsl::sky_color 字面量 {lit} 漂移或缺失——CPU 镜像须同步修改"
+            );
+        }
+        for lit in [
+            "Vec3::new(0.10, 0.36, 0.94)",
+            "Vec3::new(0.70, 0.80, 0.94)",
+            "Vec3::new(0.30, 0.24, 0.18)",
+            "Vec3::new(0.4, 0.8, 0.45)",
+            "smoothstep_f(0.9993, 0.9997, sd)",
+            "sd.powf(350.0) * 0.12",
+            "Vec3::new(30.0, 26.0, 18.0)",
+            "Vec3::new(1.0, 0.85, 0.6)",
+        ] {
+            assert!(
+                SELF.contains(lit),
+                "ddgi.rs CPU 镜像字面量 {lit} 漂移或缺失——与 environment.wgsl 失同步"
+            );
+        }
+    }
+
+    #[test]
+    fn procedural_sky_radiance_matches_analytic_directions() {
+        // 天顶：pow(1, 0.45) = 1 ⇒ lerp 落 zenith（halo = 0.799^350 ≈ e−78
+        // 下溢 0，disc = 0）；lerp 的 a + (b−a)·1 有 1 ULP 级舍入 ⇒ ±1e-6
+        let up = procedural_sky_radiance(Vec3::Y);
+        assert!(
+            (up - SKY_ZENITH).max_element() < 1e-6 && (up - SKY_ZENITH).min_element() > -1e-6,
+            "天顶 {up:?} 应落 zenith"
+        );
+        // 地平：pow(0, 0.45) = 0 ⇒ lerp 权重 0，分量为正 ⇒ a + 0 逐位恒等
+        assert_eq!(procedural_sky_radiance(Vec3::X), SKY_HORIZON);
+        // 天底：权重 1 落 ground×0.55（sd < 0 ⇒ 盘与晕双零）
+        let down = procedural_sky_radiance(Vec3::NEG_Y);
+        assert!(
+            (down - SKY_GROUND_BASE * 0.55).length() < 1e-6,
+            "天底 {down:?}"
+        );
+        // 太阳盘可判别：朝盘 vs 背盘的红通道差 ≫ 20（30·disc − 晕）
+        let sun = SKY_SUN_DIR.normalize();
+        let toward = procedural_sky_radiance(sun);
+        let away = procedural_sky_radiance(-sun);
+        assert!(
+            toward.x > away.x + 20.0,
+            "太阳盘未生效：{toward:?} vs {away:?}"
+        );
+        // 渐变单调（选背太阳方位的子午面，晕项恒 0 不干扰）
+        let at =
+            |y: f32| procedural_sky_radiance(Vec3::new(-(1.0 - y * y).max(0.0).sqrt(), y, 0.0));
+        assert!(
+            at(0.25).x > at(0.5).x && at(0.5).x > at(1.0).x,
+            "地平→天顶的红通道必须单调下降"
+        );
+    }
+
+    #[test]
+    fn hdr_sky_radiance_nearest_texel_is_analytic() {
+        use crate::asset::hdr::HdrImage;
+        let mut img = HdrImage::new(8, 4);
+        for y in 0..4 {
+            for x in 0..8 {
+                img.set_pixel(x, y, [x as f32, y as f32, 42.0]);
+            }
+        }
+        let sky = DdgiSky::Hdr {
+            image: std::sync::Arc::new(img),
+            generation: 7,
+        };
+        // +Y 天顶 ⇒ v = 0 行；atan2(0, 0) = 0 ⇒ u = 0.5 ⇒ 列 4
+        assert_eq!(sky.radiance(Vec3::Y), Vec3::new(4.0, 0.0, 42.0));
+        // −Y ⇒ v = 1 ⇒ floor(4) 钳末行 3
+        assert_eq!(sky.radiance(Vec3::NEG_Y), Vec3::new(4.0, 3.0, 42.0));
+        assert_eq!(sky.radiance(Vec3::X), Vec3::new(4.0, 2.0, 42.0));
+        // −X：atan2(0, −1) = π ⇒ u = 1.0 ⇒ x = 8 环绕回 0（接缝闭合）
+        assert_eq!(sky.radiance(-Vec3::X), Vec3::new(0.0, 2.0, 42.0));
+        // +Z：atan2(1, 0) = π/2 ⇒ u = 0.75 ⇒ 列 6
+        assert_eq!(sky.radiance(Vec3::Z), Vec3::new(6.0, 2.0, 42.0));
+    }
+
+    #[test]
+    fn gi_point_light_contribution_matches_analytic_window() {
+        let bvh = floor_only();
+        let params = dark_params();
+        let probe = Vec3::new(0.0, 1.0, 0.0);
+        let ray = Vec3::NEG_Y;
+        // 锚：无灯无天空底 ⇒ 命中点严格零（也钉住「方向光背光面零贡献」前提）
+        let (none, depth) = crate::irradiance::probe_ray_radiance_depth_gi(
+            &bvh,
+            probe,
+            ray,
+            &params,
+            &RelightInputs::default(),
+        );
+        assert_eq!(none, Vec3::ZERO, "裸口径必须严格零：{none:?}");
+        assert!(
+            (depth - 1.0).abs() < 1e-5,
+            "命中深度 = 探针高（偏移往返）：{depth}"
+        );
+        // 火把 (0,2,0)：hit (0,0,0) → dist 2、t = 0.4、window = 1−0.16、
+        // atten = window²/max(4, 0.01)、ndotl = 1 ⇒ 出射 = albedo·atten/π
+        let torch = GiLight::point(Vec3::new(0.0, 2.0, 0.0), Vec3::splat(1.0), 5.0, false);
+        let inputs = RelightInputs {
+            lights: vec![torch],
+            ..RelightInputs::default()
+        };
+        let (lit, _) =
+            crate::irradiance::probe_ray_radiance_depth_gi(&bvh, probe, ray, &params, &inputs);
+        let t = 2.0f32 / 5.0;
+        let window = 1.0 - t * t;
+        let atten = (window * window) / 4.0f32.max(0.01);
+        let expect =
+            Vec3::splat(0.5) * (Vec3::splat(1.0) * atten * 1.0) * std::f32::consts::FRAC_1_PI;
+        assert!(
+            (lit - expect).length() < 1e-6,
+            "解析窗口失配：{lit:?} vs {expect:?}"
+        );
+        // 硬影开（无障碍）⇒ 逐位同无影档：射线只加成本不改数值
+        let lit_shadowed = crate::irradiance::probe_ray_radiance_depth_gi(
+            &bvh,
+            probe,
+            ray,
+            &params,
+            &RelightInputs {
+                lights: vec![GiLight::point(
+                    Vec3::new(0.0, 2.0, 0.0),
+                    Vec3::splat(1.0),
+                    5.0,
+                    true,
+                )],
+                ..RelightInputs::default()
+            },
+        );
+        assert_eq!(
+            lit.to_array().map(f32::to_bits),
+            lit_shadowed.0.to_array().map(f32::to_bits),
+            "无遮挡硬影射线必须逐位不改值"
+        );
+    }
+
+    #[test]
+    fn gi_wall_blocks_point_light_hard_shadow_bitwise() {
+        let mut tris = quad(
+            Vec3::new(-10.0, 0.0, -10.0),
+            Vec3::new(-10.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, -10.0),
+            Vec3::splat(0.5),
+        );
+        // y = 1 的水平遮板（探针在其下方：主射线不撞它，影线必穿它）
+        tris.extend(quad(
+            Vec3::new(-3.0, 1.0, -3.0),
+            Vec3::new(-3.0, 1.0, 3.0),
+            Vec3::new(3.0, 1.0, 3.0),
+            Vec3::new(3.0, 1.0, -3.0),
+            Vec3::splat(0.6),
+        ));
+        let bvh = build_bvh(tris);
+        let params = dark_params();
+        let probe = Vec3::new(0.0, 0.5, 0.0);
+        let torch_at = Vec3::new(0.0, 2.0, 0.0);
+        let (blocked, _) = crate::irradiance::probe_ray_radiance_depth_gi(
+            &bvh,
+            probe,
+            Vec3::NEG_Y,
+            &params,
+            &RelightInputs {
+                lights: vec![GiLight::point(torch_at, Vec3::splat(1.0), 5.0, true)],
+                ..RelightInputs::default()
+            },
+        );
+        assert_eq!(blocked, Vec3::ZERO, "遮板后的火把在 GI 里必须严格零");
+        let (leaked, _) = crate::irradiance::probe_ray_radiance_depth_gi(
+            &bvh,
+            probe,
+            Vec3::NEG_Y,
+            &params,
+            &RelightInputs {
+                lights: vec![GiLight::point(torch_at, Vec3::splat(1.0), 5.0, false)],
+                ..RelightInputs::default()
+            },
+        );
+        assert!(leaked.x > 0.01, "逃生门（无影档）应照漏：{leaked:?}");
+    }
+
+    #[test]
+    fn gi_spot_cone_gates_contribution() {
+        let bvh = floor_only();
+        let params = dark_params();
+        let probe = Vec3::new(0.0, 1.0, 0.0);
+        let ray = Vec3::NEG_Y;
+        // 硬边锥（inner = outer ⇒ denom 0 走 `cosθ ≥ cos_outer` 阶跃支）
+        let cos30 = 30f32.to_radians().cos();
+        let lit_down = GiLight::spot(
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::splat(1.0),
+            5.0,
+            Vec3::NEG_Y,
+            cos30,
+            cos30,
+            false,
+        );
+        let lit_side = GiLight::spot(
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::splat(1.0),
+            5.0,
+            Vec3::NEG_Z, // 轴向侧向：命中点在 (0,−1,0) 方向，cosθ = 0 < cos30
+            cos30,
+            cos30,
+            false,
+        );
+        let torch = GiLight::point(Vec3::new(0.0, 2.0, 0.0), Vec3::splat(1.0), 5.0, false);
+        let of = |l: GiLight| {
+            crate::irradiance::probe_ray_radiance_depth_gi(
+                &bvh,
+                probe,
+                ray,
+                &params,
+                &RelightInputs {
+                    lights: vec![l],
+                    ..RelightInputs::default()
+                },
+            )
+            .0
+        };
+        // 锥轴命中 ⇒ cone 因子 = 1（乘 1.0 逐位恒等）⇒ 与同参数点光逐位一致
+        assert_eq!(
+            of(lit_down).to_array().map(f32::to_bits),
+            of(torch).to_array().map(f32::to_bits),
+            "正对锥应等值点光（cone 因子 1.0 逐位恒等）"
+        );
+        // 锥外 ⇒ 严格零（与裸口径锚逐位）
+        assert_eq!(of(lit_side), Vec3::ZERO, "锥外灯不得进 GI");
+    }
+
+    #[test]
+    fn gi_inputs_fingerprint_behavior() {
+        let params = test_params();
+        let fp = |i: &RelightInputs| relight_fingerprint_with_inputs(&params, 8, i);
+        let d = RelightInputs::default();
+        assert_eq!(fp(&d), fp(&d), "同输入两次必须相等");
+        let lit = RelightInputs {
+            lights: vec![GiLight::point(Vec3::X, Vec3::splat(1.0), 5.0, true)],
+            ..RelightInputs::default()
+        };
+        assert_ne!(fp(&d), fp(&lit), "加灯 ⇒ 指纹变");
+        let moved = RelightInputs {
+            lights: vec![GiLight::point(Vec3::X * 2.0, Vec3::splat(1.0), 5.0, true)],
+            ..RelightInputs::default()
+        };
+        assert_ne!(fp(&lit), fp(&moved), "灯位变 ⇒ 指纹变");
+        let unshadowed = RelightInputs {
+            lights: vec![GiLight::point(Vec3::X, Vec3::splat(1.0), 5.0, false)],
+            ..RelightInputs::default()
+        };
+        assert_ne!(fp(&lit), fp(&unshadowed), "硬影开关翻 ⇒ 指纹变");
+        let sky = RelightInputs {
+            sky: Some(DdgiSky::Procedural),
+            ..RelightInputs::default()
+        };
+        assert_ne!(fp(&d), fp(&sky), "天空同源开 ⇒ 指纹变");
+        let img = std::sync::Arc::new(crate::asset::hdr::HdrImage::new(4, 2));
+        let g5 = RelightInputs {
+            sky: Some(DdgiSky::Hdr {
+                image: img.clone(),
+                generation: 5,
+            }),
+            ..RelightInputs::default()
+        };
+        let g6 = RelightInputs {
+            sky: Some(DdgiSky::Hdr {
+                image: img,
+                generation: 6,
+            }),
+            ..RelightInputs::default()
+        };
+        assert_ne!(fp(&g5), fp(&g6), "generation 变 ⇒ 指纹变（同一图像也脏）");
+    }
+
+    #[test]
+    fn tick_with_lights_dirty_converges_and_differs_from_shell() {
+        let settings = test_settings(); // bounds ±6、h 0.5..3.5、k = 4、rays 8
+        let params = test_params();
+        let torch = GiLight::point(Vec3::new(4.0, 1.8, 4.0), Vec3::splat(3.0), 6.0, false);
+        let inputs = RelightInputs {
+            lights: vec![torch],
+            ..RelightInputs::default()
+        };
+        let a = installed_grid(&settings); // 薄壳档
+        let mut b = DdgiGrid::new();
+        b.install_with(
+            &settings,
+            &params,
+            room_triangles(),
+            &RelightInputs::default(),
+        );
+        // 缺席档 install_with(default) ≡ 薄壳 install：粗填逐位
+        let sh_bits_of = |g: &DdgiGrid| -> Vec<u32> { g.sh().iter().flat_map(sh_bits).collect() };
+        assert_eq!(sh_bits_of(&a), sh_bits_of(&b), "缺席档安装逐位一致");
+        // 灯输入首帧 ⇒ 全表标脏 ⇒ 逐帧推进 k 个；收敛帧数 = ⌈n/k⌉（解析）
+        let n = b.probe_count();
+        let k = settings.probes_per_frame;
+        let want = n.div_ceil(k);
+        let mut updated: Vec<usize> = Vec::new();
+        for _ in 0..want {
+            updated.push(b.tick_with(&settings, &params, &inputs));
+        }
+        assert_eq!(updated.first().copied(), Some(k), "首帧应刷新 k 个");
+        assert_eq!(updated.iter().sum::<usize>(), n, "⌈n/k⌉ 帧恰好覆盖全表");
+        assert_eq!(
+            b.tick_with(&settings, &params, &inputs),
+            0,
+            "稳态零刷新（输入不变不标脏）"
+        );
+        // 收敛表 ≡ 逐探针全量 probe_relight_with（灯在场）；且逐探针 ≢ 薄壳值
+        let bvh = build_bvh(room_triangles());
+        let mut differs = 0;
+        for (i, p) in b.positions().iter().enumerate() {
+            let fresh = probe_relight_with(&bvh, *p, &params, settings.rays_per_face, &inputs).0;
+            assert_eq!(
+                sh_bits(b.sh().get(i).unwrap()),
+                sh_bits(&fresh),
+                "收敛后须逐位等于全量重照明"
+            );
+            let shell = probe_relight(&bvh, *p, &params, settings.rays_per_face).0;
+            if sh_bits(&fresh) != sh_bits(&shell) {
+                differs += 1;
+            }
+        }
+        assert!(differs > 0, "火把必须在至少一个探针的表里留下痕迹");
     }
 }

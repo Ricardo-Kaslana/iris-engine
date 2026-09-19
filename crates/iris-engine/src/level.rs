@@ -774,6 +774,16 @@ pub struct DdgiSection {
     /// 天空辐射率覆盖（缺席 = 取 `DirectionalLight.ambient`，裁定 3）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sky_color: Option<[f32; 3]>,
+    /// 天空同源开关（C7a；缺席 = `false` = 常量天空底，逐位现口径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sky_from_source: Option<bool>,
+    /// 点光/聚光进 GI 总开关（C7a；缺席 = `false` = 灯不进 GI）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lights_in_gi: Option<bool>,
+    /// 点光/聚光进 GI 的逐灯硬影开关（C7a；缺席 = `true` = 硬影单射线）。
+    /// 仅当场景有动态灯进 GI 时被消费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_light_shadows: Option<bool>,
     #[serde(default = "default_ddgi_bounces")]
     pub bounces: u32,
 }
@@ -788,6 +798,9 @@ impl Default for DdgiSection {
             rays_per_face: default_ddgi_rays_per_face(),
             hysteresis: default_ddgi_hysteresis(),
             sky_color: None,
+            sky_from_source: None,
+            lights_in_gi: None,
+            point_light_shadows: None,
             bounces: default_ddgi_bounces(),
         }
     }
@@ -825,6 +838,9 @@ impl DdgiSection {
             rays_per_face: self.rays_per_face,
             hysteresis: self.hysteresis,
             sky_color: self.sky_color.map(Vec3::from_array),
+            sky_from_source: self.sky_from_source.unwrap_or(false),
+            lights_in_gi: self.lights_in_gi.unwrap_or(false),
+            point_light_shadows: self.point_light_shadows.unwrap_or(true),
             bounces: self.bounces,
             geometry_generation: 0,
         };
@@ -876,6 +892,10 @@ impl DdgiSection {
             rays_per_face: settings.rays_per_face,
             hysteresis: settings.hysteresis,
             sky_color: settings.sky_color.map(|v| v.to_array()),
+            // C7a 两旋钮只回写**非默认值**（默认档不落字段，旧档形态不变）
+            sky_from_source: settings.sky_from_source.then_some(true),
+            lights_in_gi: settings.lights_in_gi.then_some(true),
+            point_light_shadows: (!settings.point_light_shadows).then_some(false),
             bounces: settings.bounces,
         }
     }
@@ -2102,6 +2122,9 @@ mod tests {
             rays_per_face: 64,
             hysteresis: 0.5,
             sky_color: Some(Vec3::new(0.2, 0.2, 0.25)),
+            sky_from_source: true,
+            lights_in_gi: true,
+            point_light_shadows: false,
             bounces: 1,
             geometry_generation: 7,
         });
@@ -2128,5 +2151,8 @@ mod tests {
             Some((Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 2.0, 4.0)))
         );
         assert_eq!(settings.sky_color, Some(Vec3::new(0.2, 0.2, 0.25)));
+        assert!(settings.sky_from_source, "C7a 同源开关须往返");
+        assert!(settings.lights_in_gi, "C7a 灯进 GI 总开关须往返");
+        assert!(!settings.point_light_shadows, "C7a 硬影逃生门须往返");
     }
 }

@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1662 / release 1659**（C4a 形变目标 +12 / C4b 状态机 v2 与运行时重定向 +15 / C5a-1 BC7 Mode 6 编码器 +13 / C5a-2 KTX2 容器 +11（解析 6 含拒收五类与 mipPadding 剥离 / 目录侧表 2 / GPU 端到端 2 含硬件解码保真兜底闸 / 场景 `.ktx2` 装载 1）/ C5b 热重载局部 +5（端到端参数应用与纹理句柄不动 / 缺席零触碰 / 节流与坏内容消费两旋钮 / 未命中收集 / 去重共享旁证，全 CPU headless）/ C6 空间化 v3 +11（iris-audio 8：多普勒静止逐位锚 / 双向径向解析值 / 钳界病态 / muffle 系数解析 / 阶跃爬坡跨调用持久 / 旁路三型逐位 / 端到端过零率升频 / 句柄卫生与声速旋钮；iris-engine 3：帧差分速度解析 / 遮挡二值与 opt-in / 自碰撞体豁免，全 headless）；BC7 永不自动、KTX2 仅未压缩 + mip 级、HRTF 按三门裁出回池、C4c 动画压缩同前裁出；全部 opt-in「缺席 = 逐位不变」，既有物理/渲染/游戏/音频快照测试零改动原值通过；**C6 收官**，下一批 C7 大裁决役（OIT + DDGI 同源，设计稿先行）；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1676 / release 1673**（C4a 形变目标 +12 / C4b 状态机 v2 与运行时重定向 +15 / C5a-1 BC7 Mode 6 编码器 +13 / C5a-2 KTX2 容器 +11（解析 6 含拒收五类与 mipPadding 剥离 / 目录侧表 2 / GPU 端到端 2 含硬件解码保真兜底闸 / 场景 `.ktx2` 装载 1）/ C5b 热重载局部 +5（端到端参数应用与纹理句柄不动 / 缺席零触碰 / 节流与坏内容消费两旋钮 / 未命中收集 / 去重共享旁证，全 CPU headless）/ C6 空间化 v3 +11（iris-audio 8：多普勒静止逐位锚 / 双向径向解析值 / 钳界病态 / muffle 系数解析 / 阶跃爬坡跨调用持久 / 旁路三型逐位 / 端到端过零率升频 / 句柄卫生与声速旋钮；iris-engine 3：帧差分速度解析 / 遮挡二值与 opt-in / 自碰撞体豁免，全 headless）；C7a DDGI 同源役 +14（iris-render ddgi 9：缺席档逐位锚 / WGSL↔Rust 常数双看门 / 程序化解析向 / HDR nearest 映射解析 / 点光窗口解析值 / 遮板硬影逐位零 / 锥门控与点光逐位等 / 指纹行为组 / 滚动脏-收敛-判别全链；iris-engine 4：收集口径 / 快照优先级链 / 火把端到端+空集锚 / 天空方向性双向证据；GPU 1：火把 ROI 抬亮+稳态逐位+天空可判别）；BC7 永不自动、KTX2 仅未压缩 + mip 级、HRTF 按三门裁出回池、C4c 动画压缩同前裁出；全部 opt-in「缺席 = 逐位不变」，既有物理/渲染/游戏/音频快照测试零改动原值通过；**C6 收官、C7a ✅**，下一件 C7b OIT 役（WBOIT 公式已取证进设计稿第 5 节）；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -121,7 +121,7 @@ ARCHITECTURE.md 对应章节、本轮涉及的既有模块。
 六项门禁全绿（AGENTS.md 顺序与铁律：每门前清残留进程；
 CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 门禁串行）。REPORT.md 于仓库根：改动清单、逐二进制测试数（单次完整
-调用加总，禁用 grep -v "0 passed"，基线 debug 1662 / release 1659）、
+调用加总，禁用 grep -v "0 passed"，基线 debug 1676 / release 1673）、
 门禁表、设计决策、与规格偏离及理由。不做任何 git 写操作；REPORT.md
 不入库。
 ```
@@ -139,7 +139,7 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
 
 ## 当前状态与路线图（2026-09-14 更新）
 
-- 测试基线 debug 1662 / release 1659；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
+- 测试基线 debug 1676 / release 1673；全库零 unsafe；native+wasm32 双 target 零警告；**无 git 远端**（R56 发布时需用户提供）。
 - **路线图 v5**（2026-09-14 用户裁定定稿；全文与裁定记录见 `docs/private/roadmap-v5.md`。
   编号与执行序解耦：W8 保留 R69–R72，新轮自 R73 起编，第一梯队先于 W8 执行）：
   - 已收官：W5 内容产能 ✅（R57–R59）、W6 视觉上限 ✅（R60–R66b）、W7 首轮 R65

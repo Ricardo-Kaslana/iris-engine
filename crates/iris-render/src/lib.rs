@@ -172,17 +172,18 @@ pub mod prelude {
         ChainIk, LookIk, solve_fabrik, swing_fraction, update_chain_ik, update_look_ik,
     };
     pub use crate::context::Gpu;
-    // DDGI 动态全局光照（R88 v1 + R89 v2）：规则探针网格 + 时间片滚动重照明
-    // + 深度感知混合 + 覆盖度合成
+    // DDGI 动态全局光照（R88 v1 + R89 v2 + C7a v3：同源天空与 GI 灯集）
     pub use crate::ddgi::{
         DDGI_COVER_FADE, DDGI_DEPTH_FLOATS, DDGI_DEPTH_GRID, DDGI_DEPTH_PROBE_BYTES,
-        DDGI_DEPTH_TABLE_BYTES, DDGI_DEPTH_TEXELS, DDGI_DEPTH_TEXELS_PER_FACE, DDGI_PREFILL_GRID,
-        DDGI_RAYS_PER_FACE_CHOICES, DDGI_SIGMA_REL, DDGI_SKY_DEPTH, DdgiGrid, DdgiLayout,
-        DdgiSettings, DdgiStats, advance, axis_points, ddgi_blend, ddgi_blend_with_cov,
-        ddgi_coverage, ddgi_coverage_with_fade, ddgi_depth_face, ddgi_depth_texel,
-        ddgi_depth_weight, ddgi_depth_weight_at, default_bounds, depth_cell_of_ray,
-        depth_hysteresis, depth_moment_finish, grid_fingerprint, layout_positions,
-        neutral_depth_moment, neutral_depth_table, plan_layout, probe_relight, relight_fingerprint,
+        DDGI_DEPTH_TABLE_BYTES, DDGI_DEPTH_TEXELS, DDGI_DEPTH_TEXELS_PER_FACE, DDGI_MAX_GI_LIGHTS,
+        DDGI_PREFILL_GRID, DDGI_RAYS_PER_FACE_CHOICES, DDGI_SIGMA_REL, DDGI_SKY_DEPTH, DdgiGrid,
+        DdgiLayout, DdgiSettings, DdgiSky, DdgiStats, GiLight, RelightInputs, advance, axis_points,
+        ddgi_blend, ddgi_blend_with_cov, ddgi_coverage, ddgi_coverage_with_fade, ddgi_depth_face,
+        ddgi_depth_texel, ddgi_depth_weight, ddgi_depth_weight_at, default_bounds,
+        depth_cell_of_ray, depth_hysteresis, depth_moment_finish, gi_inputs_fingerprint,
+        grid_fingerprint, hdr_sky_radiance, layout_positions, neutral_depth_moment,
+        neutral_depth_table, plan_layout, probe_relight, probe_relight_with,
+        procedural_sky_radiance, relight_fingerprint, relight_fingerprint_with_inputs,
         sh_hysteresis, stride_for_capacity, triangles_bounds,
     };
     pub use crate::decal::{Decal, DecalInstanceRaw, DecalLighting, decal_lit_factor};
@@ -201,8 +202,9 @@ pub mod prelude {
         SH_Y1, SH_Y2A, SH_Y2B, SH_Y2C, ShCoeffs, ShProbeRaw, TetraStats, TetraValidation,
         Tetrahedralization, bake_irradiance_probes, bake_irradiance_probes_sh, cube_face_direction,
         cube_texel_solid_angle, derive_probe_radii, install_irradiance_probes,
-        probe_influence_weight, probe_ray_radiance_depth, probe_sh_coefficients, probe_sh_radiance,
-        project_probe_sh, sh_basis, sh_blend, sh_blend_l0, sh_dc, sh_eval, sh_lambert_convolve,
+        probe_influence_weight, probe_ray_radiance_depth, probe_ray_radiance_depth_gi,
+        probe_sh_coefficients, probe_sh_radiance, project_probe_sh, sh_basis, sh_blend,
+        sh_blend_l0, sh_dc, sh_eval, sh_lambert_convolve,
     };
     pub use crate::light::{
         CascadeFit, DirectionalLight, MAX_POINT_LIGHTS, POINT_SHADOW_BIAS_LEGACY,

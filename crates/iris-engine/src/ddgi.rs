@@ -1,5 +1,7 @@
-//! DDGI 每帧编排（R88）：把 [`DdgiSettings`] + [`DirectionalLight`] 派生成
-//! [`BakeParams`]，喂给 [`DdgiGrid`] 的时间片滚动重照明。
+//! DDGI 每帧编排（R88 + C7a v3）：把 [`DdgiSettings`] + [`DirectionalLight`]
+//! 派生成 [`BakeParams`]，连同 **C7a 重照明输入**（[`ddgi_relight_inputs`]：
+//! `lights_in_gi` 门控的灯集 + `sky_from_source` 门控的同源天空快照）
+//! 喂给 [`DdgiGrid`] 的时间片滚动重照明。
 //!
 //! **算法本体全在 `iris_render::ddgi` 的纯函数里**（网格生成 / 轮转 /
 //! 重照明 / 深度矩 / 混合镜像），本模块只做「读世界 → 组装口径 → 写回资源」
@@ -28,7 +30,7 @@
 
 use iris_core::world::World;
 use iris_render::bake::{BakeParams, collect_bake_triangles};
-use iris_render::ddgi::{DdgiGrid, DdgiSettings};
+use iris_render::ddgi::{DdgiGrid, DdgiSettings, DdgiSky, GiLight, RelightInputs};
 use iris_render::light::DirectionalLight;
 
 /// 由设置 + 方向光组装重照明口径（纯函数，可单测）。
@@ -51,6 +53,114 @@ pub fn ddgi_bake_params(settings: &DdgiSettings, light: &DirectionalLight) -> Ba
         shadow_softness: 0.0,
         sky_samples: 1,
         bounces: settings.bounces,
+    }
+}
+
+/// 收集本帧参与 GI 的动态灯集（C7a，§8.57② 的闭合件）。
+///
+/// 组装序与主渲染灯表同构：**点光查询序 → 聚光查询序追加**，合计裁剪到
+/// [`DDGI_MAX_GI_LIGHTS`] 盏（超出 warn——主渲染分箱可容 512 盏，GI 侧受
+/// 射线预算独立封顶，>8 盏时两侧事实源可不同，§8.67③）。逐字段口径镜像
+/// `renderer.rs` 的 Globals/binned 组装：`color × intensity`、聚光
+/// `inner.min(outer)` 钳制、零长度方向 = 颜色置零（不发光）。
+/// `shadows` 由宿主从 `DdgiSettings::point_light_shadows` 扇入逐灯。
+pub fn ddgi_gi_lights(world: &World, shadows: bool) -> Vec<GiLight> {
+    use iris_core::prelude::GlobalTransform;
+    use iris_render::light::{PointLight, SpotLight};
+    let mut lights: Vec<GiLight> = Vec::new();
+    let mut total = 0usize;
+    world.query::<(&GlobalTransform, &PointLight)>(|(gt, pl)| {
+        total += 1;
+        if lights.len() >= iris_render::ddgi::DDGI_MAX_GI_LIGHTS {
+            return;
+        }
+        lights.push(GiLight::point(
+            gt.position(),
+            pl.color * pl.intensity,
+            pl.range,
+            shadows,
+        ));
+    });
+    world.query::<(&GlobalTransform, &SpotLight)>(|(gt, sl)| {
+        total += 1;
+        if lights.len() >= iris_render::ddgi::DDGI_MAX_GI_LIGHTS {
+            return;
+        }
+        let color = if sl.direction.length_squared() == 0.0 {
+            glam::Vec3::ZERO
+        } else {
+            sl.color * sl.intensity
+        };
+        let inner = sl.inner_cutoff.min(sl.outer_cutoff);
+        lights.push(GiLight::spot(
+            gt.position(),
+            color,
+            sl.range,
+            sl.direction.normalize_or_zero(),
+            inner.cos(),
+            sl.outer_cutoff.cos(),
+            shadows,
+        ));
+    });
+    if total > iris_render::ddgi::DDGI_MAX_GI_LIGHTS {
+        log::warn!(
+            "场景有 {total} 盏动态灯，GI 侧容量 {} 盏（超出部分不进间接光；主渲染直接光不受影响）",
+            iris_render::ddgi::DDGI_MAX_GI_LIGHTS
+        );
+    }
+    lights
+}
+
+/// 同源天空快照（C7a 裁决 B1 甲的优先级链，见
+/// [`DdgiSettings::sky_from_source`] 文档）：
+///
+/// 1. 开关关 **或** `settings.sky_color = Some`（作者覆盖恒胜）⇒ `None`
+///    （未命中射线吃常量，现口径逐位不变）；
+/// 2. `SkySettings.atmosphere = true` ⇒ `None` + 进程级 warn 一次
+///    （大气 CPU 镜像未实现，拒绝用渐变冒充，§8.57① 对该场景维持）；
+/// 3. `SkySource` 缺席 ⇒ [`DdgiSky::Procedural`]（可见天空同为程序化渐变，
+///    同源成立）；`EquirectHdr` ⇒ Arc 快照（零拷贝）+ generation 入指纹。
+pub fn ddgi_sky_snapshot(world: &World, settings: &DdgiSettings) -> Option<DdgiSky> {
+    use iris_render::environment::{SkySource, SkySourceKind};
+    use iris_render::post::SkySettings;
+    if !settings.sky_from_source || settings.sky_color.is_some() {
+        return None;
+    }
+    let atmosphere = world
+        .try_resource::<SkySettings>()
+        .is_some_and(|s| s.atmosphere);
+    if atmosphere {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "DDGI sky_from_source 在 SkySettings.atmosphere = true 的场景不生效\
+                 （大气散射 CPU 镜像未实现，§8.57① 维持）：回退常量天空底"
+            );
+        }
+        return None;
+    }
+    Some(match world.try_resource::<SkySource>() {
+        None => DdgiSky::Procedural,
+        Some(sky) => match &sky.kind {
+            SkySourceKind::ProceduralSky => DdgiSky::Procedural,
+            SkySourceKind::EquirectHdr(image) => DdgiSky::Hdr {
+                image: image.clone(),
+                generation: sky.generation,
+            },
+        },
+    })
+}
+
+/// 组装本帧重照明扩展输入（灯集 + 同源天空），供 [`tick_ddgi`] /
+/// [`converge_ddgi`] 在收集阶段调用（全部只读锁，与两阶段规约兼容）。
+pub fn ddgi_relight_inputs(world: &World, settings: &DdgiSettings) -> RelightInputs {
+    RelightInputs {
+        lights: if settings.lights_in_gi {
+            ddgi_gi_lights(world, settings.point_light_shadows)
+        } else {
+            Vec::new()
+        },
+        sky: ddgi_sky_snapshot(world, settings),
     }
 }
 
@@ -78,6 +188,8 @@ pub fn tick_ddgi(world: &World) {
         light.direction
     );
     let params = ddgi_bake_params(&settings, &light);
+    // C7a：灯集 / 同源天空快照（阶段一只读收集，阶段二消费克隆好的值）
+    let inputs = ddgi_relight_inputs(world, &settings);
     // 只有（重）建帧才收集三角形：稳态帧一次都不跑（诚实限制④的成本面）
     let triangles = if needs_rebuild {
         Some(collect_bake_triangles(world))
@@ -87,9 +199,9 @@ pub fn tick_ddgi(world: &World) {
     // 阶段二（写回）：尝试型写锁，冲突即 panic（消息含 "already borrowed"）
     let mut grid = world.resource_mut::<DdgiGrid>();
     if let Some(triangles) = triangles {
-        grid.install(&settings, &params, triangles);
+        grid.install_with(&settings, &params, triangles, &inputs);
     }
-    grid.tick(&settings, &params);
+    grid.tick_with(&settings, &params, &inputs);
 }
 
 /// 把 DDGI 装进世界并跑到收敛（example / GPU 测试的一次性装配入口）。
@@ -111,12 +223,13 @@ pub fn converge_ddgi(world: &World, frames: Option<usize>) -> DdgiGrid {
         .map(|l| l.clone())
         .unwrap_or_default();
     let params = ddgi_bake_params(&settings, &light);
+    let inputs = ddgi_relight_inputs(world, &settings);
     let mut grid = DdgiGrid::new();
-    grid.install(&settings, &params, collect_bake_triangles(world));
+    grid.install_with(&settings, &params, collect_bake_triangles(world), &inputs);
     let n = grid.probe_count();
     let want = frames.unwrap_or_else(|| n.div_ceil(settings.probes_per_frame.max(1)));
     for _ in 0..want {
-        grid.tick(&settings, &params);
+        grid.tick_with(&settings, &params, &inputs);
     }
     assert_eq!(
         grid.stats().dirty_count,
@@ -475,5 +588,250 @@ mod tests {
         world.insert_resource(DdgiGrid::new());
         world.resource_mut::<DirectionalLight>().direction = Vec3::ZERO;
         tick_ddgi(&world);
+    }
+
+    // ------------------------------------------------------------------
+    // C7a · 灯集收集 / 天空快照 / 端到端（c7-design-v1 裁定甲案）
+    // ------------------------------------------------------------------
+
+    /// 灯集收集与主渲染灯表逐字段同口径：`color × intensity`、聚光
+    /// `inner.min(outer)` 钳制、零长度方向 = 颜色置零、点先聚光后、容量 8。
+    #[test]
+    fn gi_lights_collection_mirrors_main_table_semantics() {
+        use iris_render::light::{PointLight, SpotLight};
+        let mut world = room_world();
+        world.spawn((
+            Transform::from_translation(Vec3::new(-2.0, 1.0, -2.0)),
+            PointLight {
+                color: Vec3::new(1.0, 0.5, 0.2),
+                intensity: 3.0,
+                range: 7.0,
+                shadows: false,
+            },
+        ));
+        // 倒挂锥（inner 60° > outer 30° ⇒ 钳硬边）+ 零方向锥（不发光）
+        world.spawn((
+            Transform::from_translation(Vec3::new(2.0, 3.0, 2.0)),
+            SpotLight {
+                color: Vec3::splat(2.0),
+                intensity: 1.5,
+                range: 9.0,
+                direction: Vec3::new(0.0, -2.0, 0.0), // 未归一化（收集侧 normalize_or_zero）
+                inner_cutoff: 60f32.to_radians(),
+                outer_cutoff: 30f32.to_radians(),
+            },
+        ));
+        world.spawn((
+            Transform::from_translation(Vec3::new(0.0, 2.0, 4.0)),
+            SpotLight {
+                direction: Vec3::ZERO,
+                ..SpotLight::default()
+            },
+        ));
+        propagate_transforms(&mut world);
+        let lights = ddgi_gi_lights(&world, true);
+        assert_eq!(lights.len(), 3);
+        let p = &lights[0];
+        assert_eq!(p.color, Vec3::new(3.0, 1.5, 0.6), "= color × intensity");
+        assert_eq!(p.range, 7.0);
+        assert!(!p.is_spot);
+        assert!(lights.iter().all(|l| l.shadows), "shadows 由宿主扇入");
+        let s = &lights[1];
+        assert!(s.is_spot);
+        assert_eq!(s.axis, Vec3::NEG_Y, "轴归一化");
+        assert_eq!(
+            s.cos_inner.to_bits(),
+            s.cos_outer.to_bits(),
+            "inner > outer 钳到硬边（= cos 30°）"
+        );
+        assert_eq!(s.color, Vec3::splat(3.0));
+        assert_eq!(
+            lights[2].color,
+            Vec3::ZERO,
+            "零方向锥 = 不发光（颜色置零镜像）"
+        );
+        // 容量 8：9 盏点光 ⇒ 前 8 盏
+        let mut dense = room_world();
+        for i in 0..9 {
+            dense.spawn((
+                Transform::from_translation(Vec3::new(i as f32, 1.0, 0.0)),
+                PointLight::default(),
+            ));
+        }
+        propagate_transforms(&mut dense);
+        assert_eq!(ddgi_gi_lights(&dense, false).len(), 8, "GI 容量 8 盏裁剪");
+    }
+
+    /// 天空快照优先级链：关 / 作者覆盖 / atmosphere ⇒ None；开且无
+    /// SkySource ⇒ Procedural；EquirectHdr ⇒ Arc 快照带 generation。
+    #[test]
+    fn sky_snapshot_priority_chain() {
+        use iris_render::asset::hdr::HdrImage;
+        use iris_render::environment::{SkySource, SkySourceKind};
+        use iris_render::post::SkySettings;
+        let mut world = room_world();
+        let on = DdgiSettings {
+            sky_from_source: true,
+            ..DdgiSettings::default()
+        };
+        // ① 开关关 ⇒ None
+        assert!(ddgi_sky_snapshot(&world, &DdgiSettings::default()).is_none());
+        // ② 作者显式 sky_color ⇒ 覆盖恒胜
+        let override_sky = DdgiSettings {
+            sky_from_source: true,
+            sky_color: Some(Vec3::splat(0.3)),
+            ..DdgiSettings::default()
+        };
+        assert!(ddgi_sky_snapshot(&world, &override_sky).is_none());
+        // ③ atmosphere ⇒ 拒绝冒充，None（§8.57① 维持）
+        world.insert_resource(SkySettings {
+            atmosphere: true,
+            ..SkySettings::default()
+        });
+        assert!(ddgi_sky_snapshot(&world, &on).is_none());
+        // ④ atmosphere 关 + 无 SkySource ⇒ 程序化镜像
+        world.insert_resource(SkySettings::default());
+        assert!(matches!(
+            ddgi_sky_snapshot(&world, &on),
+            Some(DdgiSky::Procedural)
+        ));
+        // ⑤ HDR 全景 ⇒ Arc 快照 + generation 透传
+        let sky = SkySource::equirect_hdr(HdrImage::new(4, 2));
+        let next_gen = sky.generation;
+        assert_ne!(next_gen, 0, "构造口必须发新代数");
+        let generation = match &sky.kind {
+            SkySourceKind::EquirectHdr(_) => next_gen,
+            _ => panic!("构造口应产 EquirectHdr"),
+        };
+        world.insert_resource(sky);
+        match ddgi_sky_snapshot(&world, &on) {
+            Some(DdgiSky::Hdr {
+                image,
+                generation: g,
+            }) => {
+                assert_eq!(g, generation);
+                assert_eq!(image.width, 4);
+            }
+            other => panic!("期望 Hdr 快照，得到 {other:?}"),
+        }
+    }
+
+    /// 端到端：`lights_in_gi` 开 ⇒ 火把当帧进表（全表标脏 + L0 上升可判别）；
+    /// 开关开但世界无灯 ⇒ 与开关关**逐位一致**（收集侧空集旁路的引擎级证据）。
+    #[test]
+    fn torch_enters_table_when_gated_on_and_bitwise_absent_when_empty() {
+        let mut world = room_world();
+        world.insert_resource(settings());
+        world.insert_resource(DdgiGrid::new());
+        tick_ddgi(&world); // 安装 + 全表精修（k = MAX）
+        let off = l0_of(&world);
+        let torch_pos = Vec3::new(3.0, 1.6, 3.0);
+        world.spawn((
+            Transform::from_translation(torch_pos),
+            iris_render::light::PointLight {
+                color: Vec3::splat(1.0),
+                intensity: 8.0,
+                range: 6.0,
+                shadows: false,
+            },
+        ));
+        propagate_transforms(&mut world);
+        // 开关仍关 ⇒ 与 off 逐位一致（灯在场但门没开）
+        tick_ddgi(&world);
+        assert_eq!(off, l0_of(&world), "lights_in_gi 关 ⇒ 灯在场也逐位不变");
+        // 开门 ⇒ 全表标脏重照明
+        world.insert_resource(DdgiSettings {
+            lights_in_gi: true,
+            ..settings()
+        });
+        tick_ddgi(&world);
+        let on = l0_of(&world);
+        let brighter = off.iter().zip(&on).filter(|(a, b)| *b > *a).count();
+        assert!(
+            brighter >= off.len() / 2,
+            "火把应抬亮过半探针的 L0：{brighter}/{}",
+            off.len()
+        );
+        // 空集旁路逐位锚：无灯世界开门 ≡ 关门的同世界表
+        let mut bare = room_world();
+        bare.insert_resource(DdgiSettings {
+            lights_in_gi: true,
+            ..settings()
+        });
+        bare.insert_resource(DdgiGrid::new());
+        tick_ddgi(&bare);
+        let mut closed = room_world();
+        closed.insert_resource(settings());
+        closed.insert_resource(DdgiGrid::new());
+        tick_ddgi(&closed);
+        let bits = |w: &World| -> Vec<u32> {
+            w.resource::<DdgiGrid>()
+                .sh()
+                .iter()
+                .flat_map(|c| c.iter().flat_map(|v| v.iter().map(|f| f.to_bits())))
+                .collect()
+        };
+        assert_eq!(bits(&bare), bits(&closed), "空灯集 ⇒ 逐位等于开关关");
+    }
+
+    /// `sky_from_source` 端到端：无 SkySource 场景开同源 ⇒ 程序化渐变进表。
+    /// 判别口径：蓝通道多数探针上升（天空半球蓝 ≫ ambient 0.14）+ 角落探针
+    /// 反向变暗（地板外沿的下方射线落程序化地面色，蓝 ≈0.054）——方向性
+    /// 生效的双向证据；整表逐位 ≠ 关档。关档逐位由 render 侧薄壳锚定。
+    #[test]
+    fn sky_from_source_brightens_table_vs_ambient_constant() {
+        let bits_of = |w: &World| -> Vec<u32> {
+            w.resource::<DdgiGrid>()
+                .sh()
+                .iter()
+                .flat_map(|c| c.iter().flat_map(|v| v.iter().map(|f| f.to_bits())))
+                .collect()
+        };
+        let mut off_world = room_world();
+        off_world.insert_resource(settings());
+        off_world.insert_resource(DdgiGrid::new());
+        tick_ddgi(&off_world);
+        let off_bits = bits_of(&off_world);
+
+        let mut on_world = room_world();
+        on_world.insert_resource(DdgiSettings {
+            sky_from_source: true,
+            ..settings()
+        });
+        on_world.insert_resource(DdgiGrid::new());
+        tick_ddgi(&on_world);
+        let on_bits = bits_of(&on_world);
+
+        assert_ne!(on_bits, off_bits, "天空同源开/关整表必须可判别");
+        // 判据取蓝通道 L0：程序化天空蓝（地平 0.94 / 天顶 0.94）在**任何**
+        // 未命中方向都 ≫ ambient 0.14；红通道不做全升断言——程序化地面色
+        // 红 ≈0.132 略低于 ambient 红，贴地探针朝下看会真的变暗（可判别的
+        // 方向性正是同源的意义）。
+        let blue_l0 = |w: &World| -> Vec<f32> {
+            w.resource::<DdgiGrid>()
+                .sh()
+                .iter()
+                .map(|c| c[0][2])
+                .collect()
+        };
+        let off_b = blue_l0(&off_world);
+        let on_b = blue_l0(&on_world);
+        let brighter = on_b.iter().zip(&off_b).filter(|(a, b)| **a > **b).count();
+        // 过半探针蓝 L0 上升（天空半球 ≫ ambient），而**地板外沿的角落探针
+        // 反而变暗**——越出 12 m 平面的下方射线落在程序化地面色（蓝 ≈0.054
+        // < ambient 0.14）：方向性生效的正当物理证据，不是缺陷。
+        assert!(
+            brighter >= off_b.len() * 4 / 5,
+            "多数探针蓝 L0 应上升：{brighter}/{}",
+            off_b.len()
+        );
+        assert!(
+            brighter < off_b.len(),
+            "角落探针应被地面色拉暗（方向性证据）"
+        );
+        assert!(
+            on_b.iter().sum::<f32>() > off_b.iter().sum::<f32>(),
+            "整表蓝能量必须净上升"
+        );
     }
 }

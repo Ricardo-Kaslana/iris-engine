@@ -51,7 +51,12 @@ pub enum SkySourceKind {
     /// 程序化天空（天顶蓝 → 地平线白 + HDR 太阳盘）。
     ProceduralSky,
     /// 外部 equirectangular 全景图（约定：图像第 0 行 = +Y 天顶）。
-    EquirectHdr(HdrImage),
+    ///
+    /// `Arc` 化（C7a）：DDGI 天空同源要在 CPU 侧逐射线采样全景图，引擎每帧
+    /// 把天空源快照进重照明输入——按值持有会让每帧一次整图克隆（大 panorama
+    /// 是 MB 级 float 数组）；Arc 让快照退化为引用计数 +1。构造口
+    /// [`SkySource::equirect_hdr`] 签名不变（内部装箱）。
+    EquirectHdr(std::sync::Arc<HdrImage>),
 }
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -70,7 +75,7 @@ impl SkySource {
     /// 同一图像换入两次也会得到不同 generation，保证渲染器必然重烘。
     pub fn equirect_hdr(image: HdrImage) -> Self {
         Self {
-            kind: SkySourceKind::EquirectHdr(image),
+            kind: SkySourceKind::EquirectHdr(std::sync::Arc::new(image)),
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed) + 1,
         }
     }

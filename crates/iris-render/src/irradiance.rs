@@ -2116,9 +2116,42 @@ pub fn probe_ray_radiance_depth(
     dir: Vec3,
     params: &BakeParams,
 ) -> (Vec3, f32) {
+    probe_ray_radiance_depth_gi(
+        bvh,
+        position,
+        dir,
+        params,
+        &crate::ddgi::RelightInputs::default(),
+    )
+}
+
+/// [`probe_ray_radiance_depth`] 的 **C7a 扩展档**（DDGI 滚动重照明专用；
+/// 烘焙 / R83 探针路径继续走薄壳，灯与同源天空是 DDGI 的语义不是
+/// lightmap 的）。旁路分支保证 `inputs` 为 `default()` 时与薄壳**逐位一致**
+/// （未命中支取同一个 `params.sky_color`；命中支 `lights.is_empty()` 时
+/// `incident` 直接就是基础表达式，一帧额外算术都不做——`to_bits` 锚测试钉住）。
+///
+/// 扩展语义（口径镜像主渲染，逐式来源标注在 [`gi_lights_irradiance`]）：
+///
+/// - **未命中且 `inputs.sky = Some`** ⇒ 辐射率 = 天空按方向的 CPU 求值
+///   （程序化渐变镜像 / HDR nearest-texel；§8.57① 的闭合形态）。深度仍
+///   [`DDGI_SKY_DEPTH`](crate::ddgi::DDGI_SKY_DEPTH)。
+/// - **命中且 `inputs.lights` 非空** ⇒ 入射辐照在「方向光 + 天空底」之上
+///   追加逐灯漫反射入射（衰减窗 / 锥因子 / 逐灯硬影单射线）。**命中点的
+///   天空底仍是 `sky_color` 均值常数**——逐向化只作用于未命中射线（§8.67①）。
+pub fn probe_ray_radiance_depth_gi(
+    bvh: &crate::bake::Bvh,
+    position: Vec3,
+    dir: Vec3,
+    params: &BakeParams,
+    inputs: &crate::ddgi::RelightInputs,
+) -> (Vec3, f32) {
     let origin = position + dir * crate::bake::BAKE_SHADOW_BIAS;
     match crate::bake::raycast_bvh(bvh, origin, dir, f32::INFINITY) {
-        None => (params.sky_color, crate::ddgi::DDGI_SKY_DEPTH),
+        None => match &inputs.sky {
+            Some(sky) => (sky.radiance(dir), crate::ddgi::DDGI_SKY_DEPTH),
+            None => (params.sky_color, crate::ddgi::DDGI_SKY_DEPTH),
+        },
         Some(hit) => {
             let depth = hit.t + crate::bake::BAKE_SHADOW_BIAS;
             if params.bounces == 0 {
@@ -2131,11 +2164,84 @@ pub fn probe_ray_radiance_depth(
                 -hit.normal
             };
             let albedo = bvh.triangle(hit.triangle).albedo;
-            let incident = crate::bake::direct_irradiance(bvh, hit_point, m, params, false)
+            let base = crate::bake::direct_irradiance(bvh, hit_point, m, params, false)
                 + params.sky_color * std::f32::consts::PI;
+            let incident = if inputs.lights.is_empty() {
+                base
+            } else {
+                base + gi_lights_irradiance(bvh, hit_point, m, &inputs.lights)
+            };
             (albedo * incident * std::f32::consts::FRAC_1_PI, depth)
         }
     }
+}
+
+/// C7a：GI 灯集在着色点上的**漫反射入射辐照**（DDGI 重照明专用）。
+///
+/// 逐灯口径 = `standard.wgsl::point_light_contrib` 的镜像（同式同序）：
+///
+/// - 窗口：`dist < range` 才生效；`t = dist/range`，`window = 1 − t²`，
+///   `atten = window² / max(dist², 0.01)`（平方衰减 + 最近面防奇点，与
+///   WGSL `:913-916` 逐项一致）；
+/// - 聚光锥因子：`spot_cone_factor(cosθ, cos_inner, cos_outer)` 乘在灯色
+///   上（WGSL 分箱路径同款——贡献对 radiance 线性）；`cosθ` 用
+///   `dot(−lp, axis)`，`lp = to_light / max(dist, 1e-4)`（WGSL 用
+///   `normalize(hit − light)`，二者仅在 `dist < 1e-4` 的病态贴合处偏离，
+///   CPU 侧有界优于 NaN）；
+/// - **硬影单射线**（`shadows = true` 时）：着色点沿法线偏移
+///   `BAKE_SHADOW_BIAS` 向灯发一条，`max_t = dist`（灯本身不是遮挡物），
+///   命中 ⇒ 该灯零贡献——口径对齐 `direct_irradiance` 的硬影分支（无 PCF、
+///   全硬边，§8.67⑤）；
+/// - 入射项：`radiance × atten × max(ndotl, 0)`（方向光镜像
+///   `light_color × ndotl`）。零贡献灯（`ndotl ≤ 0` / 窗外 / 锥外 / 被挡）
+///   **跳过累加**而非「加 0」——跳过与加正的零在 −0.0 边界上等价
+///   （`base + (−0.0)` 不改 `base` 的位模式当且仅当 base ≠ ±0.0；被跳过的
+///   零项本就以乘 0 产生 +0.0，加它会把 `−0.0` 的 base 洗成 `+0.0`——
+///   跳过形态**更保真**，非空档与既有 −0 语义无冲突）。
+///
+/// 累加序 = `lights` 向量序（收集侧固定：点光查询序 → 聚光追加），逐灯
+/// f32 顺序加 ⇒ 会话内逐位确定。
+fn gi_lights_irradiance(
+    bvh: &crate::bake::Bvh,
+    position: Vec3,
+    normal: Vec3,
+    lights: &[crate::ddgi::GiLight],
+) -> Vec3 {
+    let mut sum = Vec3::ZERO;
+    for l in lights {
+        let to_light = l.position - position;
+        let dist = to_light.length();
+        // NaN 双侧显式拦截 + `>=` 正比式（`probe_influence_weight` 同款
+        // 形态——与 WGSL `!(d < range)` 对全体输入同判，含 NaN）
+        if dist.is_nan() || l.range.is_nan() || dist >= l.range {
+            continue;
+        }
+        let lp = to_light / dist.max(1e-4);
+        let ndotl = normal.dot(lp).max(0.0);
+        if ndotl <= 0.0 {
+            continue;
+        }
+        let t = dist / l.range;
+        let window = 1.0 - t * t;
+        let atten = (window * window) / (dist * dist).max(0.01);
+        let mut radiance = l.color;
+        if l.is_spot {
+            let cos_theta = (-lp).dot(l.axis);
+            radiance *= crate::light_bins::spot_cone_factor(cos_theta, l.cos_inner, l.cos_outer);
+        }
+        if l.shadows && dist >= 1e-3 {
+            // `lp` 在 dist < 1e-3 时长度偏离 1 超过 raycast_bvh 的单位守卫
+            // 容差（1e-3）——该档是「着色点几乎贴在灯上」的病态几何，
+            // 按不遮挡处理（此档贡献本身已被 atten 的上钳主导，遮挡判定
+            // 无从稳定；声明见 §8.67④）
+            let shadow_origin = position + normal * crate::bake::BAKE_SHADOW_BIAS;
+            if crate::bake::raycast_bvh(bvh, shadow_origin, lp, dist).is_some() {
+                continue;
+            }
+        }
+        sum += radiance * atten * ndotl;
+    }
+    sum
 }
 
 /// 把探针位置的辐射率场投影到三阶 SH（**未卷积**的原始投影

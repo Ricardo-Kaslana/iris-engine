@@ -1434,3 +1434,93 @@ fn reset_taa_clears_gtao_depth_history() {
     }
     assert_eq!(seq, vec![0, 1, 1], "不调 reset 的宿主不受影响");
 }
+
+// ---------------------------------------------------------------------------
+// ㉑ C7a · 火把进 GI 与同源天空的 GPU 端到端（c7-design-v1 裁定甲案）
+// ---------------------------------------------------------------------------
+
+/// 灯集 / 同源天空两个重照明输入在**像素管线**上生效且可判别，并锚住
+/// 「输入不变 ⇒ 表不动 ⇒ 像素逐位不动」的稳态语义。
+///
+/// 几何设计：火把藏在暗室西南角（`range 4`），与共享墙西面 ROI 相距 ≈ 10 m
+/// ⇒ **直射项在 ROI 结构性为零**，`px_off → px_on` 的差值只可能来自
+/// DDGI 表（火把照亮西角地板 → 探针反弹 → 整室间接光抬升）——不需要
+/// 再差一份「无火把世界」来剥离直接光。
+#[test]
+fn torch_and_sky_inputs_reach_screen_and_are_distinguishable() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    if !has_gpu() {
+        return;
+    }
+    let mut world = scene_world();
+    let torch_at = Vec3::new(-6.5, 1.5, -4.0);
+    world.spawn((
+        Transform::from_xyz(torch_at.x, torch_at.y, torch_at.z),
+        PointLight {
+            color: Vec3::ONE,
+            intensity: 30.0,
+            range: 4.0,
+            shadows: false,
+        },
+    ));
+    propagate_transforms(&mut world);
+    let settings = ddgi_settings(100);
+    let params = bake_params(&world, &settings);
+    let mut grid = DdgiGrid::new();
+    grid.install(&settings, &params, collect_bake_triangles(&world));
+    assert_eq!(grid.tick(&settings, &params), 100, "k = 100 ⇒ 首帧全表精修");
+    world.insert_resource(grid);
+
+    let camera = world.resource::<Camera>().clone();
+    let px_off = render(&world);
+    let roi_off = roi_lum(&px_off, &camera, WALL_FAR, 5);
+
+    // 开门：火把进表（收集口径 color×intensity=30 与主灯表同式）
+    let lit = RelightInputs {
+        lights: vec![GiLight::point(torch_at, Vec3::splat(30.0), 4.0, true)],
+        ..RelightInputs::default()
+    };
+    assert_eq!(
+        world
+            .resource_mut::<DdgiGrid>()
+            .tick_with(&settings, &params, &lit),
+        100,
+        "灯集入指纹 ⇒ 全表标脏（k = 100 一帧收敛）"
+    );
+    let px_on = render(&world);
+    let roi_on = roi_lum(&px_on, &camera, WALL_FAR, 5);
+    assert_ne!(fnv1a(&px_off), fnv1a(&px_on), "火把进 GI 必须改变全帧像素");
+    assert!(
+        roi_on > roi_off,
+        "共享墙西面 ROI 必须由火把反弹抬亮（直射在 ROI 结构性为零）：{roi_off} → {roi_on}"
+    );
+
+    // 稳态锚：同输入再 tick ⇒ 零脏 ⇒ 逐位同帧（「输入不变」的 GPU 级证据）
+    assert_eq!(
+        world
+            .resource_mut::<DdgiGrid>()
+            .tick_with(&settings, &params, &lit),
+        0,
+        "输入不变不得标脏"
+    );
+    assert_eq!(px_on, render(&world), "稳态帧逐位不动");
+
+    // 天空同源档：程序化天空（远亮于 AMBIENT ≈0.004 底）再翻一次口径
+    let sky_lit = RelightInputs {
+        sky: Some(DdgiSky::Procedural),
+        ..lit.clone()
+    };
+    assert!(
+        world
+            .resource_mut::<DdgiGrid>()
+            .tick_with(&settings, &params, &sky_lit)
+            > 0,
+        "天空快照变 ⇒ 全表标脏"
+    );
+    let px_sky = render(&world);
+    assert_ne!(
+        fnv1a(&px_on),
+        fnv1a(&px_sky),
+        "同源天空（逐向程序化渐变）必须与常量底可判别"
+    );
+}

@@ -5,6 +5,43 @@
 
 ## [Unreleased]
 
+### Added（C7a 闭合战役 · 大裁决役上半——DDGI v3：同源天空 × 动态光源进 GI）
+
+路线图 v5 清账战役批次八上半（池 #21）：§8.57①② 两条自认候选翻转。
+用户四点裁定（2026-09-19，设计稿 `docs/private/c7-design-v1.md`）全部
+按推荐定稿：**B1 甲**（程序化渐变 + HDR 全景逐向镜像，R79 大气维持
+挂账）；**B2 甲**（点/聚光进 GI、逐灯硬影单射线 + `point_light_shadows`
+逃生门）；验收口径升级为「**全部既有基线零改动原值通过**」（普查实锤
+DDGI 现口径不吃灯/方向天空 ⇒ 零重锁，`R89_COV1_ON` 定值锁原值通过）。
+
+- **重照明输入扩展**（单一事实源纪律）：`RelightInputs { lights, sky }`
+  平行加入，`probe_ray_radiance_depth` / `install` / `tick` /
+  `probe_relight` 全部保留为**缺席档薄壳**（`_with` 档的空调用），
+  旁路分支逐位 = R89 口径（`to_bits` 锚测试钉住）；烘焙 / R83 探针
+  路径零感知。`relight_fingerprint` 扩为含灯集 bits + 天空快照
+  （generation 入指纹）的合并指纹，任一变动 ⇒ 全表标脏不清值。
+- **天空同源**（`sky_from_source`，默认 false）：未命中射线按方向求值——
+  程序化渐变 CPU 镜像（`procedural_sky_radiance`，WGSL↔Rust 常数表
+  **源码双看门**）+ HDR 全景 nearest-texel（`SkySourceKind::EquirectHdr`
+  随 Arc 化 ⇒ 逐帧快照零拷贝）。拒绝冒充三态：atmosphere 场景不吃
+  （warn 一次）、作者 `sky_color = Some` 覆盖恒胜、命中点反弹底仍均值
+  常数（§8.67①）。
+- **灯进 GI**（`lights_in_gi` 默认 false + `point_light_shadows` 默认 true）：
+  `ddgi_gi_lights` 逐字段镜像主渲染灯表组装（`color×intensity`、
+  `inner.min(outer)` 钳、零方向不发光、点先聚光后、容量 8 盏）；命中点
+  入射追加逐灯 `radiance×atten×ndotl`（衰减窗/锥因子逐式镜像
+  `point_light_contrib`，`spot_cone_factor` 共享 CPU 函数）+ 硬影单射线
+  （墙后火把严格零进表；1e-3 m 病态贴灯档豁免，§8.67④）。
+- **序列化**：`level.ddgi` 三 `Option` 新字段（回写只落非默认值 ⇒
+  旧档形态不变）；往返对称由既有保存测试顺带钉住。
+- 诚实边界 §8.67 八条（逐向化只及未命中射线 / nearest vs 线性 /
+  8 盏与主渲染选取可不同 / 病态贴灯豁免 / 全硬边 / 成本上界随灯数 /
+  锥测无分箱 / 覆盖优先级）。
+- 测试 +14（iris-render ddgi 9：逐位锚/双看门/解析向/映射解析/窗口
+  解析值/遮板逐位零/锥门控逐位等/指纹行为/滚动全链；引擎 4：收集
+  口径/快照优先级链/火把端到端+空集锚/天空方向性双向证据；GPU 1：
+  火把 ROI 抬亮+稳态逐位+天空可判别）；基线 debug 1662 → 1676。
+
 ### Added（C6 闭合战役 · 音频役——空间化 v3：多普勒 × 遮挡 × 逐声音低通）
 
 路线图 v5 清账战役批次七（池 #13）：§8.11 的空间化半边清账。用户三点

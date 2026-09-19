@@ -5207,6 +5207,50 @@ opaque-only / 无软件光栅回退）；**本轮兑现两笔欠账**——R84/R
   缺席零触碰 + 节流 / 坏内容消费两旋钮 + 未命中收集 + 去重共享旁证），
   全 CPU、无 GPU 依赖。诚实边界 §8.65。
 
+### 4.47 DDGI v3：同源天空 × 动态光源进 GI（iris-render/ddgi·irradiance + iris-engine/ddgi·level，C7a · §8.57①② 翻转）
+
+闭合战役大裁决役上半（设计稿 `docs/private/c7-design-v1.md` 四点裁定
+甲案全取）。R88 遗留的两条自认候选——「日落暖橙不进间接光」「夜里火把
+不在 GI 留痕」——本轮各自装上 opt-in 旋钮，全部默认关 ⇒
+**既有基线零改动原值通过**（`ddgi_render.rs` 的 `R89_COV1_ON/R88_COV1_OFF`
+定值锁在内，无需归因重锁程序）。
+
+- **单一事实源扩展**：重照明输入从「`BakeParams` 三光照字段」扩为
+  `BakeParams + RelightInputs { lights: Vec<GiLight>, sky: Option<DdgiSky> }`
+  ——`probe_ray_radiance_depth` 原样保留为**缺席档薄壳**（烘焙 / R83 探针
+  路径继续走它），DDGI 滚动路径走 `_gi` 扩展档；旁路分支（`lights.is_empty()`
+  / `sky = None`）保证薄壳与扩展档空集**逐位一致**（`to_bits` 锚测试）。
+  `install_with / tick_with / probe_relight_with` 与薄壳并存，既有调用点零改动。
+- **天空同源（B1 甲）**：`sky_from_source = true` ⇒ **未命中射线**按方向求
+  天空辐亮度。两源：①程序化渐变 = `environment.wgsl::sky_color` 的 CPU
+  镜像（`procedural_sky_radiance`，常数表源码层**双看门**——WGSL 侧与
+  Rust 侧字面量各钉一遍，任一侧独改即红）；②SkySource HDR 全景 =
+  `dir_to_equirect_uv` 同式 + nearest-texel（与 §8.57⑥ 立场一致）。
+  `SkySourceKind::EquirectHdr` 随 Arc 化（`Arc<HdrImage>`）⇒ 引擎逐帧快照
+  零拷贝，generation 入指纹（换图必标脏）。**拒绝冒充**：
+  `SkySettings.atmosphere = true` 的帧本开关不生效（大气 CPU 镜像未实现，
+  §8.57① 对该场景维持，进程级 warn 一次）；作者显式 `sky_color = Some`
+  覆盖恒胜。命中点的反弹天空底仍均值常数（逐向化只及未命中射线，§8.67①）。
+- **灯进 GI（B2 甲）**：`lights_in_gi = true` ⇒ 宿主收集点/聚光
+  （`ddgi_gi_lights`：点先聚光后、查询序、容量 8 盏裁剪——逐字段镜像
+  `renderer.rs` 灯表组装：`color×intensity`、`inner.min(outer)` 钳制、
+  零方向 = 不发光）。命中点入射追加逐灯 `radiance × atten × ndotl`——
+  衰减窗 / 锥因子（共享 `light_bins::spot_cone_factor` CPU 函数）逐式
+  镜像 `standard.wgsl::point_light_contrib`；**逐灯硬影单射线**
+  （`point_light_shadows` 默认 true = 墙后火把不进 GI；false 为漏光逃生门，
+  距离 < 1e-3 m 病态档豁免影线 §8.67④）。`relight_fingerprint` 扩为
+  含灯集 / 天空快照的合并指纹（任一变动 ⇒ 全表标脏不清值，滚动收敛
+  语义与光照指纹一致）。
+- **序列化**：`level.ddgi` 段追加 `sky_from_source` / `lights_in_gi` /
+  `point_light_shadows` 三个 `Option` 字段（缺席 = 默认档；回写只落
+  非默认值 ⇒ 旧档形态不变）。
+- **验收**：`ddgi.rs` 单测 +9（缺席档逐位锚 / 双源看门 / 程序化解析向 /
+  HDR nearest 映射解析 / 点光窗口解析值 / 遮板硬影逐位零 / 锥门控与点光
+  逐位等 / 指纹行为组 / 滚动脏-收敛-判别全链）+ 引擎侧 +4（收集口径 /
+  快照优先级链 / 火把端到端 + 空集逐位锚 / 天空方向性双向证据）+
+  `ddgi_render.rs` GPU +1（火把 ROI 抬亮 + 稳态逐位不动 + 天空档可判别）。
+  诚实边界 §8.67（八条）。
+
 ## 5. 内存安全策略总表
 
 | 风险 | 传统 C++ 引擎 | Iris |
@@ -6702,12 +6746,13 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     （保守方向）——meshlet 实体多的大场景下遮挡收益被稀释。
 
 57. **DDGI 动态全局光照 v1 的诚实边界（R88）**——完整清单在
-    `iris_render::ddgi` 模块文档与 §4.44，此处索引：①**单色天空**：
-    `sky_color` 是逐通道常量，不吃 `SkySource`（程序化渐变 / HDR 全景被
-    平均成一个常量——R79 的大气天空与 DDGI 的天空底色**不同源**，日落时
-    地平线的暖橙不会进间接光）；②**无点光 / 聚光 / emissive 参与重照明**
-    （`BakeParams` 无此输入 ⇒ 夜里点亮的火把不会在 GI 里留下痕迹，R89+
-    候选）；③**1 次反弹上限**（`BakeParams.bounces ≤ 1` 现断言 ⇒ 门口那束
+    `iris_render::ddgi` 模块文档与 §4.44，此处索引：①~~单色天空~~
+    **C7a 已按方向同源**（`sky_from_source`：未命中射线吃程序化渐变 CPU
+    镜像 / HDR 全景 nearest-texel 逐向采样，§4.47）——维持半边：
+    `SkySettings.atmosphere` 场景不吃（CPU 镜像未实现）、命中点反弹天空底
+    仍均值常数；②~~无点光 / 聚光参与重照明~~ **C7a 已闭合**
+    （`lights_in_gi`：点/聚光进命中点入射，逐灯硬影单射线，边界见 §8.67）；
+    **emissive 缺席维持**（材质自发光不进 GI）；③**1 次反弹上限**（`BakeParams.bounces ≤ 1` 现断言 ⇒ 门口那束
     光在暗室里只弹一次，深处的衰减比真实更快）；④**几何变化靠宿主
     `geometry_generation` 显式宣告，不自动侦测**（自动侦测要每帧全量收集
     三角形（ms 级）或遍历算指纹；照 `SkySource.generation` / `ensure_environment`
@@ -6902,6 +6947,25 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     测量数据表 + 双耳 FIR，属新能力非清账）——「正前正后不可区分」
     v1 限制原样保留，随消费方需求回池；一次性音效（不走组件系统）的
     速度 / 闷声由游戏侧经 `Audio` 直通口自推。
+67. **DDGI v3 同源天空与 GI 灯集（C7a，§4.47）的诚实边界**——
+    ①天空逐向化**只作用于未命中射线**：命中点的反弹入射仍吃
+    `sky_color` 均值常数底（把命中点天空也做成半球积分 = 每命中点再发
+    一组逐向采样，成本另档）；②HDR 全景 CPU 侧是 **nearest-texel**，
+    GPU 捕获路径是线性滤波 ⇒ 同源指**同一张图同一 uv 式**，不指采样
+    逐位一致；程序化渐变镜像同理（CPU 即真值，可见天空经 f16 捕获量化）；
+    ③GI 灯集容量 **8 盏**（点先聚光后、查询序裁剪）——主渲染分箱可容
+    512 盏，>8 盏时「像素里的灯」与「GI 里的灯」事实源可不同；
+    ④着色点距灯 < 1e-3 m 的病态档**跳过遮挡判定**按不遮挡处理
+    （`raycast_bvh` 单位方向守卫容差撑不住 `to_light/max(d,1e-4)` 的
+    退化形态；该档贡献本身被 atten 上钳主导，遮挡无从稳定）；
+    ⑤逐灯硬影是**单条无 PCF 射线** ⇒ 火把的 GI 阴影全硬边，与方向光
+    重照明同口径（软影 = 逐灯半球多射线，成本 ×8 档，拒绝）；
+    ⑥成本：满灯（8 盏全开影）场景每命中射线追加 ≤8 条 BVH 射线，
+    §8.57⑪ 的 `1.7 ms/脏帧` 上界随灯数线性上浮（无灯 / 关 = 零额外
+    算术，旁路分支逐位锚）；⑦聚光锥测与主渲染共享
+    `spot_cone_factor` CPU 函数、但 GI 侧无分箱（8 盏线性扫，容量内
+    无须）；⑧`sky_from_source` 与作者显式 `sky_color = Some` 同时在场 ⇒
+    **覆盖恒胜**（同源不生效，warn 缺席——这是优先级语义不是 bug）。
 
 ## 9. 关键设计取舍记录
 
