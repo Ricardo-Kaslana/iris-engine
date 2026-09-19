@@ -31,6 +31,18 @@
 //!   - **已知限制——身后不消音**：无 HRTF / 耳间延迟差，源在正后方与正前方
 //!     对称（pan 同为 0、衰减只随距离）——前后靠本模型不可区分，仅左右与
 //!     远近有空间线索；非空间 `play` 恒为居中声像、无衰减，听者位姿不影响。
+//! - **空间化 v3（C6 · 多普勒 / 遮挡 / 逐声音滤波）**——三项均为
+//!   **缺席 = 逐位不变**的 opt-in 增量（HRTF 按用户裁定本轮裁出回池，
+//!   上一条「身后不消音」限制原样保留）：
+//!   - 多普勒：声源 / 听者速度（[`AudioMixer::set_sound_velocity`] /
+//!     [`ListenerParams::with_velocity`]）经 [`doppler_factor`]（双向径向、
+//!     钳 [⅓, 3]、声速全局可配 [`AudioMixer::set_speed_of_sound`]）乘进
+//!     播放步长；双方零速 ⇒ 因子精确 1.0，游标推进逐位不变；
+//!   - 遮挡：判定在引擎侧（射线：听者→源线段被静态体挡 ⇒ 二值遮挡），
+//!     混音器只吃 [`AudioMixer::set_sound_muffle`] 的 [0, 1] 强度标量，对
+//!     **增益前源值**做逐声道一阶低通（[`muffle_coef`]）；`muffle = 0` 整体
+//!     旁路（滤波分支不进、状态不触碰，与 v1/v2 逐位一致）；滤波状态跨帧
+//!     持久在槽位上（实时回调路径不新分配）。
 //! - **流式音乐总线**（R44，[`AudioMixer::play_music`]）：常驻采样量与曲目
 //!   长度**无关**的一条独立通道（OGG/Vorbis 分块解码在专用线程，混音回调按
 //!   块取数，见 `stream` 模块文档）。总线上一次只放一条音乐：淡入淡出是
@@ -52,13 +64,15 @@ use crate::stream::{AudioStream, MusicBus, MusicHandle};
 /// 应按场域尺度放大（[`AudioMixer::set_reference_distance`]）。
 pub const DEFAULT_REFERENCE_DISTANCE: f32 = 4.0;
 
-/// 听者位姿：世界坐标位置 + 前方 / 右轴单位向量。
+/// 听者位姿：世界坐标位置 + 前方 / 右轴单位向量 + 世界速度（v3 多普勒）。
 ///
 /// **契约**：`forward` / `right` 必须为单位向量且相互正交，由调用方保证
 /// （手搓位姿不满足时声像会失真但不会 panic——投影被钳制在 [-1, 1]）；
 /// 用 [`ListenerParams::from_view`] 构造可自动正交化。默认位姿与引擎右手系
 /// 一致：原点、前方 -Z、右轴 +X。v1 的声像只依赖 `right`（源方向在右轴上
 /// 的投影），`forward` 参与语义表达、为 HRTF 等后续扩展占位。
+/// `velocity`（v3）只被多普勒项消费（[`doppler_factor`]）：默认
+/// [`Vec3::ZERO`] = 静止听者，因子恒 1.0，v1/v2 路径逐位不变。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ListenerParams {
     /// 世界坐标位置。
@@ -67,6 +81,8 @@ pub struct ListenerParams {
     pub forward: Vec3,
     /// 右轴单位向量（调用方保证单位、与 `forward` 正交）。
     pub right: Vec3,
+    /// 听者世界速度（米/秒，v3 多普勒输入；ZERO = 静止）。
+    pub velocity: Vec3,
 }
 
 impl Default for ListenerParams {
@@ -75,6 +91,7 @@ impl Default for ListenerParams {
             position: Vec3::ZERO,
             forward: Vec3::NEG_Z,
             right: Vec3::X,
+            velocity: Vec3::ZERO,
         }
     }
 }
@@ -102,7 +119,15 @@ impl ListenerParams {
             position,
             forward,
             right,
+            velocity: Vec3::ZERO,
         }
+    }
+
+    /// 覆写听者速度（v3 多普勒输入；链式）。
+    #[must_use]
+    pub fn with_velocity(mut self, velocity: Vec3) -> Self {
+        self.velocity = velocity;
+        self
     }
 }
 
@@ -147,6 +172,93 @@ pub fn spatial_gain(
         attenuation * theta.cos(),
         attenuation * theta.sin(),
     )
+}
+
+/// 声音在空气中的传播速度默认值（米/秒，v3 多普勒）：常温干燥空气常数，
+/// 游戏尺度无需随温度修正（[`AudioMixer::set_speed_of_sound`] 全局可配）。
+pub const DEFAULT_SPEED_OF_SOUND: f32 = 343.0;
+
+/// 多普勒因子上下界（用户裁定 2026-09-19 病态防护）：相对径向速度达到 /
+/// 超过音速的极端场景（超音速弹丸、传送跳变）不做物理正确——那属冲击波
+/// 模拟——只保证**因子上有界**：播放步长最多 ×3 / ×⅓，音高畸变有顶。
+pub const DOPPLER_FACTOR_MIN: f32 = 1.0 / 3.0;
+pub const DOPPLER_FACTOR_MAX: f32 = 3.0;
+
+/// 多普勒因子纯函数（v3）：`f = (c + v_o) / (c − v_s)`，双向径向合成。
+///
+/// - `offset` = 声源 − 听者（世界坐标差；内部归一取径向，零长 / 退化 ⇒
+///   因子恒 1.0——源听者重叠时径向无定义）；
+/// - `v_o = dot(听者速度, d̂)`（听者**趋近**声源为正 → 频率升高）；
+/// - `v_s = −dot(声源速度, d̂)`（声源**趋近**听者为正 → 频率升高）；
+/// - 分母 ≤ 0（声源趋近达音速）⇒ 直接钳 [`DOPPLER_FACTOR_MAX`]；分子 ≤ 0
+///   （听者逃离达音速）⇒ 钳 [`DOPPLER_FACTOR_MIN`]；其余钳制到 [⅓, 3]；
+/// - **静止锚**：双方零速时 `c / c` 在 f32 下**精确**得 1.0，消费方
+///   `ratio × 1.0`（f64 乘 1.0 精确）⇒ 播放步长逐位不变——v3 缺席形态
+///   与 v1/v2 像素级同构的「逐位级」锚；
+/// - 病态守卫：`c` 非有限 / ≤ 0、速度含 NaN ⇒ 1.0（混音路径不传播病态值）。
+#[must_use]
+pub fn doppler_factor(
+    offset: Vec3,
+    listener_velocity: Vec3,
+    source_velocity: Vec3,
+    speed_of_sound: f32,
+) -> f32 {
+    if !(speed_of_sound.is_finite() && speed_of_sound > 0.0)
+        || !listener_velocity.is_finite()
+        || !source_velocity.is_finite()
+    {
+        return 1.0;
+    }
+    let distance = offset.length();
+    if distance <= 1e-6 {
+        return 1.0; // 源听者重叠：径向无定义，无多普勒
+    }
+    let dir = offset / distance; // 听者 → 声源单位向量
+    let v_o = listener_velocity.dot(dir); // 听者趋近分量（正 = 靠近声源）
+    let v_s = -source_velocity.dot(dir); // 声源趋近分量（正 = 靠近听者）
+    let num = speed_of_sound + v_o;
+    let den = speed_of_sound - v_s;
+    if den <= 0.0 {
+        return DOPPLER_FACTOR_MAX; // 声源径向趋近 ≥ 音速：冲击波区，钳上限
+    }
+    if num <= 0.0 {
+        return DOPPLER_FACTOR_MIN; // 听者径向逃离 ≥ 音速：追不上声波，钳下限
+    }
+    (num / den).clamp(DOPPLER_FACTOR_MIN, DOPPLER_FACTOR_MAX)
+}
+
+/// 遮挡闷声系数（v3）：`muffle ∈ [0, 1]` → 一阶低通跨导系数
+/// `k = 1 − 0.9·muffle`（`y += k·(x − y)`）。
+///
+/// - `muffle = 0` ⇒ k = 1 ⇒ y = x 恒等——但消费方对 0 走**整体旁路**
+///   （不进滤波分支、不触碰状态），保证与 v1/v2 路径逐位一致；
+/// - `muffle = 1` ⇒ k = 0.1 ⇒ −3 dB 截止 ≈ 810 Hz @ 48 kHz（门后隔墙的
+///   主观感受档：高频梳齿先没、低音残留）；
+/// - 非有限输入 ⇒ 1.0（透明；病态值不进混音）。
+#[must_use]
+pub fn muffle_coef(muffle: f32) -> f32 {
+    if !muffle.is_finite() {
+        return 1.0;
+    }
+    1.0 - 0.9 * muffle.clamp(0.0, 1.0)
+}
+
+/// 逐声音一阶低通（v3 遮挡滤波本体）：跨混音调用持久的每声道状态。
+///
+/// `coef` 由 [`muffle_coef`] 算出、每声音每缓冲算一次；`step` 是纯计算，
+/// 状态实际存于 [`Voice::lp_state`]（本结构只是无状态的系数持有 + 单步式）。
+/// 声道 > 2 的罕见输出布局共用前两路状态槽（诚实限制 §8.66——本引擎输出
+/// 恒单 / 双声道）。`pub(crate)`：`SourceFrames::add_frame` 签名消费。
+pub(crate) struct Muffle {
+    /// 跨导系数（[`muffle_coef`]）。
+    coef: f32,
+}
+
+impl Muffle {
+    /// 单声道一步：`y = prev + coef·(x − prev)`（全 f32 定点序，确定性）。
+    fn step(&self, prev: f32, x: f32) -> f32 {
+        prev + self.coef * (x - prev)
+    }
 }
 
 /// 声音句柄：低 32 位槽位下标 + 高 32 位世代。
@@ -196,6 +308,12 @@ impl<'a> SourceFrames<'a> {
     /// 声道映射口径（与 R44 之前的 `mix` 逐位一致）：等声道直取；单声道源
     /// 复制到全部输出通道；输出单声道时平均全部源通道；其余罕见布局逐通道
     /// 取 `min(c, 源声道 − 1)`。
+    ///
+    /// `lp`（v3 遮挡）：`Some((muffle, state))` 时对**增益前的源值**逐声道
+    /// 走一阶低通（state 各槽 = 本声音该声道的滤波记忆，跨帧持久；声道 > 2
+    /// 共用前两槽）；`None` = 旁路——与引入本参数前**逐位一致**（音乐总线
+    /// 与未遮挡声音恒 `None`，单一事实源不分叉）。低通在声道映射之后、
+    /// 增益之前：遮挡是声学现象（先闷后 pan），与声像 / 音量正交。
     pub(crate) fn add_frame(
         &self,
         dst: &mut [f32],
@@ -203,9 +321,11 @@ impl<'a> SourceFrames<'a> {
         i1: usize,
         frac: f32,
         gains: &FrameGains,
+        lp: Option<(&Muffle, &mut [f32; 2])>,
     ) {
         let channels_out = dst.len();
         let channels_src = self.channels;
+        let mut lp = lp;
         for (c, out) in dst.iter_mut().enumerate() {
             let value = if channels_src == channels_out {
                 lerp_channel(self.samples, channels_src, i0, i1, frac, c)
@@ -230,6 +350,15 @@ impl<'a> SourceFrames<'a> {
                     c.min(channels_src - 1),
                 )
             };
+            let value = match &mut lp {
+                Some((muffle, state)) => {
+                    let slot = if c < 2 { c } else { 0 };
+                    let y = muffle.step(state[slot], value);
+                    state[slot] = y;
+                    y
+                }
+                None => value,
+            };
             let factor = if channels_out == 2 {
                 if c == 0 { gains.left } else { gains.right }
             } else {
@@ -240,7 +369,8 @@ impl<'a> SourceFrames<'a> {
     }
 }
 
-/// 一个活动声音：共享剪辑 + 播放状态（+ 空间化 v1 的声源定位字段）。
+/// 一个活动声音：共享剪辑 + 播放状态（+ 空间化 v1 的声源定位字段 +
+/// v3 的多普勒速度 / 遮挡低通字段）。
 struct Voice {
     clip: AudioClip,
     volume: f32,
@@ -255,6 +385,15 @@ struct Voice {
     /// 距离参考（米）：`play_spatial` 时取混音器当前默认值，
     /// [`AudioMixer::set_sound_reference_distance`] 可按声音覆写。
     reference_distance: f32,
+    /// 声源世界速度（米/秒，v3 多普勒；[`AudioMixer::set_sound_velocity`]
+    /// 逐帧更新）。ZERO = 静止 ⇒ 因子恒 1.0（逐位不变锚）；
+    /// 仅空间声音消费（非空间无位置径向可言，不产生多普勒）。
+    velocity: Vec3,
+    /// 遮挡闷声强度 ∈ [0, 1]（v3；0 = 未遮挡 = 滤波整体旁路）。
+    /// 判定在引擎侧（射线），混音器只吃标量（见 `set_sound_muffle`）。
+    muffle: f32,
+    /// 一阶低通的逐声道滤波记忆（v3；仅 `muffle > 0` 时被触碰）。
+    lp_state: [f32; 2],
 }
 
 /// 混音器槽位：世代驻留在槽位上（复用时 +1），声音本体可空。
@@ -282,6 +421,9 @@ pub struct AudioMixer {
     reverb: Reverb,
     /// 混响启用时暂存音乐干信号的可复用缓冲（避免实时路径每次分配）。
     music_scratch: Vec<f32>,
+    /// 声速（米/秒，v3 多普勒；[`AudioMixer::set_speed_of_sound`]，
+    /// 默认 [`DEFAULT_SPEED_OF_SOUND`]）。全局单值：同场景同介质。
+    speed_of_sound: f32,
 }
 
 impl Default for AudioMixer {
@@ -302,6 +444,7 @@ impl AudioMixer {
             music: MusicBus::default(),
             reverb: Reverb::default(),
             music_scratch: Vec::new(),
+            speed_of_sound: DEFAULT_SPEED_OF_SOUND,
         }
     }
 
@@ -357,6 +500,9 @@ impl AudioMixer {
             spatial,
             position,
             reference_distance,
+            velocity: Vec3::ZERO,
+            muffle: 0.0,
+            lp_state: [0.0; 2],
         });
         SoundId::new(index as u32, slot.generation)
     }
@@ -453,6 +599,90 @@ impl AudioMixer {
             }
             None => false,
         }
+    }
+
+    // ---- 空间化 v3（C6）：多普勒速度 + 遮挡闷声 ----
+
+    /// 更新一个声音的世界速度（米/秒，v3 多普勒；下一帧 `mix` 生效）。
+    /// 句柄失效返回 `false`。**逐帧推送**口径与 [`Self::set_sound_position`]
+    /// 同款（混音器不推时间轴，速度是输入不是导数——引擎侧按位置差分或
+    /// 游戏侧直接给）。非空间声音存而不用（无径向 ⇒ 恒无多普勒）。
+    pub fn set_sound_velocity(&mut self, id: SoundId, velocity: Vec3) -> bool {
+        let Some(slot) = self.slots.get_mut(id.index()) else {
+            return false;
+        };
+        if slot.generation != id.generation() {
+            return false;
+        }
+        match &mut slot.voice {
+            Some(voice) => {
+                voice.velocity = velocity;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 设置一个声音的遮挡闷声强度（v3；`muffle` 钳到 [0, 1]，NaN 按 0 =
+    /// 旁路）。判定（射线听不见 = 遮挡）在引擎侧（`iris_engine::spatial`），
+    /// 混音器只吃标量做一阶低通（[`muffle_coef`]）。句柄失效返回 `false`。
+    pub fn set_sound_muffle(&mut self, id: SoundId, muffle: f32) -> bool {
+        let muffle = if muffle.is_finite() {
+            muffle.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let Some(slot) = self.slots.get_mut(id.index()) else {
+            return false;
+        };
+        if slot.generation != id.generation() {
+            return false;
+        }
+        match &mut slot.voice {
+            Some(voice) => {
+                voice.muffle = muffle;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 一个声音当前的闷声强度（观测 / 测试口；句柄失效 `None`）。
+    pub fn sound_muffle(&self, id: SoundId) -> Option<f32> {
+        self.slots
+            .get(id.index())
+            .filter(|s| s.generation == id.generation())
+            .and_then(|s| s.voice.as_ref())
+            .map(|v| v.muffle)
+    }
+
+    /// 一个声音当前的世界速度（观测 / 测试口；句柄失效 `None`）。
+    pub fn sound_velocity(&self, id: SoundId) -> Option<Vec3> {
+        self.slots
+            .get(id.index())
+            .filter(|s| s.generation == id.generation())
+            .and_then(|s| s.voice.as_ref())
+            .map(|v| v.velocity)
+    }
+
+    /// 覆写听者速度（v3 多普勒的听者侧输入；语义即
+    /// `set_listener(params.with_velocity(v))` 的便捷口——
+    /// 已含在 [`Self::set_listener`] 的位姿里，本口只改 velocity 分量）。
+    pub fn set_listener_velocity(&mut self, velocity: Vec3) {
+        self.listener.velocity = velocity;
+    }
+
+    /// 设置声速（米/秒，v3 多普勒全局参数）。非有限或 ≤ 0 被忽略
+    /// （保持原值，口径同 [`Self::set_reference_distance`]）。
+    pub fn set_speed_of_sound(&mut self, speed_of_sound: f32) {
+        if speed_of_sound.is_finite() && speed_of_sound > 0.0 {
+            self.speed_of_sound = speed_of_sound;
+        }
+    }
+
+    /// 当前声速（观测口）。
+    pub fn speed_of_sound(&self) -> f32 {
+        self.speed_of_sound
     }
 
     /// 当前活动声音数（含尚未被 `mix` 推进过的）。**不含**流式音乐
@@ -556,6 +786,7 @@ impl AudioMixer {
         let channels_out = channels_out as usize;
         // 听者位姿拷出：混音循环持有 slots 的可变借用
         let listener = self.listener;
+        let speed_of_sound = self.speed_of_sound;
 
         // 逐声音渲染：游标只前进、声音互不干扰
         for slot in &mut self.slots {
@@ -570,6 +801,9 @@ impl AudioMixer {
                 spatial,
                 position,
                 reference_distance,
+                velocity,
+                muffle,
+                lp_state,
             } = voice;
             let frames = clip.frame_count();
             if frames == 0 {
@@ -582,6 +816,30 @@ impl AudioMixer {
                 ratio
             } else {
                 1.0
+            };
+            // 多普勒（v3）：因子乘进播放步长（>1 趋近 = 消费更快 = 音高升高）。
+            // 仅空间声音消费（非空间无径向可言）；源与听者皆静止时
+            // `doppler_factor` 恒返回精确 1.0 ⇒ `ratio × 1.0`（f64 乘 1.0
+            // 精确）⇒ 游标推进逐位不变（v1/v2 锚）。
+            let doppler = if *spatial {
+                doppler_factor(
+                    *position - listener.position,
+                    listener.velocity,
+                    *velocity,
+                    speed_of_sound,
+                )
+            } else {
+                1.0
+            };
+            let ratio = ratio * doppler as f64;
+            // 遮挡低通（v3）：muffle = 0 走整体旁路（lp = None，与引入前
+            // 逐位一致）；> 0 时算一次系数，逐采样在声道映射后滤波。
+            let muffle_filter = if *muffle > 0.0 {
+                Some(Muffle {
+                    coef: muffle_coef(*muffle),
+                })
+            } else {
+                None
             };
 
             // 每声音的声道增益因子（空间增益每声音每缓冲算一次，非每采样）：
@@ -629,7 +887,10 @@ impl AudioMixer {
                 } else {
                     frames - 1
                 };
-                source.add_frame(out_frame, i0, i1, frac, &gains);
+                let lp = muffle_filter
+                    .as_ref()
+                    .map(|m| (m, &mut *lp_state as &mut [f32; 2]));
+                source.add_frame(out_frame, i0, i1, frac, &gains, lp);
                 *cursor += ratio;
             }
         }
@@ -708,6 +969,7 @@ pub(crate) fn sanitize_volume(volume: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procedural::sine;
 
     /// 单声道测试剪辑。
     fn mono(samples: &[f32]) -> AudioClip {
@@ -1796,5 +2058,307 @@ mod tests {
             out.iter().map(|s| s.to_bits()).collect()
         };
         assert_eq!(run(), run(), "同输入两次流式混音应逐位一致");
+    }
+
+    // ---- 空间化 v3（C6）：多普勒 + 遮挡低通 ----
+
+    /// 多普勒静止锚：双方零速 ⇒ 因子**逐位** = 1.0（343/343 精确），
+    /// 且听者速度默认位姿（from_view / Default）velocity 恒 ZERO。
+    #[test]
+    fn doppler_stationary_is_bitwise_one() {
+        let f = doppler_factor(Vec3::X * 10.0, Vec3::ZERO, Vec3::ZERO, 343.0);
+        assert_eq!(f.to_bits(), 1.0f32.to_bits(), "静止因子必须逐位 1.0");
+        assert_eq!(
+            ListenerParams::default().velocity,
+            Vec3::ZERO,
+            "默认听者速度 = 静止（v3 缺席形态）"
+        );
+        assert_eq!(
+            ListenerParams::from_view(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y).velocity,
+            Vec3::ZERO,
+            "from_view 不引入速度"
+        );
+    }
+
+    /// 多普勒双向径向合成（解析值 ±1e-5）：声源趋近 c 的 10% ⇒
+    /// f = 343/(343−34.3) ≈ 1.1111；听者趋近同速 ⇒ f = (343+34.3)/343 = 1.1。
+    /// 两者**不相等**是声学不对称的本体（介质参考系），不是实现噪声。
+    #[test]
+    fn doppler_two_way_radial_composition_matches_analytic() {
+        let offset = Vec3::X * 10.0; // 源在听者 +X 方向
+        let toward_source = Vec3::X * 34.3; // 听者趋近（v_o = +34.3）
+        let toward_listener = Vec3::NEG_X * 34.3; // 声源趋近（v_s = +34.3）
+        let f_src = doppler_factor(offset, Vec3::ZERO, toward_listener, 343.0);
+        assert!(
+            (f_src - 343.0 / (343.0 - 34.3)).abs() < 1e-5,
+            "声源趋近因子解析界：{f_src}"
+        );
+        let f_lst = doppler_factor(offset, toward_source, Vec3::ZERO, 343.0);
+        assert!(
+            (f_lst - (343.0 + 34.3) / 343.0).abs() < 1e-5,
+            "听者趋近因子解析界：{f_lst}"
+        );
+        assert!(f_src > 1.0 && f_lst > 1.0, "趋近 ⇒ 升频");
+        assert!(
+            (f_src - f_lst).abs() > 0.005,
+            "双向合成是两条独立通道（不对称可测）"
+        );
+        // 逃离取反：横向运动（径向分量为零）⇒ 因子恒 1.0
+        let lateral = doppler_factor(offset, Vec3::NEG_Z * 100.0, Vec3::Z * 100.0, 343.0);
+        assert_eq!(lateral.to_bits(), 1.0f32.to_bits(), "纯横向无多普勒");
+        let recede = doppler_factor(offset, Vec3::ZERO, Vec3::X * 34.3, 343.0);
+        assert!(recede < 1.0, "声源逃离 ⇒ 降频：{recede}");
+    }
+
+    /// 多普勒病态防护（用户裁定钳 [⅓, 3]）：音速 / 超音速、NaN 速度、
+    /// 零距重叠、坏声速一律有界或恒等，绝不传播病态值。
+    #[test]
+    fn doppler_clamps_pathologies() {
+        let offset = Vec3::X * 10.0;
+        // 声源以音速迎面冲来（den = 0）⇒ 钳上限 3.0
+        assert_eq!(
+            doppler_factor(offset, Vec3::ZERO, Vec3::NEG_X * 343.0, 343.0),
+            DOPPLER_FACTOR_MAX
+        );
+        // 超音速（den < 0）同样钳上限
+        assert_eq!(
+            doppler_factor(offset, Vec3::ZERO, Vec3::NEG_X * 700.0, 343.0),
+            DOPPLER_FACTOR_MAX
+        );
+        // 听者以超音速逃离（源在 +X，逃离 = 向 −X）⇒ 钳下限
+        assert_eq!(
+            doppler_factor(offset, Vec3::NEG_X * 400.0, Vec3::ZERO, 343.0),
+            DOPPLER_FACTOR_MIN
+        );
+        // 一般超钳制场景（300 m/s 迎面，未超音速但因子 > 3）⇒ 钳 3.0
+        assert_eq!(
+            doppler_factor(offset, Vec3::ZERO, Vec3::NEG_X * 300.0, 343.0),
+            DOPPLER_FACTOR_MAX
+        );
+        // 病态输入 ⇒ 恒 1.0（不 panic、不 NaN）
+        let nan = Vec3::new(f32::NAN, 0.0, 0.0);
+        assert_eq!(
+            doppler_factor(offset, nan, Vec3::ZERO, 343.0).to_bits(),
+            1.0f32.to_bits()
+        );
+        assert_eq!(
+            doppler_factor(Vec3::ZERO, Vec3::ZERO, Vec3::X, 343.0).to_bits(),
+            1.0f32.to_bits(),
+            "重叠源径向无定义"
+        );
+        assert_eq!(
+            doppler_factor(offset, Vec3::ZERO, Vec3::ZERO, 0.0).to_bits(),
+            1.0f32.to_bits()
+        );
+        assert_eq!(
+            doppler_factor(offset, Vec3::ZERO, Vec3::ZERO, f32::NAN).to_bits(),
+            1.0f32.to_bits()
+        );
+    }
+
+    /// 遮挡系数解析锚：0 ⇒ 1（恒等，但消费方走旁路）、1 ⇒ 0.1、
+    /// 越界钳 [0,1]、NaN ⇒ 透明。
+    #[test]
+    fn muffle_coef_analytic_anchors() {
+        assert_eq!(muffle_coef(0.0).to_bits(), 1.0f32.to_bits());
+        assert!(
+            (muffle_coef(1.0) - 0.1).abs() < 1e-6,
+            "k(1) = 0.1：{k}",
+            k = muffle_coef(1.0)
+        );
+        assert!((muffle_coef(0.5) - 0.55).abs() < 1e-6);
+        assert!(
+            (muffle_coef(2.0) - muffle_coef(1.0)).abs() < 1e-9,
+            "越界钳 1"
+        );
+        assert_eq!(
+            muffle_coef(-3.0).to_bits(),
+            muffle_coef(0.0).to_bits(),
+            "负越界钳 0"
+        );
+        assert_eq!(
+            muffle_coef(f32::NAN).to_bits(),
+            1.0f32.to_bits(),
+            "病态 = 透明"
+        );
+    }
+
+    /// 遮挡低通端到端（阶跃解析）：muffle=1（k=0.1）播全 1 阶跃，
+    /// 滤波输出逐样本 = 1−(1−k)^n 的一阶爬坡——前四样本逐位对解析式；
+    /// 同时验证**跨 mix 调用状态持久**（分两半缓冲推进，接缝处连续）。
+    #[test]
+    fn occlusion_lowpass_ramp_is_analytic_and_stateful_across_mixes() {
+        let step = vec![1.0f32; 8];
+        let mut mixer = AudioMixer::new();
+        let id = mixer.play(mono(&step), 1.0, false);
+        assert!(mixer.set_sound_muffle(id, 1.0));
+        assert_eq!(mixer.sound_muffle(id), Some(1.0), "观测口回读强度");
+        let k = muffle_coef(1.0);
+        let mut first = vec![0.0f32; 2 * 4]; // 4 帧立体声
+        mixer.mix(&mut first, 2, 48_000);
+        // 解析爬坡：y_n = 1-(1-k)^n（n 从 1 起）
+        let mut prev = 0.0f32;
+        for n in 0..4 {
+            let expect_l = prev + k * (1.0 - prev);
+            assert_eq!(
+                first[2 * n].to_bits(),
+                expect_l.to_bits(),
+                "第 {n} 样本应为一阶爬坡（左声道）"
+            );
+            assert_eq!(first[2 * n], first[2 * n + 1], "单声道源两输出声道同滤波");
+            prev = expect_l;
+        }
+        // 第二半缓冲：状态从上一缓冲末值继续（跨调用持久 ⇒ 无缝）
+        let mut second = vec![0.0f32; 2 * 4];
+        mixer.mix(&mut second, 2, 48_000);
+        for n in 0..4 {
+            let expect_l = prev + k * (1.0 - prev);
+            assert_eq!(second[2 * n].to_bits(), expect_l.to_bits(), "接缝爬坡连续");
+            prev = expect_l;
+        }
+    }
+
+    /// 旁路逐位锚：muffle=0（显式设 0 与从不设两型）与未走滤波分支的
+    /// 对照混音器**逐位一致**；「先闷后解」后新输出与「从未闷、只跳过
+    /// 同样帧数」的对照逐位一致——旁路不读不写状态，被污染的滤波记忆
+    /// 绝不回渗直通路径。
+    #[test]
+    fn muffle_bypass_is_bit_identical_and_release_restores_passthrough() {
+        let src: Vec<f32> = (0..32).map(|i| (i as f32 * 0.4).sin()).collect();
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|s| s.to_bits()).collect() };
+        // ① 显式 0 与从不设：整段逐位一致
+        let mut plain = AudioMixer::new();
+        plain.play(mono(&src), 0.8, false);
+        let mut with_zero = AudioMixer::new();
+        let id = with_zero.play(mono(&src), 0.8, false);
+        assert!(with_zero.set_sound_muffle(id, 0.0), "显式 0 句柄有效");
+        let mut a = vec![0.0f32; 2 * 32];
+        let mut b = vec![0.0f32; 2 * 32];
+        plain.mix(&mut a, 2, 48_000);
+        with_zero.mix(&mut b, 2, 48_000);
+        assert_eq!(bits(&a), bits(&b), "muffle=0 必须与旁路逐位一致");
+        // ② 闷 8 帧 → 放开 24 帧：与「从未闷、跳 8 帧混 24 帧」对照逐位一致
+        //   （若放开后仍读旧滤波记忆，输出起点会被爬坡残值污染 ⇒ 失配）
+        let mut muted = AudioMixer::new();
+        let id = muted.play(mono(&src), 0.8, false);
+        assert!(muted.set_sound_muffle(id, 1.0));
+        let mut damp = vec![0.0f32; 2 * 8];
+        muted.mix(&mut damp, 2, 48_000);
+        assert!(muted.set_sound_muffle(id, 0.0));
+        let mut released = vec![0.0f32; 2 * 24];
+        muted.mix(&mut released, 2, 48_000);
+        let mut reference = AudioMixer::new();
+        reference.play(mono(&src), 0.8, false);
+        let mut skip = vec![0.0f32; 2 * 8];
+        reference.mix(&mut skip, 2, 48_000);
+        let mut rest = vec![0.0f32; 2 * 24];
+        reference.mix(&mut rest, 2, 48_000);
+        assert_eq!(bits(&released), bits(&rest), "放开遮挡后不得有滤波残值回渗");
+    }
+
+    /// 多普勒端到端：声源以 34.3 m/s 迎面趋近（因子 ≈1.111），440 Hz
+    /// 正弦的过零率实测升高；静止对照逐位 = 默认路径（零速写入不改行为），
+    /// 且两次运行逐位确定。
+    #[test]
+    fn doppler_shifts_pitch_end_to_end_and_stationary_anchor_holds() {
+        let clip = mono(sine(440.0, 0.05, 48_000).samples());
+        let zero_crossings = |mixer: &mut AudioMixer| -> usize {
+            let mut out = vec![0.0f32; 2 * 1_200];
+            mixer.mix(&mut out, 2, 48_000);
+            let mut prev: Option<f32> = None;
+            let mut count = 0;
+            for frame in out.chunks_exact(2) {
+                let s = frame[0];
+                if let Some(p) = prev {
+                    if (p < 0.0) != (s < 0.0) {
+                        count += 1;
+                    }
+                }
+                prev = Some(s);
+            }
+            count
+        };
+        let build = |velocity: Vec3| {
+            let mut mixer = AudioMixer::new();
+            mixer.set_listener(ListenerParams::default());
+            let id = mixer.play_spatial(clip.clone(), Vec3::X * 10.0, 1.0, true);
+            assert!(mixer.set_sound_velocity(id, velocity));
+            mixer
+        };
+        let mut still = build(Vec3::ZERO);
+        let mut approaching = build(Vec3::NEG_X * 34.3);
+        let base = zero_crossings(&mut still);
+        let shifted = zero_crossings(&mut approaching);
+        assert!(shifted > base, "趋近源过零率应更高：{shifted} > {base}");
+        // 非空间声音不吃多普勒（无径向定义）：给速度后输出逐位 = 对照
+        let mut ns_plain = AudioMixer::new();
+        ns_plain.play(clip.clone(), 1.0, true);
+        let mut ns_vel = AudioMixer::new();
+        let id = ns_vel.play(clip.clone(), 1.0, true);
+        assert!(
+            ns_vel.set_sound_velocity(id, Vec3::NEG_X * 34.3),
+            "存而不用仍受理"
+        );
+        let mut x = vec![0.0f32; 2 * 600];
+        let mut y = vec![0.0f32; 2 * 600];
+        ns_plain.mix(&mut x, 2, 48_000);
+        ns_vel.mix(&mut y, 2, 48_000);
+        assert_eq!(
+            x.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            y.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            "非空间声音速度存而不用（逐位对照）"
+        );
+        // 声速旋钮非默认值断言：c = 171.5（半速介质）同速源因子翻倍于 c=343
+        let f_half = doppler_factor(Vec3::X * 10.0, Vec3::ZERO, Vec3::NEG_X * 34.3, 171.5);
+        let f_full = doppler_factor(Vec3::X * 10.0, Vec3::ZERO, Vec3::NEG_X * 34.3, 343.0);
+        assert!(f_half > f_full, "c 越低多普勒越剧烈：{f_half} vs {f_full}");
+        let mut mixer = AudioMixer::new();
+        mixer.set_speed_of_sound(f32::NAN);
+        assert_eq!(
+            mixer.speed_of_sound(),
+            DEFAULT_SPEED_OF_SOUND,
+            "病态声速输入被忽略（默认 343）"
+        );
+        mixer.set_speed_of_sound(171.5);
+        assert_eq!(mixer.speed_of_sound(), 171.5);
+        // 两次运行逐位确定（同输入同序）
+        let run1 = {
+            let mut m = build(Vec3::NEG_X * 34.3);
+            let mut out = vec![0.0f32; 2 * 1_200];
+            m.mix(&mut out, 2, 48_000);
+            out
+        };
+        let run2 = {
+            let mut m = build(Vec3::NEG_X * 34.3);
+            let mut out = vec![0.0f32; 2 * 1_200];
+            m.mix(&mut out, 2, 48_000);
+            out
+        };
+        assert_eq!(
+            run1.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            run2.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// v3 句柄卫生：死句柄 / 旧世代的所有新 setter 一律 false；观测口
+    /// `None`；`set_sound_muffle` 的 NaN 按 0（旁路）、越界钳 [0,1]。
+    #[test]
+    fn v3_setters_are_generation_guarded_and_sanitized() {
+        let clip = mono(&[0.5; 8]);
+        let mut mixer = AudioMixer::new();
+        let id = mixer.play_spatial(clip.clone(), Vec3::Z * -3.0, 1.0, false);
+        assert!(mixer.set_sound_velocity(id, Vec3::X));
+        assert_eq!(mixer.sound_velocity(id), Some(Vec3::X));
+        mixer.set_sound_muffle(id, 0.5);
+        assert_eq!(mixer.sound_muffle(id), Some(0.5));
+        mixer.set_sound_muffle(id, f32::NAN);
+        assert_eq!(mixer.sound_muffle(id), Some(0.0), "NaN 按旁路");
+        mixer.set_sound_muffle(id, 4.0);
+        assert_eq!(mixer.sound_muffle(id), Some(1.0), "越界钳 1");
+        assert!(mixer.stop(id));
+        assert!(!mixer.set_sound_velocity(id, Vec3::ZERO), "死句柄 false");
+        assert!(!mixer.set_sound_muffle(id, 1.0), "死句柄 false");
+        assert_eq!(mixer.sound_muffle(id), None);
+        assert_eq!(mixer.sound_velocity(id), None);
     }
 }

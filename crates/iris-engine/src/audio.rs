@@ -32,9 +32,12 @@ pub struct Audio {
     mixer: Arc<Mutex<AudioMixer>>,
     /// 输出设备会话；`None` = 纯混音器模式（不出声）。
     device: Option<AudioOutput>,
-    /// 空间源差分快照：上一帧活跃的（实体 bits → SoundId）列表，
-    /// 由 `update_spatial_audio` 每帧替换（组件移除 / 实体 despawn 检测）。
-    spatial_active: Mutex<Vec<(u64, SoundId)>>,
+    /// 空间源差分快照：上一帧活跃的（实体 bits → SoundId → 当帧位置）列表，
+    /// 由 `update_spatial_audio` 每帧替换（组件移除 / 实体 despawn 检测；
+    /// 位置自 v3 起同时供多普勒帧间差分）。
+    spatial_active: Mutex<Vec<(u64, SoundId, Vec3)>>,
+    /// 上一帧听者位置（v3 听者多普勒差分记忆；`None` = 首帧 / 无听者）。
+    spatial_listener_prev: Mutex<Option<Vec3>>,
 }
 
 impl Audio {
@@ -48,6 +51,7 @@ impl Audio {
                     mixer,
                     device: Some(device),
                     spatial_active: Mutex::new(Vec::new()),
+                    spatial_listener_prev: Mutex::new(None),
                 }
             }
             None => {
@@ -72,6 +76,7 @@ impl Audio {
             mixer: Arc::new(Mutex::new(AudioMixer::new())),
             device: None,
             spatial_active: Mutex::new(Vec::new()),
+            spatial_listener_prev: Mutex::new(None),
         }
     }
 
@@ -140,6 +145,28 @@ impl Audio {
             .set_sound_reference_distance(id, reference_distance)
     }
 
+    // ---- 空间化 v3（C6）：多普勒速度 / 遮挡闷声直通口 ----
+
+    /// 更新一个声音的世界速度（米/秒，多普勒输入；下一帧混音生效）。
+    /// 句柄失效返回 `false`。`update_spatial_audio` 对组件源自动按帧间
+    /// 位置差分推送；一次性音效（`play_spatial` 直放）由游戏侧经此口给速。
+    pub fn set_sound_velocity(&self, id: SoundId, velocity: Vec3) -> bool {
+        self.mixer().set_sound_velocity(id, velocity)
+    }
+
+    /// 设置一个声音的遮挡闷声强度（[0, 1]，0 = 直通旁路；NaN 按 0、
+    /// 越界钳制）。句柄失效返回 `false`。组件源由
+    /// `update_spatial_audio` 按射线遮挡判定自动推送；游戏侧亦可经此口
+    /// 手控（如「隔水听声」的自定义强度）。
+    pub fn set_sound_muffle(&self, id: SoundId, muffle: f32) -> bool {
+        self.mixer().set_sound_muffle(id, muffle)
+    }
+
+    /// 设置声速（米/秒，多普勒全局参数；病态输入忽略，默认 343）。
+    pub fn set_speed_of_sound(&self, speed_of_sound: f32) {
+        self.mixer().set_speed_of_sound(speed_of_sound);
+    }
+
     // ---- 流式音乐总线与混响（R44）----
 
     /// 播放背景音乐（流式：OGG/Vorbis 或任何 [`AudioStream`] 实现）。
@@ -198,8 +225,9 @@ impl Audio {
         self.mixer().reverb_settings()
     }
 
-    /// 读取空间源差分快照（上一帧活跃列表；`crate::spatial` 的差分管理用）。
-    pub(crate) fn spatial_active(&self) -> Vec<(u64, SoundId)> {
+    /// 读取空间源差分快照（上一帧活跃列表：实体 bits + 句柄 + 当帧位置，
+    /// v3 位置供多普勒差分；`crate::spatial` 的差分管理用）。
+    pub(crate) fn spatial_active(&self) -> Vec<(u64, SoundId, Vec3)> {
         self.spatial_active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -207,11 +235,27 @@ impl Audio {
     }
 
     /// 替换空间源差分快照（每帧由 `update_spatial_audio` 调用一次）。
-    pub(crate) fn set_spatial_active(&self, active: Vec<(u64, SoundId)>) {
+    pub(crate) fn set_spatial_active(&self, active: Vec<(u64, SoundId, Vec3)>) {
         *self
             .spatial_active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = active;
+    }
+
+    /// 读取上一帧听者位置（v3 听者多普勒差分用；`None` = 首帧）。
+    pub(crate) fn spatial_listener_prev(&self) -> Option<Vec3> {
+        *self
+            .spatial_listener_prev
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 记录本帧听者位置（`Some(None)` 语义 = 本帧无听者，清空差分记忆）。
+    pub(crate) fn set_spatial_listener_prev(&self, prev: Option<Vec3>) {
+        *self
+            .spatial_listener_prev
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = prev;
     }
 
     /// 混音器可变访问：无设备模式下手动推进混音（离线渲染 / 快照），

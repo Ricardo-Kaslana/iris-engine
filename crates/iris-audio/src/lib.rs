@@ -24,6 +24,13 @@
 //! [`AudioMixer::set_sound_position`]——距离软倒数衰减 + 恒功率立体声声像
 //! （模型与已知限制见 `mixer` 模块文档）。
 //!
+//! 空间化 v3（C6）：多普勒（[`doppler_factor`] +
+//! [`AudioMixer::set_sound_velocity`] / [`ListenerParams::with_velocity`]）
+//! 与遮挡闷声（[`AudioMixer::set_sound_muffle`]，逐声音一阶低通，
+//! [`muffle_coef`]）——两件全 opt-in，静止 / 未遮挡 = 与 v1/v2 逐位一致；
+//! HRTF 维持裁出（「前后不可辨」限制原样）。遮挡**判定**（射线）在引擎侧
+//! （`iris_engine::spatial`），混音器只吃强度标量。
+//!
 //! 音频 v2（R44）：OGG/Vorbis 解码（[`AudioClip::from_ogg`] 小音效进内存、
 //! [`OggVorbisStream`] 分块解码喂流式通道）+ 流式音乐总线
 //! （[`AudioMixer::play_music`] / [`AudioMixer::stop_music`]，常驻内存与曲目
@@ -45,7 +52,10 @@ pub mod wav;
 
 pub use clip::AudioClip;
 pub use device::AudioOutput;
-pub use mixer::{AudioMixer, DEFAULT_REFERENCE_DISTANCE, ListenerParams, SoundId, spatial_gain};
+pub use mixer::{
+    AudioMixer, DEFAULT_REFERENCE_DISTANCE, DEFAULT_SPEED_OF_SOUND, DOPPLER_FACTOR_MAX,
+    DOPPLER_FACTOR_MIN, ListenerParams, SoundId, doppler_factor, muffle_coef, spatial_gain,
+};
 pub use ogg::{OggVorbisStream, load_ogg, parse_ogg};
 pub use procedural::{noise, sine, square};
 pub use reverb::{DelayLine, Reverb, ReverbSettings};

@@ -382,14 +382,20 @@ pub struct SpatialPlugin;
 impl Plugin for SpatialPlugin {
     fn build(&self, app: &mut App) {
         use crate::spatial::{SpatialListener, SpatialSource, update_spatial_audio};
-        use iris_core::prelude::{Access, GlobalTransform, Stage};
+        use iris_core::prelude::{Access, GlobalTransform, Stage, Time, Transform};
         app.schedule.add_parallel_system(
             Stage::PostUpdate,
             Access::new()
                 .write::<SpatialSource>()
                 .read::<SpatialListener>()
                 .read::<GlobalTransform>()
-                .read::<Audio>(),
+                .read::<Audio>()
+                // v3 多普勒差分读 Time；遮挡判定读静态碰撞体（Collider /
+                // RigidBody 的 effective_static 口径 + Transform 位姿）
+                .read::<Time>()
+                .read::<Transform>()
+                .read::<iris_core::physics::Collider>()
+                .read::<iris_core::physics::RigidBody>(),
             update_spatial_audio,
         );
     }

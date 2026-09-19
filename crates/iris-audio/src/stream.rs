@@ -572,7 +572,10 @@ impl MusicBus {
                     right: *volume * frame_gain,
                     mono: *volume * frame_gain,
                 };
-                SourceFrames::new(pending, channels_src).add_frame(out_frame, i0, i1, frac, &gains);
+                // 音乐总线恒不做遮挡低通（v3 lp = None）：走与引入滤波前
+                // 逐位一致的直通路径。
+                SourceFrames::new(pending, channels_src)
+                    .add_frame(out_frame, i0, i1, frac, &gains, None);
                 *cursor += ratio;
             }
             // 剪掉已消费前缀（整数帧，f64 减整数精确 ⇒ 游标相位跨块不漂移）。

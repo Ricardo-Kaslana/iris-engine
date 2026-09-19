@@ -1,5 +1,13 @@
-//! 空间音频 v1：听者 / 声源组件与每帧同步系统（混音数学在
+//! 空间音频 v1/v3：听者 / 声源组件与每帧同步系统（混音数学在
 //! [`iris_audio::mixer`]，本模块只负责 ECS → 混音器的接线）。
+//!
+//! v3（C6）在既有位置同步之上追加两件事，**默认全关 = 逐位不变**：
+//! - **多普勒**：`SpatialSource::doppler` 开启后按帧间位置差分推估声源
+//!   速度，听者速度同样差分（首帧 / 无 `Time` ⇒ 零速 = 因子恒 1.0）；
+//! - **遮挡**：`SpatialSource::occlusion` 开启后逐帧做「听者→源」线段 ×
+//!   静态阻挡体的二值判定（`effective_static` 口径同守卫视线），命中即
+//!   推 `muffle` 强度（混音侧一阶低通，见 `iris_audio::muffle_coef`）。
+//!   判定在引擎、滤波在混音核心——混音器保持纯函数零世界依赖。
 //!
 //! - [`SpatialListener`]：标记组件，挂相机 / 听者实体——每帧取查询序
 //!   **第一个**，用其 `GlobalTransform` 位姿写混音器听者（前方取实体 -Z
@@ -38,7 +46,10 @@ use glam::Vec3;
 
 use iris_audio::{ListenerParams, SoundId};
 
-use iris_core::prelude::{Component, Entity, GlobalTransform};
+use iris_core::physics::{
+    Collider, ColliderShape, RigidBody, effective_static, segment_hits_shape_rotated,
+};
+use iris_core::prelude::{Component, Entity, GlobalTransform, Quat, Time, Transform};
 
 use crate::audio::Audio;
 
@@ -54,6 +65,19 @@ pub struct SpatialListener;
 /// v1 定位为**持续环境声源**（典型 `looping: true` 的循环音）：非循环源
 /// 播完自然移除后，系统对死句柄的同步是安全 no-op（世代校验失败即忽略），
 /// 不会自动重启——重启语义交给上层（重新插入本组件）。
+///
+/// v3（C6）两开关，**默认全关 = 与 v1/v2 逐位一致（关时系统根本不触碰
+/// 混音器对应槽位）**：
+/// - `doppler`：开启后系统按**帧间位置差分**自动推估声源速度并逐帧推送
+///   （无显式速度输入——传送/瞬移会产生一帧尖峰，多普勒因子有钳界兜底）；
+/// - `occlusion`：开启后每帧做「听者→源」线段 × 静态阻挡体
+///   （`effective_static` 口径：无 `RigidBody` / `is_static` / Kinematic，
+///   **sensor 不豁免**——与守卫视线同一事实源）的二值遮挡判定，
+///   命中 ⇒ 该声音 `muffle = occluded_muffle`，未命中 ⇒ 0（旁路）；
+///   源自身实体上的碰撞体不参与判定（贴身墙恒挡的病理排除）。
+///
+/// 运行中把开关从 true 翻回 false 不会自动清零已推送的速度/闷声
+/// （v1 边界，§8.66——需要即翻即净走 `Audio::set_sound_*` 手动口）。
 #[derive(Clone, Debug, Component)]
 pub struct SpatialSource {
     /// 声源剪辑（播放时以 `Arc` 共享，组件持有引用计数）。
@@ -65,6 +89,12 @@ pub struct SpatialSource {
     /// 距离参考（米）：衰减 `att = ref / (ref + d)` 的 ref 项，按声源尺度
     /// 配置（默认 [`iris_audio::DEFAULT_REFERENCE_DISTANCE`]）。
     pub reference_distance: f32,
+    /// 多普勒开关（v3）：开启后按帧间位置差分推估速度。默认 `false`。
+    pub doppler: bool,
+    /// 遮挡开关（v3）：开启后逐帧射线判定并推 `muffle`。默认 `false`。
+    pub occlusion: bool,
+    /// 遮挡命中时的闷声强度（v3，[0, 1]；仅 `occlusion` 开启时被读）。
+    pub occluded_muffle: f32,
     /// 内部状态：已起播的防悬垂句柄（`None` = 尚未起播）。
     /// Clone 会复制句柄（两个组件共享同一声音）——克隆后如需独立播放，
     /// 先经 [`SpatialSource::detach`] 清空。
@@ -72,7 +102,7 @@ pub struct SpatialSource {
 }
 
 impl SpatialSource {
-    /// 构造未起播的声源。
+    /// 构造未起播的声源（v3 两开关默认关 = v1 行为逐位不变）。
     pub fn new(
         clip: iris_audio::AudioClip,
         volume: f32,
@@ -84,8 +114,27 @@ impl SpatialSource {
             volume,
             looping,
             reference_distance,
+            doppler: false,
+            occlusion: false,
+            occluded_muffle: 1.0,
             started: None,
         }
+    }
+
+    /// 开启多普勒（链式）。
+    #[must_use]
+    pub fn with_doppler(mut self) -> Self {
+        self.doppler = true;
+        self
+    }
+
+    /// 开启遮挡判定（链式），并指定命中强度（[0, 1]；NaN / 越界在混音侧
+    /// 卫生化）。
+    #[must_use]
+    pub fn with_occlusion(mut self, occluded_muffle: f32) -> Self {
+        self.occlusion = true;
+        self.occluded_muffle = occluded_muffle;
+        self
     }
 
     /// 已起播的句柄（测试与调试用；`None` = 尚未被系统起播）。
@@ -99,20 +148,52 @@ impl SpatialSource {
     }
 }
 
-/// 每帧空间音频同步系统（见模块文档的差分三步与调用契约）。
+/// 每帧空间音频同步系统（见模块文档的差分三步；v3 追加多普勒 / 遮挡）。
 ///
 /// `Audio` 资源缺席时静默返回（无音频的世界照常运行）；注册为**并行
 /// 系统**：写 `SpatialSource`、读 `SpatialListener` / `GlobalTransform` /
-/// `Audio`（播放编排经 `Arc<Mutex>` 混音器完成，`&Audio` 即可，与
-/// `run_arena` 等既有系统同款声明）。
+/// `Audio` / `Time` / `Collider` / `RigidBody`（播放编排经 `Arc<Mutex>`
+/// 混音器完成，`&Audio` 即可，与 `run_arena` 等既有系统同款声明）。
+///
+/// **v3 速度 = 帧间位置差分**：本系统读上一帧快照位置 + `Time::delta_secs`
+/// 推估源 / 听者速度——游戏侧无需显式给速（代价：瞬移产生一帧尖峰，混音侧
+/// 多普勒因子钳界兜底）。遮挡判定吃静态碰撞体（`effective_static` 口径），
+/// 仅在有 `occlusion` 源时惰性收集一次静态列表（全关 = 零收集开销）。
 pub fn update_spatial_audio(world: &iris_core::world::World) {
     let Some(audio) = world.try_resource::<Audio>() else {
         return;
     };
+    let dt = world.try_resource::<Time>().map_or(0.0, |t| t.delta_secs());
+
+    // ---- 遮挡静态体（仅当有源开启遮挡才收集，存储序遍历 + entity 升序；
+    // 位姿读 `&Transform`——口径同 perception 视线静态体，见其模块文档）----
+    let mut obstacles: Vec<(Entity, Vec3, Quat, ColliderShape)> = Vec::new();
+    let mut any_occlusion = false;
+    world.query::<&SpatialSource>(|source| any_occlusion |= source.occlusion);
+    if any_occlusion {
+        world.query::<(Entity, &Transform, &Collider, Option<&RigidBody>)>(
+            |(entity, transform, collider, rigid)| {
+                if effective_static(collider, rigid) {
+                    obstacles.push((
+                        entity,
+                        transform.position,
+                        transform.rotation,
+                        collider.shape,
+                    ));
+                }
+            },
+        );
+        obstacles.sort_unstable_by_key(|(entity, ..)| *entity);
+    }
 
     // ---- 听者：查询序第一个（SpatialListener, GlobalTransform）----
-    // 前方 = 全局 -Z 轴，经 from_view 以世界 +Y 重正交化（见模块文档）。
+    // 前方 = 全局 -Z 轴（矩阵第三列取负），经 from_view 以世界 +Y 重正交化
+    // （见模块文档）；v3 速度 = 与上一帧听者位置的差分（dt 病态 ⇒ 零速，
+    // 退化为 v1 无多普勒）。
+    let prev_listener = audio.spatial_listener_prev();
     let mut listener_done = false;
+    let mut new_listener = Vec3::ZERO;
+    let mut have_listener = false;
     world.query::<(&SpatialListener, &GlobalTransform)>(|(_, global)| {
         if listener_done {
             return;
@@ -120,17 +201,27 @@ pub fn update_spatial_audio(world: &iris_core::world::World) {
         listener_done = true;
         let matrix = global.matrix();
         let forward = -Vec3::new(matrix.z_axis.x, matrix.z_axis.y, matrix.z_axis.z);
-        audio.set_listener(ListenerParams::from_view(
-            global.position(),
-            forward,
-            Vec3::Y,
-        ));
+        let position = global.position();
+        let velocity = match prev_listener {
+            Some(prev) if dt.is_finite() && dt > 0.0 => (position - prev) / dt,
+            _ => Vec3::ZERO,
+        };
+        audio.set_listener(
+            ListenerParams::from_view(position, forward, Vec3::Y).with_velocity(velocity),
+        );
+        new_listener = position;
+        have_listener = true;
     });
+    if have_listener {
+        audio.set_spatial_listener_prev(Some(new_listener));
+    }
 
     // ---- 声源差分：起播 / 逐帧同步 / 移除停止（三步见模块文档）----
-    let mut active: Vec<(u64, SoundId)> = Vec::new();
+    let prev_active = audio.spatial_active();
+    let mut active: Vec<(u64, SoundId, Vec3)> = Vec::new();
     world.query::<(Entity, &GlobalTransform, &mut SpatialSource)>(|(entity, global, source)| {
         let position = global.position();
+        let bits = entity.to_bits();
         let id = match source.started {
             Some(id) => {
                 // 已起播：只同步位置（死句柄 = 非循环源自然播完，
@@ -150,11 +241,31 @@ pub fn update_spatial_audio(world: &iris_core::world::World) {
                 id
             }
         };
-        active.push((entity.to_bits(), id));
+        // v3 多普勒：源速度 = 帧间差分（上一帧快照查本实体 bits）。
+        // 开关全关时**不触碰混音器**（默认路径零额外锁，缺席 = 逐位不变）。
+        if source.doppler {
+            let vel = match prev_active.iter().find(|(b, ..)| *b == bits) {
+                Some((_, _, prev)) if dt.is_finite() && dt > 0.0 => (position - *prev) / dt,
+                _ => Vec3::ZERO,
+            };
+            audio.set_sound_velocity(id, vel);
+        }
+        // v3 遮挡：听者→源线段被任一无关静态体命中 ⇒ 满强度闷声。排除
+        // 源自身实体（贴身墙恒挡）；本帧无听者 ⇒ 无从判定，按未遮挡。
+        if source.occlusion {
+            let blocked = have_listener
+                && obstacles.iter().any(|&(e, op, orot, oshape)| {
+                    e != entity
+                        && segment_hits_shape_rotated(new_listener, position, op, orot, &oshape)
+                            .is_some()
+                });
+            audio.set_sound_muffle(id, if blocked { source.occluded_muffle } else { 0.0 });
+        }
+        active.push((bits, id, position));
     });
     // 差分：上一帧活跃、本帧查无 → 组件已移除 / 实体已 despawn → 停止
-    for (bits, id) in audio.spatial_active() {
-        if !active.iter().any(|(current, _)| current == &bits) {
+    for (bits, id, _) in audio.spatial_active() {
+        if !active.iter().any(|(current, ..)| current == &bits) {
             audio.stop(id);
         }
     }
@@ -364,5 +475,187 @@ mod tests {
         assert!(cloned.started().is_some(), "clone 应携带句柄");
         cloned.detach();
         assert!(cloned.started().is_none(), "detach 应清空句柄");
+    }
+
+    // ---- v3（C6）：多普勒差分 + 遮挡射线 ----
+
+    use iris_core::physics::Collider;
+    use iris_core::prelude::Time;
+    use std::time::Duration;
+
+    /// 带 Time（可 advance 出非零 delta）+ Audio headless 的世界。
+    fn world_with_time_audio() -> World {
+        let mut world = world_with_audio();
+        world.insert_resource(Time::default());
+        world
+    }
+
+    /// 多普勒差分：首帧无历史 ⇒ 速度精确 ZERO；源挪 +2、听者挪 −1（X 轴）
+    /// 后次帧按 delta=0.25s（`max_delta` 钳位边界，二进制精确分数）推估
+    /// ⇒ 源 8 m/s、听者 −4 m/s（解析值逐位）。
+    #[test]
+    fn doppler_velocity_derived_from_frame_deltas() {
+        let mut world = world_with_time_audio();
+        world.spawn((
+            SpatialListener,
+            Transform::from_xyz(0.0, 0.0, 0.0),
+            GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, 0.0)),
+        ));
+        let source = world.spawn((
+            Transform::from_xyz(8.0, 0.0, 0.0),
+            GlobalTransform::from_transform(Transform::from_xyz(8.0, 0.0, 0.0)),
+            SpatialSource::new(clip(), 1.0, true, 4.0).with_doppler(),
+        ));
+        update_spatial_audio(&world);
+        let id = {
+            let mut found = None;
+            world.query::<&SpatialSource>(|s| found = s.started());
+            found.expect("首帧起播")
+        };
+        assert_eq!(
+            world.resource::<Audio>().mixer().sound_velocity(id),
+            Some(Vec3::ZERO),
+            "首帧无差分历史 ⇒ 零速（因子恒 1.0）"
+        );
+
+        // 帧 2：源 +X 挪 2、听者 −X 挪 1，delta = 0.5 s
+        world.insert_resource(Time::default());
+        world
+            .resource_mut::<Time>()
+            .advance(Duration::from_secs_f32(0.25));
+        world.insert(
+            source,
+            GlobalTransform::from_transform(Transform::from_xyz(10.0, 0.0, 0.0)),
+        );
+        let listener = {
+            let mut found = None;
+            world.query::<(Entity, &SpatialListener)>(|(e, _)| found = Some(e));
+            found.expect("听者实体")
+        };
+        world.insert(
+            listener,
+            GlobalTransform::from_transform(Transform::from_xyz(-1.0, 0.0, 0.0)),
+        );
+        update_spatial_audio(&world);
+        let audio_ref = world.resource::<Audio>();
+        let mixer = audio_ref.mixer();
+        assert_eq!(
+            mixer.sound_velocity(id),
+            Some(Vec3::new(8.0, 0.0, 0.0)),
+            "源速度 = Δpos/dt 解析值（(10−8)/0.25）"
+        );
+        assert_eq!(
+            mixer.listener().velocity,
+            Vec3::new(-4.0, 0.0, 0.0),
+            "听者速度 = Δpos/dt 解析值（(−1−0)/0.25）"
+        );
+    }
+
+    /// 遮挡二值：墙（静态 Box）在听者与源之间 ⇒ muffle = occluded_muffle；
+    /// 挪出视线 ⇒ 回 0；未开 occlusion 的源在墙后也恒 0（opt-in）；
+    /// 源自身挂碰撞体不自挡。
+    #[test]
+    fn occlusion_is_binary_ray_and_opt_in() {
+        let mut world = world_with_time_audio();
+        world.spawn((
+            SpatialListener,
+            Transform::IDENTITY,
+            GlobalTransform::from_transform(Transform::IDENTITY),
+        ));
+        // 墙：听者正后方 −Z 6 m 处的静态盒（半宽 1）
+        world.spawn((
+            Transform::from_xyz(0.0, 0.0, -6.0),
+            GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, -6.0)),
+            Collider::static_box(Vec3::splat(1.0)),
+        ));
+        // 遮挡源：−Z 12 m（墙后）；对照源：+X 12 m（无遮挡方向）
+        let occluded = world.spawn((
+            Transform::from_xyz(0.0, 0.0, -12.0),
+            GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, -12.0)),
+            SpatialSource::new(clip(), 1.0, true, 4.0).with_occlusion(1.0),
+        ));
+        let clear = world.spawn((
+            Transform::from_xyz(12.0, 0.0, 0.0),
+            GlobalTransform::from_transform(Transform::from_xyz(12.0, 0.0, 0.0)),
+            SpatialSource::new(clip(), 1.0, true, 4.0).with_occlusion(1.0),
+        ));
+        // 未开遮挡的源也在墙后 ⇒ 恒 0
+        let flag_off = world.spawn((
+            Transform::from_xyz(0.0, 0.0, -12.0),
+            GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, -12.0)),
+            SpatialSource::new(clip(), 1.0, true, 4.0),
+        ));
+        update_spatial_audio(&world);
+        let ids: Vec<(u64, SoundId)> = {
+            let mut pairs = Vec::new();
+            world.query::<(Entity, &SpatialSource)>(|(e, s)| {
+                pairs.push((e.to_bits(), s.started.expect("首帧起播")))
+            });
+            pairs
+        };
+        let id_of = |entity: Entity| -> SoundId {
+            ids.iter()
+                .find(|(bits, _)| *bits == entity.to_bits())
+                .map(|(_, id)| *id)
+                .expect("快照含本实体")
+        };
+        {
+            let audio_ref = world.resource::<Audio>();
+            let mixer = audio_ref.mixer();
+            assert_eq!(
+                mixer.sound_muffle(id_of(occluded)),
+                Some(1.0),
+                "墙后源应满强度闷声"
+            );
+            assert_eq!(mixer.sound_muffle(id_of(clear)), Some(0.0), "通视源应旁路");
+            assert_eq!(
+                mixer.sound_muffle(id_of(flag_off)),
+                Some(0.0),
+                "未开遮挡的源即使墙后也不闷（opt-in）"
+            );
+        }
+        // 挪到侧向脱墙 ⇒ 回 0（强度随帧跟随几何）
+        world.insert(
+            occluded,
+            GlobalTransform::from_transform(Transform::from_xyz(8.0, 0.0, -1.0)),
+        );
+        update_spatial_audio(&world);
+        assert_eq!(
+            world
+                .resource::<Audio>()
+                .mixer()
+                .sound_muffle(id_of(occluded)),
+            Some(0.0),
+            "脱墙后应回旁路"
+        );
+    }
+
+    /// 自碰撞体不自挡：源实体自带静态盒（枪口挂在带碰撞体的角色上），
+    /// 射线排除自身 ⇒ 不闷。
+    #[test]
+    fn source_own_collider_does_not_self_occlude() {
+        let mut world = world_with_time_audio();
+        world.spawn((
+            SpatialListener,
+            Transform::IDENTITY,
+            GlobalTransform::from_transform(Transform::IDENTITY),
+        ));
+        world.spawn((
+            Transform::from_xyz(0.0, 0.0, -5.0),
+            GlobalTransform::from_transform(Transform::from_xyz(0.0, 0.0, -5.0)),
+            Collider::static_box(Vec3::splat(1.0)),
+            SpatialSource::new(clip(), 1.0, true, 4.0).with_occlusion(1.0),
+        ));
+        update_spatial_audio(&world);
+        let id = {
+            let mut found = None;
+            world.query::<&SpatialSource>(|s| found = s.started());
+            found.expect("起播")
+        };
+        assert_eq!(
+            world.resource::<Audio>().mixer().sound_muffle(id),
+            Some(0.0),
+            "源自身碰撞体应被排除（否则带碰撞体的角色声源自闷）"
+        );
     }
 }
