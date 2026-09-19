@@ -265,6 +265,19 @@ struct GiShParams {
 @group(0) @binding(18) var<storage, read> gi_probes: array<GiProbe>;
 @group(0) @binding(19) var<uniform> gi_params: GiShParams;
 @group(0) @binding(20) var<storage, read> gi_depth: array<f32>;
+
+// 天气表面参数（R92，「不扩 Globals 前缀」扩容先例的延续——R77/R78/
+// R83/R88 同款；**uniform 而非 storage**，不触碰只读 storage 计数上限）。
+// 与 Rust 侧 weather.rs::WeatherRaw 逐字段对齐（16 B）；Weather 资源
+// 缺席 / 全零 = fs_shaded 天气分支整段不执行——既有像素逐位不变。
+struct WeatherParams {
+    // x: 湿度（粗糙度压低 + 反照率变暗）, y: 积雪量（坡度遮罩混合）,
+    // z: 涟漪强度（湿的朝上面法线扰动）, w: 涟漪时间 t（秒，与水体
+    // 波形同一时钟源 = Time.elapsed_secs）
+    params: vec4<f32>,
+};
+
+@group(0) @binding(21) var<uniform> weather: WeatherParams;
 @group(1) @binding(0) var<uniform> material: MaterialParams;
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
@@ -1295,6 +1308,68 @@ fn ddgi_irradiance(world_pos: vec3<f32>, n: vec3<f32>, env_fallback: vec3<f32>) 
     return vec4<f32>(env_fallback, cov);
 }
 
+// ---- 天气涟漪（R92）：weather.rs::ripple_gradient 的 WGSL 镜像 ----
+// （water.wgsl 持有同式第二份拷贝——WGSL 无 include 的双份镜像纪律，
+// 同 water_single_wave；整数格哈希跨平台精确，sin/cos 两侧库实现不同
+// ——CPU↔GPU 不做位级等价声明，公式锚点在 weather.rs 单测。）
+
+// 涟漪格哈希（weather.rs::weather_cell_hash 镜像）：乘常数 + 移位异或
+// 混淆，返回两个 u32 词。
+fn weather_hash(a: u32, b: u32) -> vec2<u32> {
+    var h = a * 0x9E3779B1u + b * 0x85EBCA77u;
+    h = h ^ (h >> 13u);
+    h = h * 0xC2B2AE3Du;
+    h = h ^ (h >> 16u);
+    let g = h * 0x27D4EB2Fu + 0x5BD1E995u;
+    return vec2<u32>(h, g);
+}
+
+// 高 24 位 → [0, 1)（particles_v2_sim.wgsl::v2_fraction 同式）
+fn weather_fraction(z: u32) -> f32 {
+    return f32(z >> 8u) * (1.0 / 16777216.0);
+}
+
+// 涟漪高度场梯度（weather.rs::ripple_gradient 逐式镜像）：3×3 邻格
+// 固定序（dz 外 / dx 内）求和；每格一个周期性落点（中心 = 格内
+// [0.15, 0.85] 带哈希偏移，相位 = 哈希 × 周期），环形波
+// A·decay·sin(π·u)、u = (r − v·age)/width + 1 ∈ (0, 2)（波前居中）。
+fn weather_ripple_gradient(p: vec2<f32>, t: f32) -> vec2<f32> {
+    let cell = floor(p / 0.4);
+    var grad = vec2<f32>(0.0);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            // 格坐标取整走 i32：f32→i32 对范围内的整数值截断良定义，
+            // i32→u32 是位重解释（WGSL 规范语义）——负格坐标（世界
+            // 负象限）与 Rust 侧 `as i32` + `as u32` 逐位一致；
+            // 直接 f32→u32 对负值不是位重解释，不可用。
+            let cx = i32(cell.x) + dx;
+            let cz = i32(cell.y) + dz;
+            let h = weather_hash(u32(cx), u32(cz));
+            let fx = weather_fraction(h.x);
+            let fy = weather_fraction(h.x ^ h.y);
+            let fp = weather_fraction(h.y);
+            let center = (cell + vec2<f32>(f32(dx), f32(dz))
+                + vec2<f32>(0.15 + 0.7 * fx, 0.15 + 0.7 * fy)) * 0.4;
+            let t0 = fp * 1.3;
+            var age = t - t0;
+            age = age - 1.3 * floor(age / 1.3);
+            if (age < 0.6) {
+                let d = p - center;
+                let r = length(d);
+                if (r > 1e-5) {
+                    let u = (r - 0.85 * age) / 0.09 + 1.0;
+                    if (u > 0.0 && u < 2.0) {
+                        let decay = 1.0 - age / 0.6;
+                        let dhdu = 0.01 * decay * 3.14159265 * cos(3.14159265 * u);
+                        grad = grad + (dhdu / 0.09) * (d / r);
+                    }
+                }
+            }
+        }
+    }
+    return grad;
+}
+
 // **fs_shaded 共享体（C7b）**：整段着色数学原样提取，`fs_main` 与
 // OIT gather 入口都是它的薄壳——算术逐式同序不改（R78 双路径位等价
 // 先例），既有全部像素基线即共享体的逐位锁。
@@ -1310,24 +1385,50 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
             discard;
         }
     }
-    let albedo = base.rgb;
+    var albedo = base.rgb;
     // ORM 打包（线性采样）：R = AO、G = 粗糙度、B = 金属度；标量因子
     // 作倍率相乘（glTF factor × texel 语义）。中性 ORM = (1,1,1) 时
     // x·1.0 = x 逐位精确，退化为 R41 的标量路径。
     let orm = textureSample(orm_texture, base_sampler, in.uv);
     let metallic = clamp(material.surface.x * orm.b, 0.0, 1.0);
-    let roughness = clamp(material.surface.y * orm.g, 0.045, 1.0);
+    var roughness = clamp(material.surface.y * orm.g, 0.045, 1.0);
     let ao = orm.r;
     let f0 = mix(vec3<f32>(material.surface.z), albedo, metallic);
 
     // 光照法线：几何法线 + 法线贴图扰动。n_geo 未归一化（见
     // perturbed_normal 的逐位一致说明），归一化只在此处做一次，
     // 与 R41 的 normalize(in.world_normal) 同构。
-    let n = normalize(perturbed_normal(in, in.world_normal));
+    var n = normalize(perturbed_normal(in, in.world_normal));
     // 阴影偏移 v2 用**几何法线**（而非扰动后的着色法线）：深度误差由
     // 光栅化几何决定，用逐纹素高频抖动的法线贴图法线只会给偏移量注入
     // 噪声（凹凸面出现漏光条纹）。归一化一次供两处阴影共用。
     let n_geo = normalize(in.world_normal);
+
+    // 天气表面（R92）：uniform 门（Weather 资源缺席 / 全零 = 分支整段
+    // 不执行——既有像素逐位不变，R63 铁律）。湿 = 粗糙度向 0.08 压低
+    // + 反照率按 (1 − metallic) 乘 0.7（f0 用干 albedo——金属湿感 v1
+    // 不建模）；雪 = 几何法线 y 的坡度遮罩向雪白混合（用 n_geo——着色
+    // 法线含贴图高频，做遮罩会出噪点）；涟漪 = 湿的朝上面法线扰动。
+    // 混合全部**重心形式展开**（不写 mix——CPU 镜像 weather.rs 同式，
+    // 两端点逐位精确；mix 的实现形式非规范保证）。
+    if (weather.params.x > 0.0 || weather.params.y > 0.0) {
+        let wet = clamp(weather.params.x, 0.0, 1.0);
+        roughness = roughness * (1.0 - wet) + 0.08 * wet;
+        albedo = albedo * (1.0 + (0.7 - 1.0) * (wet * (1.0 - metallic)));
+        let sm = smoothstep(0.45, 0.8, clamp(n_geo.y, 0.0, 1.0)) * clamp(weather.params.y, 0.0, 1.0);
+        let keep = 1.0 - sm;
+        albedo = vec3<f32>(
+            albedo.x * keep + 0.87 * sm,
+            albedo.y * keep + 0.89 * sm,
+            albedo.z * keep + 0.94 * sm,
+        );
+        roughness = roughness * keep + 0.6 * sm;
+        if (weather.params.z > 0.0 && wet > 0.0 && n_geo.y > 0.35) {
+            let g = weather_ripple_gradient(in.world_pos.xz, weather.params.w)
+                * weather.params.z * wet;
+            n = normalize(n + vec3<f32>(g.x, 0.0, g.y));
+        }
+    }
     let v = normalize(globals.eye_pos.xyz - in.world_pos);
 
     // 方向光（受级联阴影遮挡）

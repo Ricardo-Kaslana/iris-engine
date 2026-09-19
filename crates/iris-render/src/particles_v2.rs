@@ -107,8 +107,9 @@ const _: () = assert!(
 // 改一侧必须同步另一侧，布局大小 const 断言看门）
 // ---------------------------------------------------------------------------
 
-/// 模拟 uniform（96 B，POD；每帧每 advance 一份，CPU 判定发射数 / 种子
-/// 偏移 / dt / 风 / 位姿——GPU 只消费）。
+/// 模拟 uniform（128 B，POD；每帧每 advance 一份，CPU 判定发射数 / 种子
+/// 偏移 / dt / 风 / 位姿——GPU 只消费）。R92 扩容 96 → 128：新增体积
+/// 出生 / 发射轴向 / 线性阻尼三旋钮（降水役——雨雪发射器）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SimParamsRaw {
@@ -125,6 +126,13 @@ pub(crate) struct SimParamsRaw {
     pub wind_speed: [f32; 4],
     /// x = 出生方向抖动幅度；yzw 保留（0）。
     pub seed_jitter: [f32; 4],
+    /// xyz = 出生体积半边长（R92，盒形——发射原点为中心；全零 = 点发射
+    /// = 引入前行为逐位不变）；w = 线性阻尼系数 k（1/秒；0 = 无阻尼 =
+    /// 引入前行为逐位不变——终端速度 = g/k）。
+    pub extent_damp: [f32; 4],
+    /// xyz = 发射轴向（R92，默认 +Y = 引入前行为逐位不变；雨 = −Y）；
+    /// w 保留（0）。
+    pub axis: [f32; 4],
     /// 发射器种子 = 实体 `to_bits` 的低 / 高 32 位。
     pub seed: [u32; 2],
     /// 对齐填充（uniform 尺寸补到 16 的倍数）。
@@ -132,8 +140,8 @@ pub(crate) struct SimParamsRaw {
 }
 
 const _: () = assert!(
-    std::mem::size_of::<SimParamsRaw>() == 96,
-    "SimParamsRaw 必须为 96 字节（与 WGSL SimParams 布局一致）"
+    std::mem::size_of::<SimParamsRaw>() == 128,
+    "SimParamsRaw 必须为 128 字节（与 WGSL SimParams 布局一致）"
 );
 
 /// 拖尾渲染 uniform（64 B，POD；渲染器每帧每可见发射器写一份）。
@@ -223,6 +231,18 @@ pub struct ParticleEmitterV2 {
     pub trail_length: u32,
     /// 拖尾全宽（世界单位；条带 = 相机面向屏幕空间展宽，无体积）。
     pub trail_width: f32,
+    /// 出生体积半边长（R92，盒形，发射原点为中心）：全零（默认）= 点
+    /// 发射——GPU 侧 select 门保证与引入前逐位不变。雨雪用大体积
+    /// （发射器挂相机实体即得「跟随相机的降水体积」）。
+    pub spawn_extent: Vec3,
+    /// 发射轴向（R92）：出生方向 = normalize(axis + jitter·u)。默认 +Y =
+    /// 引入前行为逐位不变；雨 / 雪 = −Y（下落）。
+    pub spawn_axis: Vec3,
+    /// 线性阻尼系数 k（R92，1/秒）：速度每步除以 (1 + k·dt)——半隐式
+    /// 欧拉下的精确指数衰减离散（无阻尼项爆炸风险）。0（默认）= 无
+    /// 阻尼，逐位不变。终端速度 = g/k（雪 ≈ 1.5 m/s、雨 ≈ 9.8 m/s 的
+    /// 物理量级来源）。
+    pub linear_damping: f32,
 
     /// 持续发射的累计分数余量。
     spawn_accumulator: f32,
@@ -265,6 +285,9 @@ impl Clone for ParticleEmitterV2 {
             max_particles: self.max_particles,
             trail_length: self.trail_length,
             trail_width: self.trail_width,
+            spawn_extent: self.spawn_extent,
+            spawn_axis: self.spawn_axis,
+            linear_damping: self.linear_damping,
             spawn_accumulator: self.spawn_accumulator,
             emitter_age: self.emitter_age,
             burst_fired: self.burst_fired,
@@ -296,6 +319,9 @@ impl ParticleEmitterV2 {
             max_particles: PARTICLES_V2_MAX as usize,
             trail_length: 8,
             trail_width: 0.06,
+            spawn_extent: Vec3::ZERO,
+            spawn_axis: Vec3::Y,
+            linear_damping: 0.0,
             spawn_accumulator: 0.0,
             emitter_age: 0.0,
             burst_fired: false,
@@ -321,6 +347,59 @@ impl ParticleEmitterV2 {
         e.color_end = [0.60, 0.20, 0.05, 0.0];
         e.trail_length = 8;
         e.trail_width = 0.06;
+        e
+    }
+
+    /// 雨预设（R92）：大体积出生（发射器为中心 20×12×20 m 盒——**挂相机
+    /// 实体**即得跟随相机的降水体积）、−Y 下落 9 m/s、阻尼 k = 1
+    ///（终端速度 = g/k ≈ 9.8 m/s 的物理量级）、拖尾 3 点 = 运动方向雨丝
+    ///（拖尾条带沿下落路径——雨速 9 m/s × 3 帧 ≈ 0.45 m 丝长）、alpha
+    /// 混合的淡灰蓝半透明。寿命 = 顶盖到地面最坏坠落时间的余量；出生
+    /// 速率按「稳态存活 = rate × lifetime ≤ 池容量」留余量（池满永久
+    /// 停发——死粒子不回收，见模块限制）。
+    pub fn rain() -> Self {
+        let mut e = Self::new(crate::particles::ParticleBlend::Alpha);
+        e.spawn_extent = Vec3::new(10.0, 6.0, 10.0);
+        e.spawn_axis = -Vec3::Y;
+        e.spawn_rate = 1600.0;
+        e.particle_lifetime = 2.0;
+        e.initial_speed = 9.0;
+        e.velocity_jitter = 0.05;
+        e.gravity_scale = 1.0;
+        e.linear_damping = 1.0;
+        e.size_start = 0.03;
+        e.size_end = 0.03;
+        // 偏暗偏冷的半透明剪影（雨云天里雨丝对亮天空 / 亮地面是暗前景
+        //——灰背景与亮天空都有对比度；观感以 5–15 m 常见游戏距离 1080p
+        // 为准，实测 alpha 复合对 0.55 灰背景与 0.8 亮天空的 sRGB 差
+        // 均 > 25 级）
+        e.color_start = [0.30, 0.34, 0.42, 0.50];
+        e.color_end = [0.30, 0.34, 0.42, 0.40];
+        e.trail_length = 3;
+        e.trail_width = 0.05;
+        e
+    }
+
+    /// 雪预设（R92）：同 rain 的体积（20×12×20 m 盒）与轴向，但慢落（阻尼 k = 6.5 ⇒ 终端
+    /// ≈ 1.5 m/s——真实雪片量级）、无拖尾（trail 1 = 软边 billboard）、
+    /// 稍大尺寸 + 接近不透明白。寿命长（慢落穿过体积）——出生速率相应
+    /// 压低（池 4096 / 寿命 ≈ 稳态存活上限）。
+    pub fn snow() -> Self {
+        let mut e = Self::new(crate::particles::ParticleBlend::Alpha);
+        e.spawn_extent = Vec3::new(10.0, 6.0, 10.0);
+        e.spawn_axis = -Vec3::Y;
+        e.spawn_rate = 420.0;
+        e.particle_lifetime = 8.5;
+        e.initial_speed = 1.4;
+        e.velocity_jitter = 0.12;
+        e.gravity_scale = 1.0;
+        e.linear_damping = 6.5;
+        e.size_start = 0.045;
+        e.size_end = 0.045;
+        e.color_start = [0.95, 0.96, 1.0, 0.88];
+        e.color_end = [0.95, 0.96, 1.0, 0.82];
+        e.trail_length = 1;
+        e.trail_width = 0.02;
         e
     }
 
@@ -420,6 +499,13 @@ impl ParticleEmitterV2 {
                 ],
                 wind_speed: [wind.x, wind.y, wind.z, self.initial_speed],
                 seed_jitter: [self.velocity_jitter, 0.0, 0.0, 0.0],
+                extent_damp: [
+                    self.spawn_extent.x,
+                    self.spawn_extent.y,
+                    self.spawn_extent.z,
+                    self.linear_damping,
+                ],
+                axis: [self.spawn_axis.x, self.spawn_axis.y, self.spawn_axis.z, 0.0],
                 seed: split_u64(seed).into(),
                 _pad: [0; 2],
             });
@@ -597,11 +683,13 @@ mod tests {
         (Vec3::Y + jitter * v2_unit_sphere(r)).normalize_or_zero()
     }
 
-    /// 半隐式欧拉一步（v1 `advance` 步骤 1 同式 + 风加速度）：先更新
-    /// 速度再积分位置；`gravity_accel` = `PHYSICS_GRAVITY` ×
-    /// gravity_scale（CPU 预乘，与 uniform `lifetime_grav.yzw` 同源），
-    /// `wind` = `wind_sample` 采样向量。**WGSL `main` 积分段的逐式
-    /// 镜像**——同步契约。
+    /// 半隐式欧拉一步（v1 `advance` 步骤 1 同式 + 风加速度 + 线性阻尼
+    /// R92）：先更新速度（阻尼除法由 select 门包裹——`damping = 0` 时
+    /// 走原式**逐位**不变，WGSL `main` 积分段的逐式镜像）再积分位置；
+    /// `gravity_accel` = `PHYSICS_GRAVITY` × gravity_scale（CPU 预乘，
+    /// 与 uniform `lifetime_grav.yzw` 同源），`wind` = `wind_sample`
+    /// 采样向量，`damping` = 线性阻尼系数 k（速度每步 /(1 + k·dt)——
+    /// 指数衰减的精确离散）。**同步契约**。
     fn euler_step(
         pos: Vec3,
         vel: Vec3,
@@ -609,10 +697,55 @@ mod tests {
         dt: f32,
         gravity_accel: Vec3,
         wind: Vec3,
+        damping: f32,
     ) -> (Vec3, Vec3, f32) {
-        let vel = vel + (gravity_accel + wind) * dt;
+        let vel_raw = vel + (gravity_accel + wind) * dt;
+        let vel = if damping > 0.0 {
+            vel_raw / (1.0 + damping * dt)
+        } else {
+            vel_raw
+        };
         let pos = pos + vel * dt;
         (pos, vel, age + dt)
+    }
+
+    /// 体积出生随机字（WGSL `init_particle` 体积段的逐式镜像）：
+    /// r_k = mix64(counter + (seed + k))，k = 1..=3——与首两路
+    ///（counter + seed、~counter + seed ^ 黄金比率）输入互异。
+    fn v2_volume_randoms(counter: u64, seed: u64) -> [(u32, u32); 3] {
+        let mut out = [(0u32, 0u32); 3];
+        for (k, slot) in out.iter_mut().enumerate() {
+            let input = counter.wrapping_add(seed.wrapping_add(k as u64 + 1));
+            *slot = split_u64(mix64_native(input));
+        }
+        out
+    }
+
+    /// 体积出生偏移（WGSL `init_particle` 体积段的逐式镜像）：三分量
+    /// 均匀 [-1, 1)，出生位置 = `select(origin, origin + extent·off,
+    /// extent·off ≠ 0)`——**extent 全零时逐位还原原点**（select 门，
+    /// 与 GPU 同构；`0·x = ±0` 不会污染 origin 的位型）。
+    fn v2_spawn_position(origin: Vec3, extent: Vec3, counter: u64, seed: u64) -> Vec3 {
+        let r = v2_volume_randoms(counter, seed);
+        let f = |w: (u32, u32)| v2_fraction(w) * 2.0 - 1.0;
+        let vol = extent * Vec3::new(f(r[0]), f(r[1]), f(r[2]));
+        Vec3::new(
+            if vol.x != 0.0 {
+                origin.x + vol.x
+            } else {
+                origin.x
+            },
+            if vol.y != 0.0 {
+                origin.y + vol.y
+            } else {
+                origin.y
+            },
+            if vol.z != 0.0 {
+                origin.z + vol.z
+            } else {
+                origin.z
+            },
+        )
     }
 
     /// 拖尾环写指针推进（WGSL `main` 拖尾段的逐式镜像）：`head` 为
@@ -624,6 +757,11 @@ mod tests {
 
     const DT: f32 = 1.0 / 60.0;
     const SEED: u64 = 0xDEAD_BEEF;
+
+    /// Vec3 逐位比较辅助（glam 0.33 本仓特性集无 Vec3::to_bits——逐分量）。
+    fn bits3(v: Vec3) -> [u32; 3] {
+        [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]
+    }
 
     /// 肢对运算与原生 u64 逐位对照（mix64 镜像契约的锚点测试）：
     /// 覆盖 0 / 1 / 最大值 / 大素数 / 黄金比率 / 伪随机批量。
@@ -762,6 +900,7 @@ mod tests {
             DT,
             Vec3::ZERO,
             Vec3::ZERO,
+            0.0,
         );
         assert!((p.x - (1.0 + 4.0 * DT)).abs() < 1e-5);
         assert!((p.z - (3.0 - 2.0 * DT)).abs() < 1e-5);
@@ -775,7 +914,7 @@ mod tests {
         let wind = Vec3::new(2.0, 0.0, 0.0);
         let (mut pos, mut vel, mut age) = (Vec3::ZERO, Vec3::new(0.0, v0, 0.0), 0.0f32);
         for _ in 0..steps {
-            let np = euler_step(pos, vel, age, DT, gravity_accel, wind);
+            let np = euler_step(pos, vel, age, DT, gravity_accel, wind, 0.0);
             pos = np.0;
             vel = np.1;
             age = np.2;
@@ -1061,5 +1200,147 @@ mod tests {
         assert_eq!(e.capacity(), PARTICLES_V2_MAX);
         e.max_particles = 7;
         assert_eq!(e.capacity(), 7);
+    }
+
+    /// 线性阻尼解析对照（R92）：恒加速度 a + 阻尼 k 的半隐式步
+    /// v ← (v + a·dt)/(1 + k·dt) 收敛到终端速度 a/k——雪花慢落的物理
+    /// 量级根据；k = 0 时与无阻尼路径**逐位一致**（select 门镜像）。
+    #[test]
+    fn damping_converges_to_terminal_velocity_and_zero_is_identity() {
+        let g = iris_core::physics::PHYSICS_GRAVITY;
+        // k = 6.5（雪预设）：终端 = g/k ≈ 1.509
+        let k = 6.5f32;
+        let terminal = g.length() / k;
+        let (mut pos, mut vel) = (Vec3::ZERO, Vec3::ZERO);
+        for _ in 0..600 {
+            let np = euler_step(pos, vel, 0.0, DT, g, Vec3::ZERO, k);
+            pos = np.0;
+            vel = np.1;
+        }
+        assert!(
+            (vel.length() - terminal).abs() < 2e-3,
+            "600 步后应收敛到终端速度 {terminal}，实际 {}",
+            vel.length()
+        );
+        assert!(vel.y < 0.0, "重力沿 −Y，下落速度为负 y");
+        // k = 0：与无阻尼参数路径逐位一致（select 门的位级证明）
+        let a = euler_step(pos, vel, 0.0, DT, g, Vec3::new(1.0, 0.0, 0.0), 0.0);
+        let b = euler_step(pos, vel, 0.0, DT, g, Vec3::new(1.0, 0.0, 0.0), -0.0);
+        assert_eq!(bits3(a.0), bits3(b.0));
+        assert_eq!(bits3(a.1), bits3(b.1));
+        // 无阻尼长期对照：k=0 与 v1 同式（重力直线加速解析）
+        let (mut p0, mut v0) = (Vec3::ZERO, Vec3::ZERO);
+        for _ in 0..120 {
+            let np = euler_step(p0, v0, 0.0, DT, g, Vec3::ZERO, 0.0);
+            p0 = np.0;
+            v0 = np.1;
+        }
+        let n = 120.0f32;
+        let expect_y = -0.5 * g.length() * DT * DT * n * (n + 1.0);
+        assert!(
+            (p0.y - expect_y).abs() < 1e-3,
+            "k=0 应保持 v1 解析：{}",
+            p0.y
+        );
+    }
+
+    /// 体积出生（R92）：extent 全零 → 出生位置逐位 = 原点（select 门）；
+    /// 非零体积 → 偏移有界 |Δ| ≤ extent 逐分量；随机字流确定。
+    #[test]
+    fn volume_spawn_gate_and_bounds() {
+        let origin = Vec3::new(-3.7, 2.5, 0.9);
+        // extent = 0：任意计数器下逐位还原
+        for i in 0..32u64 {
+            let p = v2_spawn_position(origin, Vec3::ZERO, i, SEED);
+            assert_eq!(bits3(p), bits3(origin), "零体积必须逐位还原原点");
+        }
+        // 非零体积：偏移逐分量有界 + 确定性
+        let extent = Vec3::new(14.0, 8.0, 14.0);
+        let mut spread = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..256u64 {
+            let p = v2_spawn_position(origin, extent, i, SEED);
+            let d = p - origin;
+            assert!(d.x.abs() <= extent.x && d.y.abs() <= extent.y && d.z.abs() <= extent.z);
+            assert_eq!(
+                bits3(p),
+                bits3(v2_spawn_position(origin, extent, i, SEED)),
+                "同输入逐位一致"
+            );
+            spread.0 = spread.0.max(d.x.abs());
+            spread.1 = spread.1.max(d.y.abs());
+            spread.2 = spread.2.max(d.z.abs());
+        }
+        // 散布接近满幅（哈希流非退化——偏移不应挤在小区间）
+        assert!(
+            spread.0 > extent.x * 0.95,
+            "x 偏移散布应近满幅：{}",
+            spread.0
+        );
+        assert!(
+            spread.1 > extent.y * 0.95,
+            "y 偏移散布应近满幅：{}",
+            spread.1
+        );
+    }
+
+    /// 雨 / 雪预设（R92）：关键字段锚点——轴向 −Y、体积非零、阻尼 > 0、
+    /// 雨 = 拖尾雨丝 / 雪 = billboard；默认发射器保持 v2 原语义
+    ///（零体积 / +Y / 无阻尼——缺席 = 逐位不变）。
+    #[test]
+    fn rain_snow_presets_and_defaults() {
+        let d = ParticleEmitterV2::new(crate::particles::ParticleBlend::Alpha);
+        assert_eq!(d.spawn_extent, Vec3::ZERO, "默认 = 点发射（v2 原语义）");
+        assert_eq!(d.spawn_axis, Vec3::Y, "默认 = +Y 上抛（v2 原语义）");
+        assert_eq!(d.linear_damping, 0.0, "默认 = 无阻尼（v2 原语义）");
+        let r = ParticleEmitterV2::rain();
+        assert_eq!(r.spawn_axis, -Vec3::Y);
+        assert!(r.spawn_extent.x > 0.0 && r.spawn_extent.y > 0.0);
+        assert!(r.linear_damping > 0.0);
+        assert!(r.trail_length >= 2, "雨用拖尾雨丝");
+        assert!(r.spawn_rate > 0.0 && r.initial_speed > 5.0, "雨速量级");
+        let s = ParticleEmitterV2::snow();
+        assert_eq!(s.spawn_axis, -Vec3::Y);
+        assert_eq!(s.trail_length_clamped(), 1, "雪 = 无拖尾 billboard");
+        assert!(s.linear_damping > r.linear_damping, "雪阻尼 > 雨（慢落）");
+        assert!(s.initial_speed < 3.0, "雪初速慢");
+        assert!(
+            s.particle_lifetime > r.particle_lifetime,
+            "雪寿命长（慢落穿体积）"
+        );
+        // 稳态存活不越池：rate × lifetime ≤ 池容量（池满永久停发——预算依据）
+        assert!(
+            (r.spawn_rate * r.particle_lifetime) as usize <= PARTICLES_V2_MAX as usize,
+            "雨稳态存活应 ≤ 池容量"
+        );
+        assert!(
+            (s.spawn_rate * s.particle_lifetime) as usize <= PARTICLES_V2_MAX as usize,
+            "雪稳态存活应 ≤ 池容量"
+        );
+    }
+
+    /// advance 携带新旋钮进 uniform（R92）：extent/axis/damping 字段
+    /// 透传；默认值 = 全零 / +Y / 0（GPU select 门的缺席侧）。
+    #[test]
+    fn advance_carries_volume_axis_damping() {
+        let mut e = ParticleEmitterV2::rain();
+        e.burst_count = 1;
+        e.spawn_rate = 0.0;
+        e.advance(DT, Vec3::new(1.0, 2.0, 3.0), SEED, Vec3::ZERO);
+        let f = &e.take_frames()[0];
+        assert_eq!(f.extent_damp[0], 10.0);
+        assert_eq!(f.extent_damp[1], 6.0);
+        assert_eq!(f.extent_damp[2], 10.0);
+        assert_eq!(f.extent_damp[3], 1.0);
+        assert_eq!(f.axis[0], 0.0);
+        assert_eq!(f.axis[1], -1.0);
+        assert_eq!(f.axis[2], 0.0);
+        // 默认发射器：缺席侧字段
+        let mut d = ParticleEmitterV2::new(crate::particles::ParticleBlend::Alpha);
+        d.burst_count = 1;
+        d.spawn_rate = 0.0;
+        d.advance(DT, Vec3::ZERO, SEED, Vec3::ZERO);
+        let f = &d.take_frames()[0];
+        assert_eq!(f.extent_damp, [0.0; 4]);
+        assert_eq!(f.axis, [0.0, 1.0, 0.0, 0.0]);
     }
 }

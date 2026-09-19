@@ -539,6 +539,22 @@ pub(crate) fn create_pipeline(
                 },
                 count: None,
             },
+            // 天气表面参数（R92，「不扩 Globals 前缀」扩容先例的延续）：
+            // 21 = 16B uniform（x = wetness、y = snow、z = ripple、
+            // w = 涟漪时间 t）。Weather 资源缺席 / 全零 = fs_shaded 天气
+            // 分支整段死码——既有像素逐位不变；**uniform 而非 storage**，
+            // 片元阶段只读 storage 计数维持 4（上限）。skybox.wgsl 的
+            // 并行布局不受影响（其自持前缀不声明 binding 21）。
+            wgpu::BindGroupLayoutEntry {
+                binding: 21,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 

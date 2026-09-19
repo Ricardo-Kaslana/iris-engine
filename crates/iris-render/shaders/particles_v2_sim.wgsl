@@ -21,7 +21,7 @@
 //   读侧 (head − 1 − k) mod trail_length 取第 k 新条目——绝对计数使
 //   trail_length 变更后读取自洽）。
 //
-// 布局影子契约：SimParams ↔ SimParamsRaw（96 B）、SimParticle ↔ 560 B
+// 布局影子契约：SimParams ↔ SimParamsRaw（128 B）、SimParticle ↔ 560 B
 // 步长——改一侧必须同步 Rust 侧（const 断言看门）。
 
 const POOL: u32 = 4096u;
@@ -33,6 +33,8 @@ struct SimParams {
     lifetime_grav: vec4<f32>,  // x = 单粒子寿命（秒），yzw = 重力加速度（PHYSICS_GRAVITY × gravity_scale，CPU 预乘）
     wind_speed: vec4<f32>,     // xyz = wind_sample(发射原点, t)（Wind 缺席 = 零向量），w = 出生速率基线（米/秒）
     seed_jitter: vec4<f32>,    // x = 出生方向抖动幅度，yzw 保留
+    extent_damp: vec4<f32>,    // xyz = 出生体积半边长（R92，全零 = 点发射 = 逐位不变），w = 线性阻尼 k（0 = 无 = 逐位不变）
+    axis: vec4<f32>,           // xyz = 发射轴向（R92，默认 +Y = 逐位不变），w 保留
     seed: vec2<u32>,           // 发射器种子（实体 to_bits 低/高 32 位）
     _pad: vec2<u32>,
 };
@@ -112,11 +114,15 @@ fn normalize_or_zero(v: vec3<f32>) -> vec3<f32> {
     return select(vec3<f32>(0.0), v / l, l > 0.0);
 }
 
-// 出生状态（v1 spawn_batch 逐式镜像）：方向 = normalize(+Y + jitter·u)，
+// 出生状态（v1 spawn_batch 逐式镜像）：方向 = normalize(axis + jitter·u)，
 // u 球面均匀（z 均匀 [-1,1)、θ 均匀 [0, 2π)——TAU 取 f32 最近值
 // 6.2831855，与 std::f32::consts::TAU 一致）；速度 = dir × initial_speed；
 // age = 0。哈希输入 = 绝对池索引（死粒子不回收 ⇒ 每索引至多出生一次，
 // 输入恒定——会话内确定性与「池满与否」解耦）。
+// R92 体积出生：r2/r3/r4 = mix64(counter + (seed + k))，k = 1..=3——
+// 三分量均匀 [-1, 1) 偏移 × extent；**extent 全零时 select 门逐位还原
+// 原点**（`0·x = ±0` 的符号歧义被 select 吸收——缺席 = 逐位不变）；
+// 轴向 uniform 化（axis = +Y 时与常量路径同值同算术）。
 fn init_particle(i: u32) -> SimParticle {
     let counter = vec2<u32>(i, 0u);
     let r0 = mix64_limb(limb_add(counter, params.seed));
@@ -126,10 +132,19 @@ fn init_particle(i: u32) -> SimParticle {
     let theta = 6.2831855 * v2_fraction(r1);
     let s = sqrt(max(0.0, 1.0 - z * z));
     let u = vec3<f32>(s * cos(theta), z, s * sin(theta));
+    // 体积出生随机字（R92）：三分量偏移——与首两路输入互异
+    let r2 = mix64_limb(limb_add(counter, limb_add(params.seed, vec2<u32>(1u, 0u))));
+    let r3 = mix64_limb(limb_add(counter, limb_add(params.seed, vec2<u32>(2u, 0u))));
+    let r4 = mix64_limb(limb_add(counter, limb_add(params.seed, vec2<u32>(3u, 0u))));
+    let off = vec3<f32>(v2_fraction(r2) * 2.0 - 1.0,
+                        v2_fraction(r3) * 2.0 - 1.0,
+                        v2_fraction(r4) * 2.0 - 1.0);
+    let vol = params.extent_damp.xyz * off;
+    let pos = select(params.origin_dt.xyz, params.origin_dt.xyz + vol, vol != vec3<f32>(0.0));
     var p: SimParticle;
-    p.pos = vec4<f32>(params.origin_dt.xyz, 0.0);
-    p.vel_age = vec4<f32>(normalize_or_zero(vec3<f32>(0.0, 1.0, 0.0)
-        + params.seed_jitter.x * u) * params.wind_speed.w, 0.0);
+    p.pos = vec4<f32>(pos, 0.0);
+    p.vel_age = vec4<f32>(normalize_or_zero(params.axis.xyz + params.seed_jitter.x * u)
+        * params.wind_speed.w, 0.0);
     p.flags = vec4<u32>(1u, 0u, 0u, 0u);
     p.history = array<vec4<f32>, TRAIL_MAX>();
     return p;
@@ -154,7 +169,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // + 风加速度（wind_sample 单点采样，与重力合并）。
         // WGSL 不支持 swizzle 赋值——整向量重组。
         let accel = params.lifetime_grav.yzw + params.wind_speed.xyz;
-        let vel = p.vel_age.xyz + accel * dt;
+        let vel_raw = p.vel_age.xyz + accel * dt;
+        // 线性阻尼（R92）：k > 0 时速度 /(1 + k·dt)（指数衰减的精确
+        // 离散，无爆炸风险）；k = 0 走 select 另一侧 = 原式**逐位**不变
+        //（阻尼除法不进入既有算术的收缩 / 重结合决策——R63 教训的
+        // select 门形态）。
+        let vel = select(vel_raw, vel_raw / (1.0 + params.extent_damp.w * dt),
+            params.extent_damp.w > 0.0);
         let pos = p.pos.xyz + vel * dt;
         let age = p.vel_age.w + dt;
         p.vel_age = vec4<f32>(vel, age);

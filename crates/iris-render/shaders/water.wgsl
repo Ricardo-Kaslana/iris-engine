@@ -7,7 +7,8 @@
 // 之前读深度的 SSR / GTAO）+ 太阳镜面高光。
 //
 // 独立组 0 布局（不扩 globals 组——R61/R77/R78 先例）：0 = WaterParams
-// uniform（240B）、1 = 反射 RT（Rgba16Float 可过滤）、2 = 折射 RT、
+// uniform（256B，R92 扩容 240 → 256 增加天气通道）、1 = 反射 RT
+// （Rgba16Float 可过滤）、2 = 折射 RT、
 // 3 = scene_depth（R32Float 非过滤 textureLoad）、4 = 过滤采样器
 // （ClampToEdge——波纹扰动把投影 uv 推出界时钳边）。
 //
@@ -33,6 +34,9 @@ struct WaterParams {
     wave_b: vec4<f32>,          // x 半边长 X, y 半边长 Z, z 波形时间 t, w 吸收特征深度
     shallow: vec4<f32>,         // rgb 浅水色，w 保留
     deep: vec4<f32>,            // rgb 深水色，w 保留
+    weather: vec4<f32>,         // x = 涟漪强度（R92，Weather.ripple——雨打
+                                // 水面法线扰动；0 = 分支不执行，逐位不变），
+                                // yzw 保留
 };
 
 @group(0) @binding(0) var<uniform> params: WaterParams;
@@ -129,9 +133,62 @@ fn water_evaluate(
     return vec3<f32>(p.x + disp.x, disp.y, p.y + disp.z);
 }
 
+// ---- 天气涟漪（R92）：weather.rs::ripple_gradient 的 WGSL 镜像 ----
+// （standard.wgsl 持有同式另一份拷贝——WGSL 无 include 的双份镜像纪律；
+// 水面侧的时间源 = wave_b.z，与波形同一时钟——雨打水面与湿地表涟漪
+// 同相。整数格哈希跨平台精确；sin/cos 两侧库实现不同，CPU↔GPU 不做
+// 位级等价声明，公式锚点在 weather.rs 单测。）
+
+fn weather_hash(a: u32, b: u32) -> vec2<u32> {
+    var h = a * 0x9E3779B1u + b * 0x85EBCA77u;
+    h = h ^ (h >> 13u);
+    h = h * 0xC2B2AE3Du;
+    h = h ^ (h >> 16u);
+    let g = h * 0x27D4EB2Fu + 0x5BD1E995u;
+    return vec2<u32>(h, g);
+}
+
+fn weather_fraction(z: u32) -> f32 {
+    return f32(z >> 8u) * (1.0 / 16777216.0);
+}
+
+fn weather_ripple_gradient(p: vec2<f32>, t: f32) -> vec2<f32> {
+    let cell = floor(p / 0.4);
+    var grad = vec2<f32>(0.0);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            // 格坐标取整走 i32（f32→i32 范围内截断良定义，i32→u32 位
+            // 重解释）——负格坐标与 Rust 侧 as i32 + as u32 逐位一致。
+            let cx = i32(cell.x) + dx;
+            let cz = i32(cell.y) + dz;
+            let h = weather_hash(u32(cx), u32(cz));
+            let fx = weather_fraction(h.x);
+            let fy = weather_fraction(h.x ^ h.y);
+            let fp = weather_fraction(h.y);
+            let center = (cell + vec2<f32>(f32(dx), f32(dz))
+                + vec2<f32>(0.15 + 0.7 * fx, 0.15 + 0.7 * fy)) * 0.4;
+            let t0 = fp * 1.3;
+            var age = t - t0;
+            age = age - 1.3 * floor(age / 1.3);
+            if (age < 0.6) {
+                let d = p - center;
+                let r = length(d);
+                if (r > 1e-5) {
+                    let u = (r - 0.85 * age) / 0.09 + 1.0;
+                    if (u > 0.0 && u < 2.0) {
+                        let decay = 1.0 - age / 0.6;
+                        let dhdu = 0.01 * decay * 3.14159265 * cos(3.14159265 * u);
+                        grad = grad + (dhdu / 0.09) * (d / r);
+                    }
+                }
+            }
+        }
+    }
+    return grad;
+}
+
 @vertex
-fn vs_main(in: WaterVertexInput) -> WaterVertexOutput {
-    // 归一化格点 [−1,1]² → 世界 XZ（half_extent 展开——同一份静态网格
+fn vs_main(in: WaterVertexInput) -> WaterVertexOutput {    // 归一化格点 [−1,1]² → 世界 XZ（half_extent 展开——同一份静态网格
     // 服务任意尺寸的水面）
     let planar = in.pos_xz * vec2<f32>(params.wave_b.x, params.wave_b.y);
     var normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -157,7 +214,14 @@ fn fs_main(in: WaterVertexOutput) -> @location(0) vec4<f32> {
     // 行序一致——NDC y=+1 写进第 0 行，与雾 / 天空的采样约定相同）
     let ndc = in.clip.xy / in.clip.w;
     let screen_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    let n = normalize(in.normal);
+    var n = normalize(in.normal);
+    // 雨打水面涟漪（R92）：强度 > 0 时梯度扰动法线（Fresnel / 反射
+    // 扰动 / 太阳镜面全吃到——spec 闪点是主要观感）；时间源与波形同钟
+    //（wave_b.z）。0 = 分支不执行，逐位不变。
+    if (params.weather.x > 0.0) {
+        let g = weather_ripple_gradient(in.world_pos.xz, params.wave_b.z) * params.weather.x;
+        n = normalize(n + vec3<f32>(g.x, 0.0, g.y));
+    }
     let v = normalize(params.eye.xyz - in.world_pos);
 
     // Fresnel（Schlick，F0 = 0.02 水的物理值——垂直入射 ≈ 2% 反射，

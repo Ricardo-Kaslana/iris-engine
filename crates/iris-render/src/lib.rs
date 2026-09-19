@@ -143,6 +143,7 @@ pub mod texture_ktx2;
 pub mod ui;
 pub mod visibility;
 pub mod water;
+pub mod weather;
 
 pub mod prelude {
     pub use crate::animation::{
@@ -315,6 +316,12 @@ pub mod prelude {
         WATER_F0, WATER_GRID_SUBDIVISIONS, WATER_WAVE_COUNT, WAVE_AMPLITUDE_DECAY,
         WAVE_AMPLITUDE_SUM, WAVE_DIRECTIONS, WAVE_LENGTH_DECAY, WaterSurface, WaterVertex,
         gerstner_evaluate, gerstner_single_wave, select_water_surface, water_grid_mesh,
+    };
+    pub use crate::weather::{
+        RIPPLE_AMPLITUDE, RIPPLE_CELL, RIPPLE_LIFE, RIPPLE_PERIOD, RIPPLE_SPEED, RIPPLE_WIDTH,
+        SNOW_ALBEDO, SNOW_ROUGHNESS, SNOW_SLOPE_END, SNOW_SLOPE_START, WET_ALBEDO_DARKEN,
+        WET_ROUGHNESS_FLOOR, Weather, ripple_gradient, snow_mask, snow_surface, weather_cell_hash,
+        wet_surface,
     };
 }
 

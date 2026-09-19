@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1715 / release 1712**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；每轮收官顺手更新本行数字）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1733 / release 1730**（……前史：C4a~C7b 累计至 1685/1682，闭合战役 C0~C7 全部完成；R90 毛发 v1 +22：iris-render CPU 17（groom 确定性双跑逐位/数量公式/几何解析锚（y 单调·宽度线性·根部贴头皮）/关节共享/切线归一域；kajiya_kay 镜像 5（sin 垂直峰平行零/移位峰值角差 ≈4·shift/exponent 半宽单调/移位切线三锚/WGSL 源码看门）；fur 3（层比公式/展开保真/缺省量级）；material 2（Mask 缺省与 builder clamp/KK 缺省与 builder）；pipeline 看门 1（fur_aux 四方影子契约——中文注释的字节游标陷阱：+1 游标切进多字节字符，用全局 find 位置单调断言规避）+ GPU `fur_render.rs` 5（GPU_SERIAL 串行：缺席逐位+双会话/发带可见性（高密度帘覆盖中心）/壳层毛高单调+**毛高 0 零点锚**（与不挂壳层整帧逐位）/Mask 三档阈值（纯垫板参考渲染法——垫板 IBL 镜面残余 ≈37/通道是非零解析底值）/复合场景双会话逐位）；全部 opt-in「缺席 = 逐位不变」，shadow_v2/sss/normal/transparent 既有像素锁零改动原值通过（KK 走独立贡献函数 + uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现）；**排障教训：`MeshStore::add` 从 0 起（与 MaterialStore 的 0 号预留不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）；R92 降水 +18：iris-render CPU 12（weather 8：湿/雪端点逐位（重心式——mix 非规范保证且线性插值式 a=1 实测 2 ULP 残差）/坡度门单调/格哈希散布/涟漪有界确定间歇/geometry 覆盖/源码看门；particles_v2 4：阻尼终端速度 g/k 解析收敛+零阻尼逐位恒等/体积门逐位还原原点+散布满幅/雨雪预设字段与稳态预算 ≤ 池容量/advance 携带三旋钮）+ GPU `weather_render.rs` 6（GPU_SERIAL：缺席与全零资源逐位同构/湿 0-0.5-1 单调暗化（俯视机位——掠射 Fresnel 天空镜面会抵消变暗）/积雪墙地增量比 ~7%/雨渲染+移动+双会话逐位/雪渲染+双会话逐位/涟漪 wave_speed=0 隔离判别）；**排障教训：降水可见性的三重光度学下限**（256px 视口 + alpha 软边 + 色调映射——诊断链：draw call 与三角数照常但零像素 ⇒ 逐旋钮二分（fountain+微体积 6373 px 定位到大体积覆盖率）⇒ 加法混合 1724 vs alpha 145 定位到暗剪影对比度 ⇒ 深色化预设 + 测试放大丝宽至 0.45）；每轮收官顺手更新本行数字）。
 
 ### 门禁耗时陷阱（实测教训）
 
@@ -195,9 +195,18 @@ CARGO_HTTP_CHECK_REVOKE=false 前缀；RUSTC_WRAPPER="" 只加 wasm clippy；
     采样；世界空间模拟局部写回）× alpha 感知毛发阴影（光空间展宽/
     层比膨胀 + fs_fur 同一判定语义——**§8.69③ 闭合**）× 交叉卡片
     LOD（同一随机字契约+滞回 20%）；全部 opt-in 缺席 = R90 逐位
-    不变；诚实限制 §8.70）——**第三梯队毛发线 2/2 就此收官**，
-    剩 R92 降水、R93 海洋 v2+水下（CPU 位移图
-    折衷，裁定接受）
+    不变；诚实限制 §8.70）、R92 降水 ✅（雨雪发射器（v2 扩展三旋钮：
+    体积出生/任意轴向/线性阻尼，终端速度 = g/k 物理 量级；rain()/snow()
+    预设挂相机实体即得跟随体积；sim 三 select 门 = R82 逐位不变）×
+    湿表面（粗糙度 0.08 + 反照率 (1−metallic)×0.7，**重心形式**混合
+    ——mix 实现形式非规范且线性插值式 a=1 实测 2 ULP 残差）× 程序化
+    涟漪（XZ 哈希网格环形波无状态纯函数，湿地表 + 雨打水面两处同钟
+    消费，WGSL 双份镜像）× 积雪坡度遮罩（几何法线 y smoothstep 门，
+    墙地增量比 ~7% GPU 可判）；binding 21 uniform（不扩 Globals 先例，
+    主相机/捕获/RT 共享一只缓冲——天气是世界状态）；设计四点裁定
+    全按推荐；缺席/全零 = 逐位不变（七套像素锁原值通过）；诚实限制
+    §8.71）、R93 海洋 v2+水下（CPU 位移图
+    折衷，裁定接受）——第三梯队仅剩 R93 一轮
   - 闭合轮池（按需穿插）：约束 v2 / OBB+凸包 / 形变目标 / 状态机 v2+运行时重定向 /
     OIT / 贴花 v2 / LOD v2 / 音频 v3 空间化 / 动画压缩 / BC7+KTX2 / 热重载局部 /
     CCD / RVO 群体

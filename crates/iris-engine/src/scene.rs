@@ -945,6 +945,12 @@ pub struct ParticleV2Section {
     pub max_particles: u64,
     pub trail_length: u32,
     pub trail_width: f32,
+    /// 体积出生半边长（R92；缺省 [0,0,0] = 点发射 = 旧档不变）。
+    pub spawn_extent: [f32; 3],
+    /// 发射轴向（R92；缺省 +Y = 旧档不变）。
+    pub spawn_axis: [f32; 3],
+    /// 线性阻尼 k（R92；缺省 0 = 无阻尼 = 旧档不变）。
+    pub linear_damping: f32,
 }
 
 impl Default for ParticleV2Section {
@@ -980,6 +986,9 @@ impl ParticleV2Section {
         emitter.max_particles = max_particles;
         emitter.trail_length = self.trail_length;
         emitter.trail_width = self.trail_width;
+        emitter.spawn_extent = Vec3::from(self.spawn_extent);
+        emitter.spawn_axis = Vec3::from(self.spawn_axis);
+        emitter.linear_damping = self.linear_damping;
         Ok(emitter)
     }
 
@@ -1003,6 +1012,9 @@ impl ParticleV2Section {
             max_particles: emitter.max_particles as u64,
             trail_length: emitter.trail_length,
             trail_width: emitter.trail_width,
+            spawn_extent: emitter.spawn_extent.to_array(),
+            spawn_axis: emitter.spawn_axis.to_array(),
+            linear_damping: emitter.linear_damping,
         }
     }
 }
@@ -3756,7 +3768,10 @@ mod tests {
                                         "color_start": [1.2, 0.9, 0.45, 0.85],
                                         "color_end": [0.4, 0.5, 0.8, 0.0],
                                         "max_particles": 2048,
-                                        "trail_length": 12, "trail_width": 0.08 } },
+                                        "trail_length": 12, "trail_width": 0.08,
+                                        "spawn_extent": [10.0, 6.0, 10.0],
+                                        "spawn_axis": [0.0, -1.0, 0.0],
+                                        "linear_damping": 6.5 } },
                     { "name": "puff", "particles_v2": { "burst_count": 64 } }
                 ]
             }"#,
@@ -3775,12 +3790,20 @@ mod tests {
         assert_eq!(jet.max_particles, 2048);
         assert_eq!(jet.trail_length, 12, "拖尾字段进组件");
         assert_eq!(jet.trail_width.to_bits(), 0.08f32.to_bits());
+        // R92 降水旋钮：体积 / 轴向 / 阻尼进组件（雨雪发射器入档）
+        assert_eq!(jet.spawn_extent, Vec3::new(10.0, 6.0, 10.0));
+        assert_eq!(jet.spawn_axis, -Vec3::Y);
+        assert_eq!(jet.linear_damping.to_bits(), 6.5f32.to_bits());
         assert_eq!(jet.spawn_cursor(), 0, "加载即新鲜状态（无运行期残留）");
         assert_eq!(jet.alive_estimate(), 0);
 
         // 缺省字段 = new(Alpha)：只写 burst 一段，其余照默认（含拖尾 8 / 0.06）
         let puff = world.get::<ParticleEmitterV2>(entities[1]).unwrap();
         assert_eq!(puff.blend, ParticleBlend::Alpha);
+        // R92 旋钮缺省 = 点发射 / +Y / 无阻尼（旧档零语义变化）
+        assert_eq!(puff.spawn_extent, Vec3::ZERO);
+        assert_eq!(puff.spawn_axis, Vec3::Y);
+        assert_eq!(puff.linear_damping, 0.0);
         assert_eq!(puff.burst_count, 64);
         assert_eq!(puff.spawn_rate.to_bits(), 60.0f32.to_bits(), "缺省发射率");
         assert_eq!(puff.trail_length, 8, "缺省拖尾点数");

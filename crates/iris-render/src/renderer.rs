@@ -514,6 +514,10 @@ pub struct Renderer {
     /// 级联阴影参数（CsmParamsRaw）缓冲（globals 组 binding 8 的资源，
     /// 绑定组由 build_globals_bind_group 一并写入）。
     csm_params_buf: wgpu::Buffer,
+    /// 天气表面 uniform（R92，globals 组 binding 21）：Weather 资源 +
+    /// 涟漪时间 t，每帧 draw 首部覆写一次；主相机 / 捕获 / RT 共享
+    ///（天气是世界状态）。资源缺席 = 全零 = 天气分支死码。
+    weather_buf: wgpu::Buffer,
     /// 阴影 pass 的每级联 64B 矩阵缓冲与绑定组（一级联一份，一缓冲一级联）。
     cascade_bufs: [wgpu::Buffer; SHADOW_CASCADES],
     cascade_bgs: [wgpu::BindGroup; SHADOW_CASCADES],
@@ -1460,11 +1464,14 @@ struct WaterParamsRaw {
     shallow: [f32; 4],
     /// rgb: 深水色（线性 HDR），w: 保留。
     deep: [f32; 4],
+    /// x = 涟漪强度（R92，Weather.ripple 钳制值——雨打水面法线扰动，
+    /// 时间源与波形同用 wave_b.z；0 = 水体涟漪分支不执行），yzw 保留。
+    weather: [f32; 4],
 }
 
 const _: () = assert!(
-    std::mem::size_of::<WaterParamsRaw>() == 240,
-    "WaterParams 必须与 WGSL 布局一致（240B：2×mat4 + 7×vec4）"
+    std::mem::size_of::<WaterParamsRaw>() == 256,
+    "WaterParams 必须与 WGSL 布局一致（256B：2×mat4 + 9×vec4，R92 扩容 +天气通道）"
 );
 
 /// 平面水体（R81）的 GPU 侧资源：反射 / 折射两张**半分辨率**捕获图
@@ -2034,6 +2041,10 @@ struct ShadowMapViews<'a> {
 struct GlobalsBuffers<'a> {
     globals: &'a wgpu::Buffer,
     csm_params: &'a wgpu::Buffer,
+    /// 天气 uniform（binding 21，R92）：主相机 / 捕获 / RT **共享同一只
+    /// 缓冲**（天气是世界状态不是屏幕空间状态——反射捕获里的湿地也
+    /// 该湿；每帧 draw 首部覆写一次，全 pass 同值）。
+    weather: &'a wgpu::Buffer,
 }
 
 /// 全局绑定组里的屏幕空间效果资源（R62b 立组，R77 携带 AO 一路，R78
@@ -2188,6 +2199,13 @@ fn build_globals_bind_group(
             wgpu::BindGroupEntry {
                 binding: 20,
                 resource: probe.gi_depth.as_entire_binding(),
+            },
+            // 天气表面（R92）：全局共享 uniform（主相机 / 捕获 / RT 同源
+            // ——天气是世界状态；每帧 draw 首部覆写，Weather 缺席 = 全零
+            // ⇒ fs_shaded 天气分支死码，逐位不变）
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: buffers.weather.as_entire_binding(),
             },
         ],
     })
@@ -3416,6 +3434,14 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // 天气表面 uniform（R92，binding 21）：16B，每帧 draw 首部覆写
+        //（Weather 资源缺席 = 全零——天气分支死码，缺席语义）
+        let weather_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.weather.params"),
+            size: std::mem::size_of::<crate::weather::WeatherRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let cascade_bufs: [wgpu::Buffer; SHADOW_CASCADES] = std::array::from_fn(|_| {
             gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("iris.csm.cascade_params"),
@@ -3867,6 +3893,7 @@ impl Renderer {
                 GlobalsBuffers {
                     globals: &probe_face_globals_bufs[face],
                     csm_params: &csm_params_buf,
+                    weather: &weather_buf,
                 },
                 ShadowMapViews {
                     cascades: &shadow_map_view,
@@ -4188,6 +4215,7 @@ impl Renderer {
             GlobalsBuffers {
                 globals: &globals_buf,
                 csm_params: &csm_params_buf,
+                weather: &weather_buf,
             },
             ShadowMapViews {
                 cascades: &shadow_map_view,
@@ -4251,6 +4279,7 @@ impl Renderer {
             globals_buf,
             globals_bg,
             csm_params_buf,
+            weather_buf,
             cascade_bufs,
             cascade_bgs,
             instance_buf: None,
@@ -4428,6 +4457,7 @@ impl Renderer {
             GlobalsBuffers {
                 globals: &self.globals_buf,
                 csm_params: &self.csm_params_buf,
+                weather: &self.weather_buf,
             },
             ShadowMapViews {
                 cascades: &self.shadow_map_view,
@@ -5860,6 +5890,7 @@ impl Renderer {
                 GlobalsBuffers {
                     globals: &globals_buf,
                     csm_params: &self.csm_params_buf,
+                    weather: &self.weather_buf,
                 },
                 ShadowMapViews {
                     cascades: &self.shadow_map_view,
@@ -6244,6 +6275,26 @@ impl Renderer {
         self.mip_anisotropy = world
             .try_resource::<crate::texture::MipSettings>()
             .map(|m| m.anisotropy);
+        // 天气表面（R92）：每帧首部覆写一次（主相机 / 捕获 / RT 共享——
+        // 天气是世界状态；涟漪时间与水体波形同源 = Time.elapsed_secs，
+        // 缺席 = 0）。资源缺席 = 全零 uniform = fs_shaded 天气分支死码。
+        {
+            let (wetness, snow, ripple) = world
+                .try_resource::<crate::weather::Weather>()
+                .map(|w| w.clamped())
+                .unwrap_or((0.0, 0.0, 0.0));
+            let t = world
+                .try_resource::<iris_core::time::Time>()
+                .map(|tm| tm.elapsed_secs())
+                .unwrap_or(0.0);
+            self.gpu.queue.write_buffer(
+                &self.weather_buf,
+                0,
+                bytemuck::bytes_of(&crate::weather::WeatherRaw {
+                    params: [wetness, snow, ripple, t],
+                }),
+            );
+        }
         self.ensure_environment(world);
         self.ensure_hdr_targets(width, height);
         // 遮挡查询（R53）：帧号自增后先消费上一帧读回（非阻塞 poll +
@@ -8975,6 +9026,15 @@ impl Renderer {
                         0.0,
                     ],
                     deep: [ws.deep_color.x, ws.deep_color.y, ws.deep_color.z, 0.0],
+                    weather: [
+                        world
+                            .try_resource::<crate::weather::Weather>()
+                            .map(|w| w.clamped().2)
+                            .unwrap_or(0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
                 }),
             );
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -10784,6 +10844,7 @@ impl Renderer {
             GlobalsBuffers {
                 globals: &globals_buf,
                 csm_params: &self.csm_params_buf,
+                weather: &self.weather_buf,
             },
             ShadowMapViews {
                 cascades: &self.shadow_map_view,
