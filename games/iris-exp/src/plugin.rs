@@ -65,7 +65,7 @@ pub const PITCH_MAX: f32 = 85.0_f32.to_radians();
 /// 轨道距离下限（m）：贴近面部特写。下限取相机近裁剪面（`z_near=0.1`）
 /// 之上留裕量——再近角色表面会被近裁剪面切穿。
 pub const DIST_MIN: f32 = 0.3;
-/// 轨道距离上限（m）：拉远看全景（地面 24 m 尺度之上再留余量）。
+/// 轨道距离上限（m）：拉远看全景（视觉地面 240 m 尺度之上再留余量）。
 pub const DIST_MAX: f32 = 60.0;
 /// 角色移动速度（m/s）。**步幅匹配值**：Walk 剪辑 58 键 @60fps =
 /// 0.967 s/循环，常速步行步幅 ≈1.8 m → 1.8 m/s 起步脚不打滑。
@@ -76,8 +76,18 @@ pub const DIST_MAX: f32 = 60.0;
 pub const MOVE_SPEED: f32 = 1.8;
 /// 朝向转身速率（1/s；帧率无关指数趋近，见 [`exp_approach`]）。
 pub const TURN_RATE: f32 = 12.0;
-/// 角色活动范围半宽（m）：地面 24×24，留 1 m 边防止走出地面悬空。
+/// 角色活动范围半宽（m）：**玩法边界**（与视觉地面尺寸解耦），在边界
+/// 内任意位置身后都有 ≥100 m 的真实地面。
 pub const GROUND_HALF: f32 = 11.0;
+/// 视觉地面半宽（m）：24→240 的原因——24 m 地面的远缘只离角色 12 m，
+/// 天空盒「地平线以下淡出」的白蓝渐变（程序化天空在地平线处最亮、
+/// 下方缓变）从远缘一直铺到真实地平线，把 12–19 m 的**中距离**染成
+/// 一条 20% 画高的白纱（逐像素实测：远缘以上 (207,211,217)，是读作
+/// 雾的天空渐变，不是地面上的雾——地面远缘本身是硬边）。扩到 ±120 m
+/// 后真实地面填满地平线以下区域，默认机位下地-天边缘升到距眼角
+/// ≈1.3°（拉远到 DIST_MAX 也在画外），白纱压缩成一条细线。只改视觉
+/// 网格，玩法钳制（[`GROUND_HALF`]）不变。
+pub const GROUND_VISUAL_HALF: f32 = 120.0;
 
 /// 轨道相机状态（游戏层资源）：yaw = 环绕方位角（0 = 相机在 +Z 侧）、
 /// pitch = 俯角（0 = 水平，正值 = 相机升高俯视）、dist = 轨道距离、
@@ -286,6 +296,8 @@ fn setup_resources(world: &mut World) {
 /// 状态口径一致（拖拽不跳变）。
 fn build_scene(world: &mut World) {
     // ---- 地面：大扁立方体（哑光灰，衬托角色）----
+    // 视觉半宽 GROUND_VISUAL_HALF（中距离白纱修复，见常量文档）；玩法
+    // 活动范围仍由 GROUND_HALF 钳制，两者解耦。
     let ground_mesh = world.resource_mut::<MeshStore>().add(MeshData::cube());
     let ground_mat = world
         .resource_mut::<MaterialStore>()
@@ -294,7 +306,7 @@ fn build_scene(world: &mut World) {
         Name("exp/ground".to_string()),
         Transform {
             position: Vec3::new(0.0, -0.05, 0.0),
-            scale: Vec3::new(24.0, 0.1, 24.0),
+            scale: Vec3::new(GROUND_VISUAL_HALF * 2.0, 0.1, GROUND_VISUAL_HALF * 2.0),
             ..Transform::IDENTITY
         },
         ground_mesh,
