@@ -32,6 +32,7 @@ pub mod physics;
 pub mod query;
 pub mod ragdoll;
 pub mod resource;
+pub mod rvo;
 pub mod schedule;
 pub(crate) mod sync;
 pub mod time;
@@ -86,6 +87,10 @@ pub mod prelude {
         spawn_ragdoll_kinematic,
     };
     pub use crate::resource::Resource;
+    // RVO 群体模拟（R95）：ORCA 互避纯函数库（消费方收集→求解→写回）
+    pub use crate::rvo::{
+        LP3_PARALLEL_EPSILON, RVO_EPSILON, RvoAgent, RvoObstacle, RvoParams, rvo_step,
+    };
     pub use crate::schedule::{
         Access, MIN_SHARD_ITEMS, ParallelSystem, Schedule, Stage, System, shard_count_for,
         shard_range,

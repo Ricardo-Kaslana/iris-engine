@@ -11,7 +11,7 @@ crate 布局（依赖自上而下）：
 | crate | 职责 |
 |---|---|
 | `iris-macros` | Component/Resource derive |
-| `iris-core` | ECS / 调度 / 层级 / 时间 / 物理（旋转胶囊/约束/接触事件）/ 角色 / NavGrid 导航 / ragdoll / 事件 / **行为树 + 黑板 + 感知（R65）**（零渲染依赖） |
+| `iris-core` | ECS / 调度 / 层级 / 时间 / 物理（旋转胶囊/约束/接触事件）/ 角色 / NavGrid 导航 / ragdoll / 事件 / **行为树 + 黑板 + 感知（R65）** / **RVO 群体互避（R95）**（零渲染依赖） |
 | `iris-platform` | winit 窗口 + 输入 |
 | `iris-audio` | 混音纯函数核心 + cpal 设备薄壳（wasm 无设备自动降级）+ OGG/Vorbis 流式（symphonia）+ 音乐总线 + 混响区 |
 | `iris-render` | wgpu 渲染：PBR + 法线/ORM、CSM + 点光预算化阴影、TAA、烘焙 GI（光照贴图）、反射探针 + SSR、heightmap 地形、粒子、贴花、后处理链（DOF/MB/泛光/FXAA）、动画 v4、GLB、RTT、遮挡剔除 |
@@ -38,7 +38,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1792 / release 1789**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1810 / release 1807**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
 
 ### 门禁执行铁律（实测案例全文见 PLAYBOOK §1/§2）
 
