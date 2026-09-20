@@ -984,6 +984,9 @@ struct HdrTargets {
     motion_blur_params: wgpu::Buffer,
     /// 体积雾参数缓冲（R79，FogParamsRaw 布局；pass 关闭时不写）。
     fog_params: wgpu::Buffer,
+    /// 水下参数缓冲（R94，UnderwaterParamsRaw 布局；资源缺席或相机在水上
+    /// 时整段不写、不编码 pass）。
+    uw_params: wgpu::Buffer,
     /// blit 合成参数（16B，PostParamsRaw：x 泛光强度 / y 曝光 / z 暗角 /
     /// w 保留）。每帧整体覆写。
     post_params: wgpu::Buffer,
@@ -4909,6 +4912,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // 水下参数（R94）：176B（矩阵 + 相机/太阳 + 四组 vec4）
+        let uw_params = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("iris.underwater.params"),
+            size: std::mem::size_of::<crate::underwater::UnderwaterParamsRaw>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let post_sampler = self
             .gpu
             .device
@@ -4937,6 +4947,7 @@ impl Renderer {
             dof_params,
             motion_blur_params,
             fog_params,
+            uw_params,
             post_params,
             fxaa: None,
             taa: None,
@@ -6851,6 +6862,19 @@ impl Renderer {
         let surface_height = ocean_selected
             .map(|o| o.height)
             .or_else(|| water_selected.map(|w| w.height));
+        // 水下（R94）：资源在场**且**相机眼点低于选中水面 ⇒ 链上插一级全屏
+        // pass。两条件缺一 ⇒ `uw_on = false` ⇒ 链拓扑与命令流与 R93 逐字段
+        // 相同（零开销默认路径）。全分辨率槽与 scene_depth 在这里按需补
+        // （两处 ensure 均幂等，与水体 / OIT 同款分配位置纪律）。
+        let underwater = world
+            .try_resource::<crate::underwater::UnderwaterFog>()
+            .map(|u| u.clamped());
+        let uw_on = underwater.is_some()
+            && surface_height.is_some_and(|h| crate::underwater::submerged(eye.y, h));
+        if uw_on {
+            self.ensure_full_targets(width, height);
+            self.ensure_scene_depth(width, height);
+        }
         let (water_refl_view, water_refl_vp, water_refl_eye) = match surface_height {
             Some(height) => {
                 let mirror = Mat4::from_cols_array_2d(&[
@@ -9542,10 +9566,16 @@ impl Renderer {
         // 主解析缓冲——R59 拓扑原样）。雾开启时相机级链 A→B→A 轮转（
         // full_chain_slots_with_fog 单点定义），雾关时与旧函数逐字段
         // 相同（命令流与 R78 逐位一致）。
-        let chain_slots =
-            crate::post::full_chain_slots_with_fog(dof_on, mb_on, vignette_strength > 0.0, fog_on);
+        let chain_slots = crate::post::full_chain_slots_with_water_column(
+            dof_on,
+            mb_on,
+            vignette_strength > 0.0,
+            fog_on,
+            uw_on,
+        );
         let slots = chain_slots.slots;
         let fog_dst = chain_slots.fog_dst;
+        let uw_dst = chain_slots.uw_dst;
         let scene_or_taa =
             |slot: Option<crate::post::PingPongSlot>| crate::post::chain_source(slot, taa_on);
         // 链头（泛光与暗角的源）：雾/DOF/MB 输出槽、TAA 输出或主解析缓冲
@@ -9613,6 +9643,65 @@ impl Renderer {
                 },
             );
         }
+        // 水下（R94，雾之后 / DOF 之前）：吸收 + 太阳内散射 + Snell 窗补光 +
+        // 焦散 + 屏幕空间抖动。组布局复用 post_depth_layout（与雾 / DOF / MB
+        // 同构），源 = 雾输出（雾开）或链源，目标 = 水下专属全分辨率槽
+        // （拓扑由 post::full_chain_slots_with_water_column 单点定义）。
+        // **编码条件**：资源在场且相机在水面下——否则整段不执行（零
+        // write_buffer、零 pass、链拓扑与 R93 逐字段相同）。
+        if let (Some(uw), Some(slot)) = (underwater, uw_dst) {
+            let surface_y = surface_height.unwrap_or(0.0);
+            let wave_t = world
+                .try_resource::<iris_core::time::Time>()
+                .map(|t| t.elapsed_secs())
+                .unwrap_or(0.0);
+            let sun_dir = (-light.direction).normalize_or_zero();
+            self.gpu.queue.write_buffer(
+                &hdr.uw_params,
+                0,
+                bytemuck::bytes_of(&crate::underwater::UnderwaterParamsRaw {
+                    inv_view_proj: vp.inverse().to_cols_array_2d(),
+                    eye: [eye.x, eye.y, eye.z, 0.0],
+                    sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, 0.0],
+                    sun_color: [
+                        light.color.x * light.intensity,
+                        light.color.y * light.intensity,
+                        light.color.z * light.intensity,
+                        0.0,
+                    ],
+                    a: [uw.color.x, uw.color.y, uw.color.z, uw.absorb_depth],
+                    b: [
+                        uw.sun_inscatter,
+                        uw.sky_window,
+                        uw.caustic_strength,
+                        uw.wobble,
+                    ],
+                    c: [wave_t, z_far, 0.0, 0.0],
+                    d: [surface_y, 0.0, 0.0, 0.0],
+                }),
+            );
+            let depth_view = &self
+                .scene_depth
+                .as_ref()
+                .expect("水下开启时应已创建深度副本")
+                .view;
+            let views = hdr.post_views(taa_curr_view);
+            crate::post::encode_post_pass(
+                &mut encoder,
+                &self.gpu.device,
+                &views,
+                &hdr.post_sampler,
+                crate::post::PostPassDesc {
+                    label: "iris.pass.underwater",
+                    pipeline: &self.bundle.underwater_pipeline,
+                    layout: &self.bundle.post_depth_layout,
+                    params: &hdr.uw_params,
+                    src: scene_or_taa(fog_dst),
+                    dst: crate::post::PostScratchRef::Full(slot),
+                    extra_texture: Some(depth_view),
+                },
+            );
+        }
         // 景深（DOF）：雾输出（雾开）或主解析缓冲 → 全分辨率槽。CoC 按逐像素线性视距
         // 计算，12-tap 泊松盘 HDR 平均；位于泛光之前（HDR 线性域——焦外
         // 亮源参与亮度提取更物理）。
@@ -9656,7 +9745,7 @@ impl Renderer {
                     params: &hdr.dof_params,
                     // 源 = 雾输出槽（雾开——链头前插了一级）或链首
                     // （TAA 输出 / 主解析缓冲）
-                    src: scene_or_taa(fog_dst),
+                    src: scene_or_taa(uw_dst.or(fog_dst)),
                     dst: crate::post::PostScratchRef::Full(
                         slots.dof_dst.expect("DOF 开启时必有目标槽位"),
                     ),

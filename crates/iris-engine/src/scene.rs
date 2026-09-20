@@ -159,7 +159,7 @@ use iris_render::prelude::{
     AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, KajiyaKay, MaterialDef,
     MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, OceanSurface, ParticleBlend,
     ParticleEmitter, ParticleEmitterV2, PointLight, ReflectionProbe, SkySource, SkySourceKind,
-    TextureHandle, TextureStore, Visibility, WaterSurface, grass_textures,
+    TextureHandle, TextureStore, UnderwaterFog, Visibility, WaterSurface, grass_textures,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -410,6 +410,63 @@ struct EnvironmentSection {
     /// （组件/资源缺席语义与渲染侧一致——旧档零语义变化）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     buoyancy: Option<BuoyancySection>,
+    /// 水下效果（R94，`iris_render::underwater::UnderwaterFog`）：**缺席 =
+    /// 无水下 pass**（即使相机在水面下也不改变画面——引擎不猜意图）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    underwater: Option<UnderwaterSection>,
+}
+
+/// 水下资源段：全字段可选，缺省 = [`UnderwaterFog::default`]。
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(default)]
+struct UnderwaterSection {
+    color: [f32; 3],
+    absorb_depth: f32,
+    sun_inscatter: f32,
+    sky_window: f32,
+    caustic_strength: f32,
+    wobble: f32,
+}
+
+impl Default for UnderwaterSection {
+    fn default() -> Self {
+        Self::from_fog(&UnderwaterFog::default())
+    }
+}
+
+impl UnderwaterSection {
+    fn to_fog(self) -> Result<UnderwaterFog, SceneError> {
+        let fog = UnderwaterFog {
+            color: glam::Vec3::from_array(self.color),
+            absorb_depth: self.absorb_depth,
+            sun_inscatter: self.sun_inscatter,
+            sky_window: self.sky_window,
+            caustic_strength: self.caustic_strength,
+            wobble: self.wobble,
+        };
+        if !fog.is_valid() {
+            return Err(SceneError::OutOfRange(format!(
+                "underwater 段越界（absorb_depth={} / 强度=({},{},{},{})）：                 特征深度须为正有限数、各强度须为非负有限数",
+                fog.absorb_depth,
+                fog.sun_inscatter,
+                fog.sky_window,
+                fog.caustic_strength,
+                fog.wobble
+            )));
+        }
+        Ok(fog)
+    }
+
+    fn from_fog(f: &UnderwaterFog) -> Self {
+        Self {
+            color: f.color.to_array(),
+            absorb_depth: f.absorb_depth,
+            sun_inscatter: f.sun_inscatter,
+            sky_window: f.sky_window,
+            caustic_strength: f.caustic_strength,
+            wobble: f.wobble,
+        }
+    }
 }
 
 /// 浮力资源段：全字段可选，缺省 = [`BuoyancyPlane::default`]（水密度 +
@@ -1782,6 +1839,9 @@ fn apply_environment(
     if let Some(buoyancy) = environment.buoyancy {
         world.insert_resource(buoyancy.to_plane()?);
     }
+    if let Some(underwater) = environment.underwater {
+        world.insert_resource(underwater.to_fog()?);
+    }
     Ok(())
 }
 
@@ -2242,6 +2302,9 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     if let Some(plane) = world.try_resource::<BuoyancyPlane>() {
         environment.buoyancy = Some(BuoyancySection::from_plane(&plane));
     }
+    if let Some(fog) = world.try_resource::<UnderwaterFog>() {
+        environment.underwater = Some(UnderwaterSection::from_fog(&fog));
+    }
     if let Some(sky) = world.try_resource::<SkySource>() {
         if matches!(sky.kind, SkySourceKind::EquirectHdr(_)) {
             match &registry.sky_source {
@@ -2255,7 +2318,8 @@ pub fn save_scene(world: &mut World, path: impl AsRef<Path>) -> Result<usize, Sc
     }
     let has_environment = environment.directional_light.is_some()
         || environment.sky_source.is_some()
-        || environment.buoyancy.is_some();
+        || environment.buoyancy.is_some()
+        || environment.underwater.is_some();
 
     // level 段：加载时快照原样回写（空段省略）；`ddgi` 子段是例外——
     // 从**活动资源**回写（R89，照 `DirectionalLight` 的资源回写先例）：
@@ -4200,6 +4264,86 @@ mod tests {
 
     /// 水面 / 海面 / 浮力三段（R93 序列化补账）：加载进组件与资源、save →
     /// 重载位级一致、退化参数在加载期拒绝、**旧档（无这三段）零语义变化**。
+    /// 水下段（R94）：加载进资源、save → 重载位级一致、退化参数加载期拒绝、
+    /// 旧档（无本段）零语义变化。
+    #[test]
+    fn underwater_section_roundtrips_and_rejects_degenerate() {
+        let mut world = fresh_world();
+        load_str(
+            &mut world,
+            "underwater.scene.json",
+            r#"{
+                "environment": { "underwater": {
+                    "color": [0.02, 0.08, 0.12], "absorb_depth": 3.5,
+                    "caustic_strength": 0.7 } },
+                "entities": []
+            }"#,
+        );
+        let fog = *world
+            .try_resource::<UnderwaterFog>()
+            .expect("underwater 段应插资源");
+        assert_eq!(fog.absorb_depth.to_bits(), 3.5f32.to_bits());
+        assert_eq!(fog.caustic_strength.to_bits(), 0.7f32.to_bits());
+        assert_eq!(
+            fog.wobble,
+            UnderwaterFog::default().wobble,
+            "未写出的字段走组件 Default"
+        );
+        let out = test_dir().join("underwater_out.json");
+        save_scene(&mut world, &out).expect("保存");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains(r#""underwater""#), "underwater 段应写出");
+        let mut world_b = fresh_world();
+        load_scene(&mut world_b, &out).expect("重载");
+        assert_eq!(
+            world_b.try_resource::<UnderwaterFog>().map(|f| *f),
+            Some(fog),
+            "水下配置应往返位级一致"
+        );
+
+        for (label, body) in [
+            (
+                "负特征深度",
+                r#"{ "environment": { "underwater": { "absorb_depth": -1.0 } }, "entities": [] }"#,
+            ),
+            (
+                "负焦散强度",
+                r#"{ "environment": { "underwater": { "caustic_strength": -0.2 } }, "entities": [] }"#,
+            ),
+            (
+                "非有限抖动",
+                r#"{ "environment": { "underwater": { "wobble": 1e40 } }, "entities": [] }"#,
+            ),
+        ] {
+            let mut w = fresh_world();
+            let n = label.len();
+            let path = test_dir().join(format!("underwater_bad_{n}.json"));
+            std::fs::write(&path, body).expect("写坏档");
+            let err = load_scene(&mut w, &path).expect_err(&format!("{label} 必须被拒绝"));
+            assert!(
+                matches!(err, SceneError::OutOfRange(_)),
+                "{label} 应为越界错误，实际 {err:?}"
+            );
+        }
+
+        // 旧档零语义变化：无本段 ⇒ 无资源、重存也不冒出本段。
+        let mut legacy = fresh_world();
+        load_str(
+            &mut legacy,
+            "underwater_legacy.scene.json",
+            r#"{ "entities": [] }"#,
+        );
+        assert!(legacy.try_resource::<UnderwaterFog>().is_none());
+        let out2 = test_dir().join("underwater_legacy_out.json");
+        save_scene(&mut legacy, &out2).expect("保存旧档");
+        assert!(
+            !std::fs::read_to_string(&out2)
+                .unwrap()
+                .contains(r#""underwater""#),
+            "旧档重存不得凭空多出 underwater 段"
+        );
+    }
+
     #[test]
     fn water_ocean_buoyancy_sections_roundtrip_and_reject_degenerate() {
         let mut world = fresh_world();

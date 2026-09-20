@@ -96,6 +96,10 @@ pub(crate) struct PipelineBundle {
     /// 副本光线步进，组 0 复用 `post_depth_layout`（与 DOF / MB 同构），
     /// 见 `shaders/fog.wgsl` 与 fog.rs 的 FogSettings。
     pub fog_pipeline: wgpu::RenderPipeline,
+    /// 水下 pass 管线（R94）：`underwater.wgsl` 全屏三角形，组布局复用
+    /// `post_depth_layout`（与雾 / DOF / MB 同构，零新布局）。编码条件 =
+    /// `UnderwaterFog` 资源在场且相机在水面下；链位 = 雾之后、DOF 之前。
+    pub underwater_pipeline: wgpu::RenderPipeline,
     /// 平面水体管线（R81）：主 pass 后的水面合成网格 draw——Gerstner
     /// 顶点位移 + 反射 / 折射捕获采样 + Fresnel + 深度吸收 + 太阳镜面，
     /// `water_layout`（组 0 独立五槽位，不扩 globals 组），目标 = HDR
@@ -2207,6 +2211,13 @@ pub(crate) fn create_pipeline(
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fog.wgsl").into()),
     });
     let fog_pipeline = make_post_depth_pipeline("iris.pipeline.fog", &fog_shader, "fs_main");
+    // 水下（R94）：同 post_depth_layout 家族（params + src + sampler + 深度）
+    let underwater_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("iris.shader.underwater"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/underwater.wgsl").into()),
+    });
+    let underwater_pipeline =
+        make_post_depth_pipeline("iris.pipeline.underwater", &underwater_shader, "fs_main");
 
     // 平面水体（R81）：主 pass 之后、TAA / 后处理链之前的水面合成 pass
     // （三角网格 draw，非全屏三角形）。组 0 = `water_layout`（独立组，
@@ -3396,6 +3407,7 @@ pub(crate) fn create_pipeline(
         occlusion_pipeline,
         ao_pipeline,
         fog_pipeline,
+        underwater_pipeline,
         water_pipeline,
         water_ocean_pipeline,
         hair_pipeline,

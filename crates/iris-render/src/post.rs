@@ -1115,6 +1115,85 @@ pub(crate) fn full_chain_slots_with_fog(
     }
 }
 
+/// 水下 pass 入链后的全链槽位（R94）。`slots` = 下游链实际消费的槽位表，
+/// `fog_dst` / `uw_dst` = 雾与水下 pass 各自的目标槽（`None` = 不入链）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColumnChainSlots {
+    /// 下游链槽位（水下关 = 既有拓扑原样；开 = 再多轮转一格）。
+    pub slots: FullChainSlots,
+    /// 雾 pass 目标槽（恒 A；`None` = 雾不入链）。
+    pub fog_dst: Option<PingPongSlot>,
+    /// 水下 pass 目标槽（雾开时 = B、雾关时 = A；`None` = 水下不入链）。
+    pub uw_dst: Option<PingPongSlot>,
+}
+
+/// 槽位的对面（ping-pong 铁律：pass 不得读写同一纹理）。
+fn opposite_slot(slot: Option<PingPongSlot>) -> PingPongSlot {
+    match slot {
+        Some(PingPongSlot::A) => PingPongSlot::B,
+        _ => PingPongSlot::A,
+    }
+}
+
+/// 全分辨率链的槽位分配（含体积雾 + 水下，R94；纯函数，单测见模块尾）。
+///
+/// **两个既有函数零改动的红线**（[`full_chain_slots`] / [`full_chain_slots_with_fog`]
+/// 及其全部单测原样保留）：本函数单点定义「链头前插几级」后的新拓扑——链上
+/// 顺序恒为 `链源 → 雾? → 水下? → DOF? → MB? → 暗角? → blit`，每一级写入
+/// 都落在前驱槽位的**对面**（A→B→A 轮转）。
+///
+/// 水下关闭时**直接委托**既有函数（逐字段相同的保证由构造给出，不靠测试
+/// 兜底）：`uw_on = false` ⇒ 返回值 ≡ [`full_chain_slots_with_fog`]；
+/// 雾与水下都关 ⇒ ≡ [`full_chain_slots`]。
+pub(crate) fn full_chain_slots_with_water_column(
+    dof_on: bool,
+    mb_on: bool,
+    vignette_on: bool,
+    fog_on: bool,
+    uw_on: bool,
+) -> ColumnChainSlots {
+    if !uw_on {
+        let f = full_chain_slots_with_fog(dof_on, mb_on, vignette_on, fog_on);
+        return ColumnChainSlots {
+            slots: f.slots,
+            fog_dst: f.fog_dst,
+            uw_dst: None,
+        };
+    }
+    // 水下开启 ⇒ 链头至少有一级前插，轮转起点恒 A（与雾的规则同构）。
+    let fog_dst = fog_on.then_some(PingPongSlot::A);
+    let uw_dst = Some(opposite_slot(fog_dst));
+    let pre = uw_dst;
+    let dof_dst = dof_on.then_some(opposite_slot(pre));
+    let mb_src = if mb_on {
+        if dof_on { dof_dst } else { pre }
+    } else {
+        None
+    };
+    let mb_dst = mb_on.then_some(opposite_slot(mb_src));
+    let head = if mb_on {
+        mb_dst
+    } else if dof_on {
+        dof_dst
+    } else {
+        pre
+    };
+    let vignette_dst = vignette_on.then_some(opposite_slot(head));
+    let blit_hdr = if vignette_on { vignette_dst } else { head };
+    ColumnChainSlots {
+        slots: FullChainSlots {
+            dof_dst,
+            mb_src,
+            mb_dst,
+            head,
+            vignette_dst,
+            blit_hdr,
+        },
+        fog_dst,
+        uw_dst,
+    }
+}
+
 // ---------- TAA 纯函数（R60，离线单测见模块尾） ----------
 
 /// TAA 抖动序列的点数（Halton(2,3) 前 8 项；帧号模 8 索引）。
@@ -1793,6 +1872,114 @@ mod tests {
 
     /// 雾关闭 = 既有拓扑**逐字段相同**（渲染器走旧路径的根据——命令流
     /// 与 R78 逐位一致）+ 雾槽恒 `None`。
+    /// 水下入链后「水下关闭」必须与既有链拓扑**逐字段**相同（全部 8 种
+    /// dof / mb / vignette 组合 × 雾开 / 关）——渲染器据此在「无水下架」时
+    /// 走与 R93 完全相同的命令流。
+    #[test]
+    fn column_chain_slots_off_matches_fog_only_exactly() {
+        for fog_on in [false, true] {
+            for dof_on in [false, true] {
+                for mb_on in [false, true] {
+                    for vignette_on in [false, true] {
+                        let legacy = full_chain_slots_with_fog(dof_on, mb_on, vignette_on, fog_on);
+                        let got = full_chain_slots_with_water_column(
+                            dof_on,
+                            mb_on,
+                            vignette_on,
+                            fog_on,
+                            false,
+                        );
+                        assert_eq!(
+                            got,
+                            ColumnChainSlots {
+                                slots: legacy.slots,
+                                fog_dst: legacy.fog_dst,
+                                uw_dst: None,
+                            },
+                            "水下关闭必须逐字段等价雾档拓扑：fog={fog_on}                          dof={dof_on} mb={mb_on} vig={vignette_on}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 水下开启的全部 32 种组合的拓扑不变量：
+    /// 1. 水下槽恒在雾槽的对面（雾开 ⇒ B、雾关 ⇒ A）；
+    /// 2. 每一级 pass 读的槽位 ≠ 自己写的槽位（wgpu 同 pass 读写互斥）；
+    /// 3. 每一级读到的是链上前驱的**最新**输出（源链不断裂）；
+    /// 4. blit 源 = 暗角输出（暗角开）或链头（否则），且链头恒为最后一个
+    ///    入链 pass 的目标。
+    #[test]
+    fn column_chain_slots_invariants_for_all_combinations() {
+        for fog_on in [false, true] {
+            for uw in [false, true] {
+                for dof_on in [false, true] {
+                    for mb_on in [false, true] {
+                        for vignette_on in [false, true] {
+                            let c = full_chain_slots_with_water_column(
+                                dof_on,
+                                mb_on,
+                                vignette_on,
+                                fog_on,
+                                uw,
+                            );
+                            if uw {
+                                assert_eq!(
+                                    c.uw_dst,
+                                    Some(opposite_slot(c.fog_dst)),
+                                    "水下槽须在雾的对面：fog={fog_on}"
+                                );
+                            }
+                            // 2 / 3：逐级「读槽 ≠ 写槽」且读的是前驱输出
+                            if let (Some(fog), Some(col)) = (c.fog_dst, c.uw_dst) {
+                                assert_ne!(fog, col, "雾与水下不得同槽");
+                            }
+                            if let (Some(src), Some(dst)) = (c.slots.dof_dst, c.uw_dst) {
+                                if uw {
+                                    assert_ne!(src, dst, "DOF 读槽须≠写槽");
+                                }
+                            }
+                            if let (Some(src), Some(dst)) = (c.slots.mb_src, c.slots.mb_dst) {
+                                assert_ne!(src, dst, "MB 读槽须≠写槽");
+                            }
+                            if let (Some(src), Some(dst)) = (c.slots.head, c.slots.vignette_dst) {
+                                assert_ne!(src, dst, "暗角读槽须≠写槽");
+                            }
+                            // MB 的源 = 链上 DOF（开）或水下 / 雾（DOF 关）的输出
+                            if mb_on {
+                                let want = if dof_on {
+                                    c.slots.dof_dst
+                                } else {
+                                    c.uw_dst.or(c.fog_dst)
+                                };
+                                assert_eq!(
+                                    c.slots.mb_src, want,
+                                    "MB 源须是前驱输出：fog={fog_on} uw={uw} dof={dof_on}"
+                                );
+                            }
+                            // 4：链头 = 最后入链 pass 的目标
+                            let want_head = if mb_on {
+                                c.slots.mb_dst
+                            } else if dof_on {
+                                c.slots.dof_dst
+                            } else {
+                                c.uw_dst.or(c.fog_dst)
+                            };
+                            assert_eq!(c.slots.head, want_head, "链头判定漂移");
+                            let want_blit = if vignette_on {
+                                c.slots.vignette_dst
+                            } else {
+                                c.slots.head
+                            };
+                            assert_eq!(c.slots.blit_hdr, want_blit, "blit 源判定漂移");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn fog_chain_slots_off_matches_legacy_exactly() {
         for dof_on in [false, true] {

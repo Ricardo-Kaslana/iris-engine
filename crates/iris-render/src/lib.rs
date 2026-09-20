@@ -103,6 +103,15 @@
 //!   `BuoyancyPlane` 资源 = 浮力开关（浸没体积逐形状解析闭式，含 OBB 的
 //!   三次 box spline；缺席 / 零浸没 = 轨迹逐位不变）。见 ARCHITECTURE
 //!   §4.52 / §8.72 与 `tests/ocean_render.rs`。
+//! - 水下 + 焦散（R94，`underwater` 模块）：`UnderwaterFog` 资源在场**且**
+//!   相机眼点低于选中水面 ⇒ 后处理链在雾之后、DOF 之前插一级全屏 pass。
+//!   水下列长走**解析平面求交钳制**（`min(到几何, 视线穿出波面的距离)`，
+//!   零新资源、不改水 pass 的深度写入 ⇒ Snell 窗可见）；合成 = Beer-Lambert
+//!   吸收 + 带水色着色的太阳内散射 / Snell 窗 + 屏幕空间焦散（两方向相位场
+//!   互扭的余弦和正部三次幂，有界由构造保证）+ uv 抖动。链槽位由
+//!   `post::full_chain_slots_with_water_column` 单点定义，水下关闭时直接
+//!   委托既有函数（逐字段等价由构造给出）。资源缺席 = 零 pass、命令流逐位
+//!   不变。见 ARCHITECTURE §4.53 / §8.73 与 `tests/underwater_render.rs`。
 //! - glTF 2.0 资产管线与离屏渲染（`OffscreenRenderer»）。
 
 pub mod animation;
@@ -152,6 +161,7 @@ pub mod texture_bc7;
 pub mod texture_bcn;
 pub mod texture_ktx2;
 pub mod ui;
+pub mod underwater;
 pub mod visibility;
 pub mod water;
 pub mod weather;
@@ -326,6 +336,9 @@ pub mod prelude {
         Focusable, UiAnchor, UiAnchorPoint, UiButton, UiClickEvent, UiColor, UiFocus, UiImage,
         UiImageRtt, UiMenu, UiMenuStack, UiRect, UiText, anchor_to_position, glyph_bits,
         sort_focus_items, spawn_ui_button, text_width, update_ui_focus, update_ui_menus,
+    };
+    pub use crate::underwater::{
+        UnderwaterFog, absorption_through, caustic_intensity, submerged, water_column_distance,
     };
     pub use crate::visibility::{Visibility, set_subtree_hidden};
     pub use crate::water::{
