@@ -21,6 +21,8 @@ crate 布局（依赖自上而下）：
 
 **架构与特性全景唯一权威是 `ARCHITECTURE.md`**（§1–§8），改任何子系统前先读对应章节；`§8 已知限制` 是诚实清单，别把已声明的限制当 bug 修。历史脉络（逐轮做了什么）在 `CHANGELOG.md` 与 git log，不依赖会话记忆。
 
+**当前进度**（各梯队与闭合战役的收官状态、轮次交付内容索引）见 `docs/private/roadmap-v5.md`；该档是私有档、不入库，克隆仓库后可能缺席，此时以 `CHANGELOG.md` 最新段与 git log 为准。
+
 ## 环境硬约束（Windows / Git Bash）
 
 - **所有 cargo 命令必须加前缀 `CARGO_HTTP_CHECK_REVOKE=false`**（本机镜像 SSL 吊销检查问题，不加必挂）。
@@ -91,4 +93,4 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 - **不做任何 git 写操作除非主会话明确要求**（多智能体协作时外部 Agent 只改代码）。
 - dogfooding 游戏轮产出的引擎摩擦清单是**一级交付物**；游戏轮**不改引擎**（纪律），摩擦留给下一轮打磨闭合——每条按「现象 → 绕行 → 建议修法」记录进 ARCHITECTURE §8。
 - 与规格偏离必须汇报并给理由（历史偏离多有充分依据，如 `&mut World` spawn、rest 姿势显式捕获、上帧深度复用单份 scene_depth）。
-- 文档滞后是 bug：改行为必须同步 ARCHITECTURE 对应章节，_FEATURES 数字（测试数等）过期也要顺手修。
+- 文档滞后是 bug：改行为必须同步 ARCHITECTURE 对应章节；测试数字散落在 README「测试」节与本文门禁命令序节两处，过期要顺手修（`_FEATURES` 文件已不在仓内，勿再引用）。
