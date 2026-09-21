@@ -1173,7 +1173,15 @@ AABB 剔除判定」本身（~0.36 ms）；静态场景两朝向 `instance_uploa
   成立的转移、**一帧至多一条**（防乒乓/级联）、自环（from==to）不触发、
   越界目标 = 无条件断言 panic。**`transitions` 空表 = 恒 no-op = v1
   行为逐位不变**（与 v1 `edges` 并存、共享 `enter_state` 落账口；
-  六游戏自建状态判定自此有引擎承载）。
+  六游戏自建状态判定自此有引擎承载）。**游戏级并用首例（iris-exp）**：
+  三状态机（Idle 与 Walk 循环、Jump 单次）手动边表承担步态切换的
+  crossfade 时长（起走 0.15 s、停步 0.10 s、起跳 0.08 s），
+  `ClipFinished` 读 `moving` 参数的自动转移承担跳跃播完的回落分流
+  （静止回 Idle、移动中直落 Walk），游戏侧不写播完轮询；停步切换先过
+  「姿势距 Idle 最近」的实测相位窗口（261 通道 L1 距离曲线定窗，
+  至多等约半步走完当前步），配合起步加速与停步减速的速度平滑
+  （`ExpCharacter.velocity` 指数趋近），停步与起步不再急停打滑或瞬发
+  窜出——窗口数字有内容契约锁测试守着（GLB 换版相位挪位报警）。
 - **运行时重定向（C4b）**：`retarget_by_name(target_names,
   target_entities) -> RetargetReport`——通道不改写（节点下标保持源骨架
   空间），只把 `node_entities` 整体重绑到目标骨架实体：骨名经

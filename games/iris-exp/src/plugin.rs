@@ -17,19 +17,29 @@
 //!   `Transform`——headless / 离屏路径（无输入注入）与窗口静态帧的
 //!   逐位行为与 R66b 之前一致，外部机位覆盖（如快照 example 的
 //!   `EXP_CAM_HEAD` 诊断特写）不会被运行期系统改写。
-//! - **常态 Idle + 动画随移动切换**：`Mixamo_Idle` 是常态——停止且无
-//!   进行中的单次动作时循环播放；移动即切步行循环，`空格` 跳跃单次，
-//!   播完自动回落 Idle（此刻仍按住移动键则随即切步行）。无移动输入的
-//!   帧不写角色 `Transform`（恒等语义不变），但动画照常推进（Idle 呼吸
-//!   循环是确定性的 dt-based 采样，双跑逐位一致不受影响）。
+//! - **常态 Idle + 动作随移动切换（crossfade 过渡 + 速度平滑）**：三状
+//!   态机驱动（Idle 与 Walk 是循环常态，Jump 是空格单次），全部切换带
+//!   过渡混合而非硬切。`Mixamo_Idle` 是常态——停止且无进行中的单次
+//!   动作时循环播放；移动即以 0.15 s crossfade 淡入步行循环；`空格`
+//!   跳跃单次（0.08 s 淡入），播完由引擎条件转移（`ClipFinished` 守卫
+//!   读 `moving` 参数）自动回落——静止回 Idle、移动中直落 Walk（落地
+//!   即走），回落带 0.10 s 淡出。
+//! - **停步与起步的运动感**：停步不立即切换——等步行剪辑走到「姿势距
+//!   Idle 最近」的过步窗口（实测相位区段表，至多约半步 0.45 s）才以
+//!   0.10 s 淡出，等待期速度保持全速走完最后一步；起步速度按 6/s 指数
+//!   加速（约 0.5 s 到 95% 全速），停步放行后按 20/s 指数减速，残差低
+//!   于 0.05 m/s 精确归零。速度非零的帧照常积分位置、相机照常跟随；
+//!   **完全静止后的无输入帧不写相机与角色 `Transform`**（恒等语义的
+//!   精确口径）。动画推进、过渡计时与速度趋近全部是确定性的 dt-based
+//!   计算，双跑逐位一致不受影响。
 
 use iris_core::prelude::{Entity, Stage};
 use iris_engine::prelude::{
-    Access, ActiveCamera, AnimationClip, AnimationPlayer, AnimationPlugin, AoSettings, App, Camera,
-    DirectionalLight, HierarchyPlugin, Input, KeyCode, MaterialDef, MaterialStore, MeshData,
-    MeshStore, MipSettings, MotionBlurSettings, MouseButton, Name, OffscreenRenderer, Plugin, Quat,
-    Resource, Schedule, TaaSettings, TextureStore, Time, Transform, Vec3, VignetteSettings,
-    Visibility, World, asset_path, spawn_gltf_instance,
+    Access, ActiveCamera, AnimGuard, AnimTransition, AnimationClip, AnimationEdge, AnimationPlayer,
+    AnimationState, AoSettings, App, Camera, DirectionalLight, Input, KeyCode, MaterialDef,
+    MaterialStore, MeshData, MeshStore, MipSettings, MotionBlurSettings, MouseButton, Name,
+    OffscreenRenderer, Plugin, Quat, Resource, Schedule, TaaSettings, TextureStore, Time,
+    Transform, Vec3, VignetteSettings, Visibility, World, asset_path, spawn_gltf_instance,
 };
 
 /// 角色 GLB 路径（`asset_path` 解析：CWD 相对优先，workspace 根相对回退）。
@@ -89,6 +99,45 @@ pub const GROUND_HALF: f32 = 11.0;
 /// 网格，玩法钳制（[`GROUND_HALF`]）不变。
 pub const GROUND_VISUAL_HALF: f32 = 120.0;
 
+// ---------------------------------------------------------------------------
+// 动作状态机（crossfade 过渡）
+// ---------------------------------------------------------------------------
+
+/// 动作状态下标（`AnimationPlayer::states` 表）：Idle 常态、Walk 移动、
+/// Jump 空格单次。iris-ascent 同款 usize 常量口径。
+pub const STATE_IDLE: usize = 0;
+/// 见 [`STATE_IDLE`]。
+pub const STATE_WALK: usize = 1;
+/// 见 [`STATE_IDLE`]。
+pub const STATE_JUMP: usize = 2;
+/// Idle 与 Walk 双向切换的 crossfade 时长（秒）。0.15 s 是 iris-ascent 的
+/// 实测观感值：明显短于 0.1 s 读作姿势跳变，长于 0.3 s 起走拖沓。
+pub const STATE_BLEND: f32 = 0.15;
+/// 进入跳跃的 crossfade 时长（秒）。起势要快：更长的过渡会把蓄力帧糊成
+/// 发软的下蹲，0.08 s 只抹掉姿势突变本身。
+pub const JUMP_IN_BLEND: f32 = 0.08;
+/// 跳跃播完回落（Idle 或 Walk）的 crossfade 时长（秒）。比步态切换略长
+/// 以吸收落地缓冲的姿势差，但不长到吞掉落地反馈。
+pub const JUMP_OUT_BLEND: f32 = 0.10;
+/// 跳跃落地分流参数名：`update_exp_control` 每帧写布尔值，Jump 状态的
+/// `ClipFinished` 条件转移读它，决定落地直落 Walk 还是回 Idle。
+pub const MOVING_PARAM: &str = "moving";
+/// Walk 切回 Idle 的 crossfade 时长（秒）。停步方向比起步短：同样的
+/// 姿势差用更短的窗口覆盖，读作「收住脚步」而非「形体渐变」。
+pub const STOP_BLEND: f32 = 0.10;
+/// 起步速度趋近速率（1/s）：0 到 95% 全速约 0.5 s——站立帧全速位移会
+/// 读作脚底打滑，真人起步也要踩出半步才到全速。
+pub const ACCEL_RATE: f32 = 6.0;
+/// 停步速度趋近速率（1/s）：与 [`STOP_BLEND`] 同量级——相位门放行后
+/// 位移随姿势一起收住，过渡末段速度残留约 0.24 m/s，其后总滑行量
+/// 约十厘米内不可感知。
+pub const DECEL_RATE: f32 = 20.0;
+/// 速度归零阈值（m/s）：停步减速残差低于此值精确置零——其后无输入帧
+/// 恢复「不写角色与相机 Transform」的逐位恒等语义。
+pub const STOP_EPS: f32 = 0.05;
+/// 停步相位窗口（归一化相位区段，实测依据见 [`stop_phase_ready`]）。
+pub const STOP_PHASE_WINDOWS: &[(f32, f32)] = &[(0.93, 1.0), (0.0, 0.10), (0.57, 0.70)];
+
 /// 轨道相机状态（游戏层资源）：yaw = 环绕方位角（0 = 相机在 +Z 侧）、
 /// pitch = 俯角（0 = 水平，正值 = 相机升高俯视）、dist = 轨道距离、
 /// focus_h = 注视点在角色上方的高度（Q/E 调节）。位姿几何见
@@ -120,7 +169,7 @@ impl Default for OrbitCamera {
     }
 }
 
-/// 角色控制跨帧状态：当前朝向角（rad，[`facing_yaw`] 口径）。
+/// 角色控制跨帧状态：当前朝向角（rad，[`facing_yaw`] 口径）与水平速度。
 /// 单独成资源而非写回 `ExpEntities`（那是实体表不是状态袋）；旋转
 /// 始终写作 `from_rotation_y(yaw)`，无其他旋转分量，避免从四元数
 /// 反提取的万向锁与浮点往返误差。
@@ -128,6 +177,11 @@ impl Default for OrbitCamera {
 pub struct ExpCharacter {
     /// 当前朝向角（rad）。
     pub yaw: f32,
+    /// 水平速度（m/s，世界系）。起步按 [`ACCEL_RATE`] 指数加速，停步在
+    /// 相位门放行后按 [`DECEL_RATE`] 指数减速，残差低于 [`STOP_EPS`]
+    /// 精确归零——其后无输入帧恢复逐位恒等；相位门等待期保持当前值
+    /// （走完最后一步，脚步与位移匹配）。
+    pub velocity: Vec3,
 }
 
 impl Default for ExpCharacter {
@@ -135,7 +189,10 @@ impl Default for ExpCharacter {
         // GLB 角色面向本地 +Z（EXP_CAM_HEAD 诊断注释与旧快照正脸为证；
         // build_scene 旧注释「面向 -Z」系笔误陈留），rotation 恒等时正脸
         // 朝 +Z（初始相机侧）。
-        Self { yaw: 0.0 }
+        Self {
+            yaw: 0.0,
+            velocity: Vec3::ZERO,
+        }
     }
 }
 
@@ -169,7 +226,8 @@ impl ExpPlugin {
     /// 与 `DefaultPlugins` 的编排方式一致（Startup 一次、Update 每帧）；
     /// 独立暴露供 headless 测试与离屏快照复用。**动画与层级不在此注册**：
     /// 调用方按窗口路径的编排补上 `AnimationPlugin`（Update）与
-    /// `HierarchyPlugin`（PostUpdate）。
+    /// `HierarchyPlugin`（PostUpdate）。调度器不去重——任何一方重复注册
+    /// 都会让 `update_animations` 每帧执行两遍、动画双倍速。
     ///
     /// Update 系统注册序即执行序（同组件 `write` 冲突由调度器串行）：
     /// `update_exp_control`（角色移动 + 动画）在前、`update_orbit_camera`
@@ -204,11 +262,13 @@ impl ExpPlugin {
 
 impl Plugin for ExpPlugin {
     fn build(&self, app: &mut App) {
+        // 只注册自身系统：动画推进与层级传播由调用方编排——窗口路径的
+        // `DefaultPlugins` 已含 `AnimationPlugin` 与 `HierarchyPlugin`，
+        // headless / 离屏路径自行注册（iris-arena 同款约定）。调度器
+        // 不去重，此处再 build 一次会让 `update_animations` 每帧执行
+        // 两遍、动画以双倍速播放——本插件曾因此在窗口路径双倍速，已修，
+        // 回归锚见 tests/headless.rs 的 exp_plugin_registers_animation_advance_once。
         self.build_schedule(&mut app.schedule);
-        // 窗口路径把动画 / 层级一并补上（headless / 离屏路径由测试台按
-        // 同一编排自行注册）
-        AnimationPlugin.build(app);
-        HierarchyPlugin.build(app);
     }
 }
 
@@ -344,7 +404,7 @@ fn build_scene(world: &mut World) {
         },
         ActiveCamera::default(),
     ));
-    // ---- 角色 GLB：装配 + 步行循环自动开播 ----
+    // ---- 角色 GLB：装配 + 三状态机（常态 Idle 开播）----
     let path = asset_path(MODEL_PATH);
     let entities = match spawn_gltf_instance(world, &path) {
         Ok(instance) => {
@@ -352,17 +412,22 @@ fn build_scene(world: &mut World) {
             let walk = clip_index(&clips, WALK_CLIP);
             let jump = clip_index(&clips, JUMP_CLIP);
             let idle = clip_index(&clips, IDLE_CLIP);
+            // 剪辑缺席的退化索引（与 ExpEntities 字段落账同口径）：
+            // walk 缺席指 0（下标语义退化为「首个剪辑」）；idle 缺席回退
+            // 步行剪辑；jump 缺席指 0 且与 walk 或 idle 重合时视为无跳跃。
+            let walk_idx = walk.unwrap_or(0);
+            let jump_idx = jump.unwrap_or(0);
+            let idle_idx = idle.or(walk).unwrap_or(0);
             let model = instance.roots[0];
             world.insert(model, Name("exp/character".to_string()));
             world.insert(model, Visibility::VISIBLE);
             let mut player = instance.player();
-            // 常态 Idle 循环开播（缺 Idle 时回退步行剪辑——退化为旧语义）。
-            // 首帧 Update 按移动意图自动切 walk/idle，见 update_exp_control。
-            if let Some(start) = idle.or(walk) {
-                player.active = start;
-                player.looping = true;
-                player.playing = true;
-            }
+            // 常态 Idle 循环开播（缺 Idle 时回退步行剪辑——退化语义）。
+            // 首帧 Update 按移动意图经状态机切换，见 update_exp_control。
+            player.active = idle_idx;
+            player.looping = true;
+            player.playing = true;
+            configure_state_machine(&mut player, idle_idx, walk_idx, jump_idx);
             player.capture_rest(world);
             world.insert(model, player);
             log::info!(
@@ -375,9 +440,9 @@ fn build_scene(world: &mut World) {
             ExpEntities {
                 camera,
                 model: Some(model),
-                walk: walk.unwrap_or(0),
-                jump: jump.unwrap_or(0),
-                idle: idle.or(walk).unwrap_or(0),
+                walk: walk_idx,
+                jump: jump_idx,
+                idle: idle_idx,
             }
         }
         Err(err) => {
@@ -398,19 +463,109 @@ fn build_scene(world: &mut World) {
     world.insert_resource(entities);
 }
 
-/// Update：常态 Idle 状态机 + WASD 角色移动 + 朝向转身。状态语义：
+/// 给播放器装配三状态机（Idle 与 Walk 循环、Jump 单次）与过渡表：
 ///
-/// - `空格` 跳跃单次（`looping = false`），播完自动回落 **Idle**；
-/// - 非跳跃期 walk ↔ idle 随移动意图自动切换（移动即步行循环、停止即
-///   Idle 循环，切入时 `time = 0` 从头播放）；
-/// - 跳跃进行中被按住移动键不切走（落地回落 Idle 后若仍按住，同帧随即
-///   切步行——「动作停止且无立即下一步动作 = Idle」精确成立）；
-/// - 无移动输入的帧不写角色 `Transform`（恒等）；角色缺席（资产降级）
-///   时整帧空转。
+/// - 手动边表（v1 路径）：Idle 进 Walk 是 [`STATE_BLEND`] 秒过渡，Walk
+///   切回 Idle 是 [`STOP_BLEND`] 秒（停步方向更短，理由见常量文档——
+///   且切换时机先过停步相位门）；Idle 或 Walk 进 Jump 是
+///   [`JUMP_IN_BLEND`] 秒。`request_state` 查边启动 crossfade，游戏侧
+///   每次状态切换只调这一个方法。
+/// - 自动转移表（v2 条件路径）：Jump 播完（`ClipFinished` 守卫）按
+///   `moving` 参数分流——静止回 Idle、移动中直落 Walk（落地即走），
+///   均带 [`JUMP_OUT_BLEND`] 秒过渡。由引擎 `update_animations` 每帧
+///   步检，游戏侧不手写播完轮询。
 ///
-/// GLB 缺 jump/idle 的退化：jump 索引与 walk/idle 重合时视为「无跳跃」
-/// （不锁死状态机）；idle 缺席时 `ExpEntities::idle` 回退指 walk（停止
-/// = 步行剪辑从头循环，观感近似旧定格语义），均不 panic。
+/// 退化 GLB 不 panic：零剪辑（理论上 GLB 无动画轨）直接不装配状态机
+/// （`update_exp_control` 见空表跳过动画段）；剪辑索引重合（缺 idle 或
+/// 缺 jump）时同剪辑 `transition` 是 no-op、Jump 状态不可达即自动转移
+/// 永不触发。
+fn configure_state_machine(player: &mut AnimationPlayer, idle: usize, walk: usize, jump: usize) {
+    if player.clips.is_empty() {
+        return;
+    }
+    player.states = vec![
+        AnimationState {
+            clip: idle,
+            looping: true,
+            speed: 1.0,
+        },
+        AnimationState {
+            clip: walk,
+            looping: true,
+            speed: 1.0,
+        },
+        AnimationState {
+            clip: jump,
+            looping: false,
+            speed: 1.0,
+        },
+    ];
+    player.edges = vec![
+        AnimationEdge {
+            from: STATE_IDLE,
+            to: STATE_WALK,
+            duration: STATE_BLEND,
+        },
+        AnimationEdge {
+            from: STATE_WALK,
+            to: STATE_IDLE,
+            duration: STOP_BLEND,
+        },
+        AnimationEdge {
+            from: STATE_IDLE,
+            to: STATE_JUMP,
+            duration: JUMP_IN_BLEND,
+        },
+        AnimationEdge {
+            from: STATE_WALK,
+            to: STATE_JUMP,
+            duration: JUMP_IN_BLEND,
+        },
+    ];
+    player.transitions = vec![
+        AnimTransition {
+            from: STATE_JUMP,
+            to: STATE_IDLE,
+            duration: JUMP_OUT_BLEND,
+            guard: AnimGuard::All(vec![
+                AnimGuard::ClipFinished,
+                AnimGuard::Not(Box::new(AnimGuard::BoolIs(MOVING_PARAM.to_string(), true))),
+            ]),
+        },
+        AnimTransition {
+            from: STATE_JUMP,
+            to: STATE_WALK,
+            duration: JUMP_OUT_BLEND,
+            guard: AnimGuard::All(vec![
+                AnimGuard::ClipFinished,
+                AnimGuard::BoolIs(MOVING_PARAM.to_string(), true),
+            ]),
+        },
+    ];
+    player.current_state = STATE_IDLE;
+}
+
+/// Update：三状态动作机（crossfade 过渡 + 停步相位门 + 速度平滑）+
+/// WASD 角色移动 + 朝向转身。状态语义：
+///
+/// - `空格` 跳跃单次（进 Jump 状态，非循环）；播完由引擎条件转移自动
+///   回落——静止回 Idle、移动中直落 Walk（落地即走），回落带
+///   [`JUMP_OUT_BLEND`] 秒 crossfade，游戏侧不手写播完轮询；
+/// - 移动即从 Idle 过渡到 Walk（[`STATE_BLEND`] 秒，起步速度按
+///   [`ACCEL_RATE`] 指数加速）；停止不立即切换——步行中先等停步相位
+///   门（[`stop_phase_ready`]，至多约半步）走完当前步，再以
+///   [`STOP_BLEND`] 秒淡出，速度随后按 [`DECEL_RATE`] 指数减速，残差
+///   低于 [`STOP_EPS`] 精确归零；
+/// - 跳跃进行中不被移动打断（Jump 状态期间只写 `moving` 参数，不请求
+///   切换）；空格在跳跃中同样无效；
+/// - 速度非零的帧写角色 `Transform` 位置（起步加速与停步减速窗口内
+///   位移照常）；完全静止后的无输入帧不写任何 `Transform`（逐位恒等，
+///   精确口径见模块文档）；角色缺席（资产降级）时整帧空转。
+///
+/// GLB 缺 jump 或 idle 的退化：jump 索引与 walk 或 idle 重合时视为「无
+/// 跳跃」（不请求 Jump 状态，自动转移因状态不可达永不触发）；idle 缺席
+/// 时 Idle 状态与 Walk 状态共用步行剪辑（同剪辑 transition 为 no-op，
+/// 停止等于步行循环续播），均不 panic。
 fn update_exp_control(world: &World) {
     let Some(ents) = world.try_resource::<ExpEntities>() else {
         return;
@@ -456,52 +611,80 @@ fn update_exp_control(world: &World) {
     let Some(mut player) = world.get_mut::<AnimationPlayer>(model) else {
         return;
     };
-    let jump_is_real = ents.jump != ents.walk && ents.jump != ents.idle;
-    let in_jump = jump_is_real && player.active == ents.jump;
-    // 1) 跳跃播完（非循环到尾）→ 回落常态 Idle
-    if in_jump && (!player.playing || player.time >= player.clips[player.active].duration) {
-        player.active = ents.idle;
-        player.time = 0.0;
-        player.looping = true;
-        player.playing = true;
-    }
-    // 2) 空格 → 跳跃单次
-    if space_pressed && !in_jump {
-        player.active = ents.jump;
-        player.time = 0.0;
-        player.looping = false;
-        player.playing = true;
-    }
-    // 3) 常态切换：非跳跃期 walk ↔ idle 随移动意图（跳跃不被移动打断）。
-    //    谓词在空格分支之后重算——本帧刚触发的跳跃不被切走；退化重合
-    //    （jump 索引 == walk/idle）时 jump_is_real 恒 false，永不锁死。
-    if !(jump_is_real && player.active == ents.jump) {
-        let want = if moving { ents.walk } else { ents.idle };
-        if player.active != want {
-            player.active = want;
-            player.time = 0.0;
-            player.looping = true;
-            player.playing = true;
+    // 巡航条件：速度目标保持全速——移动中，或停步相位门等待中（走完
+    // 最后一步，脚步与位移保持匹配）；其余（停步切换后、静止腾空减速）
+    // 目标归零进入指数减速。
+    let mut cruise = moving;
+    // 零剪辑 GLB 退化（states 空表，见 configure_state_machine）：无状态
+    // 机可驱动，动画段跳过、移动照常。正常装配下表恒非空。
+    if !player.states.is_empty() {
+        // moving 参数每帧先写：跳跃落地的条件转移在 update_animations
+        // 步检时读取，而本系统注册在其后，故步检读到的是上一帧写入的
+        // 值——至多一帧陈旧，按住移动键跨落地帧的场景无感。
+        player.set_bool(MOVING_PARAM, moving);
+        let jump_is_real = ents.jump != ents.walk && ents.jump != ents.idle;
+        let in_jump = jump_is_real && player.current_state == STATE_JUMP;
+        let jump_requested = space_pressed && jump_is_real && !in_jump;
+        // 停步相位门：无输入、正在步行、且未落在过步窗口——本帧不请求
+        // 切换，保持 Walk 走完当前步（速度照常全速，脚步不打滑）。
+        let hold_walk = !in_jump
+            && !moving
+            && !jump_requested
+            && player.current_state == STATE_WALK
+            && !stop_phase_ready(player.time, player.clips[ents.walk].duration);
+        if jump_requested {
+            player.request_state(STATE_JUMP);
+        } else if !in_jump {
+            if moving {
+                player.request_state(STATE_WALK);
+            } else if !hold_walk {
+                player.request_state(STATE_IDLE);
+            }
+            // hold_walk 帧：不请求——等过步窗口
         }
+        cruise = moving || hold_walk;
     }
 
-    // ---- 位置积分 + 朝向转身（有移动输入才写，无输入恒等）----
-    if moving {
+    // ---- 速度平滑 + 位置积分 + 朝向转身 ----
+    // 目标速度：移动中是意图方向乘全速（起步按 ACCEL_RATE 加速）；相位
+    // 门等待期保持当前值（走完最后一步）；其余归零（停步按 DECEL_RATE
+    // 减速）。速度非零的帧写位置（停步减速窗口内位移照常推进，完全
+    // 静止后恢复无输入恒等，语义见模块文档）；朝向只在有输入帧更新。
+    let (velocity, yaw) = {
+        let Some(mut ch) = world.try_resource_mut::<ExpCharacter>() else {
+            return;
+        };
+        let target = if moving {
+            dir * MOVE_SPEED
+        } else if cruise {
+            ch.velocity
+        } else {
+            Vec3::ZERO
+        };
+        let rate = if moving { ACCEL_RATE } else { DECEL_RATE };
+        let mut vel = exp_approach_vec3(ch.velocity, target, rate, dt);
+        if !cruise && vel.length() < STOP_EPS {
+            vel = Vec3::ZERO;
+        }
+        ch.velocity = vel;
+        if moving {
+            ch.yaw = wrap_angle(exp_approach(ch.yaw, facing_yaw(dir), TURN_RATE, dt));
+        }
+        (ch.velocity, ch.yaw)
+    };
+    if velocity != Vec3::ZERO {
         let Some(mut t) = world.get_mut::<Transform>(model) else {
             return;
         };
-        let mut pos = t.position + dir * (MOVE_SPEED * dt);
+        let mut pos = t.position + velocity * dt;
         pos.x = pos.x.clamp(-GROUND_HALF, GROUND_HALF);
         pos.z = pos.z.clamp(-GROUND_HALF, GROUND_HALF);
         t.position = pos;
-        if let Some(mut ch) = world.try_resource_mut::<ExpCharacter>() {
-            ch.yaw = wrap_angle(exp_approach(ch.yaw, facing_yaw(dir), TURN_RATE, dt));
+    }
+    if moving {
+        if let Some(mut t) = world.get_mut::<Transform>(model) {
+            t.rotation = Quat::from_rotation_y(yaw);
         }
-        let yaw = world
-            .try_resource::<ExpCharacter>()
-            .map(|c| c.yaw)
-            .unwrap_or(0.0);
-        t.rotation = Quat::from_rotation_y(yaw);
     }
 }
 
@@ -515,11 +698,12 @@ fn wasd_held(input: &Input) -> bool {
 }
 
 /// Update：右键拖拽轨道环绕 + 滚轮缩放 + Q/E 调注视点高度 + 注视点跟随
-/// 角色。鼠标、滚轮、Q/E 与 WASD 全静默的帧直接返回（不写相机
-/// `Transform`、不写资源——恒等帧保护外部机位覆盖与 headless 逐位稳定）；
-/// WASD 按住帧照写（注视点跟随移动中的角色，钳制边界上写的是逐位恒等
-/// 值，无副作用）。相机实体缺席（理论上不发生，实体表自有即建）时仅
-/// 状态更新不写位姿。
+/// 角色。鼠标、滚轮、Q/E 与 WASD 全静默且角色已完全静止的帧直接返回
+/// （不写相机 `Transform`、不写资源——恒等帧保护外部机位覆盖与
+/// headless 逐位稳定）；WASD 按住帧照写（注视点跟随移动中的角色，钳制
+/// 边界上写的是逐位恒等值，无副作用）；停步减速滑行窗口（无输入但速度
+/// 未归零）照常跟随最后几厘米位移。相机实体缺席（理论上不发生，实体表
+/// 自有即建）时仅状态更新不写位姿。
 fn update_orbit_camera(world: &World) {
     let Some(ents) = world.try_resource::<ExpEntities>() else {
         return;
@@ -531,7 +715,19 @@ fn update_orbit_camera(world: &World) {
     let (dx, dy) = input.mouse_delta();
     let wheel = input.wheel_delta();
     let focus_key_held = input.key(KeyCode::KeyQ) || input.key(KeyCode::KeyE);
-    if !dragging && dx == 0.0 && dy == 0.0 && wheel == 0.0 && !focus_key_held && !wasd_held(&input)
+    // 停步减速滑行（无输入但速度未归零）：注视点跟着最后几厘米位移走，
+    // 完全静止后恢复无输入恒等。
+    let gliding = world
+        .try_resource::<ExpCharacter>()
+        .map(|c| c.velocity != Vec3::ZERO)
+        .unwrap_or(false);
+    if !dragging
+        && dx == 0.0
+        && dy == 0.0
+        && wheel == 0.0
+        && !focus_key_held
+        && !wasd_held(&input)
+        && !gliding
     {
         return;
     }
@@ -643,6 +839,37 @@ pub fn exp_approach(cur: f32, target: f32, rate: f32, dt: f32) -> f32 {
     }
     let k = 1.0 - (-rate * dt).exp();
     cur + shortest_angle(cur, target) * k
+}
+
+/// 帧率无关向量指数趋近（纯函数）：与 [`exp_approach`] 同式但无角环绕
+/// 语义，逐分量独立趋近。残差向量按 `exp(−rate·Σdt)` 收缩（解析解），
+/// 同一段真实时间任意切分收敛轨迹一致（浮点舍入内），`rate ≤ 0` 直接
+/// 贴合。起步加速与停步减速的速度平滑都用它。
+pub fn exp_approach_vec3(cur: Vec3, target: Vec3, rate: f32, dt: f32) -> Vec3 {
+    if rate <= 0.0 {
+        return target;
+    }
+    let k = 1.0 - (-rate * dt).exp();
+    cur + (target - cur) * k
+}
+
+/// 停步相位门（纯函数）：步行剪辑的归一化时间是否落在「姿势距 Idle
+/// 最近」的窗口内——此刻切回 Idle 要跨越的姿势距离最小，过渡中间姿势
+/// 最不像两姿势的算术平均。窗口表 [`STOP_PHASE_WINDOWS`] 的实测依据：
+/// 对 Mixamo_Walk 全部 261 通道按逐分量 L1 计算对 Idle 首帧的距离曲线
+/// （96 相位采样），循环末尾最深（相位 0.93~1.0，距离 10.1~10.6，两脚
+/// 并拢的触地换步点），0~0.10 与 0.57~0.70 两段次窗口距离 12.9~13.7
+/// （与循环首帧 12.9 同量级），三者把最大等待压到约半步（0.45 s）；
+/// 曲线峰值在 0.26 与 0.52（满幅分腿，17~18），窗口避开。
+/// `walk_duration ≤ 0` 视为无门（退化资产直切，不等待）。
+pub fn stop_phase_ready(walk_time: f32, walk_duration: f32) -> bool {
+    if walk_duration <= 0.0 {
+        return true;
+    }
+    let phase = (walk_time / walk_duration).rem_euclid(1.0);
+    STOP_PHASE_WINDOWS
+        .iter()
+        .any(|&(lo, hi)| phase >= lo && phase <= hi)
 }
 
 /// 离屏渲染器便捷构造（快照 example / 手动验收用；无 GPU 返回 None）。
@@ -802,5 +1029,62 @@ mod tests {
         assert_eq!(exp_approach(0.3, 2.0, 0.0, 1.0 / 60.0), 2.0);
         let wrapped = exp_approach(0.0, -pi + 0.01, TURN_RATE, 1.0 / 60.0);
         assert!(wrapped < 0.0, "目标在 -π 附近应走负向短弧，实际 {wrapped}");
+    }
+
+    #[test]
+    fn exp_approach_vec3_analytic() {
+        // 单步解析解：残差向量长度 = 初差 × exp(−rate·dt)（与 exp_approach
+        // 同式，无角环绕）
+        let cur = Vec3::new(1.0, -2.0, 0.5);
+        let target = Vec3::new(-3.0, 2.0, 0.5);
+        let v = exp_approach_vec3(cur, target, ACCEL_RATE, 1.0 / 60.0);
+        let expect = target - (target - cur) * (-ACCEL_RATE / 60.0).exp();
+        assert!(
+            v.abs_diff_eq(expect, 1e-6),
+            "单步应等于解析解：期望 {expect:?}，实际 {v:?}"
+        );
+        // 同一段真实时间（0.5 s）不同切分（30×1/60 vs 1×0.5 vs 100×0.005）
+        // 收敛一致（指数衰减解析解）
+        let run = |steps: usize, dt: f32| -> Vec3 {
+            let mut v = Vec3::ZERO;
+            let t = Vec3::new(0.0, 0.0, -MOVE_SPEED);
+            for _ in 0..steps {
+                v = exp_approach_vec3(v, t, ACCEL_RATE, dt);
+            }
+            v
+        };
+        let a = run(30, 1.0 / 60.0);
+        let b = run(1, 0.5);
+        let c = run(100, 0.005);
+        assert!(
+            a.abs_diff_eq(b, 1e-5) && a.abs_diff_eq(c, 1e-5),
+            "切分无关性被破坏：{a:?} vs {b:?} vs {c:?}"
+        );
+        // 与目标重合时恒等（零差值）；rate ≤ 0 直接贴合
+        assert_eq!(exp_approach_vec3(a, a, ACCEL_RATE, 1.0 / 60.0), a);
+        assert_eq!(exp_approach_vec3(a, Vec3::ONE, 0.0, 1.0 / 60.0), Vec3::ONE);
+    }
+
+    #[test]
+    fn stop_phase_windows_membership() {
+        // 主窗口（循环末尾两脚并拢）与两段次窗口内放行
+        for phase in [0.0_f32, 0.05, 0.10, 0.57, 0.635, 0.70, 0.93, 0.97, 0.999] {
+            assert!(
+                stop_phase_ready(phase * 0.966_666_64, 0.966_666_64),
+                "相位 {phase} 应在停步窗口内"
+            );
+        }
+        // 窗外保持步行（满幅分腿区与过渡肩部）
+        for phase in [0.11_f32, 0.26, 0.45, 0.56, 0.71, 0.85, 0.92] {
+            assert!(
+                !stop_phase_ready(phase * 0.966_666_64, 0.966_666_64),
+                "相位 {phase} 应在停步窗口外"
+            );
+        }
+        // 时间跨过循环长度按相位回绕：1.5 圈 = 相位 0.5 → 窗外
+        assert!(!stop_phase_ready(1.5 * 0.966_666_64, 0.966_666_64));
+        assert!(stop_phase_ready(2.0 * 0.966_666_64, 0.966_666_64));
+        // 退化：非正时长视为无门（直切不等待）
+        assert!(stop_phase_ready(0.25, 0.0));
     }
 }
