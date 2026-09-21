@@ -223,7 +223,7 @@ const _: () = assert!(
 /// 阴影暗部保留的光照比例（0 = 全黑阴影，1 = 无阴影）。
 const SHADOW_STRENGTH: f32 = 0.45;
 
-/// 与 WGSL `MaterialParams` 结构对齐（80 字节，POD）。
+/// 与 WGSL `MaterialParams` 结构对齐（96 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialRaw {
@@ -239,11 +239,15 @@ struct MaterialRaw {
     // x: KK 开关（0/1）、y: alpha cutout 阈值（0 = 不裁；仅 Mask 模式
     // 与壳层写入非零值）、z: KK shift、w: KK exponent
     fur: [f32; 4],
+    // 高光染色（R96，与 WGSL MaterialParams.fur_tint 逐字段对齐）：
+    // xyz = KK 高光色乘子（缺省 (1,1,1) = R90 固定式逐位不变），
+    // w: 保留。
+    fur_tint: [f32; 4],
 }
 
 const _: () = assert!(
-    std::mem::size_of::<MaterialRaw>() == 80,
-    "MaterialParams 必须与 WGSL 布局一致（R90 起 80 B）"
+    std::mem::size_of::<MaterialRaw>() == 96,
+    "MaterialParams 必须与 WGSL 布局一致（R96 起 96 B）"
 );
 
 struct GpuMesh {
@@ -12877,6 +12881,15 @@ impl Renderer {
                 },
                 def.kajiya_kay.map_or(0.0, |kk| kk.shift),
                 def.kajiya_kay.map_or(0.0, |kk| kk.exponent),
+            ],
+            // 高光染色（R96）：恒按材质字段写入（KK 关闭时着色器分支不
+            // 进入，取值无关紧要——与 SSS 的 v 坐标同款「无先开后关跳变」
+            // 口径）。缺省 (1,1,1) 乘子 = R90 固定式逐位一致。
+            fur_tint: [
+                def.kajiya_kay.map_or(1.0, |kk| kk.highlight_tint[0]),
+                def.kajiya_kay.map_or(1.0, |kk| kk.highlight_tint[1]),
+                def.kajiya_kay.map_or(1.0, |kk| kk.highlight_tint[2]),
+                0.0,
             ],
         };
         let params_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {

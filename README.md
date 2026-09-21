@@ -921,7 +921,7 @@ cargo run -p iris-assault --example gen_assault_assets --release # 重新生成 
 ## 测试
 
 ```sh
-cargo test --workspace   # 1817 项测试（release 1814 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 1823 项测试（release 1820 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

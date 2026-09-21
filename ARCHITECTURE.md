@@ -5327,16 +5327,21 @@ groom 起步（`groom.rs::generate_hair_strands`——头皮圆盘面积均匀�
 计算零改动。cull None（屏幕展宽绕向随相机变化）+ REPLACE + 深度写。
 
 **Kajiya-Kay 着色**：材质 flag（`MaterialDef::kajiya_kay: Option<
-KajiyaKay{shift, exponent}>`）门控——`fs_shaded` 内方向光 if/else
-二选一（else 支语句序与引入前逐条相同）、点光两路循环（均匀门 +
-分箱）的贡献点换调 `kk_point_contrib`（阴影 / 衰减段与
+KajiyaKay{shift, exponent, highlight_tint}>`）门控——`fs_shaded` 内方向
+光 if/else 二选一（else 支语句序与引入前逐条相同）、点光两路循环（均匀
+门 + 分箱）的贡献点换调 `kk_point_contrib`（阴影 / 衰减段与
 `point_light_contrib` 逐式同步的**复制**——不改既有函数本体的理由 =
 R63 教训：函数体内加分支会改编译器内联 / FMA 决策，以 ±1 LSB 基线
 漂移的形式付出过代价；实测本轮 shadow_v2 / sss 像素锁原值通过）。
 模型：漫反射 max(0, sin(T·L))、高光 sin(T'·H)^e（T' 沿伪法线偏移
-shift·(2t−1) 根梢移位）、高光颜色 mix(白, albedo, 0.5) 固定式；
-间接项（IBL / 探针 / 光照贴图）各向同性伪法线（v1 边界）。CPU 镜像
-`kajiya_kay.rs::kk_lobe` 解析锚 + WGSL 源码看门双轨。
+shift·(2t−1) 根梢移位）、高光颜色 mix(白, albedo, 0.5) × highlight_tint
+（R96 增补染色乘子：R90 固定式在近黑发色上把瓣色钳到灰白量级，实机
+读作漂白，故开放逐分量乘子；serde 缺省 [1,1,1] 与 R90 固定式逐位一致，
+IEEE 乘 1.0 精确，无分支无重排；材质 uniform 同轮从 80 B 扩到 96 B，
+`shadow.wgsl` 影子结构同步、`MaterialRaw` 编译期断言看门）；间接项
+（IBL / 探针 / 光照贴图）各向同性伪法线（v1 边界，不经过高光色，染色
+不生效）。CPU 镜像 `kajiya_kay.rs::kk_lobe` 与 `highlight_color` 解析锚
++ WGSL 源码看门双轨。
 
 **壳层**：`ShellInstanceRaw`（InstanceRaw + loc15 = 层比 / 毛高，
 144 B）独立实例缓冲每帧全量上传（不进主实例缓冲的增量比对——量级
@@ -7375,8 +7380,11 @@ pack 读反而快约 2 倍：单文件归档天然免 open/Close 每次开销；
     跟头骨 + 风场摆动 + 远景 LOD + **毛发阴影**（发带 / 壳层独立于
     实例区间绘制，天然不投影）全部留 R91；②KK 着色 v1 = 单级高光带
     （无 primary/secondary 双带）、漫反射 KK 1989 原式（无 Scheuermann
-    根梢混合，背光侧偏暗）、间接项各向同性伪法线近似、高光颜色固定式
-    无独立旋钮（不设无断言看管的旋钮——R89 铁律）；③**AlphaMask 阴影
+    根梢混合，背光侧偏暗）、间接项各向同性伪法线近似、高光颜色
+    mix(白, albedo, 0.5) × highlight_tint（R96 增补染色乘子，serde 缺省
+    [1,1,1] 与固定式逐位一致；固定式对近黑发色把瓣色钳到灰白量级，
+    iris-exp 实测黑发资产只能取哑光——见 frictions ⑳，按 albedo 加权
+    的高光模型为引擎候选）；③**AlphaMask 阴影
     为实心近似**（深度 pass 不感知 alpha，cutout 孔洞在投影中闭合）；
     ④发带 GPU 缓存按实体位只建一次——运行期改 `HairStrands.mesh`
     不生效（需新实体；句柄值缓存纪律，跨世界对照须独立渲染器）；

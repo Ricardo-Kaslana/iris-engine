@@ -1,5 +1,6 @@
-//! [`ExpPlugin`]：实验项目的全部内容——场景装配（地面 / 方向光 / 相机）
-//! + 外部 GLB 角色实例化 + 动作切换接线 + 轨道相机与角色移动控制。
+//! [`ExpPlugin`]：实验项目的全部内容——场景装配（地面 / 方向光 /
+//! 轮廓与补光 / 相机）+ 外部 GLB 角色实例化 + 材质升级覆写 + 动作切换
+//! 接线 + 轨道相机与角色移动控制。
 //!
 //! 与完整游戏（iris-assault 等）刻意保持最小：无逻辑状态机、无物理、
 //! 无音频内容、无 UI——只保留回答「渲染 / 动画 / 切换 / 控制」四问所需
@@ -32,14 +33,35 @@
 //!   **完全静止后的无输入帧不写相机与角色 `Transform`**（恒等语义的
 //!   精确口径）。动画推进、过渡计时与速度趋近全部是确定性的 dt-based
 //!   计算，双跑逐位一致不受影响。
+//!
+//! # 角色材质升级与布光（渲染质量）
+//!
+//! GLB 导入路径按契约把皮肤次表面散射留关（glTF 规范没有这种参数，
+//! 需要方在导入后覆写），本插件装配后按**节点名**覆写：皮肤节点（含
+//! 身体与脸部两个 prim）开预积分次表面散射，头发与睫毛节点抬到哑光
+//! 粗糙度，眼球节点材质的粗糙度从全镜面 0 抬到角膜量级（路由与参数
+//! 见 [`material_upgrade_for_node`] 与 [`apply_material_upgrade`]）。
+//! 布光在单方向光之外加一盏冷色轮廓锥光与一盏暖色补光（三点布光的
+//! 背光与填充位，均不投影），用于近景角色的轮廓分离与暗部层次。
+//!
+//! **头发与睫毛不挂 Kajiya-Kay（实测证据链）**：R90 的固定高光色
+//! `mix(白, albedo, 0.5)` 按中等深度发色的假设设计，本资产发色的
+//! albedo 约 0.06，高光色被钳在约 0.53 的灰白，直射高光在黑发上读作
+//! 漂白。引擎 R96 补 `highlight_tint` 染色乘子（缺省与固定式逐位一致）
+//! 之后，染色 0.12 档在 720p 下仍余可见的蓝灰渐变；再叠加天空 IBL 镜面
+//! （间接项各向同性且不受染色控制），窗口实机中的头发读作未修复。头发
+//! 贴图本身接近纯黑：任何可见的定向高光都读作灰白，压到不可见则等于
+//! 没有高光。因此本资产的终点是哑光黑（roughness 0.85、不挂 KK），染色
+//! 旋钮留给浅色毛发或彩色毛发的资产使用。
 
 use iris_core::prelude::{Entity, Stage};
 use iris_engine::prelude::{
     Access, ActiveCamera, AnimGuard, AnimTransition, AnimationClip, AnimationEdge, AnimationPlayer,
-    AnimationState, AoSettings, App, Camera, DirectionalLight, Input, KeyCode, MaterialDef,
-    MaterialStore, MeshData, MeshStore, MipSettings, MotionBlurSettings, MouseButton, Name,
-    OffscreenRenderer, Plugin, Quat, Resource, Schedule, TaaSettings, TextureStore, Time,
-    Transform, Vec3, VignetteSettings, Visibility, World, asset_path, spawn_gltf_instance,
+    AnimationState, AoSettings, App, Camera, DirectionalLight, GltfInstance, Input, KeyCode,
+    MaterialDef, MaterialHandle, MaterialStore, MeshData, MeshStore, MipSettings,
+    MotionBlurSettings, MouseButton, Name, OffscreenRenderer, Plugin, PointLight, Quat, Resource,
+    Schedule, SpotLight, TaaSettings, TextureStore, Time, Transform, Vec3, VignetteSettings,
+    Visibility, World, asset_path, spawn_gltf_instance,
 };
 
 /// 角色 GLB 路径（`asset_path` 解析：CWD 相对优先，workspace 根相对回退）。
@@ -138,6 +160,38 @@ pub const STOP_EPS: f32 = 0.05;
 /// 停步相位窗口（归一化相位区段，实测依据见 [`stop_phase_ready`]）。
 pub const STOP_PHASE_WINDOWS: &[(f32, f32)] = &[(0.93, 1.0), (0.0, 0.10), (0.57, 0.70)];
 
+// ---------------------------------------------------------------------------
+// 角色材质升级（GLB 导入后按节点名覆写；引擎 SSS 通道按导入契约恒关
+// ——glTF 规范无此参数，由游戏层显式打开）
+// ---------------------------------------------------------------------------
+
+/// 皮肤节点名（GLB 节点名即契约，与 `Mixamo_Walk` 剪辑名同款口径）：
+/// 该节点下挂身体与脸部两个 prim 的材质，均开预积分 SSS。
+pub const SKIN_NODE: &str = "body.001";
+/// 头发节点名：材质抬到哑光粗糙度（见 [`HAIR_ROUGHNESS`]），并且不挂
+/// Kajiya-Kay。近黑发色上任何可见的定向高光都读作灰白，完整证据链见
+/// 模块文档与 frictions ⑳。
+pub const HAIR_NODE: &str = "mesh_56";
+/// 睫毛节点名：同 [`HAIR_ROUGHNESS`] 哑光档。
+pub const LASH_NODE: &str = "mesh_57";
+/// 眼球节点名：材质无 ORM 图、粗糙度因子 0（全镜面），覆写为角膜量级。
+pub const EYE_NODE: &str = "mesh_30";
+/// 皮肤 SSS 强度（0..1）：0.55 取「终结线软坡明显、不到蜡像」的中强档
+/// （引擎调参表的默认观感档是 strength 由调用方定、scale 定包裹角）。
+pub const SKIN_SSS_STRENGTH: f32 = 0.55;
+/// 皮肤 SSS 曲率尺度半径（米，越小包裹越强）：引擎调参表按真人尺度给
+/// 头部 0.1 m；本 GLB 角色约 4 m 高（约 2.2 倍），头/前臂等比放大取
+/// 0.22 m 量级（包裹参数 t ≈ 0.23，介于调参表「躯干」与「头部」档
+/// 之间——身体与脸部两 prim 共用一档的折中，脸部略欠包裹是有意取舍）。
+pub const SKIN_SSS_SCALE: f32 = 0.22;
+/// 眼球材质覆写后的粗糙度：GLB 原值 0（无 ORM 图、因子 0）只采样预
+/// 滤理环境图 mip0，高光锐得失真；0.12 是「角膜湿润反光」量级。
+pub const EYE_ROUGHNESS: f32 = 0.12;
+/// 头发与睫毛覆写后的粗糙度（GLB 原值 0.5）：哑光档同时压制两路高光，
+/// 一路是天空 IBL 镜面（间接项；引擎诚实边界为各向同性且不受染色控制），
+/// 另一路是直射 GGX 镜面。头发贴图本身接近纯黑，哑光黑是本资产的终点。
+pub const HAIR_ROUGHNESS: f32 = 0.85;
+
 /// 轨道相机状态（游戏层资源）：yaw = 环绕方位角（0 = 相机在 +Z 侧）、
 /// pitch = 俯角（0 = 水平，正值 = 相机升高俯视）、dist = 轨道距离、
 /// focus_h = 注视点在角色上方的高度（Q/E 调节）。位姿几何见
@@ -210,6 +264,95 @@ pub struct ExpEntities {
     /// 待机循环剪辑下标（常态；GLB 缺 Idle 时回退指 walk——
     /// 行为退化为「停止 = 步行剪辑定格」的旧语义，不 panic）。
     pub idle: usize,
+}
+
+/// 角色材质升级种类：按 GLB 节点名路由的四种覆写（纯数据，供单测与
+/// headless 断言直接消费）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterialUpgrade {
+    /// 皮肤（含脸部）：开预积分次表面散射。
+    Skin,
+    /// 头发：抬到哑光粗糙度（不挂 Kajiya-Kay，理由见模块文档）。
+    Hair,
+    /// 睫毛：同哑光档。
+    Lash,
+    /// 眼球：粗糙度抬到角膜量级。
+    Eye,
+}
+
+/// 节点名 → 材质升级种类（纯函数）。GLB 节点名即契约：换版资产改动了
+/// 这些节点名时路由落空、材质停在导入默认（渲染照常，只是升级缺席），
+/// headless 契约测试会先一步失败——与剪辑名（`Mixamo_Walk` 等）同款
+/// 失效模式。
+pub fn material_upgrade_for_node(node_name: &str) -> Option<MaterialUpgrade> {
+    match node_name {
+        SKIN_NODE => Some(MaterialUpgrade::Skin),
+        HAIR_NODE => Some(MaterialUpgrade::Hair),
+        LASH_NODE => Some(MaterialUpgrade::Lash),
+        EYE_NODE => Some(MaterialUpgrade::Eye),
+        _ => None,
+    }
+}
+
+/// 应用材质升级（纯函数：直接改传入的 [`MaterialDef`]，可脱离 World 单
+/// 测）。只写目标字段，其余保持导入原值——布料的 ORM、皮肤的金属度、
+/// 各材质的透明模式与双面声明都不受影响。
+pub fn apply_material_upgrade(def: &mut MaterialDef, upgrade: MaterialUpgrade) {
+    match upgrade {
+        MaterialUpgrade::Skin => {
+            def.subsurface_strength = SKIN_SSS_STRENGTH;
+            def.subsurface_scale = SKIN_SSS_SCALE;
+        }
+        MaterialUpgrade::Hair => {
+            // 纯哑光：粗糙度从 GLB 原值 0.5 抬到 0.85。近黑发色（albedo
+            // 约 0.06）上任何可见的定向高光（KK 瓣染色已试到 0.12，以及
+            // 天空 IBL 镜面）在窗口分辨率下都读作灰白高光；本资产头发
+            // 贴图本身接近纯黑，哑光是唯一自洽档。KK 不挂，完整证据链
+            // 见模块文档与 frictions ⑳；引擎 highlight_tint 旋钮为浅色
+            // 毛发资产保留。
+            def.roughness = HAIR_ROUGHNESS;
+        }
+        MaterialUpgrade::Lash => {
+            def.roughness = HAIR_ROUGHNESS;
+        }
+        MaterialUpgrade::Eye => {
+            def.roughness = EYE_ROUGHNESS;
+        }
+    }
+}
+
+/// 走访 GLB 实例的全部节点，对命中路由表的节点覆写其 prim 材质。材质
+/// 句柄挂在节点实体的 **part 子实体**上（加载器给每个 primitive 一个
+/// 子实体），故路径是：节点名路由 → 节点实体 → `children` 取 part →
+/// `MaterialHandle` 组件 → `MaterialStore::get_mut` 覆写。返回覆写数
+/// （预期 5：皮肤双 prim + 头发 + 睫毛 + 眼球各一），装配日志据此对账。
+fn upgrade_character_materials(world: &mut World, instance: &GltfInstance) -> usize {
+    let mut upgraded = 0usize;
+    for (name, entity) in instance
+        .node_names
+        .iter()
+        .zip(instance.node_entities.iter())
+    {
+        let Some(upgrade) = name.as_deref().and_then(material_upgrade_for_node) else {
+            continue;
+        };
+        let Some(&entity) = entity.as_ref() else {
+            continue;
+        };
+        for part in world.children(entity) {
+            let Some(handle) = world.get::<MaterialHandle>(part) else {
+                continue;
+            };
+            let handle = *handle;
+            let mut store = world.resource_mut::<MaterialStore>();
+            let Some(def) = store.get_mut(handle) else {
+                continue;
+            };
+            apply_material_upgrade(def, upgrade);
+            upgraded += 1;
+        }
+    }
+    upgraded
 }
 
 /// 实验项目插件：Startup 装配场景与角色，Update 接线动作切换、角色
@@ -385,6 +528,48 @@ fn build_scene(world: &mut World) {
         light.shadows = true;
     }
 
+    // ---- 轮廓光（三点布光的背光位）：冷色锥光从角色背后上方斜照 ----
+    // 角色面向 +Z、初始相机在 +Z 侧，背光在 -Z 高处把肩、发、衣缘从灰
+    // 背景里剥出（立体分离）。方向取指向角色胸腹 (0, 2.2, 0) 的向量；
+    // inner 24° 在 4.4 m 距离全覆盖 4 m 身高、outer 46° 软化边缘溢出。
+    // 强度 8：锥光到头部约 4.4 m，平方衰减 (1−d/range)² ≈ 0.6 后有效
+    // 强度约 4.8——与主光 1.4 拉开约两档才是可读的轮廓分离（初版 4.0
+    // 在快照中不可辨，肩臂边缘没有冷亮边）。SpotLight v1 诚实限制：
+    // direction 是世界空间固定指向、不投影、不进探针捕获——本场景固定
+    // 机位量级，无碍。
+    world.spawn((
+        Name("exp/rim-light".to_string()),
+        Transform {
+            position: Vec3::new(0.0, 5.2, -4.2),
+            ..Transform::IDENTITY
+        },
+        SpotLight {
+            color: Vec3::new(0.55, 0.68, 1.0),
+            intensity: 8.0,
+            range: 18.0,
+            direction: Vec3::new(0.0, -0.6, 0.8),
+            inner_cutoff: 24.0_f32.to_radians(),
+            outer_cutoff: 46.0_f32.to_radians(),
+        },
+    ));
+    // ---- 补光（三点布光的填充位）：暖色点光从相机左前上方填暗部 ----
+    // 不投影、不给第二阴影——把面部与服装的背光半区抬一档并补回肤色
+    // 暖调（天空 IBL 与冷色环境底会把皮肤读灰）。距离面部约 4.2 m 处
+    // 衰减后有效强度约 0.9，仍弱于主光一个量级（填充位不造新阴影）。
+    world.spawn((
+        Name("exp/fill-light".to_string()),
+        Transform {
+            position: Vec3::new(-3.2, 2.6, 4.6),
+            ..Transform::IDENTITY
+        },
+        PointLight {
+            color: Vec3::new(1.0, 0.82, 0.62),
+            intensity: 2.6,
+            range: 11.0,
+            shadows: false,
+        },
+    ));
+
     // ---- 相机：轨道位姿构造（注视原点上方 orbit.focus_h）----
     let orbit = *world
         .try_resource::<OrbitCamera>()
@@ -430,8 +615,13 @@ fn build_scene(world: &mut World) {
             configure_state_machine(&mut player, idle_idx, walk_idx, jump_idx);
             player.capture_rest(world);
             world.insert(model, player);
+            // 材质升级（渲染质量轮）：按节点名覆写 SSS / Kajiya-Kay（染
+            // 色档）/ 眼球粗糙度——GLB 导入契约恒关，游戏层显式打开。
+            // 预期 5 项（皮肤双 prim + 头发 + 睫毛 + 眼球），数字进日志
+            // 供装配对账。
+            let upgraded = upgrade_character_materials(world, &instance);
             log::info!(
-                "ExpPlugin：角色已装配（{} 节点 / {} 剪辑），\
+                "ExpPlugin：角色已装配（{} 节点 / {} 剪辑 / 材质升级 {upgraded} 项），\
                  控制：WASD 移动 / 右键拖拽视角 / 滚轮缩放 / Q·E 注视点高度 / \
                  空格 跳跃（停止即回落 Idle）",
                 instance.node_entities.len(),
@@ -1086,5 +1276,66 @@ mod tests {
         assert!(stop_phase_ready(2.0 * 0.966_666_64, 0.966_666_64));
         // 退化：非正时长视为无门（直切不等待）
         assert!(stop_phase_ready(0.25, 0.0));
+    }
+
+    #[test]
+    fn material_upgrade_routing() {
+        // 四个契约节点名各命中其升级
+        assert_eq!(
+            material_upgrade_for_node(SKIN_NODE),
+            Some(MaterialUpgrade::Skin)
+        );
+        assert_eq!(
+            material_upgrade_for_node(HAIR_NODE),
+            Some(MaterialUpgrade::Hair)
+        );
+        assert_eq!(
+            material_upgrade_for_node(LASH_NODE),
+            Some(MaterialUpgrade::Lash)
+        );
+        assert_eq!(
+            material_upgrade_for_node(EYE_NODE),
+            Some(MaterialUpgrade::Eye)
+        );
+        // 骨骼 / 布料 / 空名不路由（覆写不外溢）
+        assert_eq!(material_upgrade_for_node("gMan Head"), None);
+        assert_eq!(material_upgrade_for_node("cloth01"), None);
+        assert_eq!(material_upgrade_for_node(""), None);
+    }
+
+    #[test]
+    fn apply_material_upgrade_each_kind() {
+        // 皮肤：SSS 双字段精确落位，KK 不动，其余保持默认
+        let mut skin = MaterialDef::default();
+        apply_material_upgrade(&mut skin, MaterialUpgrade::Skin);
+        assert_eq!(skin.subsurface_strength, SKIN_SSS_STRENGTH);
+        assert_eq!(skin.subsurface_scale, SKIN_SSS_SCALE);
+        assert!(skin.kajiya_kay.is_none(), "皮肤不应挂 Kajiya-Kay");
+        assert_eq!(skin.roughness, MaterialDef::default().roughness);
+        // 头发：纯哑光（粗糙度抬升 + **不挂 KK**——近黑发上任何可见
+        // 定向高光都读灰白，回归断言防 KK 复挂）
+        let mut hair = MaterialDef::default();
+        apply_material_upgrade(&mut hair, MaterialUpgrade::Hair);
+        assert_eq!(hair.roughness, HAIR_ROUGHNESS, "头发粗糙度应抬到哑光档");
+        assert!(
+            hair.kajiya_kay.is_none(),
+            "头发不得挂 Kajiya-Kay（漂白证据链）"
+        );
+        assert_eq!(hair.subsurface_strength, 0.0, "头发不应开 SSS");
+        // 睫毛：同哑光档
+        let mut lash = MaterialDef::default();
+        apply_material_upgrade(&mut lash, MaterialUpgrade::Lash);
+        assert_eq!(lash.roughness, HAIR_ROUGHNESS);
+        assert!(lash.kajiya_kay.is_none(), "睫毛不得挂 Kajiya-Kay");
+        // 眼球：粗糙度从 GLB 导入原值 0 抬到目标，金属度等其他字段不动
+        let mut eye = MaterialDef {
+            roughness: 0.0,
+            ..Default::default()
+        };
+        apply_material_upgrade(&mut eye, MaterialUpgrade::Eye);
+        assert_eq!(eye.roughness, EYE_ROUGHNESS);
+        assert!(eye.roughness > 0.0, "目标粗糙度应是抬升而非维持全镜面");
+        assert_eq!(eye.metallic, 0.0);
+        assert!(eye.kajiya_kay.is_none());
     }
 }

@@ -136,8 +136,9 @@ fn fs_point(in: PointShadowVertexOutput) -> @location(0) vec4<f32> {
 // 材质组声明在 **group(1)**（shadow_hair/shadow_pipeline 的布局 =
 // [cascade, material]）——与蒙皮入口的 group(1) joint_mats 同点不同
 // 变量（本文件 vs_point 头注释的同款合法形态：无入口同时使用两者）。
-// MaterialParams 是 standard.wgsl 的影子契约（80 B，fur 字段含 cutoff）
-// ——改一侧必须另一侧（看门：material.rs 布局 const 断言）。
+// MaterialParams 是 standard.wgsl 的影子契约（96 B，fur 字段含 cutoff、
+// fur_tint 为 R96 高光染色）——改一侧必须另一侧（看门：material.rs 布
+// 局 const 断言）。
 
 struct MaterialParams {
     base_color: vec4<f32>,
@@ -145,6 +146,7 @@ struct MaterialParams {
     surface: vec4<f32>,
     sss: vec4<f32>,
     fur: vec4<f32>,
+    fur_tint: vec4<f32>,
 };
 
 @group(1) @binding(0) var<uniform> shadow_material: MaterialParams;

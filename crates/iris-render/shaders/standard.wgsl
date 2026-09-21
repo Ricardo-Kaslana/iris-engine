@@ -107,6 +107,10 @@ struct MaterialParams {
     // z: KK 切线偏移幅度 shift（根梢高光移位），
     // w: KK 高光锐度指数 exponent。
     fur: vec4<f32>,
+    // KK 高光染色（R96，与 Rust 侧 MaterialRaw.fur_tint 逐字段对齐）：
+    // xyz = 高光色逐分量乘子（缺省 (1,1,1) = R90 固定式逐位一致，
+    // IEEE ×1.0 精确），w: 保留。
+    fur_tint: vec4<f32>,
 };
 
 // ---- 阴影偏移 v2 的着色器侧常量（R61，与 light.rs 同名常量一一对应）----
@@ -485,11 +489,13 @@ fn pbr_light(n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
 // 高光 = sin(T'·H)^exponent，T' = normalize(T + N·shift·(2t−1))——
 // 沿伪法线偏移切线，t = 沿发丝参数（发带 UV.x，根 0 梢 1），偏移量
 // 线性渐变产生根梢高光移位（发丝高光带倾斜的来源）；
-// 高光颜色 = mix(白, albedo, 0.5) 固定式——无独立强度旋钮（R89：不设
-// 无断言看管的旋钮）。
+// 高光颜色 = mix(白, albedo, 0.5) × tint——染色乘子是 R96 增补的唯一
+// 旋钮（缺省 (1,1,1) = R90 固定式逐位一致，CPU 镜像 highlight_color
+// 看管，R89 非默认断言）；近黑毛发用它把灰白高光压回发色域。
 fn kk_light(t_strand: vec3<f32>, n_pseudo: vec3<f32>, t_along: f32,
             v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>,
-            albedo: vec3<f32>, shift: f32, exponent: f32) -> vec3<f32> {
+            albedo: vec3<f32>, shift: f32, exponent: f32,
+            tint: vec3<f32>) -> vec3<f32> {
     let t_shift = normalize(t_strand
         + n_pseudo * (shift * (2.0 * t_along - 1.0)));
     let ctl = dot(t_strand, l);
@@ -498,7 +504,7 @@ fn kk_light(t_strand: vec3<f32>, n_pseudo: vec3<f32>, t_along: f32,
     let cth = dot(t_shift, h);
     let sin_th = sqrt(max(1.0 - cth * cth, 0.0));
     let spec = pow(sin_th, exponent);
-    let spec_color = mix(vec3<f32>(1.0), albedo, 0.5);
+    let spec_color = mix(vec3<f32>(1.0), albedo, 0.5) * tint;
     return (albedo * diffuse + spec_color * spec) * radiance;
 }
 
@@ -1001,7 +1007,7 @@ fn kk_point_contrib(
     t_along: f32, v: vec3<f32>, n_geo: vec3<f32>,
     light_pos: vec3<f32>, light_rgb: vec3<f32>, light_range: f32,
     light_shadow: vec4<f32>,
-    albedo: vec3<f32>, shift: f32, exponent: f32,
+    albedo: vec3<f32>, shift: f32, exponent: f32, tint: vec3<f32>,
 ) {
     let to_light = light_pos - world_pos;
     let dist = length(to_light);
@@ -1035,7 +1041,7 @@ fn kk_point_contrib(
         let atten = (window * window) / max(dist * dist, 0.01);
         let pl = light_rgb * atten * shadow;
         *color = *color + kk_light(t_strand, n_pseudo, t_along, v, lp,
-                                   pl, albedo, shift, exponent);
+                                   pl, albedo, shift, exponent, tint);
     }
 }
 
@@ -1443,7 +1449,8 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
     var color: vec3<f32>;
     if (material.fur.x > 0.5) {
         color = kk_light(normalize(in.tangent.xyz), n, in.uv.x, v, l,
-                         radiance, albedo, material.fur.z, material.fur.w);
+                         radiance, albedo, material.fur.z, material.fur.w,
+                         material.fur_tint.xyz);
     } else {
         color = pbr_light(n, v, l, radiance, albedo, f0, metallic, roughness);
         // 预积分 SSS 补项（R63）：radiance 已含 CSM 阴影因子 ⇒ 阴影内补项为 0。
@@ -1470,7 +1477,8 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
                                  normalize(in.tangent.xyz), in.uv.x, v, n_geo,
                                  light.position.xyz, light.color.rgb, light.color.w,
                                  light.shadow,
-                                 albedo, material.fur.z, material.fur.w);
+                                 albedo, material.fur.z, material.fur.w,
+                                 material.fur_tint.xyz);
             } else {
                 point_light_contrib(&color, in.world_pos, n, v, n_geo,
                                     light.position.xyz, light.color.rgb, light.color.w,
@@ -1516,7 +1524,8 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
                                  normalize(in.tangent.xyz), in.uv.x, v, n_geo,
                                  light.pos_type.xyz, light_rgb, light.color_range.w,
                                  light.shadow,
-                                 albedo, material.fur.z, material.fur.w);
+                                 albedo, material.fur.z, material.fur.w,
+                                 material.fur_tint.xyz);
             } else {
                 point_light_contrib(&color, in.world_pos, n, v, n_geo,
                                     light.pos_type.xyz, light_rgb, light.color_range.w,

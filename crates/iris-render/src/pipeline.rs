@@ -3592,14 +3592,18 @@ mod tests {
                 "{name} 的 fur_aux 必须是 @location(1) vec4<f32>"
             );
         }
-        // shadow.wgsl 的 MaterialParams 影子契约：80 B 布局 + fur 字段
-        // 在位（与 standard.wgsl 的 MaterialParams 同构——改一侧必须
-        // 另一侧；此处只锁关键存在性，完整布局由 material.rs 的
-        // const 断言钉 Rust 侧）。
+        // shadow.wgsl 的 MaterialParams 影子契约：96 B 布局 + fur 字段
+        // 与 fur_tint 槽在位（与 standard.wgsl 的 MaterialParams 同构
+        // ——改一侧必须另一侧；此处只锁关键存在性，完整布局由
+        // material.rs 的 const 断言钉 Rust 侧）。
         let shadow = include_str!("../shaders/shadow.wgsl");
         assert!(
             shadow.contains("fur: vec4<f32>"),
             "shadow.wgsl 的 MaterialParams 必须含 fur 字段（cutoff 判定的消费端）"
+        );
+        assert!(
+            shadow.contains("fur_tint: vec4<f32>"),
+            "shadow.wgsl 的 MaterialParams 必须含 fur_tint 字段（与 standard 同构，R96）"
         );
     }
 

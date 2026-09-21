@@ -5,6 +5,37 @@
 
 ## [Unreleased]
 
+### Added（iris-exp 角色材质升级与三点布光）
+
+iris-exp 在 GLB 导入后按节点名覆写四类材质，并补齐近景角色观感所需的
+布光。皮肤节点（身体与脸部两个 primitive）开启预积分次表面散射（强度
+0.55，曲率尺度 0.22 米——引擎调参表按真人尺度给值，本角色身高约为真人
+的两倍，按等比放大）；眼球材质的粗糙度从全镜面 0 抬到 0.12，角膜高光
+恢复自然；头发与睫毛抬到哑光粗糙度 0.85。布光在方向光之外新增一盏冷色
+轮廓锥光（角色背后上方，负责肩部与发缘的轮廓分离）与一盏暖色补点光
+（相机侧填充暗部），两者均不投影。
+
+头发贴图本身接近纯黑，任何可见的定向高光在实机分辨率下都读作灰白，
+因此哑光黑是该资产的终点；Kajiya-Kay 的适配边界与完整证据链记录在
+iris-exp frictions ⑳。快照工具新增三个诊断机位（`EXP_CAM_HEAD` 正面
+特写、`EXP_CAM_CROWN` 头顶俯视、`EXP_CAM_SIDE` 侧斜俯，均按 gMan Head
+骨骼实时定位）与 `EXP_RES=宽x高` 分辨率覆盖，材质验收从此覆盖三视角且
+不低于 720p。验收图 `docs/exp.png`（四联）与 `docs/exp_closeup.png`、
+`docs/exp_crown.png`、`docs/exp_side.png`（720p 三视角）随本轮更新。
+
+### Changed（引擎：Kajiya-Kay 高光染色乘子 highlight_tint）
+
+`KajiyaKay` 新增 `highlight_tint` 字段（线性 RGB，逐分量乘在高光色
+mix(白, albedo, 0.5) 之上）。R90 的固定高光色按中等深度发色设计，近黑
+毛发会把瓣色钳到灰白量级，实机观感读作漂白；染色乘子让深色毛发把高光
+压回发色域。serde 缺省值 [1, 1, 1] 与 R90 固定式逐位一致（IEEE 乘 1.0
+精确，无分支无重排），旧场景文件反序列化按缺省补齐。材质 uniform 从
+80 字节扩到 96 字节，`standard.wgsl` 与 `shadow.wgsl` 的影子结构同步，
+布局由 `MaterialRaw` 编译期断言与 pipeline 源码看门钉住。CPU 侧新增镜
+像函数 `kajiya_kay::highlight_color`，配 R89 非默认断言、缺省逐位锚与
+serde 兼容测试；`fur_render.rs` 八项 GPU 测试原值全过，既有像素基线不
+变。
+
 ### Added（iris-exp 动作自然过渡：三状态机 crossfade + 停步运动感）
 
 iris-exp 的动作切换此前是硬切——直接改写 `player.active` 并把时间归零，

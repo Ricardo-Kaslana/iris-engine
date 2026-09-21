@@ -72,18 +72,22 @@ pub enum AlphaMode {
     Mask,
 }
 
-/// Kajiya-Kay 各向异性毛发着色参数（R90）。
+/// Kajiya-Kay 各向异性毛发着色参数（R90；R96 增高光染色）。
 ///
 /// 发丝方向取顶点切线（发带管线的 VS 写入 `VertexOutput.tangent.xyz`，
-/// 普通网格则取 glTF tangent——两条通路同一消费点）。v1 模型（声明边界，
+/// 普通网格则取 glTF tangent——两条通路同一消费点）。模型边界（声明，
 /// 详见 `kajiya_kay.rs` 模块文档）：
 ///
 /// - 漫反射 = `max(0, sin(T·L))`（KK 1989 原式，无 Scheuermann 根梢
 ///   混合）；
 /// - 高光 = `pow(sin(T'·H), exponent)`，`T' = normalize(T + N·shift·(2t−1))`
 ///   沿伪法线偏移切线，`t` = 沿发丝参数（UV.x），产生根梢高光移位；
-/// - 高光颜色 = `mix(白, albedo, 0.5)` 固定式，**无独立强度旋钮**
-///   （R89「旋钮必须有非默认断言」——不开的旋钮不设）；
+/// - 高光颜色 = `mix(白, albedo, 0.5) × highlight_tint`——固定式之外的
+///   唯一旋钮是本染色乘子（R89：有非默认断言看管，见 `kajiya_kay.rs`
+///   的 `highlight_color` 测试）。缺省 `[1, 1, 1]` = 与 R90 固定式**逐位
+///   一致**（IEEE ×1.0 精确，无分支无重排）。动机：固定式在近黑毛发
+///   （albedo ≈ 0.06）上把高光钳到 ≈0.53 灰白，实机目检读作漂白；染色
+///   乘子让深色毛发把高光压回发色域（如 `[0.4, 0.42, 0.55]` 的冷灰蓝）；
 /// - 伪法线 = 视线在垂直于 T 平面上的投影（片元侧重算），保证
 ///   NdotV/NdotL 域良好，同时供 IBL / 探针间接项消费。
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -93,6 +97,29 @@ pub struct KajiyaKay {
     pub shift: f32,
     /// 高光锐度指数（越大高光带越窄）。典型 ∈ [20, 200]。
     pub exponent: f32,
+    /// 高光染色乘子（线性 RGB，逐分量乘在高光色上）。缺省
+    /// `[1, 1, 1]` = R90 固定式逐位不变；反序列化旧场景文件（无此字段）
+    /// 时按缺省补齐（`serde(default)`）。直射光（方向光 + 点光 + 锥光）
+    /// 的 KK 瓣统一消费；间接项不经过高光色，不受影响。
+    #[serde(default = "KajiyaKay::default_highlight_tint")]
+    pub highlight_tint: [f32; 3],
+}
+
+impl KajiyaKay {
+    /// 缺省高光染色 = 恒等乘子（serde 缺省入口 + CPU 镜像的解析锚）。
+    pub fn default_highlight_tint() -> [f32; 3] {
+        [1.0, 1.0, 1.0]
+    }
+
+    /// 以缺省染色构造（R90 字面量补齐字段的最短路径；shift / exponent
+    /// 逐字段直传）。
+    pub fn new(shift: f32, exponent: f32) -> Self {
+        Self {
+            shift,
+            exponent,
+            highlight_tint: Self::default_highlight_tint(),
+        }
+    }
 }
 
 /// 材质定义（CPU 侧）。GPU 侧 uniform 由渲染器按需创建。
@@ -462,17 +489,9 @@ mod tests {
         ] {
             assert_eq!(d.kajiya_kay, None, "便捷构造器不携带 KK");
         }
-        let hair = MaterialDef::solid(0.12, 0.09, 0.06, 1.0).with_kajiya_kay(KajiyaKay {
-            shift: 0.15,
-            exponent: 96.0,
-        });
-        assert_eq!(
-            hair.kajiya_kay,
-            Some(KajiyaKay {
-                shift: 0.15,
-                exponent: 96.0
-            })
-        );
+        let hair =
+            MaterialDef::solid(0.12, 0.09, 0.06, 1.0).with_kajiya_kay(KajiyaKay::new(0.15, 96.0));
+        assert_eq!(hair.kajiya_kay, Some(KajiyaKay::new(0.15, 96.0)));
         assert_eq!(
             hair.alpha_mode,
             AlphaMode::Opaque,

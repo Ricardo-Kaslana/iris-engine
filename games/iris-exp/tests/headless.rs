@@ -18,6 +18,9 @@
 //!   朝向转身 + 速度平滑（依赖资产）；
 //! - **插件装配**：`ExpPlugin` 不重复注册动画推进（合成播放器回归锚，
 //!   不依赖资产——历史上曾因双重注册导致窗口路径动画双倍速）；
+//! - **角色材质升级与布光**：GLB 装配后按节点名覆写材质（皮肤双 prim
+//!   开 SSS、头发 / 睫毛挂带染色的 Kajiya-Kay、眼球粗糙度抬升、布料
+//!   负对照），轮廓锥光与补点光的布光档位（后者不依赖资产）；
 //! - **确定性**：同一输入两次推进，采样关节位姿 `to_bits()` 逐位一致
 //!   （引擎确定性文化的标准测试模式）。
 //!
@@ -34,13 +37,16 @@ use std::time::Duration;
 use iris_core::prelude::{Entity, Stage};
 use iris_engine::prelude::{
     AnimationPlayer, AnimationPlugin, App, Audio, Camera, DirectionalLight, GlobalTransform,
-    HierarchyPlugin, Input, KeyCode, MeshStore, MouseButton, Plugin, Time, Viewport,
+    HierarchyPlugin, Input, KeyCode, MaterialDef, MaterialHandle, MaterialStore, MeshStore,
+    MouseButton, Plugin, PointLight, SpotLight, Time, Viewport,
 };
 use iris_exp::ExpPlugin;
 use iris_exp::plugin::{
-    ACCEL_RATE, DIST_MAX, FOCUS_H_MAX, FOCUS_H_MIN, FOCUS_H_RATE, GROUND_HALF, JUMP_IN_BLEND,
-    JUMP_OUT_BLEND, MOVE_SPEED, ORBIT_SENS, PITCH_MAX, STATE_BLEND, STATE_IDLE, STATE_JUMP,
-    STATE_WALK, STOP_BLEND, TARGET_HEIGHT, WHEEL_SENS, exp_approach_vec3, facing_yaw, orbit_pose,
+    ACCEL_RATE, DIST_MAX, EYE_NODE, EYE_ROUGHNESS, FOCUS_H_MAX, FOCUS_H_MIN, FOCUS_H_RATE,
+    GROUND_HALF, HAIR_NODE, HAIR_ROUGHNESS, JUMP_IN_BLEND, JUMP_OUT_BLEND, LASH_NODE, MOVE_SPEED,
+    ORBIT_SENS, PITCH_MAX, SKIN_NODE, SKIN_SSS_SCALE, SKIN_SSS_STRENGTH, STATE_BLEND, STATE_IDLE,
+    STATE_JUMP, STATE_WALK, STOP_BLEND, TARGET_HEIGHT, WHEEL_SENS, exp_approach_vec3, facing_yaw,
+    orbit_pose,
 };
 
 /// 测试台：世界 + ExpPlugin 系统链 + 层级 / 动画插件 + 虚拟时钟
@@ -1299,5 +1305,158 @@ fn walk_stop_phase_windows_match_pose_distance_curve() {
     assert!(
         d_split_b > 16.0,
         "相位 0.52（分腿峰）距离应 > 16.0，实际 {d_split_b}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 角色材质升级与布光（渲染质量轮）
+// ---------------------------------------------------------------------------
+
+/// 节点实体 → 其 prim 子实体的材质定义快照（Clone 出 [`MaterialDef`]，
+/// 不持有世界借用）。
+fn node_materials(world: &iris_engine::prelude::World, node: Entity) -> Vec<MaterialDef> {
+    world
+        .children(node)
+        .iter()
+        .map(|&part| {
+            let handle = world
+                .get::<MaterialHandle>(part)
+                .expect("prim 实体应挂材质");
+            let handle = *handle;
+            world
+                .resource::<MaterialStore>()
+                .get(handle)
+                .expect("材质句柄应在 store 注册")
+                .clone()
+        })
+        .collect()
+}
+
+/// 材质升级落位（依赖资产）：皮肤双 prim 开 SSS、头发 / 睫毛挂带染色
+/// 的 Kajiya-Kay（R96 引擎旋钮——染色是漂白问题的修复本体）、眼球粗糙
+/// 度抬升，布料负对照不被误染。GLB 节点名即契约（与剪辑名同款口径），
+/// 换版资产改节点名时本测试先于渲染失败。
+#[test]
+fn character_material_upgrades_applied() {
+    if !asset_available() {
+        return;
+    }
+    let game = Harness::new();
+    let ents = *game
+        .app
+        .world
+        .try_resource::<iris_exp::ExpEntities>()
+        .expect("实体表在位");
+    let model = ents.model.expect("资产在位时角色应装配成功");
+
+    // 按名定位四个升级节点 + 布料负对照节点（播放器持有同款节点名表）
+    let (skin, hair, lash, eye, cloth) = {
+        let player = game
+            .app
+            .world
+            .get::<AnimationPlayer>(model)
+            .expect("播放器在位");
+        (
+            player
+                .node_entity_by_name(SKIN_NODE)
+                .expect("皮肤节点应存在（节点名契约）"),
+            player
+                .node_entity_by_name(HAIR_NODE)
+                .expect("头发节点应存在"),
+            player
+                .node_entity_by_name(LASH_NODE)
+                .expect("睫毛节点应存在"),
+            player
+                .node_entity_by_name(EYE_NODE)
+                .expect("眼球节点应存在"),
+            player
+                .node_entity_by_name("cloth01")
+                .expect("布料节点应存在（负对照）"),
+        )
+    };
+
+    // 皮肤：身体与脸部两个 prim 均开 SSS，档位精确
+    let skin_defs = node_materials(&game.app.world, skin);
+    assert_eq!(
+        skin_defs.len(),
+        2,
+        "皮肤节点应含身体与脸部两个 prim（换版资产需复核路由）"
+    );
+    for def in &skin_defs {
+        assert_eq!(
+            def.subsurface_strength, SKIN_SSS_STRENGTH,
+            "皮肤 SSS 强度应被覆写"
+        );
+        assert_eq!(
+            def.subsurface_scale, SKIN_SSS_SCALE,
+            "皮肤 SSS 尺度应被覆写"
+        );
+        assert!(def.kajiya_kay.is_none(), "皮肤不应挂 Kajiya-Kay");
+    }
+
+    // 头发 / 睫毛：纯哑光（粗糙度抬升 + **不挂 KK**——近黑发上任何
+    // 可见定向高光都读灰白，回归断言防 KK 复挂）
+    for (what, defs) in [
+        ("头发", node_materials(&game.app.world, hair)),
+        ("睫毛", node_materials(&game.app.world, lash)),
+    ] {
+        assert!(!defs.is_empty(), "{what}节点应有 prim");
+        for def in &defs {
+            assert_eq!(
+                def.roughness, HAIR_ROUGHNESS,
+                "{what}粗糙度应抬到哑光档（压 IBL 与直射镜面）"
+            );
+            assert!(
+                def.kajiya_kay.is_none(),
+                "{what}不得挂 Kajiya-Kay（漂白证据链）"
+            );
+            assert_eq!(def.subsurface_strength, 0.0, "{what}不应被误开 SSS");
+        }
+    }
+
+    // 眼球：粗糙度从 GLB 导入原值 0 抬到角膜档
+    let eye_defs = node_materials(&game.app.world, eye);
+    assert!(!eye_defs.is_empty(), "眼球节点应有 prim");
+    assert_eq!(eye_defs[0].roughness, EYE_ROUGHNESS);
+    assert!(eye_defs[0].roughness > 0.0, "目标应是抬升而非维持全镜面");
+
+    // 负对照：布料保持导入默认（覆写不外溢）
+    for def in node_materials(&game.app.world, cloth) {
+        assert_eq!(def.subsurface_strength, 0.0, "布料不应被误开 SSS");
+        assert!(def.kajiya_kay.is_none(), "布料不应被误挂 Kajiya-Kay");
+    }
+}
+
+/// 布光装配（不依赖资产）：一盏冷色轮廓锥光与一盏暖色补点光，补光
+/// 不投影且弱于轮廓光（三点布光的背光 / 填充位语义）。
+#[test]
+fn scene_lighting_rig_present() {
+    let game = Harness::new();
+    let mut spots: Vec<SpotLight> = Vec::new();
+    game.app
+        .world
+        .query::<(Entity, &SpotLight)>(|(_, s)| spots.push(*s));
+    let mut points: Vec<PointLight> = Vec::new();
+    game.app
+        .world
+        .query::<(Entity, &PointLight)>(|(_, p)| points.push(*p));
+    assert_eq!(spots.len(), 1, "轮廓锥光应恰好一盏，实际 {}", spots.len());
+    assert_eq!(points.len(), 1, "补光点光应恰好一盏，实际 {}", points.len());
+    let rim = spots[0];
+    // 轮廓光：从 -Z 背侧照来（角色面向 +Z、相机在 +Z 侧）、冷色、内外锥角有序
+    assert!(rim.direction.z > 0.0, "轮廓光应从角色背侧照向 +Z");
+    assert!(rim.color.z > rim.color.x, "轮廓光应是冷色（蓝分量高于红）");
+    assert!(
+        rim.inner_cutoff > 0.0 && rim.outer_cutoff > rim.inner_cutoff,
+        "轮廓光锥角应有序（inner < outer 且为正）"
+    );
+    let fill = points[0];
+    assert!(!fill.shadows, "补光不应投影");
+    assert!(fill.color.x > fill.color.z, "补光应是暖色（红分量高于蓝）");
+    assert!(
+        fill.intensity < rim.intensity,
+        "补光应弱于轮廓光（填充位语义），实际补 {} / 轮 {}",
+        fill.intensity,
+        rim.intensity
     );
 }

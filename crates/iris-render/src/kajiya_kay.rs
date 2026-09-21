@@ -11,7 +11,9 @@
 //! - 单级高光带（无 primary/secondary 双带，Marschner 简化不做）；
 //! - 漫反射 = `max(0, sin(T·L))` KK 1989 原式，无 Scheuermann 根梢
 //!   混合（背光侧发丝偏暗）；
-//! - 高光颜色 = `mix(白, albedo, 0.5)` 固定式，无独立强度 / 颜色旋钮；
+//! - 高光颜色 = `mix(白, albedo, 0.5) × highlight_tint`——R96 增补染色
+//!   乘子前的固定式在近黑毛发上把高光钳到 ≈0.53 灰白（实机目检读作
+//!   漂白）；缺省 `[1,1,1]` 与 R90 固定式逐位一致（IEEE ×1.0 精确）；
 //! - 间接项（IBL / 探针 / 光照贴图 / DDGI）维持各向同性伪法线路径
 //!   （伪法线 = 发带 VS 预计算的视图投影法线，走 world_normal 通道）；
 //! - `sin(θ)` 一律 `sqrt(1 − cos²)` 计算（libm 的 asin/acos 无位级
@@ -73,6 +75,22 @@ pub fn kk_lobe(
     let sin_th = (1.0 - cth * cth).max(0.0).sqrt();
     let specular = sin_th.powf(exponent);
     (diffuse, specular)
+}
+
+/// KK 高光颜色（R96 的 CPU 镜像）：`mix(白, albedo, 0.5) × tint` 逐分量。
+///
+/// 与 WGSL `kk_light` 的 `spec_color` 行**同式同序**（mix = `x·(1−t) + y·t`
+/// 的 WGSL 语义），看门由 [`wgsl_kk_formula_matches_mirror`] 锁字符串。
+/// `tint = [1,1,1]`（缺省）时乘法为 IEEE 精确恒等 ⇒ 与 R90 固定式逐位
+/// 一致；近黑毛发传发色域乘子（如 `[0.4, 0.42, 0.55]`）把灰白高光压回
+/// 深色域。`albedo` / `tint` 分量不要求归一。
+pub fn highlight_color(albedo: [f32; 3], tint: [f32; 3]) -> [f32; 3] {
+    let t = 0.5_f32;
+    [
+        (1.0 * (1.0 - t) + albedo[0] * t) * tint[0],
+        (1.0 * (1.0 - t) + albedo[1] * t) * tint[1],
+        (1.0 * (1.0 - t) + albedo[2] * t) * tint[2],
+    ]
 }
 
 /// WGSL 源码层看门：`standard.wgsl` 的 `kk_light` 关键算式必须与镜像
@@ -228,10 +246,65 @@ mod tests {
             src.contains("let h = normalize(v + l);"),
             "WGSL 半程向量必须 normalize(v + l)（镜像同式）"
         );
-        // 高光颜色固定式
+        // 高光颜色固定式 + R96 染色乘子
         assert!(
-            src.contains("mix(vec3<f32>(1.0), albedo, 0.5)"),
-            "WGSL 高光颜色必须是 mix(白, albedo, 0.5) 固定式"
+            src.contains("mix(vec3<f32>(1.0), albedo, 0.5) * tint"),
+            "WGSL 高光颜色必须是 mix(白, albedo, 0.5) × tint（R96 染色乘子）"
         );
+        assert!(
+            src.contains("fur_tint: vec4<f32>"),
+            "WGSL MaterialParams 必须含 fur_tint 槽（R96）"
+        );
+    }
+
+    /// 高光颜色镜像的解析锚（R89 非默认断言）：
+    /// - 缺省 tint = [1,1,1] ⇒ 与 R90 固定式 `mix(白, albedo, 0.5)` **逐位
+    ///   一致**（同式同序 + IEEE ×1.0 精确，to_bits 断言）；
+    /// - 非默认 tint ⇒ 逐位等于固定式逐分量乘 tint（乘法本身 IEEE 精确，
+    ///   to_bits 断言）——染色旋钮真实生效而非摆设。
+    #[test]
+    fn highlight_color_tint_bits() {
+        let albedo = [0.06_f32, 0.07, 0.09];
+        let legacy = [
+            1.0 * (1.0 - 0.5_f32) + albedo[0] * 0.5,
+            1.0 * (1.0 - 0.5_f32) + albedo[1] * 0.5,
+            1.0 * (1.0 - 0.5_f32) + albedo[2] * 0.5,
+        ];
+        // 缺省染色 = R90 固定式（逐位）
+        let default = highlight_color(albedo, [1.0, 1.0, 1.0]);
+        for c in 0..3 {
+            assert_eq!(
+                default[c].to_bits(),
+                legacy[c].to_bits(),
+                "缺省染色必须与 R90 固定式逐位一致（通道 {c}）"
+            );
+        }
+        // 非默认染色 = 固定式 × tint（逐位）
+        let tint = [0.4_f32, 0.42, 0.55];
+        let tinted = highlight_color(albedo, tint);
+        for c in 0..3 {
+            assert_eq!(
+                tinted[c].to_bits(),
+                (legacy[c] * tint[c]).to_bits(),
+                "染色必须逐位等于固定式 × tint（通道 {c}）"
+            );
+        }
+    }
+
+    /// serde 兼容（R96）：旧场景文件（KajiyaKay 无 highlight_tint 字段）
+    /// 反序列化按缺省 [1,1,1] 补齐 = 旧数据行为不变；新字段往返保真。
+    #[test]
+    fn serde_legacy_json_gets_default_tint() {
+        let legacy = r#"{"shift":0.15,"exponent":96.0}"#;
+        let kk: crate::material::KajiyaKay =
+            serde_json::from_str(legacy).expect("旧格式（无 highlight_tint）必须可反序列化");
+        assert_eq!(kk.highlight_tint, [1.0, 1.0, 1.0], "旧数据补缺省染色");
+        let tinted = crate::material::KajiyaKay {
+            highlight_tint: [0.4, 0.42, 0.55],
+            ..crate::material::KajiyaKay::new(0.15, 96.0)
+        };
+        let json = serde_json::to_string(&tinted).expect("序列化");
+        let back: crate::material::KajiyaKay = serde_json::from_str(&json).expect("往返");
+        assert_eq!(back, tinted, "非默认染色往返保真");
     }
 }

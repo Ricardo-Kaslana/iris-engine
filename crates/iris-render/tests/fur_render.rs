@@ -340,10 +340,7 @@ fn fur_sessions_are_bitwise_deterministic() {
                 roughness: 0.35,
                 ..Default::default()
             }
-            .with_kajiya_kay(KajiyaKay {
-                shift: 0.15,
-                exponent: 96.0,
-            })
+            .with_kajiya_kay(KajiyaKay::new(0.15, 96.0))
             .with_alpha_mask(0.4),
         );
         world.spawn((

@@ -43,7 +43,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn new() -> Self {
+    fn new(width: u32, height: u32) -> Self {
         let mut app = App::new();
         app.world.insert_resource(Time::default());
         app.world.insert_resource(Input::new());
@@ -51,7 +51,7 @@ impl Harness {
         app.world.insert_resource(Camera::default());
         app.world.insert_resource(DirectionalLight::default());
         app.world.insert_resource(Audio::headless());
-        app.world.insert_resource(Viewport::new(640, 360));
+        app.world.insert_resource(Viewport::new(width, height));
         HierarchyPlugin.build(&mut app);
         AnimationPlugin.build(&mut app);
         ExpPlugin.build_schedule(&mut app.schedule);
@@ -99,29 +99,101 @@ fn main() {
         eprintln!("跳过：角色 GLB 缺席（assets/exp_weiqing.glb）——把导出的 GLB 放到该路径后重跑");
         std::process::exit(1);
     }
-    let Some(mut renderer) = OffscreenRenderer::new(640, 360) else {
+    // 分辨率：默认 640×360（快照归档口径）；`EXP_RES=宽x高` 覆盖——高
+    // 分辨率用于材质瑕疵验收（小分辨率 + TAA 会把灰度渐变平均掉，
+    // 与窗口实机观感脱节）。
+    let (width, height) = std::env::var("EXP_RES")
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+        })
+        .unwrap_or((640, 360));
+    let Some(mut renderer) = OffscreenRenderer::new(width, height) else {
         eprintln!("无 GPU，无法离屏渲染");
         std::process::exit(1);
     };
 
-    let mut game = Harness::new();
+    let mut game = Harness::new(width, height);
 
-    // 诊断机位（EXP_CAM_HEAD=1）：头部特写——角色面向 +Z，头部约在
-    // y≈3.0；相机放 +Z 侧近距直视面部。正常验收不设该变量。
-    if std::env::var("EXP_CAM_HEAD").is_ok() {
-        use iris_engine::prelude::{ActiveCamera, Transform};
-        let mut hit = None;
-        game.app
+    // 诊断机位共用：读 `gMan Head` 节点当前世界位（角色呼吸与换版资产
+    // 的头位漂移不再失帧；旧硬编码 y=2.72 实测只框到胸腹——头在画外）。
+    // 正常验收不设这些变量。
+    use iris_engine::prelude::{ActiveCamera, AnimationPlayer, GlobalTransform, Transform};
+    let head_pos = {
+        let ents = game
+            .app
             .world
-            .query::<(iris_engine::prelude::Entity, &ActiveCamera)>(|(e, _)| {
-                hit = Some(e);
-            });
-        if let Some(cam) = hit {
+            .try_resource::<iris_exp::ExpEntities>()
+            .and_then(|ents| ents.model);
+        ents.and_then(|model| {
+            let player = game.app.world.get::<AnimationPlayer>(model)?;
+            let head = player.node_entity_by_name("gMan Head")?;
+            game.app
+                .world
+                .get::<GlobalTransform>(head)
+                .map(|gt| gt.position())
+        })
+        .unwrap_or(glam::Vec3::new(0.0, 3.5, 0.0))
+    };
+    let mut cam_hit = None;
+    game.app
+        .world
+        .query::<(iris_engine::prelude::Entity, &ActiveCamera)>(|(e, _)| {
+            cam_hit = Some(e);
+        });
+
+    // EXP_CAM_HEAD=1：头部正面特写——头前 1.25 m 水平直视（+Z 侧正脸）。
+    if std::env::var("EXP_CAM_HEAD").is_ok() {
+        if let Some(cam) = cam_hit {
             game.app.world.insert(
                 cam,
                 Transform {
-                    position: glam::Vec3::new(0.0, 2.72, 1.5),
+                    position: glam::Vec3::new(0.0, head_pos.y, 1.25),
                     rotation: glam::Quat::IDENTITY,
+                    scale: glam::Vec3::ONE,
+                },
+            );
+        }
+    }
+    // EXP_CAM_CROWN=1：头顶俯视，KK 高光带的压力位。视线方向与光源方向
+    // 在头顶都和发丝切线大面积对齐，各向异性瓣整片饱和；漂白问题的验收
+    // 必须覆盖本视角，正面平视看不出。轨道几何复用 `orbit_pose`
+    //（pitch 72° 俯角、0.9 m 距离、注视点头顶）。
+    if std::env::var("EXP_CAM_CROWN").is_ok() {
+        let (eye, rot) = iris_exp::plugin::orbit_pose(
+            0.0,
+            72.0_f32.to_radians(),
+            0.9,
+            glam::Vec3::new(head_pos.x, head_pos.y + 0.12, head_pos.z),
+        );
+        if let Some(cam) = cam_hit {
+            game.app.world.insert(
+                cam,
+                Transform {
+                    position: eye,
+                    rotation: rot,
+                    scale: glam::Vec3::ONE,
+                },
+            );
+        }
+    }
+    // EXP_CAM_SIDE=1：左侧斜俯——发卡侧面大片受角的第三压力位（天空
+    // IBL 镜面与 KK 瓣叠加的灰渐变在此最显形）。yaw 66°（+X 前侧方）、
+    // 俯角 16°、距离 1.0 m，注视头部。
+    if std::env::var("EXP_CAM_SIDE").is_ok() {
+        let (eye, rot) = iris_exp::plugin::orbit_pose(
+            66.0_f32.to_radians(),
+            16.0_f32.to_radians(),
+            1.0,
+            head_pos,
+        );
+        if let Some(cam) = cam_hit {
+            game.app.world.insert(
+                cam,
+                Transform {
+                    position: eye,
+                    rotation: rot,
                     scale: glam::Vec3::ONE,
                 },
             );
@@ -141,9 +213,12 @@ fn main() {
     );
 
     // ---- 帧 1：按住 S 朝相机行走 30 帧（满幅迈步）----
-    // 诊断特写模式（EXP_CAM_HEAD）不注入移动：角色停在常态 Idle 循环，
-    // 过渡帧无意义（无切换发生）。
-    if std::env::var("EXP_CAM_HEAD").is_err() {
+    // 诊断机位模式不注入移动：角色停在常态 Idle 循环，过渡帧无意义
+    //（无切换发生）。
+    let diag = std::env::var("EXP_CAM_HEAD").is_ok()
+        || std::env::var("EXP_CAM_CROWN").is_ok()
+        || std::env::var("EXP_CAM_SIDE").is_ok();
+    if !diag {
         game.hold_s();
     }
     for _ in 0..30 {
@@ -167,7 +242,7 @@ fn main() {
     // ---- 帧 2：松开 S——停步相位门放行后的淡出中段 ----
     // 释放后角色先走完当前步（相位门，至多约半步），过窗切 Idle 并以
     // 0.10 s 淡出；帧 2 取淡出进行到约一半（混合权重约 0.5）。
-    if std::env::var("EXP_CAM_HEAD").is_err() {
+    if !diag {
         game.release_s();
         let state_of = |game: &Harness| -> usize {
             game.app
