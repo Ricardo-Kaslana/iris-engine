@@ -21,7 +21,9 @@ crate 布局（依赖自上而下）：
 
 **架构与特性全景唯一权威是 `ARCHITECTURE.md`**（§1–§8），改任何子系统前先读对应章节；`§8 已知限制` 是诚实清单，别把已声明的限制当 bug 修。历史脉络（逐轮做了什么）在 `CHANGELOG.md` 与 git log，不依赖会话记忆。
 
-**当前进度**（各梯队与闭合战役的收官状态、轮次交付内容索引）见 `docs/private/roadmap-v5.md`；该档是私有档、不入库，克隆仓库后可能缺席，此时以 `CHANGELOG.md` 最新段与 git log 为准。
+`docs/` 目录分工：根目录的 PNG 是各特性的离屏验收图（入库）；`docs/archive/`（**入库**）是已收官设计的定稿归档，按主题一篇一档（如 `ddgi_v2_design.md`、`r95-rvo.md`），只读参考，不再随实现更新；`docs/private/`（**不入库**，已在 `.gitignore`）是私有工作档——路线图、游戏摩擦清单、动捕笔记、辅助脚本与本机验收证据，克隆仓库后缺席，脉络以 `CHANGELOG.md` 与 git log 补齐。
+
+**当前进度**：项目**不再按照路线图 v5 / v6 开发**，两档路线图均为私有档、不入库，仅作历史参考，不再作为开发依据。历史脉络以 `CHANGELOG.md` 与 git log 为准——路线图未体现的久远历史 commit 同样记录在 `CHANGELOG.md` 中；克隆仓库后私有档缺席也不影响，以 `CHANGELOG.md` 最新段与 git log 为准。
 
 ## 环境硬约束（Windows / Git Bash）
 
@@ -88,7 +90,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 
 ## 工作流（每轮的完成定义）
 
-1. 设计定稿（读码 → 决策写清）→ 2. 实现 + 测试 → 3. 六项门禁全绿 → 4. 涉渲染出离屏验收图并**目检** → 5. 文档三件套（README / ARCHITECTURE 对应章节 / CHANGELOG Unreleased；AGENTS.md 基线数字过期顺手修）→ 6. 提交（中文 conventional commit，body 写设计理由与偏离声明）。
+1. 设计定稿（读码 → 决策写清）→ 2. 实现 + 测试 → 3. 六项门禁全绿 → 4. 涉渲染出离屏验收图并**目检** → 5. 文档三件套（README / ARCHITECTURE 对应章节 / CHANGELOG Unreleased；AGENTS.md 基线数字过期顺手修）→ 6. 提交（中文 conventional commit，body 写设计理由与偏离声明；**提交标题与正文禁止出现 Rxx 轮次信息**——路线图已弃，轮次编号不再进入 git 历史，逐项交付内容只记 `CHANGELOG.md`）。
 
 - **不做任何 git 写操作除非主会话明确要求**（多智能体协作时外部 Agent 只改代码）。
 - dogfooding 游戏轮产出的引擎摩擦清单是**一级交付物**；游戏轮**不改引擎**（纪律），摩擦留给下一轮打磨闭合——每条按「现象 → 绕行 → 建议修法」记录进 ARCHITECTURE §8。
