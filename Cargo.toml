@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -28,20 +28,20 @@ authors = ["Iris Engine Contributors"]
 
 [workspace.dependencies]
 # 内部 crate
-iris-macros = { path = "crates/iris-macros", version = "0.1.2" }
-iris-core = { path = "crates/iris-core", version = "0.1.2" }
-iris-render = { path = "crates/iris-render", version = "0.1.2" }
-iris-platform = { path = "crates/iris-platform", version = "0.1.2" }
-iris-audio = { path = "crates/iris-audio", version = "0.1.2" }
-iris-engine = { path = "crates/iris-engine", version = "0.1.2" }
-iris-game = { path = "games/iris-game", version = "0.1.2" }
-iris-arena = { path = "games/iris-arena", version = "0.1.2" }
-iris-bastion = { path = "games/iris-bastion", version = "0.1.2" }
-iris-ascent = { path = "games/iris-ascent", version = "0.1.2" }
-iris-infiltration = { path = "games/iris-infiltration", version = "0.1.2" }
-iris-assault = { path = "games/iris-assault", version = "0.1.2" }
-iris-exp = { path = "games/iris-exp", version = "0.1.2" }
-iris-editor = { path = "crates/iris-editor", version = "0.1.2" }
+iris-macros = { path = "crates/iris-macros", version = "0.1.3" }
+iris-core = { path = "crates/iris-core", version = "0.1.3" }
+iris-render = { path = "crates/iris-render", version = "0.1.3" }
+iris-platform = { path = "crates/iris-platform", version = "0.1.3" }
+iris-audio = { path = "crates/iris-audio", version = "0.1.3" }
+iris-engine = { path = "crates/iris-engine", version = "0.1.3" }
+iris-game = { path = "games/iris-game", version = "0.1.3" }
+iris-arena = { path = "games/iris-arena", version = "0.1.3" }
+iris-bastion = { path = "games/iris-bastion", version = "0.1.3" }
+iris-ascent = { path = "games/iris-ascent", version = "0.1.3" }
+iris-infiltration = { path = "games/iris-infiltration", version = "0.1.3" }
+iris-assault = { path = "games/iris-assault", version = "0.1.3" }
+iris-exp = { path = "games/iris-exp", version = "0.1.3" }
+iris-editor = { path = "crates/iris-editor", version = "0.1.3" }
 
 # 数学：SIMD 优化的线性代数库
 glam = "0.33"

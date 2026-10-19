@@ -3,7 +3,7 @@
 本文件记录 Iris 引擎的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵守 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.1.3] - 2026-10-19
 
 ### Added（iris-exp 角色材质升级与三点布光）
 
