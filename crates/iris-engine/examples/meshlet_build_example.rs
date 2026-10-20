@@ -59,12 +59,19 @@ fn main() {
         }
     }
 
-    let meshes = world.resource::<MeshStore>().contents().to_vec();
+    // 逐槽位克隆：构建过程不持有 Store 借用；句柄号直接作为产物编号，
+    // 墓碑（已删除槽位）由 `iter` 自动跳过。
+    let meshes: Vec<(MeshHandle, MeshData)> = world
+        .resource::<MeshStore>()
+        .iter()
+        .map(|(handle, data)| (handle, data.clone()))
+        .collect();
     println!("网格总数：{}", meshes.len());
 
     let mut built = 0usize;
     let mut skipped = 0usize;
-    for (i, data) in meshes.iter().enumerate() {
+    for (handle, data) in &meshes {
+        let i = handle.0;
         if !is_meshlet_eligible(data) {
             println!("  #{i} 跳过：含蒙皮 / 切线 / UV2 属性（V1 容器只载标准 32 B 顶点）");
             skipped += 1;

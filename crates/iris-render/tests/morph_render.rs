@@ -192,3 +192,38 @@ fn morph_shadow_follows_displaced_geometry() {
     }
     assert!(diff > 30, "位移应带动地面阴影变化，地面带差分像素 {diff}");
 }
+
+/// 形变网格同句柄更新：权重位图案不变也必须重新混合上传（`MorphGpu`
+/// 的网格句柄与修订号脏检），否则画面会继续使用旧基座的混合结果。
+#[test]
+fn morph_mesh_update_at_same_handle_reblends_with_same_weights() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer) = OffscreenRenderer::new(128, 128) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+    let Scene { mut world, entity } = build_scene(false);
+    world.insert(entity, MorphWeights::new(vec![1.0]));
+    renderer.render(&world);
+    let before = renderer.read_pixels();
+    let uploads_before = renderer.renderer().morph_uploads();
+
+    let mesh = *world.get::<MeshHandle>(entity).expect("实体应挂网格句柄");
+    let mut updated = shifted_cube();
+    // 基座几何沿 +Z 平移 0.5：权重不变，混合结果必须随之变化。
+    for vertex in &mut updated.vertices {
+        vertex.position[2] += 0.5;
+    }
+    assert!(
+        world.resource_mut::<MeshStore>().update(mesh, updated),
+        "存活形变网格更新必须命中"
+    );
+    renderer.render(&world);
+    let after = renderer.read_pixels();
+    assert_eq!(
+        renderer.renderer().morph_uploads(),
+        uploads_before + 1,
+        "网格修订号变化必须强制重新混合并上传一次"
+    );
+    assert!(before != after, "基座几何变化必须反映到画面");
+}

@@ -1,4 +1,8 @@
 //! 网格：CPU 数据目录 + 基础图元生成器 + 距离 LOD 组件。
+//!
+//! 目录是槽位表，支持逐句柄原地更新与删除。删除只释放内容并留下墓碑，
+//! 句柄号永不复用；渲染器按槽位修订号失效 GPU 缓存。完整语义见
+//! [`MeshStore`] 与 ARCHITECTURE §4.9。
 
 use glam::Vec3;
 use iris_core::Resource;
@@ -515,10 +519,36 @@ pub mod primitives {
     }
 }
 
+/// 单个网格槽位：墓碑（`data = None`）保留句柄号，不参与遍历与统计。
+#[derive(Clone, Debug)]
+struct MeshSlot {
+    data: Option<MeshData>,
+    /// 内容修订号：0 表示缺席，存活槽位由目录纪元赋值。
+    revision: u64,
+}
+
 /// CPU 侧网格目录（World 资源）。GPU 上传由渲染器按需懒执行。
-#[derive(Default, Resource)]
+///
+/// # 动态生命周期
+///
+/// 句柄是槽位号，永不复用。`add` 追加槽位；`update` 原地替换内容并递增
+/// 修订号；`remove` 释放内容并把槽位留作墓碑。删除的句柄不会分配给后续
+/// `add`，因此仍持有旧句柄的组件不会静默指向新内容。代价是槽位表随不同
+/// 句柄数量单调增长，GPU 侧资源由渲染器按修订号释放。
+///
+/// `epoch` 在每次目录变更时递增（回绕语义 `wrapping_add`）。每个存活槽位
+/// 的 `revision` 等于其最近一次变更时的 `epoch`。渲染器按这对数值判断
+/// GPU 缓存是否陈旧；0 保留给“缺席”。
+///
+/// # 删除前提
+///
+/// 渲染器在收集阶段跳过已删除句柄，因此悬挂引用不会触发绘制 panic，但该
+/// 实体本帧不画。调用方仍应把删除与实体销毁或组件替换放在同一帧完成。
+#[derive(Clone, Debug, Default, Resource)]
 pub struct MeshStore {
-    meshes: Vec<MeshData>,
+    slots: Vec<MeshSlot>,
+    alive: usize,
+    epoch: u64,
 }
 
 impl MeshStore {
@@ -526,48 +556,130 @@ impl MeshStore {
         Self::default()
     }
 
+    /// 推进目录纪元并返回新值。
+    fn next_epoch(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+    }
+
+    /// 追加网格并返回新句柄。槽位号不复用。
     pub fn add(&mut self, data: MeshData) -> MeshHandle {
-        self.meshes.push(data);
-        MeshHandle(self.meshes.len() as u32 - 1)
+        let revision = self.next_epoch();
+        self.slots.push(MeshSlot {
+            data: Some(data),
+            revision,
+        });
+        self.alive += 1;
+        MeshHandle(self.slots.len() as u32 - 1)
+    }
+
+    /// 原地替换存活句柄的网格内容。返回是否命中存活槽位。
+    ///
+    /// 更新会推进修订号；渲染器在下一帧同步时驱逐旧 GPU 缓冲并按需重传。
+    /// 死句柄返回 `false` 且不推进纪元。
+    pub fn update(&mut self, handle: MeshHandle, data: MeshData) -> bool {
+        let index = handle.0 as usize;
+        let Some(slot) = self.slots.get(index) else {
+            return false;
+        };
+        if slot.data.is_none() {
+            return false;
+        }
+        let revision = self.next_epoch();
+        let slot = &mut self.slots[index];
+        slot.data = Some(data);
+        slot.revision = revision;
+        true
+    }
+
+    /// 删除存活句柄并返回其内容；槽位留作墓碑。死句柄返回 `None` 且不
+    /// 推进纪元。
+    pub fn remove(&mut self, handle: MeshHandle) -> Option<MeshData> {
+        let index = handle.0 as usize;
+        if self.slots.get(index).is_none_or(|slot| slot.data.is_none()) {
+            return None;
+        }
+        let revision = self.next_epoch();
+        let slot = &mut self.slots[index];
+        let data = slot.data.take();
+        slot.revision = revision;
+        self.alive -= 1;
+        data
     }
 
     pub fn get(&self, handle: MeshHandle) -> Option<&MeshData> {
-        self.meshes.get(handle.0 as usize)
+        self.slots.get(handle.0 as usize)?.data.as_ref()
     }
 
+    /// 查询内容与修订号（渲染器缓存比对口）。死句柄返回 `None`。
+    pub fn get_with_revision(&self, handle: MeshHandle) -> Option<(&MeshData, u64)> {
+        let slot = self.slots.get(handle.0 as usize)?;
+        slot.data.as_ref().map(|data| (data, slot.revision))
+    }
+
+    /// 存活句柄的内容修订号；死句柄返回 `None`。
+    pub fn revision(&self, handle: MeshHandle) -> Option<u64> {
+        self.get_with_revision(handle).map(|(_, revision)| revision)
+    }
+
+    /// 当前目录纪元。任何 `add`、`update`、`remove` 与 `restore_from` 都
+    /// 会推进它；渲染器据此决定是否需要扫描缓存。
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// 存活条目数（不含墓碑）。
     pub fn len(&self) -> usize {
-        self.meshes.len()
+        self.alive
+    }
+
+    /// 句柄空间长度（含墓碑）。用于容量观测，不用于遍历。
+    pub fn slot_len(&self) -> usize {
+        self.slots.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.meshes.is_empty()
+        self.alive == 0
     }
 
-    /// 目录内容只读视图（下标 = 句柄号）。
-    pub fn contents(&self) -> &[MeshData] {
-        &self.meshes
+    /// 按槽位号升序遍历存活条目，跳过墓碑。
+    pub fn iter(&self) -> impl Iterator<Item = (MeshHandle, &MeshData)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.data
+                .as_ref()
+                .map(|data| (MeshHandle(index as u32), data))
+        })
     }
 
-    /// 整体替换目录内容（下标 = 句柄号重新按序分配）。
+    /// 用另一目录的槽位布局覆盖自身。
     ///
-    /// **安全前提在调用方**：替换后，旧内容中未保留的句柄不得再被任何
-    /// 实体引用（当前唯一消费者是 iris-editor 的 undo 快照恢复——快照存
-    /// 整库克隆、恢复先换库再重建实体，前提天然成立；对比截断式恢复的
-    /// 论证：整库克隆同时是 redo 可逆的前提——截断丢数据无法 redo）。
-    pub fn set_contents(&mut self, meshes: Vec<MeshData>) {
-        self.meshes = meshes;
+    /// 保留全部句柄号与墓碑位置，并把纪元推进到双方最大值之后，为每个
+    /// 存活槽位写入同一个新修订号。编辑器 undo / redo 用它在快照恢复时
+    /// 强制渲染器失效缓存，即使快照携带的旧纪元与当前缓存纪元相同。
+    pub fn restore_from(&mut self, source: &MeshStore) {
+        self.epoch = self.epoch.max(source.epoch).wrapping_add(1);
+        self.slots.clone_from(&source.slots);
+        let revision = self.epoch;
+        let mut alive = 0;
+        for slot in &mut self.slots {
+            if slot.data.is_some() {
+                slot.revision = revision;
+                alive += 1;
+            }
+        }
+        self.alive = alive;
     }
 
     /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 ×
-    /// 32B + 切线 × 16B + 光照贴图 UV × 8B）（不含 Vec 分配器开销）。
+    /// 32B + 切线 × 16B + 光照贴图 UV × 8B）（不含 Vec 分配器开销，且只
+    /// 统计存活条目）。
     /// 「低占用」卖点的观测口径之一；GPU 侧顶点 / 索引缓冲与源同尺寸
     /// （蒙皮 / 切线 / UV2 缓冲同），故该值亦即 GPU 网格占用的准确上界
     /// 估算（切线与 UV2 缺席的网格只绑定渲染器常驻的零填充垫缓冲，
     /// 无逐网格开销）。
     pub fn memory_bytes(&self) -> u64 {
-        self.meshes
-            .iter()
-            .map(|data| {
+        self.iter()
+            .map(|(_, data)| {
                 data.vertices.len() as u64 * std::mem::size_of::<Vertex>() as u64
                     + data.indices.len() as u64 * std::mem::size_of::<u32>() as u64
                     + data.skin.as_ref().map_or(0, |s| {
@@ -1071,5 +1183,84 @@ mod tests {
         let mut data = primitives::cube();
         data.uv2 = Some(vec![[0.0, 0.0]; 5]);
         let _ = upload_mesh(&gpu, &data);
+    }
+
+    /// 动态生命周期：更新原地生效、删除留墓碑、句柄号不复用。
+    #[test]
+    fn store_update_remove_preserves_handles_and_revisions() {
+        let mut store = MeshStore::new();
+        let a = store.add(primitives::cube());
+        let b = store.add(primitives::cube());
+        assert_eq!((a, b), (MeshHandle(0), MeshHandle(1)));
+        assert_eq!((store.len(), store.slot_len(), store.epoch()), (2, 2, 2));
+
+        let mut stretched = primitives::cube();
+        stretched.vertices[0].position[1] = 2.0;
+        assert!(store.update(a, stretched.clone()));
+        assert_eq!(store.get(a).unwrap().vertices[0].position[1], 2.0);
+        assert_eq!(store.revision(a), Some(3));
+        let (_, revision) = store.get_with_revision(a).unwrap();
+        assert_eq!(revision, 3);
+        assert_eq!(store.epoch(), 3);
+
+        let removed = store.remove(b).expect("存活句柄应可删除");
+        assert_eq!(removed.vertices.len(), 24);
+        assert!(store.get(b).is_none());
+        assert_eq!(store.revision(b), None);
+        assert_eq!((store.len(), store.slot_len(), store.epoch()), (1, 2, 4));
+
+        assert!(store.remove(b).is_none(), "重复删除不命中");
+        assert!(!store.update(b, primitives::cube()), "死句柄更新不命中");
+        assert_eq!(store.epoch(), 4, "失败操作不推进纪元");
+
+        let c = store.add(primitives::cube());
+        assert_eq!(c, MeshHandle(2), "槽位号不复用");
+        assert_eq!((store.len(), store.slot_len(), store.epoch()), (2, 3, 5));
+        let handles: Vec<u32> = store.iter().map(|(handle, _)| handle.0).collect();
+        assert_eq!(handles, vec![0, 2], "遍历跳过墓碑且保持槽位序");
+    }
+
+    /// 快照恢复保留墓碑位置，并为全部存活槽位写入新修订号。
+    #[test]
+    fn store_restore_from_keeps_tombstones_and_bumps_revisions() {
+        let mut source = MeshStore::new();
+        let dead = source.add(primitives::cube());
+        let alive = source.add(primitives::cube());
+        source.remove(dead);
+        assert_eq!((source.len(), source.slot_len(), source.epoch()), (1, 2, 3));
+
+        let mut target = MeshStore::new();
+        target.add(primitives::cube());
+        target.restore_from(&source);
+        assert_eq!((target.len(), target.slot_len()), (1, 2));
+        assert!(target.get(dead).is_none(), "墓碑位置保留");
+        assert!(target.get(alive).is_some(), "存活句柄号保留");
+        assert_eq!(target.epoch(), 4, "纪录取双方最大值加一");
+        assert_eq!(
+            target.revision(alive),
+            Some(4),
+            "恢复后全部存活槽位刷新修订号"
+        );
+
+        assert!(target.update(alive, primitives::cube()));
+        assert_eq!(
+            target.revision(alive),
+            Some(5),
+            "恢复后的更新继续推进修订号"
+        );
+    }
+
+    /// 内存统计只计存活条目；删除后立即归还 CPU 源占用。
+    #[test]
+    fn store_memory_bytes_skips_removed() {
+        let mut store = MeshStore::new();
+        let a = store.add(primitives::cube());
+        let b = store.add(primitives::cube());
+        let one = (24 * 32 + 36 * 4) as u64;
+        assert_eq!(store.memory_bytes(), 2 * one);
+        store.remove(b);
+        assert_eq!(store.memory_bytes(), one);
+        store.update(a, primitives::cube());
+        assert_eq!(store.memory_bytes(), one);
     }
 }

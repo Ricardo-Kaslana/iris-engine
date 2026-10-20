@@ -1608,8 +1608,9 @@ struct EntitySnapshot {
 struct WorldSnapshot {
     /// 可编辑实体（存储序 = spawn 序）。
     entities: Vec<EntitySnapshot>,
-    /// `MeshStore` 整库克隆（句柄号 = 下标，恢复整库替换）。
-    meshes: Vec<MeshData>,
+    /// `MeshStore` 整库克隆（槽位号保留、墓碑位置保留；恢复用
+    /// [`MeshStore::restore_from`]，会刷新修订号强制渲染器失效缓存）。
+    meshes: MeshStore,
     /// `MaterialStore` 整库克隆（同上）。
     materials: Vec<MaterialDef>,
     /// 登记表全文（BTree 序收集——恢复重建 `HashMap`，内容恒定）。
@@ -1671,7 +1672,7 @@ fn capture_snapshot(world: &World) -> Option<WorldSnapshot> {
     Some(WorldSnapshot {
         meshes: world
             .try_resource::<MeshStore>()
-            .map(|store| store.contents().to_vec())
+            .map(|store| (*store).clone())
             .unwrap_or_default(),
         materials: world
             .try_resource::<MaterialStore>()
@@ -1819,7 +1820,7 @@ fn restore_snapshot(world: &mut World, snapshot: &WorldSnapshot) {
     // 2) 两 Store 整库替换（快照克隆即快照时点的完整内容——摆放新增的
     // 条目随之消失、被 undo 掉的条目在 redo 时随库恢复）
     if let Some(mut store) = world.try_resource_mut::<MeshStore>() {
-        store.set_contents(snapshot.meshes.clone());
+        store.restore_from(&snapshot.meshes);
     }
     if let Some(mut store) = world.try_resource_mut::<MaterialStore>() {
         store.set_contents(snapshot.materials.clone());
@@ -4008,6 +4009,44 @@ mod tests {
             (pushed.y.asin() + SUN_PITCH_LIMIT).abs() < 1e-4,
             "俯仰限位 −89°：{}",
             pushed.y.asin().to_degrees()
+        );
+    }
+
+    /// 动态网格槽位的快照恢复：墓碑位置与句柄号保留，修订号刷新。
+    #[test]
+    fn snapshot_restore_preserves_mesh_tombstones_and_bumps_revisions() {
+        let mut world = World::new();
+        world.insert_resource(MeshStore::new());
+        world.insert_resource(EditorState::new("target/editor_unused.json"));
+        let dead = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        let alive = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        assert!(world.resource_mut::<MeshStore>().remove(dead).is_some());
+        let snapshot = capture_snapshot(&world).expect("空实体世界应可捕获");
+        let epoch_before = world.resource::<MeshStore>().epoch();
+
+        // 破坏现场：更新存活网格并追加第三个句柄。
+        let mut changed = MeshData::cube();
+        changed.vertices[0].position[0] = 7.0;
+        assert!(world.resource_mut::<MeshStore>().update(alive, changed));
+        let extra = world.resource_mut::<MeshStore>().add(MeshData::cube());
+        assert_eq!(extra, MeshHandle(2));
+
+        restore_snapshot(&mut world, &snapshot);
+        let store = world.resource::<MeshStore>();
+        assert!(store.get(dead).is_none(), "墓碑位置必须恢复");
+        let expected_x = MeshData::cube().vertices[0].position[0];
+        assert_eq!(
+            store.get(alive).unwrap().vertices[0].position[0],
+            expected_x,
+            "存活句柄应恢复快照内容"
+        );
+        assert!(store.get(extra).is_none(), "快照之后的追加句柄应消失");
+        assert_eq!((store.len(), store.slot_len()), (1, 2));
+        assert!(store.epoch() > epoch_before, "恢复必须推进目录纪元");
+        assert_eq!(
+            store.revision(alive),
+            Some(store.epoch()),
+            "恢复后全部存活槽位写入新修订号"
         );
     }
 

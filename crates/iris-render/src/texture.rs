@@ -1,5 +1,10 @@
 //! 纹理：程序化生成的 CPU 纹理目录（零外部图像解码依赖）。
 //!
+//! 目录是槽位表，支持逐句柄原地更新与删除；0 号槽位固定为白色兜底，
+//! 不可更新或删除。删除留下墓碑，句柄号永不复用；渲染器按槽位修订号
+//! 失效 GPU 纹理缓存并连带失效材质与贴花绑定组。完整语义见
+//! [`TextureStore`] 与 ARCHITECTURE §4.9。
+//!
 //! **色彩空间（R42）**：[`CpuTexture::srgb`] 标注数据的语义解释——`true`
 //! 为 sRGB 编码（baseColor / 贴花等「颜色」数据，GPU 采样时硬件自动做
 //! sRGB → 线性解码，上传格式 `Rgba8UnormSrgb`）；`false` 为线性数据
@@ -369,10 +374,30 @@ impl CpuTexture {
     }
 }
 
+/// 单个纹理槽位：墓碑（`texture = None`）保留句柄号，不参与遍历与统计。
+#[derive(Clone, Debug)]
+struct TextureSlot {
+    texture: Option<CpuTexture>,
+    /// 内容修订号：0 为白色兜底，存活槽位由目录纪元赋值。
+    revision: u64,
+}
+
 /// CPU 侧纹理目录（World 资源）。0 号槽位固定为白色纯色纹理。
+///
+/// # 动态生命周期
+///
+/// 句柄是槽位号，永不复用。`update` 原地替换纹素并递增修订号；`remove`
+/// 释放纹理并保留墓碑。0 号白色兜底不可更新或删除。渲染器按槽位修订号
+/// 失效 GPU 纹理缓存，并连带失效引用它的材质与贴花绑定组。
+///
+/// `update` 会清除该句柄的 KTX2 预压缩载荷（新纹素不是容器块流），但
+/// 保留 BC3、BC7 与无压缩声明：声明是句柄级上传策略，不随纹素替换而
+/// 改变。`remove` 同时清除四张侧表。
 #[derive(Resource)]
 pub struct TextureStore {
-    textures: Vec<CpuTexture>,
+    slots: Vec<TextureSlot>,
+    alive: usize,
+    epoch: u64,
     /// 经 manifest 声明走 BC3 上传的句柄表（R59，见模块文档）。
     /// 缺席 = 既有 RGBA8 / BC1 决策树逐位不变——默认路径零改动。
     bc3_declared: BTreeSet<u32>,
@@ -425,7 +450,12 @@ impl CompressedLevels {
 impl Default for TextureStore {
     fn default() -> Self {
         Self {
-            textures: vec![CpuTexture::solid([255, 255, 255, 255])],
+            slots: vec![TextureSlot {
+                texture: Some(CpuTexture::solid([255, 255, 255, 255])),
+                revision: 0,
+            }],
+            alive: 1,
+            epoch: 0,
             bc3_declared: BTreeSet::new(),
             bc7_declared: BTreeSet::new(),
             uncompressed: BTreeSet::new(),
@@ -439,9 +469,61 @@ impl TextureStore {
         Self::default()
     }
 
+    /// 推进目录纪元并返回新值。
+    fn next_epoch(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+    }
+
+    fn is_alive(&self, handle: TextureHandle) -> bool {
+        self.slots
+            .get(handle.0 as usize)
+            .is_some_and(|slot| slot.texture.is_some())
+    }
+
+    /// 追加纹理并返回新句柄。槽位号不复用。
     pub fn add(&mut self, texture: CpuTexture) -> TextureHandle {
-        self.textures.push(texture);
-        TextureHandle(self.textures.len() as u32 - 1)
+        let revision = self.next_epoch();
+        self.slots.push(TextureSlot {
+            texture: Some(texture),
+            revision,
+        });
+        self.alive += 1;
+        TextureHandle(self.slots.len() as u32 - 1)
+    }
+
+    /// 原地替换存活句柄的纹素。返回是否命中存活槽位。
+    ///
+    /// 更新会推进修订号并清除该句柄的 KTX2 预压缩载荷；BC3、BC7 与
+    /// 无压缩声明保留。0 号白色兜底与死句柄返回 `false`。
+    pub fn update(&mut self, handle: TextureHandle, texture: CpuTexture) -> bool {
+        if handle.0 == 0 || !self.is_alive(handle) {
+            return false;
+        }
+        let revision = self.next_epoch();
+        let slot = &mut self.slots[handle.0 as usize];
+        slot.texture = Some(texture);
+        slot.revision = revision;
+        self.compressed.remove(&handle.0);
+        true
+    }
+
+    /// 删除存活句柄并返回其纹理；槽位留作墓碑。0 号白色兜底与死句柄
+    /// 返回 `None`。删除会清理四张侧表。
+    pub fn remove(&mut self, handle: TextureHandle) -> Option<CpuTexture> {
+        if handle.0 == 0 || !self.is_alive(handle) {
+            return None;
+        }
+        let revision = self.next_epoch();
+        let slot = &mut self.slots[handle.0 as usize];
+        let texture = slot.texture.take();
+        slot.revision = revision;
+        self.alive -= 1;
+        self.bc3_declared.remove(&handle.0);
+        self.bc7_declared.remove(&handle.0);
+        self.uncompressed.remove(&handle.0);
+        self.compressed.remove(&handle.0);
+        texture
     }
 
     /// 登记纹理并**同时声明 BC3 压缩**（R59）：等价 `add` + `declare_bc3`，
@@ -470,6 +552,9 @@ impl TextureStore {
     /// 只需发生在**首次 GPU 上传前**（渲染器懒上传，首帧 draw 才编码）。
     /// 返回是否新插入（重复声明幂等，返回 false）。
     pub fn declare_bc3(&mut self, handle: TextureHandle) -> bool {
+        if handle.0 == 0 || !self.is_alive(handle) {
+            return false;
+        }
         self.bc3_declared.insert(handle.0)
     }
 
@@ -489,6 +574,9 @@ impl TextureStore {
     /// 为已存在的句柄补 BC7 声明（C5a）：与 [`Self::declare_bc3`] 同
     /// 纪律——声明只需发生在首次 GPU 上传前；重复声明幂等。
     pub fn declare_bc7(&mut self, handle: TextureHandle) -> bool {
+        if handle.0 == 0 || !self.is_alive(handle) {
+            return false;
+        }
         self.bc7_declared.insert(handle.0)
     }
 
@@ -536,6 +624,9 @@ impl TextureStore {
     /// 不走 BC1/BC3 块压缩（BC1 对法线的近距块状伪梯度，frictions ⑨）。
     /// 声明只需发生在**首次 GPU 上传前**（渲染器懒上传）；重复声明幂等。
     pub fn declare_uncompressed(&mut self, handle: TextureHandle) {
+        if handle.0 == 0 || !self.is_alive(handle) {
+            return;
+        }
         self.uncompressed.insert(handle.0);
     }
 
@@ -545,25 +636,51 @@ impl TextureStore {
     }
 
     pub fn get(&self, handle: TextureHandle) -> Option<&CpuTexture> {
-        self.textures.get(handle.0 as usize)
+        self.slots.get(handle.0 as usize)?.texture.as_ref()
     }
 
+    /// 查询纹理与修订号（渲染器缓存比对口）。死句柄返回 `None`。
+    pub fn get_with_revision(&self, handle: TextureHandle) -> Option<(&CpuTexture, u64)> {
+        let slot = self.slots.get(handle.0 as usize)?;
+        slot.texture
+            .as_ref()
+            .map(|texture| (texture, slot.revision))
+    }
+
+    /// 存活句柄的内容修订号；死句柄返回 `None`。0 号白色兜底恒为 0。
+    pub fn revision(&self, handle: TextureHandle) -> Option<u64> {
+        self.get_with_revision(handle).map(|(_, revision)| revision)
+    }
+
+    /// 当前目录纪元。`add` / `update` / `remove` 推进它；声明变更不推进。
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// 存活条目数（含 0 号白色兜底）。
     pub fn len(&self) -> usize {
-        self.textures.len()
+        self.alive
     }
 
     pub fn is_empty(&self) -> bool {
-        self.textures.is_empty()
+        self.alive == 0
+    }
+
+    /// 按槽位号升序遍历存活条目，跳过墓碑。0 号白色兜底在首位。
+    pub fn iter(&self) -> impl Iterator<Item = (TextureHandle, &CpuTexture)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.texture
+                .as_ref()
+                .map(|texture| (TextureHandle(index as u32), texture))
+        })
     }
 
     /// CPU 侧纹理目录驻留字节：RGBA8 源 = Σ 宽×高×4；KTX2 预压缩纹理
     /// （C5a-2）= 全级块字节（其 `rgba` 占位空表，不按尺寸虚计）。
     /// 「低占用」卖点的观测口径之一。
     pub fn memory_bytes(&self) -> u64 {
-        self.textures
-            .iter()
-            .enumerate()
-            .map(|(index, t)| match self.compressed.get(&(index as u32)) {
+        self.iter()
+            .map(|(handle, t)| match self.compressed.get(&handle.0) {
                 Some(c) => c.total_bytes(),
                 None => t.width as u64 * t.height as u64 * 4,
             })
@@ -614,10 +731,8 @@ impl TextureStore {
     /// 格式一致（决策函数共用），`false` / `true` 两次调用的差即压缩节省。
     /// 分层互斥（全不透明即使声明 BC3 也归 BC1，0.5 B/px 优于 1 B/px）。
     pub fn gpu_bytes_estimate(&self, feature_bc: bool) -> u64 {
-        self.textures
-            .iter()
-            .enumerate()
-            .map(|(index, t)| self.texture_gpu_bytes(index, t, feature_bc))
+        self.iter()
+            .map(|(handle, t)| self.texture_gpu_bytes(handle.0 as usize, t, feature_bc))
             .sum()
     }
 
@@ -628,12 +743,9 @@ impl TextureStore {
     /// 时上传为单 mip，估算偏保守）；1×1 纹理链长 1，无增量。旧
     /// [`Self::gpu_bytes_estimate`] 签名与数值口径不动（既有测试零改动）。
     pub fn gpu_bytes_estimate_mipped(&self, feature_bc: bool) -> u64 {
-        self.textures
-            .iter()
-            .enumerate()
-            .map(|(index, t)| {
-                let base = self.texture_gpu_bytes(index, t, feature_bc);
-                let handle = TextureHandle(index as u32);
+        self.iter()
+            .map(|(handle, t)| {
+                let base = self.texture_gpu_bytes(handle.0 as usize, t, feature_bc);
                 // KTX2 预压缩（C5a-2）：mip 增量 = 容器自带级表，不走
                 // 决策树链推算
                 if let Some(c) = self.compressed.get(&handle.0) {
@@ -1169,5 +1281,96 @@ mod tests {
         let before = store.len();
         assert!(store.add_ktx2(&[0, 1, 2, 3]).is_err());
         assert_eq!(store.len(), before, "解析失败不入库");
+    }
+
+    /// 动态生命周期：原地更新、删除留墓碑、句柄号不复用、0 号受保护。
+    #[test]
+    fn store_update_and_remove_preserve_handles_and_revisions() {
+        let mut store = TextureStore::new();
+        assert_eq!(store.len(), 1, "0 号白色兜底");
+        assert_eq!(store.revision(TextureHandle(0)), Some(0));
+        assert_eq!((store.epoch(), store.len()), (0, 1));
+
+        let h = store.add(CpuTexture::solid([255, 0, 0, 255]));
+        assert_eq!(h, TextureHandle(1));
+        assert_eq!((store.epoch(), store.revision(h)), (1, Some(1)));
+
+        assert!(store.update(h, CpuTexture::solid([0, 0, 255, 255])));
+        assert_eq!(store.get(h).unwrap().rgba, vec![0, 0, 255, 255]);
+        assert_eq!((store.epoch(), store.revision(h)), (2, Some(2)));
+
+        assert!(!store.update(TextureHandle(0), CpuTexture::solid([0; 4])));
+        assert!(store.remove(TextureHandle(0)).is_none(), "0 号不可删除");
+        assert_eq!(store.epoch(), 2, "失败操作不推进纪元");
+
+        let removed = store.remove(h).expect("存活句柄应可删除");
+        assert_eq!(removed.rgba, vec![0, 0, 255, 255]);
+        assert!(store.get(h).is_none());
+        assert_eq!(store.revision(h), None);
+        assert_eq!((store.epoch(), store.len()), (3, 1));
+
+        assert!(store.remove(h).is_none(), "重复删除不命中");
+        assert!(!store.update(h, CpuTexture::solid([0, 255, 0, 255])));
+        assert_eq!(store.epoch(), 3, "失败操作不推进纪元");
+
+        let h2 = store.add(CpuTexture::solid([0, 255, 0, 255]));
+        assert_eq!(h2, TextureHandle(2), "槽位号不复用");
+        let handles: Vec<u32> = store.iter().map(|(handle, _)| handle.0).collect();
+        assert_eq!(handles, vec![0, 2], "遍历跳过墓碑且保持槽位序");
+        assert_eq!((store.epoch(), store.len()), (4, 2));
+    }
+
+    /// 更新清除 KTX2 载荷但保留声明；删除清理四张侧表。
+    #[test]
+    fn update_clears_ktx2_payload_and_keeps_declarations() {
+        let bytes = crate::texture_ktx2::build_ktx2(145, 16, 16, &[vec![7u8; 256], vec![9u8; 64]]);
+        let mut store = TextureStore::new();
+        let h = store.add_ktx2(&bytes).expect("合法 KTX2 应入库");
+        assert!(store.compressed_levels(h).is_some());
+        assert!(store.declare_bc3(h), "存活句柄可补声明");
+
+        assert!(store.update(h, CpuTexture::solid([10, 20, 30, 255])));
+        assert!(
+            store.compressed_levels(h).is_none(),
+            "新纹素不是容器块流，预压缩载荷必须清除"
+        );
+        assert!(store.is_bc3_declared(h), "声明是句柄级策略，更新后保留");
+        assert_eq!(store.get(h).unwrap().rgba, vec![10, 20, 30, 255]);
+        assert_eq!(store.memory_bytes(), 4 + 4, "更新后按 RGBA8 计");
+
+        assert!(store.remove(h).is_some());
+        assert!(!store.is_bc3_declared(h), "删除清理 BC3 声明");
+        assert!(store.compressed_levels(h).is_none());
+        assert_eq!(store.memory_bytes(), 4, "墓碑不参与驻留统计");
+    }
+
+    /// 删除后 CPU 驻留与显存估算只计存活槽位。
+    #[test]
+    fn memory_stats_skip_tombstones() {
+        let mut store = TextureStore::new();
+        let checker = CpuTexture::checkerboard(2, 4, [0, 0, 0, 255], [255, 255, 255, 255]);
+        let h = store.add(checker);
+        assert_eq!(store.memory_bytes(), 4 + 8 * 8 * 4);
+        assert_eq!(store.gpu_bytes_estimate(true), 4 + 2 * 2 * 8);
+        store.remove(h);
+        assert_eq!(store.memory_bytes(), 4);
+        assert_eq!(store.gpu_bytes_estimate(true), 4);
+        assert_eq!(store.gpu_bytes_estimate_mipped(true), 4);
+    }
+
+    /// 声明接口拒绝 0 号与死句柄，避免侧表为不可用槽位留下垃圾。
+    #[test]
+    fn declarations_reject_zero_and_dead_handles() {
+        let mut store = TextureStore::new();
+        assert!(!store.declare_bc3(TextureHandle(0)));
+        assert!(!store.declare_bc7(TextureHandle(0)));
+        store.declare_uncompressed(TextureHandle(0));
+        assert!(!store.is_uncompressed_declared(TextureHandle(0)));
+        let h = store.add(CpuTexture::solid([1, 2, 3, 255]));
+        store.remove(h);
+        assert!(!store.declare_bc3(h));
+        assert!(!store.declare_bc7(h));
+        store.declare_uncompressed(h);
+        assert!(!store.is_uncompressed_declared(h));
     }
 }

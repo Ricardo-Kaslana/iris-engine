@@ -306,7 +306,8 @@ pub mod prelude {
         select_active_probes,
     };
     pub use crate::renderer::{
-        CpuCollectResult, CpuCollector, FrameStats, Renderer, diff_changed_ranges,
+        CpuCollectResult, CpuCollector, FrameStats, Renderer, ResourceCacheStats,
+        diff_changed_ranges,
     };
     pub use crate::rendertarget::{
         RenderTargetHandle, RenderTargetSpec, RenderTargetStore, RendersTo,

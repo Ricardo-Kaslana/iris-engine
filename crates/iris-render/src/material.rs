@@ -332,8 +332,8 @@ impl MaterialStore {
     /// 整体替换目录内容（下标 = 句柄号重新按序分配）。
     ///
     /// **安全前提在调用方**：替换后，旧内容中未保留的句柄不得再被任何
-    /// 实体引用（当前唯一消费者是 iris-editor 的 undo 快照恢复，见
-    /// `MeshStore::set_contents` 同款论证）。
+    /// 实体引用（当前唯一消费者是 iris-editor 的 undo 快照恢复；网格侧
+    /// 的同类快照用 `MeshStore::restore_from`，会刷新修订号）。
     pub fn set_contents(&mut self, materials: Vec<MaterialDef>) {
         self.materials = materials;
     }

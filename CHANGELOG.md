@@ -3,6 +3,46 @@
 本文件记录 Iris 引擎的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵守 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added（引擎：网格与纹理动态生命周期）
+
+`MeshStore` 与 `TextureStore` 从只增目录改为槽位表，支持逐句柄原地更新与
+删除。每个槽位记录内容修订号，目录记录单调推进的纪元；删除只释放内容并
+留下墓碑，句柄号永不复用。`MeshStore` 新增 `update`、`remove`、
+`get_with_revision`、`revision`、`epoch`、`iter`、`slot_len` 与
+`restore_from`；`TextureStore` 新增 `update`、`remove`、
+`get_with_revision`、`revision`、`epoch` 与 `iter`。0 号白色兜底纹理
+不可更新或删除。`TextureStore::update` 清除该句柄的 KTX2 预压缩载荷，
+保留 BC3、BC7 与无压缩声明。
+
+`Renderer` 在主绘制与反射探针烘焙的编码之前按目录纪元同步 GPU 缓存：
+修订号变化或槽位已死的网格、纹理条目被驱逐，纹理变化连带失效引用它的
+材质绑定组与贴花绑定组。`ensure_mesh`、`ensure_texture` 与
+`ensure_material` 也做同样的修订检查，覆盖非主绘制入口。`MorphGpu`
+增加网格句柄与修订号脏检，网格内容原地更新后即使权重不变也会重新混合。
+新增诊断口 `Renderer::resource_cache_stats` 与 `ResourceCacheStats`。
+
+删除仍被实体引用的网格句柄时，收集阶段跳过该实体，不再触发主 pass 直接
+索引 panic；删除仍被材质引用的纹理句柄时，材质与贴花回退 0 号白色兜底。
+未调用更新或删除的既有场景，GPU 缓存内容、上传次数与像素输出逐位不变。
+
+编辑器 undo 快照改存完整 `MeshStore`，恢复走 `restore_from`，保留墓碑
+位置与句柄号并刷新修订号；meshlet 构建示例改用 `iter()` 并跳过墓碑。
+`MeshStore::contents` 与 `set_contents` 因无法表达空洞而删除；遍历改用
+`iter()`，快照恢复改用 `restore_from`。
+
+测试新增网格与纹理槽位语义的 CPU 单测、编辑器快照墓碑恢复单测，以及
+同句柄网格更新、纹理更新、贴花纹理更新、网格删除、纹理删除、形变网格
+更新的 GPU 回归；既有像素基线原值通过。门禁对账基线为 debug 1837 /
+release 1834，较上一基线各增 14 项。诚实边界见 ARCHITECTURE §8.75。
+
+### Changed（文档）
+
+ARCHITECTURE §4.9 修订 GPU 资源生命周期契约，§8.4 修正“网格顶点与纹理
+像素不可换”的旧表述，新增 §8.75 动态生命周期边界。README 核心特性表
+新增动态资源生命周期一行。`MINECRAFT-GAPS.md` §2.1 标记为已实现。
+
 ## [0.1.3] - 2026-10-19
 
 ### Added（iris-exp 角色材质升级与三点布光）

@@ -774,3 +774,73 @@ fn decal_lighting_neutral_anchor_and_sun_discriminability() {
         center_roi_sum(&sun_off, w)
     );
 }
+
+/// 贴花纹理动态更新：同句柄换色后必须重建贴花绑定组，画面与新建世界
+/// 逐字节一致，且绑定组缓存不累积。
+#[test]
+fn decal_texture_update_at_same_handle_rebuilds_bind_group() {
+    let _gpu = GPU_SERIAL.lock().unwrap();
+    let Some(mut renderer) = OffscreenRenderer::new(256, 256) else {
+        eprintln!("跳过：环境无 GPU 适配器");
+        return;
+    };
+
+    let mut world = dark_world();
+    set_topdown_camera(&mut world);
+    spawn_green_floor(&mut world);
+    let texture = world
+        .resource_mut::<TextureStore>()
+        .add(CpuTexture::solid([255, 0, 0, 255]));
+    let decal = Decal {
+        texture,
+        size: Vec3::new(2.0, 2.0, 0.1),
+        tint: [1.0, 1.0, 1.0, 1.0],
+    };
+    spawn_floor_decal(&mut world, decal);
+    propagate_transforms(&mut world);
+
+    renderer.render(&world);
+    let red = renderer.read_pixels();
+    assert_eq!(
+        renderer.renderer().resource_cache_stats().decal_bind_groups,
+        1,
+        "首帧应有一个贴花纹理绑定组"
+    );
+
+    assert!(
+        world
+            .resource_mut::<TextureStore>()
+            .update(texture, CpuTexture::solid([0, 0, 255, 255])),
+        "存活贴花纹理更新必须命中"
+    );
+    renderer.render(&world);
+    let blue = renderer.read_pixels();
+    assert_eq!(
+        renderer.renderer().resource_cache_stats().decal_bind_groups,
+        1,
+        "纹理更新后绑定组重建，不得累积"
+    );
+    assert!(red != blue, "贴花红蓝换色必须可判别");
+
+    let mut fresh = dark_world();
+    set_topdown_camera(&mut fresh);
+    spawn_green_floor(&mut fresh);
+    let fresh_texture = fresh
+        .resource_mut::<TextureStore>()
+        .add(CpuTexture::solid([0, 0, 255, 255]));
+    spawn_floor_decal(
+        &mut fresh,
+        Decal {
+            texture: fresh_texture,
+            size: Vec3::new(2.0, 2.0, 0.1),
+            tint: [1.0, 1.0, 1.0, 1.0],
+        },
+    );
+    propagate_transforms(&mut fresh);
+    let mut fresh_renderer = OffscreenRenderer::new(256, 256).expect("GPU 已在场");
+    fresh_renderer.render(&fresh);
+    assert!(
+        blue == fresh_renderer.read_pixels(),
+        "贴花纹理更新后的画面必须与新建世界逐字节一致"
+    );
+}

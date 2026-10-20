@@ -4,7 +4,9 @@
 //! ```text
 //! World 资源（MeshStore / MaterialStore / TextureStore，CPU 目录）
 //!     -> Renderer 内 GPU 缓存（HashMap<句柄, GPU 资源>，按需懒上传；
-//!        纹理按 BC1 决策树压缩上传，见 texture_bcn）
+//!        纹理按 BC1 决策树压缩上传，见 texture_bcn；缓存按槽位修订号
+//!        失效并驱逐，纹理变化连带失效材质与贴花绑定组，见
+//!        sync_resource_caches）
 //!     -> 查询 (Transform, MaterialHandle, MeshHandle|LodMesh|LodMesh3) 收集实例
 //!        （LodMesh 按实体-相机距离选 high/low，见 mesh.rs；LodMesh3 三级
 //!        同口径，地形 chunk 用，见 terrain.rs）
@@ -254,6 +256,9 @@ struct GpuMesh {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     num_indices: u32,
+    /// 上传时网格槽位的内容修订号。与 `MeshStore::revision` 不等即陈旧，
+    /// 下一帧同步或懒上传时整体重建。
+    revision: u64,
     /// 蒙皮属性缓冲（非蒙皮网格为 None）。
     skin_buf: Option<wgpu::Buffer>,
     /// 顶点切线缓冲（R42；网格无切线为 None——绑定常驻零垫缓冲，
@@ -327,6 +332,10 @@ struct MorphGpu {
     capacity_bytes: u64,
     /// 上次上传的权重位图案（一致 ⇒ 不重混合、不重上传）。
     last_weights: Vec<u32>,
+    /// 上次混合所用的网格句柄与内容修订号。网格内容原地更新时，即使
+    /// 顶点数与权重都没变也必须重新混合。
+    mesh: u32,
+    mesh_revision: u64,
 }
 
 /// 发带控制网格的 GPU 缓冲（R90）：键 = 发带实体位（`hair_gpu`）。
@@ -398,6 +407,9 @@ struct DecalItem {
 struct GpuTexture {
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// 上传时纹理槽位的内容修订号。与 `TextureStore::revision` 不等即
+    /// 陈旧；替换时连带失效引用它的材质与贴花绑定组。
+    revision: u64,
     /// 上传时是否走了 BC1 压缩（R30：`texture_is_bc1` 的观测口径，
     /// 供测试断言与内存对账）。
     bc1: bool,
@@ -421,6 +433,11 @@ enum CompressedPath {
 
 struct GpuMaterial {
     bind_group: wgpu::BindGroup,
+    /// 绑定组捕获的三槽纹理句柄，依次是基础色、法线与 ORM。法线缺席
+    /// 用 `u32::MAX`，基础色与 ORM 缺席使用 0 号白色兜底。
+    textures: [u32; 3],
+    /// 三槽纹理在上传时的内容修订号；任一变化即重建绑定组。
+    revisions: [u64; 3],
 }
 
 /// 单张渲染目标（R40）的 GPU 侧资源：颜色纹理（UI 可采样）+ 深度 +
@@ -531,8 +548,17 @@ pub struct Renderer {
     /// 供帧级比对决策全量 / 增量 / 跳过上传。上传完成后与组装 scratch
     /// `mem::swap` 零拷贝交换（见 `draw` 步骤 3）。
     last_instances: Vec<InstanceRaw>,
+    /// 网格 GPU 缓存（句柄 → 缓冲）。按内容修订号失效；删除槽位在帧首
+    /// 同步时驱逐。详细生命周期见 [`Self::sync_resource_caches`]。
     mesh_gpu: HashMap<u32, GpuMesh>,
+    /// 纹理 GPU 缓存（句柄 → 视图 / 采样器）。按内容修订号失效；纹理
+    /// 变化会连带失效材质与贴花绑定组。
     texture_gpu: HashMap<u32, GpuTexture>,
+    /// 上一帧同步过的网格目录纪元。`None` = 尚未同步或世界无
+    /// `MeshStore`，下一次出现时强制全扫。
+    mesh_store_epoch: Option<u64>,
+    /// 上一帧同步过的纹理目录纪元；语义同 `mesh_store_epoch`。
+    texture_store_epoch: Option<u64>,
     /// MipSettings 的上传期快照（R66）：`draw` 开头从 World 读取，此后
     /// 本帧内的全部懒上传（材质 / 探针捕获 / UI 图片）同口径。`None` =
     /// 资源缺席（单 mip + 采样器逐字段与 R66 之前一致）；`Some(a)` =
@@ -1940,6 +1966,19 @@ struct MeshletLodFrameParams {
     threshold_px: f32,
 }
 
+/// GPU 资源缓存诊断计数（动态生命周期测试与内存排查用）。
+///
+/// `texture_entries` 包含渲染器内置的 0 号白色兜底纹理；`material_entries`
+/// 按（材质, 光照贴图）复合键计数；`decal_bind_groups` 是按贴花纹理句柄
+/// 缓存的绑定组数量。计数只反映缓存条目，不代表显存精确字节。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceCacheStats {
+    pub mesh_entries: usize,
+    pub texture_entries: usize,
+    pub material_entries: usize,
+    pub decal_bind_groups: usize,
+}
+
 /// 单帧渲染统计。除注明外均为**主几何口径**（不透明主 pass、贴花 pass、
 /// 透明 pass 与粒子 pass，见 ARCHITECTURE §4.16 / §4.17 / §4.20）：UI pass
 /// 只计入 `draw_calls` 的单批，阴影 pass（CSM 3 级联各一遍 + 点光每投影灯
@@ -2640,6 +2679,10 @@ fn collect_instances(
         ) else {
             return;
         };
+        // 动态资源删除守卫：句柄已死 ⇒ 本帧不画（阴影 / 捕获同源）。
+        if mesh_store.get(m).is_none() {
+            return;
+        }
         skinned_entities.insert(e.to_bits());
         let mut joint_matrices = Vec::with_capacity(skin.joints.len());
         skin.joint_matrices(world, gt.matrix(), &mut joint_matrices);
@@ -2707,6 +2750,10 @@ fn collect_instances(
         ) else {
             return;
         };
+        // 动态资源删除守卫：句柄已死 ⇒ 本帧不画（阴影 / 捕获同源）。
+        if mesh_store.get(m).is_none() {
+            return;
+        }
         let model = gt.matrix();
         // 包围球剔除：局部球心经模型矩阵变换，半径按最大列缩放保守放大
         //（按 LOD 选中的网格算，高低模包围体差异直接进入剔除边界）
@@ -2808,6 +2855,10 @@ fn collect_fur_items(
         if visibility.is_some_and(|v| !v.visible) || hidden_by_ancestor(world, e) {
             return;
         }
+        // 动态资源删除守卫：底皮网格已死 ⇒ 壳层不画。
+        if mesh_store.get(*mesh).is_none() {
+            return;
+        }
         let model = gt.matrix();
         let bounds = mesh_store.get(*mesh).and_then(|data| data.bounds());
         if let Some((min, max)) = bounds {
@@ -2873,7 +2924,8 @@ fn collect_fur_items(
                 use_card = true;
             }
             lod_memory.insert(entity, use_card);
-            if use_card {
+            // 卡片网格被删除时回退发带，而不是推入死句柄绘制项。
+            if use_card && mesh_store.get(*card).is_some() {
                 // 远档：普通不透明项（标准管线合批，KK 材质照常）
                 card_items.push(DrawItem {
                     key: ((card.0 as u64) << 32) | mat.0 as u64,
@@ -4052,6 +4104,8 @@ impl Renderer {
             sampler: gpu
                 .device
                 .create_sampler(&wgpu::SamplerDescriptor::default()),
+            // 0 号槽位恒为白色兜底，修订号固定 0（不可更新或删除）。
+            revision: 0,
             // 1×1 兜底纹理非 4 对齐，恒走 RGBA 路径（决策树与其一致）
             bc1: false,
             bc3: false,
@@ -4360,6 +4414,8 @@ impl Renderer {
             last_instances: Vec::new(),
             mesh_gpu: HashMap::new(),
             texture_gpu,
+            mesh_store_epoch: None,
+            texture_store_epoch: None,
             mip_anisotropy: None,
             material_gpu: HashMap::new(),
             neutral_normal_tex,
@@ -5201,6 +5257,9 @@ impl Renderer {
             log::warn!("世界缺 MeshStore / MaterialStore 资源，反射探针无法捕获");
             return false;
         };
+        // 动态资源同步：探针捕获同样消费网格 / 材质缓存，必须在收集前
+        // 完成更新与驱逐。
+        self.sync_resource_caches(world);
         let texture_store = world.try_resource::<TextureStore>();
         let lightmap_store = world.try_resource::<LightmapStore>();
 
@@ -6493,6 +6552,16 @@ impl Renderer {
         self.stats
     }
 
+    /// 当前 GPU 资源缓存条目数（诊断与动态生命周期测试用）。
+    pub fn resource_cache_stats(&self) -> ResourceCacheStats {
+        ResourceCacheStats {
+            mesh_entries: self.mesh_gpu.len(),
+            texture_entries: self.texture_gpu.len(),
+            material_entries: self.material_gpu.len(),
+            decal_bind_groups: self.decal_bind_groups.len(),
+        }
+    }
+
     /// 最近一次成功消费的 meshlet 紧凑列表（packed 条目：实例槽 << 16 |
     /// 簇局部号；紧凑序 = 全局簇号升序 ⇒ 本切片恒严格升序）。GPU 测试与
     /// 验收的观测口（稳定紧凑化的确定性断言）；`None` = 尚无有效回读
@@ -6526,6 +6595,9 @@ impl Renderer {
         self.mip_anisotropy = world
             .try_resource::<crate::texture::MipSettings>()
             .map(|m| m.anisotropy);
+        // 动态资源同步（网格 / 纹理的更新与删除）：必须在任何 pass 编码
+        // 与懒上传之前完成，否则陈旧缓冲会被本帧直接索引。
+        self.sync_resource_caches(world);
         // 天气表面（R92）：每帧首部覆写一次（主相机 / 捕获 / RT 共享——
         // 天气是世界状态；涟漪时间与水体波形同源 = Time.elapsed_secs，
         // 缺席 = 0）。资源缺席 = 全零 uniform = fs_shaded 天气分支死码。
@@ -12071,13 +12143,17 @@ impl Renderer {
     }
 
     fn ensure_mesh(&mut self, store: &MeshStore, handle: MeshHandle) {
-        if self.mesh_gpu.contains_key(&handle.0) {
-            return;
-        }
-        let Some(data) = store.get(handle) else {
+        let Some((data, revision)) = store.get_with_revision(handle) else {
+            self.mesh_gpu.remove(&handle.0);
             log::warn!("网格句柄 {handle:?} 不存在");
             return;
         };
+        if let Some(gpu) = self.mesh_gpu.get(&handle.0) {
+            if gpu.revision == revision {
+                return;
+            }
+            self.mesh_gpu.remove(&handle.0);
+        }
         let (vertex_buf, index_buf, num_indices, skin_buf, tangent_buf, uv2_buf) =
             upload_mesh(&self.gpu, data);
         // 无切线 / 无 UV2 且顶点数超出常驻零垫容量（65536）的网格：单独
@@ -12110,6 +12186,7 @@ impl Renderer {
                 vertex_buf,
                 index_buf,
                 num_indices,
+                revision,
                 skin_buf,
                 tangent_buf,
                 uv2_buf,
@@ -12181,6 +12258,7 @@ impl Renderer {
         &mut self,
         handle: TextureHandle,
         levels: &crate::texture::CompressedLevels,
+        revision: u64,
     ) {
         use crate::texture_ktx2::Ktx2BcFormat;
         if levels.width % 4 != 0 || levels.height % 4 != 0 {
@@ -12269,6 +12347,7 @@ impl Renderer {
             GpuTexture {
                 view,
                 sampler,
+                revision,
                 bc1: matches!(
                     levels.format,
                     Ktx2BcFormat::Bc1Unorm | Ktx2BcFormat::Bc1Srgb
@@ -12308,7 +12387,7 @@ impl Renderer {
             let Some(weights) = item.morph_weights.take() else {
                 continue;
             };
-            let Some(base) = mesh_store.get(MeshHandle(item.mesh)) else {
+            let Some((base, revision)) = mesh_store.get_with_revision(MeshHandle(item.mesh)) else {
                 continue;
             };
             let Some(morph) = base.morph.as_ref() else {
@@ -12318,10 +12397,12 @@ impl Renderer {
                 (base.vertices.len() * std::mem::size_of::<crate::mesh::Vertex>()) as u64;
             let key = item.skin_entity;
             let bits: Vec<u32> = weights.iter().map(|w| w.to_bits()).collect();
-            let clean = self
-                .morph_gpu
-                .get(&key)
-                .is_some_and(|entry| entry.last_weights == bits && bytes <= entry.capacity_bytes);
+            let clean = self.morph_gpu.get(&key).is_some_and(|entry| {
+                entry.mesh == item.mesh
+                    && entry.mesh_revision == revision
+                    && entry.last_weights == bits
+                    && bytes <= entry.capacity_bytes
+            });
             if clean {
                 // 权重位图案未变 ⇒ 不重混合、不重上传（缓冲内容照常生效）
                 let entry = self.morph_gpu.get(&key).expect("上查在场");
@@ -12344,6 +12425,8 @@ impl Renderer {
                         vertex_buf,
                         capacity_bytes: bytes.max(4),
                         last_weights: Vec::new(),
+                        mesh: item.mesh,
+                        mesh_revision: revision,
                     },
                 );
                 dirty = true;
@@ -12360,7 +12443,8 @@ impl Renderer {
                 entry.capacity_bytes = bytes.max(4);
                 dirty = true;
             }
-            if dirty || entry.last_weights != bits {
+            let mesh_changed = entry.mesh != item.mesh || entry.mesh_revision != revision;
+            if dirty || mesh_changed || entry.last_weights != bits {
                 if bytes > 0 {
                     self.gpu.queue.write_buffer(
                         &entry.vertex_buf,
@@ -12369,6 +12453,8 @@ impl Renderer {
                     );
                 }
                 entry.last_weights.clone_from(&bits);
+                entry.mesh = item.mesh;
+                entry.mesh_revision = revision;
                 self.morph_uploads += 1;
             }
             item.vertex_override = Some(entry.vertex_buf.clone());
@@ -12380,15 +12466,99 @@ impl Renderer {
         self.morph_uploads
     }
 
-    fn ensure_texture(&mut self, store: Option<&TextureStore>, handle: TextureHandle) {
-        // 0 号纹理是渲染器内置的白色兜底纹理，无需上传
-        if handle.0 == 0 || self.texture_gpu.contains_key(&handle.0) {
+    /// 按目录纪元同步 GPU 资源缓存。
+    ///
+    /// `MeshStore` 与 `TextureStore` 每次内容变更都推进纪元。纪元未变
+    /// 表示缓存与目录一致，本帧零扫描。纪元变化时逐条比较修订号，删除
+    /// 内容已更新或槽位已死的 GPU 条目。纹理条目被删除时，所有引用它的
+    /// 材质绑定组与贴花绑定组一并失效，避免旧纹理视图被间接保活。
+    ///
+    /// 必须在任何 pass 编码之前调用；主入口是 [`Self::draw`] 与
+    /// [`Self::bake_reflection_probe`]。资源缺席时把对应纪元置为 `None`，
+    /// 下一次资源出现会强制全扫。
+    fn sync_resource_caches(&mut self, world: &iris_core::world::World) {
+        if let Some(store) = world.try_resource::<MeshStore>() {
+            let epoch = store.epoch();
+            if self.mesh_store_epoch != Some(epoch) {
+                let stale: Vec<u32> = self
+                    .mesh_gpu
+                    .iter()
+                    .filter_map(|(handle, gpu)| {
+                        (store.revision(MeshHandle(*handle)) != Some(gpu.revision))
+                            .then_some(*handle)
+                    })
+                    .collect();
+                for handle in stale {
+                    self.mesh_gpu.remove(&handle);
+                }
+                self.mesh_store_epoch = Some(epoch);
+            }
+        } else {
+            self.mesh_store_epoch = None;
+        }
+
+        if let Some(store) = world.try_resource::<TextureStore>() {
+            let epoch = store.epoch();
+            if self.texture_store_epoch != Some(epoch) {
+                let stale: Vec<u32> = self
+                    .texture_gpu
+                    .iter()
+                    .filter_map(|(handle, gpu)| {
+                        if *handle == 0 {
+                            return None;
+                        }
+                        (store.revision(TextureHandle(*handle)) != Some(gpu.revision))
+                            .then_some(*handle)
+                    })
+                    .collect();
+                for handle in &stale {
+                    self.texture_gpu.remove(handle);
+                }
+                self.invalidate_texture_dependents(&stale);
+                self.texture_store_epoch = Some(epoch);
+            }
+        } else {
+            self.texture_store_epoch = None;
+        }
+    }
+
+    /// 失效引用了给定纹理句柄的材质与贴花绑定组。
+    ///
+    /// 绑定组捕获纹理视图；纹理被替换或删除后旧视图必须释放。材质在
+    /// 下一次 `ensure_material` 时按修订号重建，贴花在下一次绘制时重建。
+    fn invalidate_texture_dependents(&mut self, changed: &[u32]) {
+        if changed.is_empty() {
             return;
         }
-        let Some(cpu) = store.and_then(|s| s.get(handle)) else {
+        self.decal_bind_groups
+            .retain(|handle, _| !changed.contains(handle));
+        self.material_gpu.retain(|_, material| {
+            !material
+                .textures
+                .iter()
+                .any(|handle| changed.contains(handle))
+        });
+    }
+
+    fn ensure_texture(&mut self, store: Option<&TextureStore>, handle: TextureHandle) {
+        // 0 号纹理是渲染器内置的白色兜底纹理，无需上传
+        if handle.0 == 0 {
+            return;
+        }
+        let Some((cpu, revision)) = store.and_then(|s| s.get_with_revision(handle)) else {
+            if self.texture_gpu.remove(&handle.0).is_some() {
+                self.invalidate_texture_dependents(&[handle.0]);
+            }
             log::warn!("纹理句柄 {handle:?} 不存在，使用白色兜底纹理");
             return;
         };
+        if let Some(gpu) = self.texture_gpu.get(&handle.0) {
+            if gpu.revision == revision {
+                return;
+            }
+            self.texture_gpu.remove(&handle.0);
+            self.invalidate_texture_dependents(&[handle.0]);
+        }
         let width = cpu.width.max(1);
         let height = cpu.height.max(1);
         // KTX2 预压缩纹理（C5a-2）：容器已带块数据，短路 RGBA8/编码
@@ -12404,7 +12574,7 @@ impl Renderer {
                 );
                 return;
             }
-            self.upload_compressed(handle, levels);
+            self.upload_compressed(handle, levels, revision);
             return;
         }
         // R30 BC1 压缩决策树（决策纯函数与 TextureStore::gpu_bytes_estimate
@@ -12639,6 +12809,7 @@ impl Renderer {
             GpuTexture {
                 view,
                 sampler,
+                revision,
                 bc1: path == CompressedPath::Bc1,
                 bc3: path == CompressedPath::Bc3,
                 bc7: path == CompressedPath::Bc7,
@@ -12810,19 +12981,40 @@ impl Renderer {
         lightmap: u32,
     ) {
         let key = material_key(handle.0, lightmap);
-        if self.material_gpu.contains_key(&key) {
-            return;
-        }
         let Some(def) = materials.get(handle) else {
             log::warn!("材质句柄 {handle:?} 不存在");
             return;
         };
-        self.ensure_texture(textures, def.texture);
         // 法线 / ORM 槽位（R42）：Some 懒上传后用真实纹理；None 绑中性
         // 常驻纹理（法线 (0.5,0.5,1) / ORM 白色 1.0——白色兜底纹理采样
         // 恒 1.0，与中性 ORM 语义一致）。三张贴图共用 base 采样器。
         let normal_handle = def.normal_texture;
         let orm_handle = def.orm_texture;
+        // 纹理槽位与修订号是绑定组缓存的一部分：句柄替换或同句柄纹素
+        // 更新都必须重建，否则采样视图仍指向旧 GPU 纹理。
+        let texture_slots = [
+            def.texture.0,
+            normal_handle.map_or(u32::MAX, |tex| tex.0),
+            orm_handle.map_or(0, |tex| tex.0),
+        ];
+        let texture_revisions = [
+            textures
+                .and_then(|store| store.revision(def.texture))
+                .unwrap_or(0),
+            normal_handle
+                .and_then(|tex| textures.and_then(|store| store.revision(tex)))
+                .unwrap_or(0),
+            orm_handle
+                .and_then(|tex| textures.and_then(|store| store.revision(tex)))
+                .unwrap_or(0),
+        ];
+        if let Some(existing) = self.material_gpu.get(&key) {
+            if existing.textures == texture_slots && existing.revisions == texture_revisions {
+                return;
+            }
+            self.material_gpu.remove(&key);
+        }
+        self.ensure_texture(textures, def.texture);
         if let Some(tex) = normal_handle {
             self.ensure_texture(textures, tex);
         }
@@ -12832,13 +13024,24 @@ impl Renderer {
         // 光照贴图（R52c）：懒上传后取真实图集视图；缺席 / 悬垂绑常驻
         // 1×1 黑纹理。采样器全图集共用一份常驻。
         self.ensure_lightmap(lightmaps, lightmap);
-        let texture = &self.texture_gpu[&def.texture.0];
+        let texture = self
+            .texture_gpu
+            .get(&def.texture.0)
+            .unwrap_or(&self.texture_gpu[&0]);
         let normal_view = match normal_handle {
-            Some(tex) => &self.texture_gpu[&tex.0].view,
+            Some(tex) => self
+                .texture_gpu
+                .get(&tex.0)
+                .map(|gpu| &gpu.view)
+                .unwrap_or(&self.neutral_normal_view),
             None => &self.neutral_normal_view,
         };
         let orm_view = match orm_handle {
-            Some(tex) => &self.texture_gpu[&tex.0].view,
+            Some(tex) => self
+                .texture_gpu
+                .get(&tex.0)
+                .map(|gpu| &gpu.view)
+                .unwrap_or(&self.texture_gpu[&0].view),
             None => &self.texture_gpu[&0].view,
         };
         let (lightmap_view, lightmap_sampler) = match self.lightmap_gpu.get(&lightmap) {
@@ -12944,7 +13147,14 @@ impl Renderer {
                     },
                 ],
             });
-        self.material_gpu.insert(key, GpuMaterial { bind_group });
+        self.material_gpu.insert(
+            key,
+            GpuMaterial {
+                bind_group,
+                textures: texture_slots,
+                revisions: texture_revisions,
+            },
+        );
     }
 }
 
