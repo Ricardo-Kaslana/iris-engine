@@ -90,6 +90,8 @@ struct VertexOutput {
     // 毛发辅助通道（R90，影子契约——四方同步见 standard.wgsl 同名结构）：
     // meshlet 路径恒写 0（不进壳层裁剪语义）
     @location(6) fur_aux: vec4<f32>,
+    // 顶点色（影子契约）：meshlet 容器不载颜色，恒写白色（乘性恒等）。
+    @location(7) color: vec4<f32>,
 };
 
 @vertex
@@ -123,6 +125,7 @@ fn vs_main(
         degenerate.uv2 = vec2<f32>(0.0);
         degenerate.probe = vec4<f32>(0.0);
         degenerate.fur_aux = vec4<f32>(0.0);
+        degenerate.color = vec4<f32>(1.0);
         return degenerate;
     }
 
@@ -151,5 +154,6 @@ fn vs_main(
     out.uv2 = vec2<f32>(0.0, 0.0);
     out.probe = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     out.fur_aux = vec4<f32>(0.0);
+    out.color = vec4<f32>(1.0);
     return out;
 }

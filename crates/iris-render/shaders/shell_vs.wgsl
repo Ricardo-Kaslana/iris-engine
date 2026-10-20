@@ -32,6 +32,8 @@ struct VertexOutput {
     @location(4) uv2: vec2<f32>,
     @location(5) probe: vec4<f32>,
     @location(6) fur_aux: vec4<f32>,
+    // 顶点色（影子契约）：壳层管线没有颜色顶点流，恒写白色（乘性恒等）。
+    @location(7) color: vec4<f32>,
 };
 
 struct VertexInput {
@@ -68,5 +70,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.probe = vec4<f32>(0.0);
     // 层比传片元：cutout 阈值 = max(材质 cutoff, t)
     out.fur_aux = vec4<f32>(in.shell.x, 0.0, 0.0, 0.0);
+    out.color = vec4<f32>(1.0);
     return out;
 }

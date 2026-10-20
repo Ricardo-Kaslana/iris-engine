@@ -42,6 +42,19 @@
 //! （R52c `select` 先例的强化形态：「把逐位不变交给语言语义，而不是浮点
 //! 恒等式」）。故全部既有材质（`..MaterialDef::default()` 构造）渲染结果
 //! 与 R62b **逐位一致**，由既有 GPU FNV 基线原值通过看门。
+//!
+//! # 受控材质扩展
+//!
+//! [`MaterialExtensions`] 提供两个引擎白名单内的开关：顶点色消费方式
+//! （`Ignore` / `Multiply`）与着色模式（`Lit` / `Unlit`）。两个字段
+//! 缺省关闭，材质 uniform 的扩展槽写零，着色器分支整段不进入。该入口
+//! 不是任意 WGSL 注入点；新增扩展模式必须改引擎并补像素测试。
+//!
+//! # 材质修订号
+//!
+//! [`MaterialStore`] 为每个材质槽位维护修订号。`get_mut` 与
+//! `set_contents` 推进修订号，渲染器据此在下一帧重建材质绑定组。
+//! 默认场景没有修改，缓存命中行为与引入修订号之前一致。
 
 use crate::texture::TextureHandle;
 
@@ -122,6 +135,66 @@ impl KajiyaKay {
     }
 }
 
+/// 顶点色消费方式（受控材质扩展的一部分）。
+///
+/// - `Ignore`（默认）：网格即使携带顶点色也不参与着色。着色器分支整段
+///   不执行，默认路径与引入顶点色之前逐位一致。
+/// - `Multiply`：片元把顶点色的 RGB 乘到反照率上。颜色是线性乘子，
+///   255 为恒等；网格缺席颜色时渲染器绑定白色垫，因此该模式对无颜色
+///   网格是空操作。alpha 通道当前不参与任何计算。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VertexColorMode {
+    #[default]
+    Ignore,
+    Multiply,
+}
+
+/// 着色模式（受控材质扩展的一部分）。
+///
+/// `Lit`（默认）走完整 PBR 着色。`Unlit` 在 alpha cutout 之后提前返回
+/// “反照率与自发光”，跳过直射光、IBL、光照贴图、探针、SSR、AO、天气、
+/// SSS 与 Kajiya-Kay。透明模式、OIT 深度测试、场景深度、阴影投射、雾
+/// 与后处理链不受影响。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadingMode {
+    #[default]
+    Lit,
+    Unlit,
+}
+
+/// 材质受控扩展入口：引擎白名单内的功能开关，不是任意 WGSL 注入点。
+///
+/// 字段全部关闭时，材质 uniform 的扩展槽写零，着色器分支不进入，渲染
+/// 结果与引入扩展之前逐位一致。场景格式在整组缺省时省略本字段，旧场景
+/// 反序列化回落到默认值。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct MaterialExtensions {
+    /// 顶点色消费方式（见 [`VertexColorMode`]）。
+    pub vertex_color: VertexColorMode,
+    /// 着色模式（见 [`ShadingMode`]）。
+    pub shading: ShadingMode,
+}
+
+impl MaterialExtensions {
+    /// 整组是否等于缺省值（场景序列化的省略条件）。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 写入材质 uniform 扩展槽的旗标：x = 顶点色乘入，y = unlit，z/w 保留。
+    pub(crate) fn shader_flags(self) -> [f32; 4] {
+        [
+            f32::from(self.vertex_color == VertexColorMode::Multiply),
+            f32::from(self.shading == ShadingMode::Unlit),
+            0.0,
+            0.0,
+        ]
+    }
+}
+
 /// 材质定义（CPU 侧）。GPU 侧 uniform 由渲染器按需创建。
 #[derive(Clone, Debug)]
 pub struct MaterialDef {
@@ -178,6 +251,9 @@ pub struct MaterialDef {
     /// `Some` = 直射光（方向光 + 点光 + 聚光）换 KK 瓣，间接项（IBL /
     /// 探针 / 光照贴图）仍走各向同性伪法线路径。见 [`KajiyaKay`]。
     pub kajiya_kay: Option<KajiyaKay>,
+    /// 受控材质扩展（本轮）：顶点色消费方式与着色模式。缺省全部关闭，
+    /// 与引入该字段之前逐位一致。见 [`MaterialExtensions`]。
+    pub extensions: MaterialExtensions,
 }
 
 impl Default for MaterialDef {
@@ -196,6 +272,7 @@ impl Default for MaterialDef {
             subsurface_scale: crate::sss::SSS_DEFAULT_SCALE,
             alpha_cutoff: 0.5,
             kajiya_kay: None,
+            extensions: MaterialExtensions::default(),
         }
     }
 }
@@ -276,18 +353,44 @@ impl MaterialDef {
         self.kajiya_kay = Some(params);
         self
     }
+
+    /// 设置顶点色消费方式（builder 风格）。`Multiply` 要求网格侧提供
+    /// `MeshData::colors`；网格缺席颜色时渲染器绑白色垫，乘性恒等。
+    pub fn with_vertex_color(mut self, mode: VertexColorMode) -> Self {
+        self.extensions.vertex_color = mode;
+        self
+    }
+
+    /// 切换为无光照输出（builder 风格）：反照率与自发光直接出图，跳过
+    /// 全部场景光照与间接项。见 [`ShadingMode::Unlit`]。
+    pub fn with_unlit(mut self) -> Self {
+        self.extensions.shading = ShadingMode::Unlit;
+        self
+    }
 }
 
 /// CPU 侧材质目录（World 资源）。0 号槽位固定为默认材质。
+///
+/// # 修订号
+///
+/// 每个材质槽位记录最近一次变更的修订号，目录维护单调推进的 `epoch`。
+/// `add` 为新材质分配新修订号；`get_mut` 推进被编辑材质的修订号；
+/// `set_contents` 为全部材质分配新修订号。渲染器按修订号决定是否重建
+/// 该材质的 GPU 绑定组，因此运行期修改数值字段或扩展开关会在下一帧
+/// 生效。修订号只用于失效判断，不进入任何着色计算。
 #[derive(iris_core::Resource)]
 pub struct MaterialStore {
     materials: Vec<MaterialDef>,
+    revisions: Vec<u64>,
+    epoch: u64,
 }
 
 impl Default for MaterialStore {
     fn default() -> Self {
         Self {
             materials: vec![MaterialDef::default()],
+            revisions: vec![1],
+            epoch: 1,
         }
     }
 }
@@ -297,9 +400,17 @@ impl MaterialStore {
         Self::default()
     }
 
+    /// 推进目录纪元并返回新值。
+    fn next_epoch(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+    }
+
     /// 注册材质；新句柄从 1 开始（0 为默认材质）。
     pub fn add(&mut self, def: MaterialDef) -> MaterialHandle {
+        let revision = self.next_epoch();
         self.materials.push(def);
+        self.revisions.push(revision);
         MaterialHandle(self.materials.len() as u32 - 1)
     }
 
@@ -307,12 +418,28 @@ impl MaterialStore {
         self.materials.get(handle.0 as usize)
     }
 
-    /// 可变视图（C5b 热重载局部的写入口）：就地改既有句柄的**数值**
-    /// 参数。渲染器每帧从目录现读材质定义（无逐句柄 GPU 缓存），写入
-    /// 下一帧即生效。纹理像素 / 网格顶点等内容级替换仍不提供（句柄
-    /// 内容不可变是既有边界，见 ARCHITECTURE §8.4 / §8.65）。
+    /// 可变视图（C5b 热重载局部的写入口）：就地改既有句柄的数值参数或
+    /// 扩展开关。本次调用推进该材质的修订号，渲染器在下一帧重建它的
+    /// 绑定组并重新读取全部字段。纹理像素与网格顶点等内容级替换仍走
+    /// 各自的目录修订号（见 ARCHITECTURE §4.9 / §8.4）。
     pub fn get_mut(&mut self, handle: MaterialHandle) -> Option<&mut MaterialDef> {
-        self.materials.get_mut(handle.0 as usize)
+        let index = handle.0 as usize;
+        if index >= self.materials.len() {
+            return None;
+        }
+        let revision = self.next_epoch();
+        self.revisions[index] = revision;
+        self.materials.get_mut(index)
+    }
+
+    /// 材质槽位的当前修订号；无效句柄返回 `None`。
+    pub fn revision(&self, handle: MaterialHandle) -> Option<u64> {
+        self.revisions.get(handle.0 as usize).copied()
+    }
+
+    /// 当前目录纪元。任何 `add`、`get_mut` 与 `set_contents` 都会推进它。
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// 已注册材质数（含 0 号默认材质）。
@@ -329,12 +456,15 @@ impl MaterialStore {
         &self.materials
     }
 
-    /// 整体替换目录内容（下标 = 句柄号重新按序分配）。
+    /// 整体替换目录内容（下标 = 句柄号重新按序分配），并为全部材质分配
+    /// 新修订号，强制渲染器丢弃旧绑定组。
     ///
     /// **安全前提在调用方**：替换后，旧内容中未保留的句柄不得再被任何
-    /// 实体引用（当前唯一消费者是 iris-editor 的 undo 快照恢复；网格侧
-    /// 的同类快照用 `MeshStore::restore_from`，会刷新修订号）。
+    /// 实体引用（当前消费者是 iris-editor 的 undo 快照恢复；网格侧的
+    /// 同类快照用 `MeshStore::restore_from`，同样会刷新修订号）。
     pub fn set_contents(&mut self, materials: Vec<MaterialDef>) {
+        let revision = self.next_epoch();
+        self.revisions = vec![revision; materials.len()];
         self.materials = materials;
     }
 }
@@ -498,5 +628,74 @@ mod tests {
             "builder 不得改写其他字段"
         );
         assert_eq!(hair.roughness, 0.5);
+    }
+
+    /// 受控材质扩展：整组缺省关闭；两个 builder 只改目标字段；uniform
+    /// 旗标按枚举映射为 0/1，缺省全零保证着色器分支不进入。
+    #[test]
+    fn extensions_default_off_and_builders_map_flags() {
+        let def = MaterialDef::default();
+        assert_eq!(def.extensions, MaterialExtensions::default());
+        assert!(def.extensions.is_default());
+        assert_eq!(def.extensions.vertex_color, VertexColorMode::Ignore);
+        assert_eq!(def.extensions.shading, ShadingMode::Lit);
+        assert_eq!(def.extensions.shader_flags(), [0.0; 4]);
+
+        let colored =
+            MaterialDef::solid(0.8, 0.8, 0.8, 1.0).with_vertex_color(VertexColorMode::Multiply);
+        assert_eq!(colored.extensions.vertex_color, VertexColorMode::Multiply);
+        assert_eq!(colored.extensions.shading, ShadingMode::Lit);
+        assert_eq!(colored.extensions.shader_flags(), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            colored.base_color,
+            [0.8, 0.8, 0.8, 1.0],
+            "builder 不改其他字段"
+        );
+
+        let unlit = MaterialDef::solid(0.3, 0.4, 0.5, 1.0).with_unlit();
+        assert_eq!(unlit.extensions.shading, ShadingMode::Unlit);
+        assert_eq!(unlit.extensions.vertex_color, VertexColorMode::Ignore);
+        assert_eq!(unlit.extensions.shader_flags(), [0.0, 1.0, 0.0, 0.0]);
+
+        let both = MaterialDef::solid(1.0, 1.0, 1.0, 1.0)
+            .with_vertex_color(VertexColorMode::Multiply)
+            .with_unlit();
+        assert_eq!(both.extensions.shader_flags(), [1.0, 1.0, 0.0, 0.0]);
+        assert!(!both.extensions.is_default());
+    }
+
+    /// 修订号：`add` 给新材质分配新值且不扰动既有材质；`get_mut` 只推进
+    /// 被编辑材质；`set_contents` 为全部材质刷新。无效句柄不推进纪元。
+    #[test]
+    fn material_store_revisions_track_edits() {
+        let mut store = MaterialStore::new();
+        assert_eq!(store.epoch(), 1);
+        assert_eq!(store.revision(MaterialHandle(0)), Some(1));
+        let a = store.add(MaterialDef::solid(1.0, 0.0, 0.0, 1.0));
+        let b = store.add(MaterialDef::solid(0.0, 1.0, 0.0, 1.0));
+        assert_eq!((a, b), (MaterialHandle(1), MaterialHandle(2)));
+        assert_eq!(store.revision(a), Some(2));
+        assert_eq!(store.revision(b), Some(3));
+        assert_eq!(
+            store.revision(MaterialHandle(0)),
+            Some(1),
+            "新材质不得改写既有修订号"
+        );
+        assert_eq!(store.epoch(), 3);
+
+        store.get_mut(a).unwrap().roughness = 0.1;
+        assert_eq!(store.revision(a), Some(4), "get_mut 推进被编辑材质");
+        assert_eq!(store.revision(b), Some(3), "未编辑材质保持不变");
+        assert_eq!(store.revision(MaterialHandle(0)), Some(1));
+        assert_eq!(store.epoch(), 4);
+
+        assert!(store.get_mut(MaterialHandle(99)).is_none());
+        assert_eq!(store.epoch(), 4, "无效句柄不推进纪元");
+
+        store.set_contents(store.contents().to_vec());
+        assert_eq!(store.revision(a), Some(5), "整体替换刷新全部材质");
+        assert_eq!(store.revision(b), Some(5));
+        assert_eq!(store.revision(MaterialHandle(0)), Some(5));
+        assert_eq!(store.epoch(), 5);
     }
 }

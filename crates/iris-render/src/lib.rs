@@ -257,10 +257,13 @@ pub mod prelude {
         LIGHTMAP_DILATE_ITERATIONS, LightmapBinding, LightmapHandle, LightmapInstall, LightmapItem,
         LightmapStore, NO_LIGHTMAP, build_uv2_mesh, dilate_atlas, f32_to_f16, install_lightmap,
     };
-    pub use crate::material::{AlphaMode, KajiyaKay, MaterialDef, MaterialHandle, MaterialStore};
+    pub use crate::material::{
+        AlphaMode, KajiyaKay, MaterialDef, MaterialExtensions, MaterialHandle, MaterialStore,
+        ShadingMode, VertexColorMode,
+    };
     pub use crate::mesh::{
-        LodMesh, LodSettings, MeshData, MeshHandle, MeshStore, SkinVertex, UV2_LAYOUT, Vertex,
-        primitives,
+        COLOR_LAYOUT, LodMesh, LodSettings, MeshData, MeshHandle, MeshStore, SkinVertex,
+        UV2_LAYOUT, Vertex, VertexColor, primitives,
     };
     pub use crate::meshlet::{
         MAX_MESHLET_CLUSTERS, MESHLET_CLUSTER_MAX_TRIANGLES, MESHLET_CLUSTER_MAX_VERTICES,

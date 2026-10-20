@@ -800,6 +800,8 @@ impl GltfLoader {
             tangents,
             // 光照贴图 UV 是烘焙产物、不进 glTF（R52c，见 MeshData::uv2 文档）
             uv2: None,
+            // COLOR_0 导入不在本轮范围（见 ARCHITECTURE §8.76）。
+            colors: None,
             morph: self.build_morph(mesh_index, primitive, vertex_count)?,
         })
     }
@@ -1110,6 +1112,9 @@ impl GltfLoader {
                     // Kajiya-Kay（R90）：glTF 无毛发着色标准，导入恒关；
                     // 发带材质由调用方以 with_kajiya_kay 组装。
                     kajiya_kay: None,
+                    // 受控扩展：glTF 导入不读 COLOR_0，也不映射
+                    // KHR_materials_unlit（见 ARCHITECTURE §8.76）。
+                    extensions: crate::material::MaterialExtensions::default(),
                 };
                 // 法线贴图（R42）：线性数据贴图
                 if let Some(info) = &mat.normal_texture {

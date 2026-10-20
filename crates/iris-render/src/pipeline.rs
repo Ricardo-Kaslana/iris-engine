@@ -720,10 +720,12 @@ pub(crate) fn create_pipeline(
                               msaa: u32,
                               double_sided: bool|
      -> wgpu::RenderPipeline {
-        // 顶点缓冲（R42 起含切线路、R52c 起含光照贴图 UV2 路）：
-        // 普通 = [顶点, 实例, 切线, UV2]，蒙皮 = [顶点, 蒙皮属性, 实例,
-        // 切线, UV2]（切线 loc12 / UV2 loc13）。两路都按网格携带，缺席由
-        // 渲染器垫零缓冲（TANGENT_LAYOUT / UV2_LAYOUT 注释）。
+        // 顶点缓冲（切线、光照贴图 UV2、顶点色各占一路）：
+        // 普通 = [顶点, 实例, 切线, UV2, 颜色]，蒙皮 = [顶点, 蒙皮属性,
+        // 实例, 切线, UV2, 颜色]（切线 loc12 / UV2 loc13 / 颜色 loc15）。
+        // 三路都按网格携带，缺席由渲染器垫常驻缓冲：切线零垫、UV2 零垫、
+        // 颜色白色垫（COLOR_LAYOUT 注释）。蒙皮布局合计 16 个属性，
+        // 恰好用满 WebGPU 默认上限。
         let buffers: &[Option<wgpu::VertexBufferLayout<'static>>] = if skinned {
             &[
                 Some(crate::mesh::Vertex::LAYOUT),
@@ -731,6 +733,7 @@ pub(crate) fn create_pipeline(
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
                 Some(crate::mesh::UV2_LAYOUT),
+                Some(crate::mesh::COLOR_LAYOUT),
             ]
         } else {
             &[
@@ -738,6 +741,7 @@ pub(crate) fn create_pipeline(
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
                 Some(crate::mesh::UV2_LAYOUT),
+                Some(crate::mesh::COLOR_LAYOUT),
             ]
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1091,6 +1095,7 @@ pub(crate) fn create_pipeline(
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
                 Some(crate::mesh::UV2_LAYOUT),
+                Some(crate::mesh::COLOR_LAYOUT),
             ]
         } else {
             &[
@@ -1098,6 +1103,7 @@ pub(crate) fn create_pipeline(
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
                 Some(crate::mesh::UV2_LAYOUT),
+                Some(crate::mesh::COLOR_LAYOUT),
             ]
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1299,6 +1305,7 @@ pub(crate) fn create_pipeline(
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
                 Some(crate::mesh::UV2_LAYOUT),
+                Some(crate::mesh::COLOR_LAYOUT),
             ]
         } else {
             &[
@@ -1306,6 +1313,7 @@ pub(crate) fn create_pipeline(
                 Some(crate::instance::InstanceRaw::LAYOUT),
                 Some(crate::mesh::TANGENT_LAYOUT),
                 Some(crate::mesh::UV2_LAYOUT),
+                Some(crate::mesh::COLOR_LAYOUT),
             ]
         };
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -3509,7 +3517,7 @@ mod tests {
             ("hair_vs.wgsl", include_str!("../shaders/hair_vs.wgsl")),
             ("shell_vs.wgsl", include_str!("../shaders/shell_vs.wgsl")),
         ];
-        // VertexOutput 字段序（@location 0..6 + builtin）——四方逐名同序
+        // VertexOutput 字段序（@location 0..7 + builtin）——四方逐名同序
         let order = [
             "clip_position",
             "world_pos",
@@ -3519,6 +3527,7 @@ mod tests {
             "uv2",
             "probe",
             "fur_aux",
+            "color",
         ];
         for (name, src) in files {
             let body = src
@@ -3544,7 +3553,42 @@ mod tests {
                 body.contains("@location(6) fur_aux: vec4<f32>"),
                 "{name} 的 fur_aux 必须是 @location(6) vec4<f32>"
             );
+            assert!(
+                body.contains("@location(7) color: vec4<f32>"),
+                "{name} 的 color 必须是 @location(7) vec4<f32>"
+            );
         }
+    }
+
+    /// **标准蒙皮管线的顶点属性预算看门**：六个顶点流合计恰好 16 个属性，
+    /// location 覆盖 0..15 且无重复——正好用满 WebGPU 默认的
+    /// `max_vertex_attributes = 16`。未来再加逐顶点属性会越过上限，必须
+    /// 合并布局或新建管线；本测试在管线创建失败之前给出定位。
+    #[test]
+    fn standard_skinned_vertex_attribute_budget_is_exact() {
+        let layouts = [
+            crate::mesh::Vertex::LAYOUT,
+            crate::mesh::SkinVertex::LAYOUT,
+            crate::instance::InstanceRaw::LAYOUT,
+            crate::mesh::TANGENT_LAYOUT,
+            crate::mesh::UV2_LAYOUT,
+            crate::mesh::COLOR_LAYOUT,
+        ];
+        let mut locations: Vec<u32> = layouts
+            .iter()
+            .flat_map(|layout| layout.attributes.iter().map(|a| a.shader_location))
+            .collect();
+        assert_eq!(locations.len(), 16, "标准蒙皮管线属性数应恰好为 16");
+        locations.sort_unstable();
+        assert_eq!(
+            locations,
+            (0..16).collect::<Vec<u32>>(),
+            "顶点属性 location 必须覆盖 0..15 且无重复"
+        );
+        assert!(
+            layouts.len() <= 8,
+            "顶点缓冲数不得超过默认 max_vertex_buffers"
+        );
     }
 
     /// **毛发阴影接口影子契约看门（R91）**：`ShadowFurVertexOutput`
@@ -3592,18 +3636,23 @@ mod tests {
                 "{name} 的 fur_aux 必须是 @location(1) vec4<f32>"
             );
         }
-        // shadow.wgsl 的 MaterialParams 影子契约：96 B 布局 + fur 字段
-        // 与 fur_tint 槽在位（与 standard.wgsl 的 MaterialParams 同构
-        // ——改一侧必须另一侧；此处只锁关键存在性，完整布局由
-        // material.rs 的 const 断言钉 Rust 侧）。
+        // shadow.wgsl 的 MaterialParams 是 standard 的 96 B 前缀契约：
+        // fur 与 fur_tint 槽在位（标准结构本轮扩到 112 B，阴影只读前缀
+        // ——改前缀字段必须两侧同步；此处只锁关键存在性，完整布局由
+        // renderer.rs 的 const 断言钉 Rust 侧）。
         let shadow = include_str!("../shaders/shadow.wgsl");
+        let standard = include_str!("../shaders/standard.wgsl");
         assert!(
             shadow.contains("fur: vec4<f32>"),
             "shadow.wgsl 的 MaterialParams 必须含 fur 字段（cutoff 判定的消费端）"
         );
         assert!(
             shadow.contains("fur_tint: vec4<f32>"),
-            "shadow.wgsl 的 MaterialParams 必须含 fur_tint 字段（与 standard 同构，R96）"
+            "shadow.wgsl 的 MaterialParams 必须含 fur_tint 字段（与 standard 前缀同构）"
+        );
+        assert!(
+            standard.contains("extensions: vec4<f32>"),
+            "standard.wgsl 的 MaterialParams 必须含 extensions 字段（受控扩展旗标）"
         );
     }
 
@@ -3705,7 +3754,16 @@ mod tests {
             );
         }
         // ② VertexOutput 逐字段同序（跨模块片元接口）
-        let vo_fields = ["world_pos", "world_normal", "uv", "tangent", "uv2", "probe"];
+        let vo_fields = [
+            "world_pos",
+            "world_normal",
+            "uv",
+            "tangent",
+            "uv2",
+            "probe",
+            "fur_aux",
+            "color",
+        ];
         let std_vo = body_of(standard, "struct VertexOutput {");
         let mesh_vo = body_of(draw, "struct VertexOutput {");
         let mut cursor = (0usize, 0usize);

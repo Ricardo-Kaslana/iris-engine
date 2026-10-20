@@ -41,8 +41,8 @@
 //! 输入即索引序：同一网格的三角形排列顺序变化会得到不同（但各自确定）
 //! 的聚类——GLB 加载产物天然满足。索引必须 3 的倍数且全部在顶点范围内
 //! （断言拦截）。[`is_meshlet_eligible`] 判定 V1 支持的网格形态：
-//! 无蒙皮 / 切线 / 光照贴图 UV（容器只载 32 B 标准顶点，opaque-only
-//! 边界见 `iris_render::meshlet` 模块头）。
+//! 无蒙皮 / 切线 / 光照贴图 UV / 顶点色（容器只载 32 B 标准顶点，
+//! opaque-only 边界见 `iris_render::meshlet` 模块头）。
 //!
 //! # 确定性声明
 //!
@@ -81,10 +81,11 @@ use iris_render::meshlet::{
 };
 use iris_render::meshlet_stream::{MESHLET_PAGE_CLUSTERS, MeshletPageTable};
 
-/// V1 支持的网格形态：无蒙皮 / 切线 / 光照贴图 UV（容器只载标准 32 B
-/// 顶点）。不满足时用 [`build_meshlets_from_mesh_data`] 会断言拦截。
+/// V1 支持的网格形态：无蒙皮 / 切线 / 光照贴图 UV / 顶点色（容器只载
+/// 标准 32 B 顶点，没有颜色侧表）。不满足时用
+/// [`build_meshlets_from_mesh_data`] 会断言拦截。
 pub fn is_meshlet_eligible(data: &MeshData) -> bool {
-    data.skin.is_none() && data.tangents.is_none() && data.uv2.is_none()
+    data.skin.is_none() && data.tangents.is_none() && data.uv2.is_none() && data.colors.is_none()
 }
 
 /// 便捷入口：[`MeshData`] → [`MeshletMesh`]（要求
@@ -92,8 +93,8 @@ pub fn is_meshlet_eligible(data: &MeshData) -> bool {
 pub fn build_meshlets_from_mesh_data(data: &MeshData) -> MeshletMesh {
     assert!(
         is_meshlet_eligible(data),
-        "meshlet V1 只支持标准网格（无蒙皮 / 切线 / 光照贴图 UV）——\
-         蒙皮与带切线网格的簇化留待后续轮次"
+        "meshlet V1 只支持标准网格（无蒙皮 / 切线 / 光照贴图 UV / 顶点色）——\
+         这些属性的簇化与容器存储留待后续轮次"
     );
     build_meshlets(&data.vertices, &data.indices)
 }
@@ -551,7 +552,7 @@ struct GroupBuild {
 pub fn build_meshlet_hierarchy_from_mesh_data(data: &MeshData) -> MeshletMesh {
     assert!(
         is_meshlet_eligible(data),
-        "meshlet 层级构建只支持标准网格（无蒙皮 / 切线 / 光照贴图 UV）"
+        "meshlet 层级构建只支持标准网格（无蒙皮 / 切线 / 光照贴图 UV / 顶点色）"
     );
     build_meshlet_hierarchy(&data.vertices, &data.indices)
 }
@@ -1177,6 +1178,7 @@ mod tests {
             skin: None,
             tangents: None,
             uv2: None,
+            colors: None,
             morph: None,
         };
         let mesh = build_meshlets(&tri.vertices, &tri.indices);
@@ -1220,7 +1222,8 @@ mod tests {
         build_meshlets(&verts, &[0, 1, 2, 3]);
     }
 
-    /// 资格判定：蒙皮 / 切线 / UV2 任一存在即不合格（V1 容器只载标准顶点）。
+    /// 资格判定：蒙皮 / 切线 / UV2 / 顶点色任一存在即不合格（V1 容器只载
+    /// 标准顶点）。
     #[test]
     fn eligibility_rejects_extended_attributes() {
         let mut data = MeshData::cube();
@@ -1239,6 +1242,9 @@ mod tests {
         data.tangents = None;
         data.uv2 = Some(vec![[0.0, 0.0]; 24]);
         assert!(!is_meshlet_eligible(&data));
+        data.uv2 = None;
+        data.colors = Some(vec![iris_render::mesh::VertexColor::WHITE; 24]);
+        assert!(!is_meshlet_eligible(&data), "顶点色网格必须被拒绝");
     }
 
     // ---- R86：体素聚类简化器 ----

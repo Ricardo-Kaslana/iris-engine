@@ -359,6 +359,7 @@ pub fn generate_hair_cards(params: &HairGroomParams, card_scale: f32) -> crate::
         skin: None,
         tangents: Some(tangents),
         uv2: None,
+        colors: None,
         morph: None,
     }
 }

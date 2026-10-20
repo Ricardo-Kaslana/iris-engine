@@ -150,6 +150,36 @@ impl Vertex {
     };
 }
 
+/// 逐顶点颜色（4 字节，POD）：线性 RGB 乘子与一个当前不参与着色的 alpha。
+///
+/// 值按 `Unorm8x4` 上传，0 与 255 在着色器中精确映射为 0.0 与 1.0。
+/// 它承载体素表面的烘焙环境光遮蔽、天空光与方块光，也可以用于染色；
+/// 作为乘子使用时，255 对应乘性恒等，缺席属性的白色兜底因此不改变画面。
+/// 只有材质扩展开启 [`VertexColorMode::Multiply`](crate::material::VertexColorMode::Multiply)
+/// 时才会被消费；alpha 通道预留给将来的逐顶点不透明度，当前不进入任何计算。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VertexColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl VertexColor {
+    /// 乘性恒等颜色。渲染器在网格缺席颜色时绑定的白色垫使用该值。
+    pub const WHITE: Self = Self {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: 255,
+    };
+
+    pub const fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
 /// 蒙皮顶点属性：4 个关节索引 + 4 个混合权重（16 字节，POD）。
 ///
 /// 与主顶点数据分离为独立缓冲：非蒙皮网格不为蒙皮属性付出 16 字节/顶点。
@@ -213,7 +243,27 @@ pub const UV2_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayo
     }],
 };
 
-/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线 / 光照贴图 UV / 形变目标属性）。
+/// 顶点颜色缓冲布局：每顶点 4 字节 `Unorm8x4`（红、绿、蓝、alpha），
+/// shader_location 取 15。独立顶点缓冲（与蒙皮 / 切线 / UV2 同理）：
+/// 无颜色的网格不为颜色侧表分配 CPU 与逐网格 GPU 存储，渲染器绑定
+/// **白色**常驻垫；标准网格绘制仍会读取该垫的 4 B/顶点（见
+/// ARCHITECTURE §8.76②）。255 在 `Unorm8x4` 中精确映射为 1.0，作为
+/// 乘子是恒等元；不能用零垫，否则 `Multiply` 模式会把基色乘黑。
+///
+/// 颜色只由标准网格管线消费。壳层管线在 loc15 绑定壳层实例参数，
+/// 发带与 meshlet 管线没有颜色输入；这些管线与标准网格管线互斥，
+/// 因此同一个 location 不会在一个管线里同时表示两种数据。
+pub const COLOR_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<VertexColor>() as wgpu::BufferAddress,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[wgpu::VertexAttribute {
+        offset: 0,
+        shader_location: 15,
+        format: wgpu::VertexFormat::Unorm8x4,
+    }],
+};
+
+/// CPU 侧网格数据（顶点 + 索引 + 可选蒙皮 / 切线 / 光照贴图 UV / 顶点色 / 形变目标属性）。
 ///
 /// 组件缺席语义：`skin` 缺席 = 非蒙皮网格；`tangents` 缺席 = 网格无
 /// 顶点切线——法线贴图扰动所需的 TBN 由着色器在屏幕空间用
@@ -221,9 +271,11 @@ pub const UV2_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayo
 /// （法线槽位缺省）渲染结果零影响；`uv2` 缺席 = 网格无光照贴图 UV——
 /// 渲染器绑常驻零垫，配合材质侧 `lightmap_mask = 0`，间接光走原 IBL
 /// 路径**逐位不变**（R52c 硬约束，论证见 `lightmap.rs` 模块文档）；
-/// `morph` 缺席 = 网格无形变目标（权重组件在场也无效）——Some 时
-/// `vertices` 恒为绑定姿势，形变顶点是渲染期按权重混合的临时产物，
-/// 不回写本表（C4a，见 `morph.rs` 模块文档）。
+/// `colors` 缺席 = 网格无顶点色——渲染器绑常驻**白色**垫，作为乘子是
+/// 恒等元；只有材质扩展开启顶点色消费时颜色才参与着色，缺省材质因此
+/// 与引入该属性前逐位一致；`morph` 缺席 = 网格无形变目标（权重组件
+/// 在场也无效）——Some 时 `vertices` 恒为绑定姿势，形变顶点是渲染期
+/// 按权重混合的临时产物，不回写本表（C4a，见 `morph.rs` 模块文档）。
 #[derive(Clone, Debug, Default)]
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
@@ -240,6 +292,11 @@ pub struct MeshData {
     /// （每实体一份网格副本——UV2 是逐实体的图集坐标，共享网格必须分裂，
     /// 见该函数文档）。
     pub uv2: Option<Vec<[f32; 2]>>,
+    /// 逐顶点颜色（线性 RGB 乘子，8 位 unorm）；Some 时长度必须与
+    /// `vertices` 一致。用于烘焙体素光照、环境光遮蔽与染色。只有
+    /// [`MaterialDef::extensions`](crate::material::MaterialDef::extensions)
+    /// 的 `vertex_color` 设为 `Multiply` 时才乘入反照率；alpha 当前不消费。
+    pub colors: Option<Vec<VertexColor>>,
     /// 形变目标表（C4a，glTF morphTargets 语义）：`vertices` 保持绑定
     /// 姿势，增量在 [`morph`](crate::morph) 侧表；Some 时各目标增量长度
     /// 必须与 `vertices` 一致。**渲染期只对蒙皮实体生效**——逐实体权重
@@ -671,11 +728,11 @@ impl MeshStore {
     }
 
     /// CPU 源内存占用（字节）：Σ（顶点 × 32B + 索引 × 4B + 蒙皮属性 ×
-    /// 32B + 切线 × 16B + 光照贴图 UV × 8B）（不含 Vec 分配器开销，且只
-    /// 统计存活条目）。
+    /// 32B + 切线 × 16B + 光照贴图 UV × 8B + 顶点色 × 4B + 形变增量）
+    /// （不含 Vec 分配器开销，且只统计存活条目）。
     /// 「低占用」卖点的观测口径之一；GPU 侧顶点 / 索引缓冲与源同尺寸
-    /// （蒙皮 / 切线 / UV2 缓冲同），故该值亦即 GPU 网格占用的准确上界
-    /// 估算（切线与 UV2 缺席的网格只绑定渲染器常驻的零填充垫缓冲，
+    /// （蒙皮 / 切线 / UV2 / 颜色缓冲同），故该值亦即 GPU 网格占用的准确
+    /// 上界估算（切线、UV2 与顶点色缺席的网格只绑定渲染器常驻的垫缓冲，
     /// 无逐网格开销）。
     pub fn memory_bytes(&self) -> u64 {
         self.iter()
@@ -687,28 +744,38 @@ impl MeshStore {
                     })
                     + data.tangents.as_ref().map_or(0, |t| (t.len() * 16) as u64)
                     + data.uv2.as_ref().map_or(0, |u| (u.len() * 8) as u64)
+                    + data
+                        .colors
+                        .as_ref()
+                        .map_or(0, |c| (c.len() * std::mem::size_of::<VertexColor>()) as u64)
                     + data.morph.as_ref().map_or(0, |m| m.memory_bytes())
             })
             .sum()
     }
 }
 
+/// `upload_mesh` 的产物：索引数与全部可选顶点流。
+pub(crate) struct UploadedMesh {
+    pub vertex_buf: wgpu::Buffer,
+    pub index_buf: wgpu::Buffer,
+    pub num_indices: u32,
+    /// 蒙皮属性缓冲（非蒙皮网格为 None）。
+    pub skin_buf: Option<wgpu::Buffer>,
+    /// 顶点切线缓冲（网格无切线为 None）。
+    pub tangent_buf: Option<wgpu::Buffer>,
+    /// 光照贴图 UV2 缓冲（网格无 UV2 为 None）。
+    pub uv2_buf: Option<wgpu::Buffer>,
+    /// 顶点色缓冲（网格无颜色为 None）。
+    pub color_buf: Option<wgpu::Buffer>,
+}
+
 /// 便捷上传：由渲染器调用，将 `MeshData` 变为 GPU 缓冲。
-/// 蒙皮属性存在时附带第三张顶点缓冲；切线存在时附带切线顶点缓冲；
-/// 光照贴图 UV（R52c）存在时附带 UV2 顶点缓冲（`None` 均由渲染器绑定
-/// 常驻零垫——切线零向量 = 「无顶点切线」标记走屏幕空间 TBN 路径，
-/// UV2 零值配合材质 `lightmap_mask = 0` 走原 IBL 路径）。
-pub(crate) fn upload_mesh(
-    gpu: &crate::context::Gpu,
-    data: &MeshData,
-) -> (
-    wgpu::Buffer,
-    wgpu::Buffer,
-    u32,
-    Option<wgpu::Buffer>,
-    Option<wgpu::Buffer>,
-    Option<wgpu::Buffer>,
-) {
+/// 蒙皮属性存在时附带蒙皮顶点缓冲；切线存在时附带切线顶点缓冲；
+/// 光照贴图 UV（R52c）存在时附带 UV2 顶点缓冲；顶点色存在时附带颜色
+/// 顶点缓冲（`None` 均由渲染器绑定常驻垫——切线零向量 = 「无顶点切线」
+/// 标记走屏幕空间 TBN 路径，UV2 零值配合材质 `lightmap_mask = 0` 走原
+/// IBL 路径，颜色白色垫在乘子语义下是恒等元）。
+pub(crate) fn upload_mesh(gpu: &crate::context::Gpu, data: &MeshData) -> UploadedMesh {
     if let Some(skin) = &data.skin {
         assert_eq!(
             skin.len(),
@@ -728,6 +795,13 @@ pub(crate) fn upload_mesh(
             uv2.len(),
             data.vertices.len(),
             "光照贴图 UV 数量必须与顶点数量一致"
+        );
+    }
+    if let Some(colors) = &data.colors {
+        assert_eq!(
+            colors.len(),
+            data.vertices.len(),
+            "顶点色数量必须与顶点数量一致"
         );
     }
     let vertex_buf = gpu
@@ -768,14 +842,23 @@ pub(crate) fn upload_mesh(
                 usage: wgpu::BufferUsages::VERTEX,
             })
     });
-    (
+    let color_buf = data.colors.as_ref().map(|colors| {
+        gpu.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.mesh.color_vbo"),
+                contents: bytemuck::cast_slice(colors),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+    });
+    UploadedMesh {
         vertex_buf,
         index_buf,
-        data.indices.len() as u32,
+        num_indices: data.indices.len() as u32,
         skin_buf,
         tangent_buf,
         uv2_buf,
-    )
+        color_buf,
+    }
 }
 
 #[cfg(test)]
@@ -1123,6 +1206,7 @@ mod tests {
             ]),
             tangents: None,
             uv2: None,
+            colors: None,
             morph: None,
         };
         let _ = upload_mesh(&gpu, &data);
@@ -1182,6 +1266,55 @@ mod tests {
         };
         let mut data = primitives::cube();
         data.uv2 = Some(vec![[0.0, 0.0]; 5]);
+        let _ = upload_mesh(&gpu, &data);
+    }
+
+    /// 顶点色字节计入内存统计：4 B/顶点；缺席时零开销。
+    #[test]
+    fn vertex_color_bytes_count_into_memory() {
+        let mut store = MeshStore::new();
+        let mut data = primitives::cube();
+        assert!(data.colors.is_none(), "基础图元默认不带顶点色");
+        store.add(data.clone());
+        assert_eq!(store.memory_bytes(), (24 * 32 + 36 * 4) as u64);
+        data.colors = Some(vec![VertexColor::new(128, 64, 32, 255); 24]);
+        store.add(data);
+        assert_eq!(
+            store.memory_bytes(),
+            2 * (24 * 32 + 36 * 4) as u64 + 24 * 4,
+            "顶点色缓冲 4 B/顶点必须计入"
+        );
+    }
+
+    /// GPU 布局契约：顶点色是 4 B/顶点的单属性缓冲，`Unorm8x4`，
+    /// shader_location 15（0–2 主顶点 / 3–9 实例 / 10–11 蒙皮 /
+    /// 12 切线 / 13 UV2 / 14 探针之后）。壳层实例在另一条管线里占用
+    /// loc15，两者不会同时出现在同一管线。
+    #[test]
+    fn vertex_color_layout_matches_gpu_contract() {
+        assert_eq!(std::mem::size_of::<VertexColor>(), 4);
+        assert_eq!(COLOR_LAYOUT.array_stride, 4);
+        assert_eq!(COLOR_LAYOUT.step_mode, wgpu::VertexStepMode::Vertex);
+        let attrs = COLOR_LAYOUT.attributes;
+        assert_eq!(attrs.len(), 1);
+        assert_eq!((attrs[0].shader_location, attrs[0].offset), (15, 0));
+        assert_eq!(attrs[0].format, wgpu::VertexFormat::Unorm8x4);
+        assert_eq!(VertexColor::WHITE, VertexColor::new(255, 255, 255, 255));
+        // 位级往返（Pod 契约）
+        let color = VertexColor::new(7, 31, 127, 255);
+        let bytes: &[u8] = bytemuck::bytes_of(&color);
+        assert_eq!(bytes, &[7, 31, 127, 255]);
+    }
+
+    #[test]
+    #[should_panic(expected = "顶点色数量必须与顶点数量一致")]
+    fn upload_mesh_rejects_mismatched_colors() {
+        let gpu = crate::context::Gpu::offscreen();
+        let Some(gpu) = gpu else {
+            return; // 无 GPU 环境：跳过
+        };
+        let mut data = primitives::cube();
+        data.colors = Some(vec![VertexColor::WHITE; 5]);
         let _ = upload_mesh(&gpu, &data);
     }
 

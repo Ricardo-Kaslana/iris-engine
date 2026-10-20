@@ -157,9 +157,10 @@ use iris_render::asset::{
 };
 use iris_render::prelude::{
     AlphaMode, CpuTexture, DdgiSettings, DirectionalLight, GrassTextures, KajiyaKay, MaterialDef,
-    MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore, OceanSurface, ParticleBlend,
-    ParticleEmitter, ParticleEmitterV2, PointLight, ReflectionProbe, SkySource, SkySourceKind,
-    TextureHandle, TextureStore, UnderwaterFog, Visibility, WaterSurface, grass_textures,
+    MaterialExtensions, MaterialHandle, MaterialStore, MeshData, MeshHandle, MeshStore,
+    OceanSurface, ParticleBlend, ParticleEmitter, ParticleEmitterV2, PointLight, ReflectionProbe,
+    SkySource, SkySourceKind, TextureHandle, TextureStore, UnderwaterFog, Visibility, WaterSurface,
+    grass_textures,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -810,6 +811,10 @@ pub struct MaterialSection {
     /// 发带材质的关卡格式入口。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kajiya_kay: Option<KajiyaKay>,
+    /// 受控材质扩展（顶点色消费方式与着色模式）：整组缺省时序列化省略，
+    /// 旧档（无该字段）反序列化回落默认，重存后仍不含该字段。
+    #[serde(skip_serializing_if = "MaterialExtensions::is_default")]
+    pub extensions: MaterialExtensions,
 }
 
 impl Default for MaterialSection {
@@ -828,6 +833,7 @@ impl Default for MaterialSection {
             subsurface_scale: MaterialDef::default().subsurface_scale,
             alpha_cutoff: MaterialDef::default().alpha_cutoff,
             kajiya_kay: None,
+            extensions: MaterialExtensions::default(),
         }
     }
 }
@@ -876,6 +882,7 @@ impl MaterialSection {
             subsurface_scale: self.subsurface_scale,
             alpha_cutoff: self.alpha_cutoff,
             kajiya_kay: self.kajiya_kay,
+            extensions: self.extensions,
         }
     }
 
@@ -913,6 +920,7 @@ impl MaterialSection {
             subsurface_scale: def.subsurface_scale,
             alpha_cutoff: def.alpha_cutoff,
             kajiya_kay: def.kajiya_kay,
+            extensions: def.extensions,
         }
     }
 }
@@ -1482,37 +1490,53 @@ struct ProcCache {
     orm: Option<TextureHandle>,
 }
 
-/// 材质去重键：解析后 [`MaterialDef`] 的位模式（f32 逐位、句柄与
-/// `AlphaMode` 本身 `Eq`）。
-type MaterialKey = (
-    [u32; 4],
-    [u32; 4],
-    u32,
-    u32,
-    TextureHandle,
-    Option<TextureHandle>,
-    Option<TextureHandle>,
-    AlphaMode,
-    u32,
-    u32,
-);
+/// 材质去重键：解析后 [`MaterialDef`] 的逐字段快照（f32 逐位、句柄、
+/// 枚举与扩展本身 `Eq`）。用具名字段而不是元组，新增材质字段时不会
+/// 受元组元素上限或位置顺序牵制。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MaterialKey {
+    base_color: [u32; 4],
+    emissive: [u32; 4],
+    metallic: u32,
+    roughness: u32,
+    texture: TextureHandle,
+    normal_texture: Option<TextureHandle>,
+    orm_texture: Option<TextureHandle>,
+    alpha_mode: AlphaMode,
+    double_sided: bool,
+    subsurface_strength: u32,
+    subsurface_scale: u32,
+    alpha_cutoff: u32,
+    /// Kajiya-Kay 的存在性与三个字段位模式：(shift, exponent, tint)。
+    kajiya_kay: Option<([u32; 2], [u32; 3])>,
+    extensions: MaterialExtensions,
+}
 
 /// **去重键必须覆盖全部字段**：漏一个字段会让「只差该字段」的两个材质
-/// 被合并成同一句柄（R63 的 SSS 参数就是这样一对——同一几何的皮肤与
-/// 盔甲只差 `subsurface_*`）。新增字段时同步在此追加。
+/// 被合并成同一句柄（SSS 参数与双面标志都踩过这个坑）。新增字段时同步
+/// 在此追加。
 fn material_key(def: &MaterialDef) -> MaterialKey {
-    (
-        def.base_color.map(f32::to_bits),
-        def.emissive.map(f32::to_bits),
-        def.metallic.to_bits(),
-        def.roughness.to_bits(),
-        def.texture,
-        def.normal_texture,
-        def.orm_texture,
-        def.alpha_mode,
-        def.subsurface_strength.to_bits(),
-        def.subsurface_scale.to_bits(),
-    )
+    MaterialKey {
+        base_color: def.base_color.map(f32::to_bits),
+        emissive: def.emissive.map(f32::to_bits),
+        metallic: def.metallic.to_bits(),
+        roughness: def.roughness.to_bits(),
+        texture: def.texture,
+        normal_texture: def.normal_texture,
+        orm_texture: def.orm_texture,
+        alpha_mode: def.alpha_mode,
+        double_sided: def.double_sided,
+        subsurface_strength: def.subsurface_strength.to_bits(),
+        subsurface_scale: def.subsurface_scale.to_bits(),
+        alpha_cutoff: def.alpha_cutoff.to_bits(),
+        kajiya_kay: def.kajiya_kay.map(|kk| {
+            (
+                [kk.shift.to_bits(), kk.exponent.to_bits()],
+                kk.highlight_tint.map(f32::to_bits),
+            )
+        }),
+        extensions: def.extensions,
+    }
 }
 
 impl LoadCache {
@@ -2042,6 +2066,7 @@ pub struct MaterialParamPatch {
     pub subsurface_scale: f32,
     pub alpha_cutoff: f32,
     pub kajiya_kay: Option<iris_render::material::KajiyaKay>,
+    pub extensions: iris_render::material::MaterialExtensions,
 }
 
 /// 点光参数补丁（组件四字段直通）。
@@ -2108,6 +2133,7 @@ impl From<&MaterialSection> for MaterialParamPatch {
             subsurface_scale: s.subsurface_scale,
             alpha_cutoff: s.alpha_cutoff,
             kajiya_kay: s.kajiya_kay,
+            extensions: s.extensions,
         }
     }
 }
@@ -2202,6 +2228,7 @@ pub fn apply_scene_param_patch(world: &mut World, patch: &SceneParamPatch) -> Pa
                         def.subsurface_scale = m.subsurface_scale;
                         def.alpha_cutoff = m.alpha_cutoff;
                         def.kajiya_kay = m.kajiya_kay;
+                        def.extensions = m.extensions;
                         report.materials_applied += 1;
                     } else {
                         log::warn!("热重载：实体「{name}」材质句柄 {h:?} 失效，补丁跳过");
@@ -2463,6 +2490,7 @@ mod tests {
     use super::*;
     use iris_core::physics::ColliderShape;
     use iris_render::asset::{HdrImage, encode_hdr, write_glb};
+    use iris_render::prelude::{ShadingMode, VertexColorMode};
     use std::path::PathBuf;
 
     /// 测试固定目录（与 gltf.rs / hdr.rs 测试同款约定）。
@@ -3595,6 +3623,71 @@ mod tests {
         );
     }
 
+    /// 受控材质扩展序列化：旧档（无 `extensions` 字段）加载回退整组默认；
+    /// 默认组在 save 时省略（旧档重存字节级稳定）；非默认组写出且
+    /// save ↔ load 往返保持。
+    #[test]
+    fn material_extensions_legacy_default_and_roundtrip() {
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "legacy_material_extensions.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": { "color": [0.5, 0.5, 0.5, 1.0] }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.extensions, MaterialExtensions::default());
+        let out = test_dir().join("legacy_material_extensions_out.json");
+        save_scene(&mut world, &out).expect("保存旧档");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            !text.contains("extensions"),
+            "默认扩展组 save 时省略，旧文件重存保持字节级稳定"
+        );
+
+        let mut world = fresh_world();
+        let (entities, _) = load_str(
+            &mut world,
+            "material_extensions.scene.json",
+            r#"{ "entities": [{
+                    "mesh": { "primitive": { "kind": "cube" } },
+                    "material": {
+                        "color": [0.5, 0.5, 0.5, 1.0],
+                        "extensions": { "vertex_color": "multiply", "shading": "unlit" }
+                    }
+                }] }"#,
+        );
+        let handle = *world.get::<MaterialHandle>(entities[0]).unwrap();
+        let def = world
+            .resource::<MaterialStore>()
+            .get(handle)
+            .unwrap()
+            .clone();
+        assert_eq!(def.extensions.vertex_color, VertexColorMode::Multiply);
+        assert_eq!(def.extensions.shading, ShadingMode::Unlit);
+        let out_a = test_dir().join("material_extensions_out_a.json");
+        save_scene(&mut world, &out_a).expect("保存扩展材质场景");
+        let text = std::fs::read_to_string(&out_a).unwrap();
+        assert!(text.contains(r#""vertex_color": "multiply""#));
+        assert!(text.contains(r#""shading": "unlit""#));
+        let mut world_b = fresh_world();
+        let entities_b = load_scene(&mut world_b, &out_a).expect("二次加载");
+        let handle_b = *world_b.get::<MaterialHandle>(entities_b[0]).unwrap();
+        let def_b = world_b
+            .resource::<MaterialStore>()
+            .get(handle_b)
+            .unwrap()
+            .clone();
+        assert_eq!(def_b.extensions, def.extensions, "往返后扩展组保持");
+    }
+
     /// 预积分 SSS 序列化（R63）：旧档（无两字段）加载回退引擎缺省 =
     /// 关闭；缺省值 save 时**双省略**（旧档重存逐字节不变）；
     /// 显式参数写出且 save ↔ load 往返保持；强度 0 + 非缺省尺度时
@@ -3736,6 +3829,71 @@ mod tests {
             h0, h1,
             "只差 SSS 参数的材质不得被去重合并（material_key 必须覆盖新字段）"
         );
+    }
+
+    /// 材质去重键必须覆盖全部字段：逐字段制造一个只差该字段的变体，
+    /// 键必须全部不同。覆盖本轮新增的扩展组，以及此前漏掉的
+    /// `double_sided` / `alpha_cutoff` / `kajiya_kay`。
+    #[test]
+    fn material_key_covers_every_field() {
+        let base = MaterialDef::solid(0.8, 0.7, 0.6, 1.0);
+        let key = material_key(&base);
+        assert_eq!(key, material_key(&base.clone()), "同字段必须同键");
+
+        let mut variants: Vec<(&str, MaterialDef)> = Vec::new();
+        let mut v = base.clone();
+        v.base_color = [0.1, 0.2, 0.3, 1.0];
+        variants.push(("base_color", v));
+        let mut v = base.clone();
+        v.emissive = [0.1, 0.0, 0.0, 1.0];
+        variants.push(("emissive", v));
+        let mut v = base.clone();
+        v.metallic = 1.0;
+        variants.push(("metallic", v));
+        let mut v = base.clone();
+        v.roughness = 0.9;
+        variants.push(("roughness", v));
+        let mut v = base.clone();
+        v.texture = TextureHandle(7);
+        variants.push(("texture", v));
+        let mut v = base.clone();
+        v.normal_texture = Some(TextureHandle(8));
+        variants.push(("normal_texture", v));
+        let mut v = base.clone();
+        v.orm_texture = Some(TextureHandle(9));
+        variants.push(("orm_texture", v));
+        let mut v = base.clone();
+        v.alpha_mode = AlphaMode::Blend;
+        variants.push(("alpha_mode", v));
+        let mut v = base.clone();
+        v.double_sided = true;
+        variants.push(("double_sided", v));
+        let mut v = base.clone();
+        v.subsurface_strength = 1.0;
+        variants.push(("subsurface_strength", v));
+        let mut v = base.clone();
+        v.subsurface_scale = 0.3;
+        variants.push(("subsurface_scale", v));
+        let mut v = base.clone();
+        v.alpha_cutoff = 0.7;
+        variants.push(("alpha_cutoff", v));
+        let mut v = base.clone();
+        v.kajiya_kay = Some(KajiyaKay::new(0.2, 64.0));
+        variants.push(("kajiya_kay", v));
+        let mut v = base.clone();
+        v.extensions.vertex_color = VertexColorMode::Multiply;
+        variants.push(("extensions.vertex_color", v));
+        let mut v = base.clone();
+        v.extensions.shading = ShadingMode::Unlit;
+        variants.push(("extensions.shading", v));
+
+        for (field, variant) in variants {
+            assert_ne!(
+                key,
+                material_key(&variant),
+                "只差 {field} 的材质不得被去重合并"
+            );
+        }
     }
 
     /// 错误 Display 风格与 GltfError 一致（含上下文、可作 dyn Error）。

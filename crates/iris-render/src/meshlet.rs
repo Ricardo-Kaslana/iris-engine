@@ -55,8 +55,8 @@
 //!
 //! - **无 visbuffer**：不经软件光栅、不记逐像素三角 id——V1 经既有常规
 //!   网格路径渲染（compute 剔除是 R85 的事）；
-//! - **opaque-only**：透明 / 蒙皮 / 带切线 / 带光照贴图 UV 的网格不适用
-//!   （容器只载 32 B 标准顶点）；
+//! - **opaque-only**：透明 / 蒙皮 / 带切线 / 带光照贴图 UV / 带顶点色
+//!   的网格不适用（容器只载 32 B 标准顶点）；
 //! - **无软件光栅回退**；
 //! - **单 LOD（R84/R85 口径）**——R86 起层级 LOD 在本文件落地（簇 DAG +
 //!   屏幕空间误差选择，见下节），但簇级 `error` 字段仍恒 0.0：误差记录
@@ -398,7 +398,8 @@ impl MeshletMesh {
     /// 锚点：展开只是「顶点重排 + 索引重排」，三角形集合（含环绕方向）
     /// 与逐角属性值与构建输入完全一致 ⇒ 不透明几何渲染**逐字节一致**
     /// （覆盖集不变、逐角插值不变——GPU 佐证见 `tests/meshlet_render.rs`）。
-    /// 蒙皮 / 切线 / UV2 缺席（V1 容器不载这些属性，见模块头 MVP 边界）。
+    /// 蒙皮 / 切线 / UV2 / 顶点色缺席（V1 容器不载这些属性，见模块头
+    /// MVP 边界）。
     pub fn expand(&self) -> MeshData {
         let mut indices = Vec::with_capacity(self.indices.len());
         for cluster in &self.clusters {
@@ -414,6 +415,8 @@ impl MeshletMesh {
             skin: None,
             tangents: None,
             uv2: None,
+            // meshlet 容器不载顶点色（见 ARCHITECTURE §8.76）。
+            colors: None,
             morph: None,
         }
     }
@@ -2045,7 +2048,7 @@ mod tests {
     }
 
     /// 展开纯函数：手搓双簇网格展开后三角形集合（属性三元组排序比较）
-    /// 与全局索引所指一致；蒙皮 / 切线 / UV2 缺席（V1 边界）。
+    /// 与全局索引所指一致；蒙皮 / 切线 / UV2 / 顶点色缺席（V1 边界）。
     #[test]
     fn expand_produces_mesh_data_with_same_triangles() {
         let mesh = sample_mesh();

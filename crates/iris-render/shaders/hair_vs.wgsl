@@ -43,6 +43,8 @@ struct VertexOutput {
     @location(4) uv2: vec2<f32>,
     @location(5) probe: vec4<f32>,
     @location(6) fur_aux: vec4<f32>,
+    // 顶点色（影子契约）：发带管线没有颜色输入，恒写白色（乘性恒等）。
+    @location(7) color: vec4<f32>,
 };
 
 struct VertexInput {
@@ -105,5 +107,6 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.uv2 = vec2<f32>(0.0, 0.0);
     out.probe = in.probe;
     out.fur_aux = vec4<f32>(0.0);
+    out.color = vec4<f32>(1.0);
     return out;
 }

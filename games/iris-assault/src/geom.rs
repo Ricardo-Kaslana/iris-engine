@@ -436,6 +436,7 @@ impl Assembly {
             },
             tangents: None,
             uv2: None,
+            colors: None,
             morph: None,
         };
         smooth_normals(&mut mesh);

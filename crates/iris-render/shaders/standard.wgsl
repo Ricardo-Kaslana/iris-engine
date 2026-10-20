@@ -97,9 +97,9 @@ struct MaterialParams {
     surface: vec4<f32>,
     // x: 预积分 SSS 强度（R63，0 = 关闭——片元分支整段跳过），
     // y: 曲率包裹参数 t ∈ [0, 1]（CPU 侧 sss::wrap_param 换算好），
-    // z/w: 保留。与 Rust 侧 MaterialRaw 逐字段对齐（64 B）。
+    // z/w: 保留。与 Rust 侧 MaterialRaw 逐字段对齐。
     sss: vec4<f32>,
-    // 毛发参数（R90，与 Rust 侧 MaterialRaw.fur 逐字段对齐，80 B）：
+    // 毛发参数（R90，与 Rust 侧 MaterialRaw.fur 逐字段对齐）：
     // x: Kajiya-Kay 开关（1 = 直射光换各向异性瓣；0 = 标准 PBR，
     //    **分支整段不执行**——R63「把逐位不变交给语言语义」铁律），
     // y: alpha cutout 阈值（0 = 不裁剪；Mask 模式与壳层层比取 max，
@@ -111,6 +111,11 @@ struct MaterialParams {
     // xyz = 高光色逐分量乘子（缺省 (1,1,1) = R90 固定式逐位一致，
     // IEEE ×1.0 精确），w: 保留。
     fur_tint: vec4<f32>,
+    // 受控材质扩展（与 Rust 侧 MaterialRaw.extensions 逐字段对齐）：
+    // x: 顶点色乘入（1 = 反照率乘顶点色 RGB；0 = 分支整段不执行），
+    // y: unlit（1 = cutout 之后输出反照率与自发光，跳过全部场景光照），
+    // z/w: 保留。两项都为 0 时默认材质逐位不变。
+    extensions: vec4<f32>,
 };
 
 // ---- 阴影偏移 v2 的着色器侧常量（R61，与 light.rs 同名常量一一对应）----
@@ -330,6 +335,9 @@ struct VertexInput {
     // 光照探针间接辐照（R64，实例属性 loc14）：xyz = E/π（与 irradiance_map
     // 采样值同口径）、w = 标志位（0 = 探针缺席 ⇒ 走原全局 env 路径）
     @location(14) probe: vec4<f32>,
+    // 顶点色（loc15，独立顶点缓冲；网格无颜色时渲染器绑白色垫）。
+    // 只有材质扩展 material.extensions.x 开启时才乘入反照率；alpha 不消费。
+    @location(15) color: vec4<f32>,
 };
 
 // 阴影投影改在片元做（按 view 深度选级联后乘该级联矩阵），
@@ -355,6 +363,9 @@ struct VertexOutput {
     // 并行声明，改动必须四方同步（看门：pipeline.rs::
     // vertex_output_fur_aux_matches_standard_layout）。
     @location(6) fur_aux: vec4<f32>,
+    // 顶点色（输入 loc15 透传到 loc7）：只有标准网格管线有颜色顶点流；
+    // meshlet / 发带 / 壳层管线恒写白色，作为乘子为恒等元。
+    @location(7) color: vec4<f32>,
 };
 
 @vertex
@@ -371,6 +382,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.uv2 = in.uv2;
     out.probe = in.probe;
     out.fur_aux = vec4<f32>(0.0);
+    out.color = in.color;
     return out;
 }
 
@@ -389,6 +401,7 @@ struct SkinnedVertexInput {
     @location(12) tangent: vec4<f32>,
     @location(13) uv2: vec2<f32>,
     @location(14) probe: vec4<f32>,
+    @location(15) color: vec4<f32>,
     @location(10) joints: vec4<u32>,
     @location(11) weights: vec4<f32>,
 };
@@ -417,6 +430,7 @@ fn vs_skinned(in: SkinnedVertexInput) -> VertexOutput {
     out.uv2 = in.uv2;
     out.probe = in.probe;
     out.fur_aux = vec4<f32>(0.0);
+    out.color = in.color;
     return out;
 }
 
@@ -1392,6 +1406,18 @@ fn fs_shaded(in: VertexOutput) -> vec4<f32> {
         }
     }
     var albedo = base.rgb;
+    // 受控材质扩展（与 material.rs 的 MaterialExtensions 对应）。
+    // 顶点色乘入：仅在材质开启时执行，关闭时分支整段不进入——默认
+    // 材质不引入任何算术，既有像素逐位不变。只乘 RGB，alpha 不消费。
+    if (material.extensions.x > 0.5) {
+        albedo = albedo * in.color.rgb;
+    }
+    // 无光照输出：cutout 已经执行，这里直接返回反照率与自发光，
+    // 跳过直射光、IBL、光照贴图、探针、SSR、AO、天气、SSS 与 KK。
+    // 透明模式与 OIT 深度测试在外层照常工作。
+    if (material.extensions.y > 0.5) {
+        return vec4<f32>(albedo + material.emissive.rgb, base.a);
+    }
     // ORM 打包（线性采样）：R = AO、G = 粗糙度、B = 金属度；标量因子
     // 作倍率相乘（glTF factor × texel 语义）。中性 ORM = (1,1,1) 时
     // x·1.0 = x 逐位精确，退化为 R41 的标量路径。

@@ -41,7 +41,7 @@ use crate::light_bins::{
 };
 use crate::lightmap::{LightmapBinding, LightmapHandle, LightmapStore, NO_LIGHTMAP};
 use crate::material::{AlphaMode, MaterialHandle, MaterialStore};
-use crate::mesh::{LodMesh, LodSettings, MeshHandle, MeshStore, upload_mesh};
+use crate::mesh::{LodMesh, LodSettings, MeshHandle, MeshStore, UploadedMesh, upload_mesh};
 use crate::occlusion::{
     AABB_CORNERS, AABB_INDEX_COUNT, AABB_INDICES, AabbInstanceRaw, OcclusionCulling, world_aabb,
 };
@@ -225,7 +225,7 @@ const _: () = assert!(
 /// 阴影暗部保留的光照比例（0 = 全黑阴影，1 = 无阴影）。
 const SHADOW_STRENGTH: f32 = 0.45;
 
-/// 与 WGSL `MaterialParams` 结构对齐（96 字节，POD）。
+/// 与 WGSL `MaterialParams` 结构对齐（112 字节，POD）。
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialRaw {
@@ -245,11 +245,15 @@ struct MaterialRaw {
     // xyz = KK 高光色乘子（缺省 (1,1,1) = R90 固定式逐位不变），
     // w: 保留。
     fur_tint: [f32; 4],
+    // 受控材质扩展（与 WGSL MaterialParams.extensions 逐字段对齐）：
+    // x: 顶点色乘入（0/1）、y: unlit（0/1）、z/w: 保留。
+    // 两项都为 0 时着色器分支整段不执行，默认材质逐位不变。
+    extensions: [f32; 4],
 }
 
 const _: () = assert!(
-    std::mem::size_of::<MaterialRaw>() == 96,
-    "MaterialParams 必须与 WGSL 布局一致（R96 起 96 B）"
+    std::mem::size_of::<MaterialRaw>() == 112,
+    "MaterialParams 必须与 WGSL 布局一致（112 B）"
 );
 
 struct GpuMesh {
@@ -267,6 +271,9 @@ struct GpuMesh {
     /// 光照贴图 UV2 缓冲（R52c；网格无 UV2 为 None——绑定常驻零垫，
     /// 配合材质掩码 0，采样结果被 `select` 丢弃）。
     uv2_buf: Option<wgpu::Buffer>,
+    /// 顶点色缓冲（网格无颜色为 None——绑定常驻**白色**垫，在乘子
+    /// 语义下是恒等元）。
+    color_buf: Option<wgpu::Buffer>,
 }
 
 /// 一张光照贴图图集的 GPU 资源（R52c）：Rgba16Float 线性 HDR 纹理 +
@@ -438,6 +445,9 @@ struct GpuMaterial {
     textures: [u32; 3],
     /// 三槽纹理在上传时的内容修订号；任一变化即重建绑定组。
     revisions: [u64; 3],
+    /// 构建绑定组时的材质目录修订号。数值字段或扩展开关被编辑后，
+    /// 目录修订号推进，绑定组随之重建。
+    store_revision: u64,
 }
 
 /// 单张渲染目标（R40）的 GPU 侧资源：颜色纹理（UI 可采样）+ 深度 +
@@ -584,6 +594,11 @@ pub struct Renderer {
     /// （512 KiB = 65536 顶点 × 8 B；顶点数超出垫容量的网格在
     /// `ensure_mesh` 单独分配零缓冲）。内容全零，配合材质掩码 0。
     uv2_dummy_buf: wgpu::Buffer,
+    /// 常驻**白色**顶点色垫缓冲：无颜色网格共用（256 KiB = 65536 顶点
+    /// × 4 B；超限网格在 `ensure_mesh` 单独分配白色缓冲）。255 在
+    /// `Unorm8x4` 中精确映射为 1.0，作为乘子是恒等元；不用零垫，否则
+    /// 顶点色乘入模式会把无颜色网格的基色乘黑。
+    color_dummy_buf: wgpu::Buffer,
     /// 光照贴图图集 GPU 缓存（R52c）：句柄值 → Rgba16Float 纹理 + 采样器，
     /// 按句柄懒上传、跨帧持有（照 `texture_gpu`）。
     lightmap_gpu: HashMap<u32, GpuLightmap>,
@@ -4174,6 +4189,17 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
             mapped_at_creation: false,
         });
+        // 常驻白色顶点色垫：256 KiB = 65536 顶点 × 4 B。wgpu 缓冲创建即
+        // 零初始化，这里必须显式填 0xFF——零色在顶点色乘入模式下会把
+        // 基色乘黑，白色才是乘性恒等元。
+        let color_dummy = vec![0xFFu8; 65536 * 4];
+        let color_dummy_buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("iris.mesh.color_dummy"),
+                contents: &color_dummy,
+                usage: wgpu::BufferUsages::VERTEX,
+            });
         // 常驻 1×1 黑光照贴图（R52c）：wgpu 纹理创建即零初始化 ⇒ 无需
         // write_texture（全零辐照；掩码 0 时 select 直接丢弃采样结果）。
         let lightmap_dummy_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -4422,6 +4448,7 @@ impl Renderer {
             neutral_normal_view,
             tangent_dummy_buf,
             uv2_dummy_buf,
+            color_dummy_buf,
             lightmap_gpu: HashMap::new(),
             lightmap_dummy_tex,
             lightmap_dummy_view,
@@ -5601,9 +5628,7 @@ impl Renderer {
                         &self.bundle.probe_capture_pipeline
                     });
                     pass.set_bind_group(1, &material.bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                    pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                    self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     let first = index as u32;
                     let last = (index + count) as u32;
@@ -5625,16 +5650,7 @@ impl Renderer {
                         });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(
-                            1,
-                            mesh.skin_buf
-                                .as_ref()
-                                .expect("蒙皮网格应有蒙皮属性缓冲")
-                                .slice(..),
-                        );
+                        self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         let base = (total + i) as u32;
                         pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
@@ -8536,11 +8552,7 @@ impl Renderer {
                     &self.bundle.pipeline
                 });
                 pass.set_bind_group(1, &material.bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
-                pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                // 光照贴图 UV2（R52c，槽 3）：缺席网格同样绑零垫
-                pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 // 子段遍历（R53）：遮挡关闭 = 恒整段一次 draw，命令流与
                 // 引入前逐位一致；开启 = 只提交「未被遮挡」的连续子段
@@ -8589,18 +8601,7 @@ impl Renderer {
                     });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
-                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                    // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
-                    pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                    // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
-                    pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(
-                        1,
-                        mesh.skin_buf
-                            .as_ref()
-                            .expect("蒙皮网格应有蒙皮属性缓冲")
-                            .slice(..),
-                    );
+                    self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     let base = (total + i) as u32;
                     pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
@@ -9034,11 +9035,7 @@ impl Renderer {
                     &self.bundle.transparent_pipeline
                 });
                 pass.set_bind_group(1, &material.bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
-                pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                // UV2（R52c，槽 3）：缺席绑零垫（掩码 0 ⇒ 采样结果被丢弃）
-                pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(
                     0..mesh.num_indices,
@@ -9074,18 +9071,7 @@ impl Renderer {
                     });
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
-                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                    // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
-                    pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                    // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
-                    pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(
-                        1,
-                        mesh.skin_buf
-                            .as_ref()
-                            .expect("蒙皮网格应有蒙皮属性缓冲")
-                            .slice(..),
-                    );
+                    self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     let start = (opaque_total + transparent_total + i) as u32;
                     pass.draw_indexed(0..mesh.num_indices, 0, start..start + 1);
@@ -9166,9 +9152,7 @@ impl Renderer {
                 });
                 pass.set_bind_group(1, &material.bind_group, &[]);
                 pass.set_bind_group(2, &oit_gpu.depth_bg, &[]);
-                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                 pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(
                     0..mesh.num_indices,
@@ -9199,16 +9183,7 @@ impl Renderer {
                     pass.set_bind_group(1, &material.bind_group, &[]);
                     pass.set_bind_group(2, &skin.bind_group, &[]);
                     pass.set_bind_group(3, &oit_gpu.depth_bg, &[]);
-                    pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(
-                        1,
-                        mesh.skin_buf
-                            .as_ref()
-                            .expect("蒙皮网格应有蒙皮属性缓冲")
-                            .slice(..),
-                    );
+                    self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     let start = (opaque_total + transparent_total + i) as u32;
                     pass.draw_indexed(0..mesh.num_indices, 0, start..start + 1);
@@ -11684,11 +11659,7 @@ impl Renderer {
                         &self.bundle.rt_pipeline
                     });
                     pass.set_bind_group(1, &material.bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                    // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
-                    pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                    // 光照贴图 UV2（R52c，槽 3）：缺席网格同样绑零垫
-                    pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                    self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.num_indices, 0, idx as u32..(idx + count) as u32);
                     idx += count;
@@ -11709,18 +11680,7 @@ impl Renderer {
                         });
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                        // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
-                        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                        // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
-                        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(
-                            1,
-                            mesh.skin_buf
-                                .as_ref()
-                                .expect("蒙皮网格应有蒙皮属性缓冲")
-                                .slice(..),
-                        );
+                        self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         let base = (total + i) as u32;
                         pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
@@ -11747,11 +11707,7 @@ impl Renderer {
                             &self.bundle.rt_transparent_pipeline
                         });
                         pass.set_bind_group(1, &material.bind_group, &[]);
-                        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                        // 切线缓冲（R42，槽 2）：缺席网格绑常驻零垫
-                        pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                        // UV2（R52c，槽 3）：缺席绑零垫
-                        pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                        self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         pass.draw_indexed(
                             0..mesh.num_indices,
@@ -11777,18 +11733,7 @@ impl Renderer {
                             });
                             pass.set_bind_group(1, &material.bind_group, &[]);
                             pass.set_bind_group(2, &skin.bind_group, &[]);
-                            pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                            // 切线缓冲（R42，槽 3，蒙皮布局）：缺席绑零垫
-                            pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                            // UV2（R52c，槽 4，蒙皮布局）：缺席绑零垫
-                            pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
-                            pass.set_vertex_buffer(
-                                1,
-                                mesh.skin_buf
-                                    .as_ref()
-                                    .expect("蒙皮网格应有蒙皮属性缓冲")
-                                    .slice(..),
-                            );
+                            self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                             pass.set_index_buffer(
                                 mesh.index_buf.slice(..),
                                 wgpu::IndexFormat::Uint32,
@@ -12020,11 +11965,7 @@ impl Renderer {
                     let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                     let material = &self.material_gpu[&material_key(key as u32, lightmap)];
                     pass.set_bind_group(1, &material.bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                    // 切线 / UV2（槽 2/3）：缺席网格绑常驻零垫（与主 pass
-                    // 同口径——零切线 = 着色器走屏幕空间 TBN）
-                    pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                    self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.num_indices, 0, idx as u32..(idx + count) as u32);
                     idx += count;
@@ -12039,16 +11980,7 @@ impl Renderer {
                         let skin = &self.skin_gpu[&item.skin_entity];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(
-                            1,
-                            mesh.skin_buf
-                                .as_ref()
-                                .expect("蒙皮网格应有蒙皮属性缓冲")
-                                .slice(..),
-                        );
-                        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
+                        self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         let base = (refl_total + i) as u32;
                         pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
@@ -12101,9 +12033,7 @@ impl Renderer {
                     let mesh = &self.mesh_gpu[&((key >> 32) as u32)];
                     let material = &self.material_gpu[&material_key(key as u32, lightmap)];
                     pass.set_bind_group(1, &material.bind_group, &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                    pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
-                    pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+                    self.bind_static_mesh_streams(&mut pass, mesh, &mesh.vertex_buf);
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.num_indices, 0, idx as u32..(idx + count) as u32);
                     idx += count;
@@ -12118,16 +12048,7 @@ impl Renderer {
                         let skin = &self.skin_gpu[&item.skin_entity];
                         pass.set_bind_group(1, &material.bind_group, &[]);
                         pass.set_bind_group(2, &skin.bind_group, &[]);
-                        pass.set_vertex_buffer(0, item.vertex_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(
-                            1,
-                            mesh.skin_buf
-                                .as_ref()
-                                .expect("蒙皮网格应有蒙皮属性缓冲")
-                                .slice(..),
-                        );
-                        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
-                        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
+                        self.bind_skinned_mesh_streams(&mut pass, mesh, item.vertex_buf(mesh));
                         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                         let base = (main_total + i) as u32;
                         pass.draw_indexed(0..mesh.num_indices, 0, base..base + 1);
@@ -12154,11 +12075,19 @@ impl Renderer {
             }
             self.mesh_gpu.remove(&handle.0);
         }
-        let (vertex_buf, index_buf, num_indices, skin_buf, tangent_buf, uv2_buf) =
-            upload_mesh(&self.gpu, data);
-        // 无切线 / 无 UV2 且顶点数超出常驻零垫容量（65536）的网格：单独
-        // 分配零缓冲兜底（wgpu 缓冲创建即零初始化）。常规网格恒走常驻零垫，
-        // 零逐网格开销。
+        let UploadedMesh {
+            vertex_buf,
+            index_buf,
+            num_indices,
+            skin_buf,
+            tangent_buf,
+            uv2_buf,
+            color_buf,
+        } = upload_mesh(&self.gpu, data);
+        // 无切线 / 无 UV2 / 无顶点色且顶点数超出常驻垫容量（65536）的
+        // 网格：单独分配兜底缓冲。切线与 UV2 是零填充；顶点色是白色填充
+        // （零色在乘入模式下会把基色乘黑）。常规网格恒走常驻垫，零逐网格
+        // 开销。
         let oversized = data.vertices.len() > Self::TANGENT_DUMMY_VERTICES;
         let tangent_buf = tangent_buf.or_else(|| {
             oversized.then(|| {
@@ -12180,6 +12109,19 @@ impl Renderer {
                 })
             })
         });
+        // 无颜色且超出常驻垫容量的网格：分配逐网格白色兜底（乘性恒等）。
+        let color_buf = color_buf.or_else(|| {
+            oversized.then(|| {
+                let white = vec![0xFFu8; data.vertices.len() * 4];
+                self.gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("iris.mesh.color_white"),
+                        contents: &white,
+                        usage: wgpu::BufferUsages::VERTEX,
+                    })
+            })
+        });
         self.mesh_gpu.insert(
             handle.0,
             GpuMesh {
@@ -12190,6 +12132,7 @@ impl Renderer {
                 skin_buf,
                 tangent_buf,
                 uv2_buf,
+                color_buf,
             },
         );
     }
@@ -12209,6 +12152,48 @@ impl Renderer {
     /// 缺席绑常驻零垫（全零 + 材质掩码 0 ⇒ 光照贴图路径不生效）。
     fn uv2_buf<'a>(&'a self, mesh: &'a GpuMesh) -> &'a wgpu::Buffer {
         mesh.uv2_buf.as_ref().unwrap_or(&self.uv2_dummy_buf)
+    }
+
+    /// 该网格应绑定的顶点色缓冲：网格自带颜色用自有缓冲；缺席绑常驻
+    /// **白色**垫（255 映射为 1.0，乘性恒等）。超限网格的白色兜底在
+    /// `ensure_mesh` 单独分配，此处的 `unwrap_or` 恒安全。
+    fn color_buf<'a>(&'a self, mesh: &'a GpuMesh) -> &'a wgpu::Buffer {
+        mesh.color_buf.as_ref().unwrap_or(&self.color_dummy_buf)
+    }
+
+    /// 绑定标准静态网格的顶点流：0 顶点、2 切线、3 UV2、4 颜色。
+    /// 实例流（槽 1）由各 pass 自己绑定。
+    fn bind_static_mesh_streams(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        mesh: &GpuMesh,
+        vertex_buf: &wgpu::Buffer,
+    ) {
+        pass.set_vertex_buffer(0, vertex_buf.slice(..));
+        pass.set_vertex_buffer(2, self.tangent_buf(mesh).slice(..));
+        pass.set_vertex_buffer(3, self.uv2_buf(mesh).slice(..));
+        pass.set_vertex_buffer(4, self.color_buf(mesh).slice(..));
+    }
+
+    /// 绑定标准蒙皮网格的顶点流：0 顶点、1 蒙皮、3 切线、4 UV2、
+    /// 5 颜色。实例流（槽 2）由各 pass 自己绑定。
+    fn bind_skinned_mesh_streams(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        mesh: &GpuMesh,
+        vertex_buf: &wgpu::Buffer,
+    ) {
+        pass.set_vertex_buffer(0, vertex_buf.slice(..));
+        pass.set_vertex_buffer(
+            1,
+            mesh.skin_buf
+                .as_ref()
+                .expect("蒙皮网格应有蒙皮属性缓冲")
+                .slice(..),
+        );
+        pass.set_vertex_buffer(3, self.tangent_buf(mesh).slice(..));
+        pass.set_vertex_buffer(4, self.uv2_buf(mesh).slice(..));
+        pass.set_vertex_buffer(5, self.color_buf(mesh).slice(..));
     }
 
     /// 蒙皮的关节矩阵缓冲：按关节数上限分配，不足以时整体重建。
@@ -12972,6 +12957,10 @@ impl Renderer {
     /// 缓存键 = [`material_key`]`(材质, 图集)`：同一材质配不同图集时掩码
     /// （`surface.w`）与图集纹理都不同，必须各建一组；无光照贴图时槽位
     /// 恒 0，与 R52b 的按材质缓存一一对应。
+    ///
+    /// 早退条件同时比较三件东西：三个纹理槽的句柄、它们的纹理修订号，
+    /// 以及材质目录的逐材质修订号。任一项变化都重建绑定组，因此
+    /// `MaterialStore::get_mut` 的数值修改与扩展开关在下一帧生效。
     fn ensure_material(
         &mut self,
         materials: &MaterialStore,
@@ -12983,6 +12972,10 @@ impl Renderer {
         let key = material_key(handle.0, lightmap);
         let Some(def) = materials.get(handle) else {
             log::warn!("材质句柄 {handle:?} 不存在");
+            return;
+        };
+        let Some(store_revision) = materials.revision(handle) else {
+            log::warn!("材质句柄 {handle:?} 缺少修订号");
             return;
         };
         // 法线 / ORM 槽位（R42）：Some 懒上传后用真实纹理；None 绑中性
@@ -13009,7 +13002,10 @@ impl Renderer {
                 .unwrap_or(0),
         ];
         if let Some(existing) = self.material_gpu.get(&key) {
-            if existing.textures == texture_slots && existing.revisions == texture_revisions {
+            if existing.textures == texture_slots
+                && existing.revisions == texture_revisions
+                && existing.store_revision == store_revision
+            {
                 return;
             }
             self.material_gpu.remove(&key);
@@ -13094,6 +13090,8 @@ impl Renderer {
                 def.kajiya_kay.map_or(1.0, |kk| kk.highlight_tint[2]),
                 0.0,
             ],
+            // 受控扩展：缺省全零，着色器分支不进入（逐位兼容）。
+            extensions: def.extensions.shader_flags(),
         };
         let params_buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("iris.material.params"),
@@ -13153,6 +13151,7 @@ impl Renderer {
                 bind_group,
                 textures: texture_slots,
                 revisions: texture_revisions,
+                store_revision,
             },
         );
     }

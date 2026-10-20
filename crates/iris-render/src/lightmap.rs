@@ -485,7 +485,8 @@ pub fn f32_to_f16(value: f32) -> u16 {
 ///
 /// 纯函数：同输入逐位同输出（拆分只按三角形序 / 角点序追加，无哈希、无
 /// 浮点比较之外的判据）。返回的网格 `vertices` 可能比输入长（拆分），
-/// `indices` 长度不变（拓扑不变）。
+/// `indices` 长度不变（拓扑不变）。拆分新增的顶点复制全部逐顶点属性：
+/// 蒙皮、切线、顶点色，以及每个形变目标的位置与法线增量。
 pub fn build_uv2_mesh(data: &MeshData, tri_uvs: &[[[f32; 2]; 3]]) -> MeshData {
     assert_eq!(
         data.indices.len() % 3,
@@ -528,6 +529,21 @@ pub fn build_uv2_mesh(data: &MeshData, tri_uvs: &[[[f32; 2]; 3]]) -> MeshData {
                     }
                     if let (Some(src), Some(dst)) = (&data.tangents, &mut out.tangents) {
                         dst.push(src[index]);
+                    }
+                    if let (Some(src), Some(dst)) = (&data.colors, &mut out.colors) {
+                        dst.push(src[index]);
+                    }
+                    if let (Some(src), Some(dst)) = (&data.morph, &mut out.morph) {
+                        for (target, out_target) in src.targets.iter().zip(&mut dst.targets) {
+                            out_target
+                                .position_deltas
+                                .push(target.position_deltas[index]);
+                            if let (Some(src), Some(dst)) =
+                                (&target.normal_deltas, &mut out_target.normal_deltas)
+                            {
+                                dst.push(src[index]);
+                            }
+                        }
                     }
                     uv2.push(uv);
                     out.indices[t * 3 + slot] = (out.vertices.len() - 1) as u32;
@@ -803,6 +819,45 @@ mod tests {
             split_t.tangents.as_ref().unwrap().len(),
             5,
             "切线属性必须跟着拆分"
+        );
+        // 顶点色与形变增量也必须跟着拆分（否则侧表长度与顶点数失配）。
+        let mut with_extras = plane.clone();
+        let colors = [
+            crate::mesh::VertexColor::new(10, 20, 30, 255),
+            crate::mesh::VertexColor::new(40, 50, 60, 255),
+            crate::mesh::VertexColor::new(70, 80, 90, 255),
+            crate::mesh::VertexColor::new(100, 110, 120, 255),
+        ];
+        with_extras.colors = Some(colors.to_vec());
+        with_extras.morph = Some(crate::morph::MorphData::new(vec![
+            crate::morph::MorphTarget::new(
+                None,
+                vec![[1.0, 0.0, 0.0]; 4],
+                Some(vec![[0.0, 1.0, 0.0]; 4]),
+            ),
+        ]));
+        let split_e = build_uv2_mesh(&with_extras, &conflict);
+        assert_eq!(
+            split_e.colors.as_ref().unwrap().len(),
+            5,
+            "顶点色必须跟着拆分"
+        );
+        assert_eq!(split_e.colors.as_ref().unwrap()[4], colors[0]);
+        let morph = split_e.morph.as_ref().unwrap();
+        assert_eq!(
+            morph.targets[0].position_deltas.len(),
+            5,
+            "位置增量跟着拆分"
+        );
+        assert_eq!(morph.targets[0].position_deltas[4], [1.0, 0.0, 0.0]);
+        assert_eq!(
+            morph.targets[0].normal_deltas.as_ref().unwrap().len(),
+            5,
+            "法线增量跟着拆分"
+        );
+        assert_eq!(
+            morph.targets[0].normal_deltas.as_ref().unwrap()[4],
+            [0.0, 1.0, 0.0]
         );
         // 确定性：同输入两次逐位一致
         let again = build_uv2_mesh(&plane, &conflict);

@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1837 / release 1834**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1849 / release 1846**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
 
 ### 门禁执行铁律（实测案例全文见 PLAYBOOK §1/§2）
 
@@ -64,7 +64,7 @@ cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ## 测试规约
 
 - 断言用**精确值**（解析解对照、±1e-5 容差写明依据），不写「大于 0」式摆设断言；**有效性断言要可判别**（R53/R60 的指标学教训：指标要在分布高端区分、ROI 避开混淆源）。
-- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件（同文件多测试并行共用单适配器）会挂死——必须在文件内加 `static` 互斥锁串行化**（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal / post / probe / meshlet / meshlet_v2 / meshlet_lod / meshlet_stream）。不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠；新写 GPU 套件时直接带上互斥，别等挂了再补；cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。症状谱与历次漏配挂死案例见 PLAYBOOK §4。
+- GPU 测试：`OffscreenRenderer::new` 返回 None 时 `eprintln!("跳过：环境无 GPU")` + return，不 panic。**重负载 GPU 套件（同文件多测试并行共用单适配器）会挂死——必须在文件内加 `static` 互斥锁串行化**（参照 `ssr_render.rs::GPU_SERIAL`；现有互斥：ssr / sss / irradiance / shadow_v2 / transparent / decal / post / probe / meshlet / meshlet_v2 / meshlet_lod / meshlet_stream / vertex_color）。不要靠 `RUST_TEST_THREADS=1` 记忆——标准门禁命令必须默认可靠；新写 GPU 套件时直接带上互斥，别等挂了再补；cargo test 的二进制之间本就串行执行，争用只来自**同文件多测试并行**，所以文件内互斥即足。症状谱与历次漏配挂死案例见 PLAYBOOK §4。
 - should_panic 测试若依赖 `debug_assert!`，必须 `#[cfg(debug_assertions)]` 门控（R33/R38 各踩过一次 release 假失败）。
 - 测试间**共享文件名会竞态**（并行执行）——临时文件唯一名 = **进程 id + 调用序计数**，缺一不可（四起事故案例见 PLAYBOOK §4）。
 - 改物理/模拟必须有确定性测试；改渲染必须有像素断言测试；渲染器按**句柄值**缓存 GPU 资源——同一渲染器上渲染「同句柄不同内容」的多个世界会串味（R53/R62 两次踩到），跨世界对照必须各用独立渲染器。
