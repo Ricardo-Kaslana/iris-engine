@@ -29,6 +29,7 @@ pub fn build_atlas() -> CpuTexture {
         Tile::WoodTop,
         Tile::Planks,
         Tile::Bedrock,
+        Tile::Glowstone,
     ] {
         let (col, row) = tile.slot();
         let origin_x = col * TILE_SIZE;
@@ -133,6 +134,11 @@ fn pattern(tile: Tile, x: u32, y: u32) -> [u8; 3] {
         Tile::Bedrock => {
             let dark = (hash(x / 2, y / 2, 43) % 3 == 0) as i32;
             shade([62, 62, 66], noise(x, y, 47, 18) - dark * 22)
+        }
+        Tile::Glowstone => {
+            let speck = (hash(x, y, 53) % 7 == 0) as i32;
+            let dark = (hash(x / 3, y / 3, 59) % 4 == 0) as i32;
+            shade([238, 202, 92], noise(x, y, 61, 18) + speck * 24 - dark * 26)
         }
     }
 }

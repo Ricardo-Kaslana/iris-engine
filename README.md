@@ -921,34 +921,40 @@ cargo run -p iris-assault --example assault_snapshot --release   # 战斗中段�
 cargo run -p iris-assault --example gen_assault_assets --release # 重新生成 GLB + pack
 ```
 
-### VII. Iris Voxel（`games/iris-voxel`）——可玩体素沙盒首版
+### VII. Iris Voxel（`games/iris-voxel`）——可玩体素沙盒
 
 **Dogfooding VII**——类 Minecraft 的固定体素世界：8×8 个区块，每区块
 16×16×48 方块并全部常驻；确定性地形、面剔除区块网格、程序化纹理图集、
-第一人称胶囊碰撞、DDA 方块拾取、左键破坏与右键放置、目标框与快捷栏 HUD。
+天空光与方块光传播、平滑光照与逐顶点环境光遮蔽、第一人称胶囊碰撞、
+DDA 方块拾取、左键破坏与右键放置、目标框与快捷栏 HUD。
 
-纯逻辑在 `logic/`（只依赖 glam）：方块调色板、世界与区块、splitmix64
-地形、视角数学与 Amanatides–Woo DDA；`VoxelPlugin` 负责 ECS 接线。区块
-编辑后走 `MeshStore::update` 原地重建，句柄不增长；碰撞按区块只缓存
-暴露于空气的实心壳，玩家每步合并所在区块及 8 邻区块。渲染使用无光照
-材质与逐面顶点色明暗（复用顶点色扩展），避免 Lit 材质在方块表面产生
-镜面高光；程序化图集带 2 像素 gutter，mip 与各向异性通过 `MipSettings`
-开启。
+纯逻辑在 `logic/`（只依赖 glam）：方块调色板、世界与光照网格、
+splitmix64 地形、视角数学与 Amanatides–Woo DDA；`VoxelPlugin` 负责
+ECS 接线。区块编辑后走 `MeshStore::update` 原地重建，句柄不增长；碰撞
+按区块只缓存暴露于空气的实心壳，玩家每步合并所在区块及 8 邻区块。
 
-首版边界：没有天空光与方块光传播、没有存档、没有区块流式加载，也没有
-洞穴、树木、水体与生物；后续路线见 `MINECRAFT-GAPS.md`。
+天空光从所有直接露天的空气格以 15 起步，方块光从荧光石以 15 起步，
+两者沿六个轴向每步衰减 1；编辑方块时按「移除—边界回填—添加」三段
+增量更新，只重建光照实际波及的区块网格。网格每个顶点采样面外的
+前向、两侧与对角格：环境光遮蔽由后三格的实心性决定，光照只平均空气
+格，再用整数查表合成冷色天空光与暖色方块光的顶点色。渲染仍使用无
+光照材质，避免 Lit 材质在方块表面产生镜面高光；程序化图集带 2 像素
+gutter，mip 与各向异性通过 `MipSettings` 开启。
+
+当前边界：没有透明方块衰减、彩色光源与昼夜循环，没有存档、区块流式
+加载，也没有洞穴、树木、水体与生物；后续路线见 `MINECRAFT-GAPS.md`。
 
 ![体素世界验收](docs/voxel.png)
 
 ```sh
-cargo run -p iris-voxel --release                  # 左键捕获/挖掘，右键放置，1-6 或滚轮选块，Esc 释放后再退出
+cargo run -p iris-voxel --release                  # 左键捕获/挖掘，右键放置，1-7 或滚轮选块，Esc 释放后再退出
 cargo run -p iris-voxel --example voxel_snapshot --release   # 三视角离屏验收图
 ```
 
 ## 测试
 
 ```sh
-cargo test --workspace   # 1907 项测试（release 1904 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 1921 项测试（release 1918 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

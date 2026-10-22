@@ -1,6 +1,7 @@
 //! headless 集成测试：不建窗口、不建 GPU，复用 `VoxelPlugin` 的完整
 //! 系统链驱动真实世界。覆盖启动区块、第一人称移动与跳跃、相对鼠标
-//! 视角、DDA 破坏与放置、边界区块邻接重建与 HUD 选择。
+//! 视角、DDA 破坏与放置、边界区块邻接重建、HUD 选择，以及天空光与
+//! 荧光石方块光的增量传播和跨区块网格重建。
 
 use std::time::Duration;
 
@@ -307,6 +308,71 @@ fn border_edit_remeshes_neighbour_chunks() {
     assert_eq!(harness.revision(far), far_before, "远处区块不应重建");
 }
 
+/// 启动后平台上方空气直接露天，天空光为 15；实心格与地下没有方块光。
+#[test]
+fn startup_world_has_sky_light() {
+    let mut harness = Harness::new(9);
+    harness.settle();
+    let world = harness.world();
+    assert_eq!(world.light().sky(IVec3::new(64, 15, 64)), 15);
+    assert_eq!(world.light().sky(IVec3::new(64, 14, 64)), 0);
+    assert_eq!(world.light().block_light(IVec3::new(64, 15, 64)), 0);
+}
+
+/// 在跨区块位置放荧光石：附近方块光为 14，光照波及的区块网格全部
+/// 重建，远处区块不受影响；拆掉光源后方块光归零。
+#[test]
+fn glowstone_relights_surroundings_and_remeshes_cross_chunk() {
+    let mut harness = Harness::new(10);
+    harness.settle();
+    let source = IVec3::new(65, 40, 65);
+    let chunks = [
+        IVec2::new(3, 3),
+        IVec2::new(3, 4),
+        IVec2::new(4, 3),
+        IVec2::new(4, 4),
+        IVec2::new(4, 5),
+        IVec2::new(5, 4),
+    ];
+    let handles: Vec<MeshHandle> = chunks
+        .iter()
+        .map(|&coord| harness.mesh_handle_at(coord))
+        .collect();
+    let before: Vec<u64> = handles
+        .iter()
+        .map(|&handle| harness.revision(handle))
+        .collect();
+    let far = harness.mesh_handle_at(IVec2::new(6, 4));
+    let far_before = harness.revision(far);
+    let diagonal = harness.mesh_handle_at(IVec2::new(5, 5));
+    let diagonal_before = harness.revision(diagonal);
+
+    assert!(apply_edit(&mut harness.app.world, source, Block::Glowstone));
+    assert_eq!(harness.world().light().block_light(source), 15);
+    for offset in [IVec3::new(0, -1, 0), IVec3::X, IVec3::Z] {
+        assert_eq!(
+            harness.world().light().block_light(source + offset),
+            14,
+            "光源邻格 {offset:?} 应为 14"
+        );
+    }
+    for (handle, before) in handles.iter().zip(before) {
+        assert!(
+            harness.revision(*handle) > before,
+            "光照波及的区块应重建网格"
+        );
+    }
+    assert_eq!(harness.revision(far), far_before, "远处区块不应重建");
+    assert_eq!(
+        harness.revision(diagonal),
+        diagonal_before,
+        "光照 14 格未到达对角区块"
+    );
+
+    assert!(apply_edit(&mut harness.app.world, source, Block::Air));
+    assert_eq!(harness.world().light().block_light(source + IVec3::X), 0);
+}
+
 /// 快捷栏选择改变 HUD 标签。
 #[test]
 fn hotbar_selection_updates_hud_label() {
@@ -317,4 +383,8 @@ fn hotbar_selection_updates_hud_label() {
     harness.frame();
     harness.release(KeyCode::Digit3);
     assert_eq!(harness.hud_label(), "SELECTED: STONE");
+    harness.press(KeyCode::Digit7);
+    harness.frame();
+    harness.release(KeyCode::Digit7);
+    assert_eq!(harness.hud_label(), "SELECTED: GLOWSTONE");
 }

@@ -1,11 +1,11 @@
-//! 体素沙盒离屏验收图：出生点远景、编辑后的木板墙近景、空中俯瞰。
+//! 体素沙盒离屏验收图：出生点远景、荧光石房间近景、空中俯瞰。
 //!
 //! 输出三张 640×360 BMP（已被 `.gitignore` 忽略），用 ffmpeg 横向
 //! 拼接成入库的 `docs/voxel.png`：
 //!
 //! ```sh
 //! cargo run -p iris-voxel --example voxel_snapshot --release
-//! ffmpeg -y -i voxel_spawn.bmp -i voxel_edit.bmp -i voxel_overview.bmp \
+//! ffmpeg -y -i voxel_spawn.bmp -i voxel_light.bmp -i voxel_overview.bmp \
 //!   -filter_complex hstack=inputs=3 docs/voxel.png
 //! ```
 
@@ -49,29 +49,31 @@ fn main() {
         return;
     };
 
-    // 1. 出生点远景：抬高一点俯瞰平台与丘陵，避免掠射角把台地间隙
-    //    压成一条天空细线。
+    build_light_shaft(&mut app.world);
+
+    // 1. 出生点远景：拉远抬高压低塔楼在画面中的占比，展示平台与丘陵。
     set_camera(
         &mut app.world,
-        Vec3::new(64.5, 24.0, 80.0),
-        Vec3::new(64.0, 14.0, 56.0),
+        Vec3::new(92.0, 40.0, 108.0),
+        Vec3::new(62.0, 20.0, 60.0),
     );
     shoot(&mut renderer, &app.world, "voxel_spawn.bmp");
 
-    // 2. 编辑后的木板墙：直接写入世界并重建受影响区块。
-    build_demo_wall(&mut app.world);
+    // 2. 光井内景：从塔顶俯视 3×3 净空的竖井。底部荧光石的暖光沿
+    //    井壁向上衰减，近 20 格光程后完全熄灭，顶部只剩环境底光；
+    //    底部四角可见 AO 压暗。
     set_camera(
         &mut app.world,
-        Vec3::new(64.5, 18.0, 72.0),
-        Vec3::new(64.5, 16.0, 61.0),
+        Vec3::new(61.5, 33.0, 61.5),
+        Vec3::new(60.8, 14.0, 60.8),
     );
-    shoot(&mut renderer, &app.world, "voxel_edit.bmp");
+    shoot(&mut renderer, &app.world, "voxel_light.bmp");
 
-    // 3. 空中俯瞰：抬高相机俯视丘陵与平台。
+    // 3. 空中俯瞰：拉高相机俯视丘陵、平台与光井塔楼顶部。
     set_camera(
         &mut app.world,
-        Vec3::new(52.0, 40.0, 84.0),
-        Vec3::new(64.0, 14.0, 64.0),
+        Vec3::new(40.0, 52.0, 100.0),
+        Vec3::new(64.0, 18.0, 64.0),
     );
     shoot(&mut renderer, &app.world, "voxel_overview.bmp");
 }
@@ -95,23 +97,32 @@ fn shoot(renderer: &mut OffscreenRenderer, world: &World, path: &str) {
     );
 }
 
-/// 在出生点前方搭一面 6×5 的木板墙，中间留 2×3 的门洞，并在墙前
-/// 放两根石柱，作为编辑闭环的视觉证据。
-fn build_demo_wall(world: &mut World) {
-    for x in 61..=67 {
-        for y in 15..=19 {
-            if (64..=65).contains(&x) && (15..=17).contains(&y) {
-                continue;
+/// 在平台北侧盖一座 5×5 的光井塔：石墙、木板屋顶，内部净空 3×3、
+/// 高 19 格，南墙在出生点旁留一个 1×2 门洞，井底中央嵌一块荧光石。
+/// 光井完全由方块编辑接口搭建，光照随每次写入增量更新；从塔顶俯视
+/// 可以看到暖光沿井壁向上衰减到完全熄灭。
+fn build_light_shaft(world: &mut World) {
+    const X0: i32 = 59;
+    const X1: i32 = 63;
+    const Z0: i32 = 59;
+    const Z1: i32 = 63;
+    for z in Z0..=Z1 {
+        for x in X0..=X1 {
+            apply_edit(world, IVec3::new(x, 14, z), Block::Stone);
+            let perimeter = x == X0 || x == X1 || z == Z0 || z == Z1;
+            for y in 15..=33 {
+                let door = z == Z1 && x == 61 && (15..=16).contains(&y);
+                let block = if door {
+                    Block::Air
+                } else if perimeter {
+                    Block::Stone
+                } else {
+                    Block::Air
+                };
+                apply_edit(world, IVec3::new(x, y, z), block);
             }
-            apply_edit(world, IVec3::new(x, y, 61), Block::Planks);
+            apply_edit(world, IVec3::new(x, 34, z), Block::Planks);
         }
     }
-    for y in 15..=17 {
-        apply_edit(world, IVec3::new(60, y, 63), Block::Stone);
-        apply_edit(world, IVec3::new(68, y, 63), Block::Stone);
-    }
-    // 墙前的地面铺一条沙路，保证近景有明显的材质对比。
-    for x in 62..=66 {
-        apply_edit(world, IVec3::new(x, 14, 60), Block::Sand);
-    }
+    apply_edit(world, IVec3::new(61, 14, 61), Block::Glowstone);
 }

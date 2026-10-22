@@ -49,6 +49,7 @@ pub enum Tile {
     WoodTop,
     Planks,
     Bedrock,
+    Glowstone,
 }
 
 impl Tile {
@@ -64,6 +65,7 @@ impl Tile {
             Tile::WoodTop => (2, 1),
             Tile::Planks => (3, 1),
             Tile::Bedrock => (0, 2),
+            Tile::Glowstone => (1, 2),
         }
     }
 }
@@ -80,6 +82,7 @@ pub enum Block {
     Sand = 5,
     Wood = 6,
     Planks = 7,
+    Glowstone = 8,
 }
 
 impl Block {
@@ -93,6 +96,7 @@ impl Block {
             5 => Block::Sand,
             6 => Block::Wood,
             7 => Block::Planks,
+            8 => Block::Glowstone,
             _ => Block::Air,
         }
     }
@@ -109,6 +113,15 @@ impl Block {
     /// 是否可被玩家破坏。基岩不可破坏。
     pub const fn is_breakable(self) -> bool {
         !matches!(self, Block::Air | Block::Bedrock)
+    }
+
+    /// 自身发出的方块光等级；不发光为 0。光源格本身是实心不透明的，
+    /// 光从相邻空气格开始按等级递减传播。
+    pub const fn emission(self) -> u8 {
+        match self {
+            Block::Glowstone => 15,
+            _ => 0,
+        }
     }
 
     /// 该面使用的图集槽位。
@@ -128,6 +141,7 @@ impl Block {
             },
             Block::Planks => Tile::Planks,
             Block::Bedrock => Tile::Bedrock,
+            Block::Glowstone => Tile::Glowstone,
             Block::Air => Tile::Stone,
         }
     }
@@ -143,6 +157,7 @@ impl Block {
             Block::Sand => "SAND",
             Block::Wood => "WOOD",
             Block::Planks => "PLANKS",
+            Block::Glowstone => "GLOWSTONE",
         }
     }
 
@@ -157,6 +172,7 @@ impl Block {
             Block::Sand => [0.82, 0.75, 0.50, 1.0],
             Block::Wood => [0.47, 0.33, 0.18, 1.0],
             Block::Planks => [0.68, 0.50, 0.29, 1.0],
+            Block::Glowstone => [0.95, 0.78, 0.34, 1.0],
         }
     }
 }
@@ -177,6 +193,7 @@ mod tests {
             Block::Sand,
             Block::Wood,
             Block::Planks,
+            Block::Glowstone,
         ];
         for block in blocks {
             assert_eq!(Block::from_u8(block.as_u8()), block);
@@ -195,12 +212,31 @@ mod tests {
             Block::Sand,
             Block::Wood,
             Block::Planks,
+            Block::Glowstone,
         ] {
             assert!(block.is_solid());
         }
         assert!(!Block::Bedrock.is_breakable());
         assert!(!Block::Air.is_breakable());
         assert!(Block::Grass.is_breakable());
+    }
+
+    /// 只有荧光石发光，且发光等级为最大值 15。
+    #[test]
+    fn emission_levels() {
+        assert_eq!(Block::Glowstone.emission(), 15);
+        for block in [
+            Block::Air,
+            Block::Bedrock,
+            Block::Stone,
+            Block::Dirt,
+            Block::Grass,
+            Block::Sand,
+            Block::Wood,
+            Block::Planks,
+        ] {
+            assert_eq!(block.emission(), 0);
+        }
     }
 
     /// 草方块顶面与侧面使用不同槽位，原木同理；其余方块六面同槽。
@@ -212,6 +248,7 @@ mod tests {
         assert_eq!(Block::Wood.atlas_tile(Face::Top), Tile::WoodTop);
         assert_eq!(Block::Wood.atlas_tile(Face::North), Tile::WoodSide);
         assert_eq!(Block::Stone.atlas_tile(Face::South), Tile::Stone);
+        assert_eq!(Block::Glowstone.atlas_tile(Face::Top), Tile::Glowstone);
     }
 
     /// 图集槽位不重复且落在 4×4 网格内。
@@ -227,6 +264,7 @@ mod tests {
             Tile::WoodTop,
             Tile::Planks,
             Tile::Bedrock,
+            Tile::Glowstone,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for tile in tiles {

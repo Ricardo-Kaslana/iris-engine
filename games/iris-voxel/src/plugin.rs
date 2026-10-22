@@ -22,13 +22,14 @@ use crate::mesh::{build_chunk_mesh, wireframe_cube_mesh};
 /// 拾取与放置的最大距离（米）。
 pub const REACH: f32 = 5.0;
 /// 快捷栏按顺序放置的方块。
-pub const HOTBAR_BLOCKS: [Block; 6] = [
+pub const HOTBAR_BLOCKS: [Block; 7] = [
     Block::Grass,
     Block::Dirt,
     Block::Stone,
     Block::Sand,
     Block::Wood,
     Block::Planks,
+    Block::Glowstone,
 ];
 
 /// 体素游戏插件。
@@ -190,8 +191,9 @@ fn build_world_and_assets(world: &mut World) {
     let atlas_handle = world
         .resource_mut::<TextureStore>()
         .add_uncompressed_declared(atlas_texture);
-    // 经典体素观感：无光照材质 + 逐面顶点色明暗。等体素光照轮再接入
-    // 天空光与方块光，当前避免 Lit 材质在掠射角出现镜面高光。
+    // 经典体素观感：无光照材质 + 逐顶点光照与明暗。天空光、方块光与
+    // AO 都由游戏侧烘进顶点色，材质保持 unlit，避免 Lit 材质在掠射角
+    // 出现镜面高光。
     let material = world.resource_mut::<MaterialStore>().add(
         MaterialDef {
             texture: atlas_handle,
@@ -363,6 +365,7 @@ fn update_hotbar(world: &mut World) {
             KeyCode::Digit4,
             KeyCode::Digit5,
             KeyCode::Digit6,
+            KeyCode::Digit7,
         ];
         let picked = keys.iter().position(|key| input.key_pressed(*key));
         (picked, input.wheel_delta())
@@ -514,7 +517,8 @@ fn update_target_and_edits(world: &mut World) {
 
 /// 写入一个方块并重建受影响区块的网格与碰撞壳。返回世界是否改变。
 ///
-/// 公开给 headless 测试复用边界编辑与邻区块重建路径。
+/// 几何脏区块重建网格与碰撞，光照脏区块只重建网格；纯光照变化不会
+/// 改动碰撞壳。公开给 headless 测试复用边界编辑与邻区块重建路径。
 pub fn apply_edit(world: &mut World, pos: IVec3, block: Block) -> bool {
     let outcome = {
         let mut world_data = world.resource_mut::<VoxelWorld>();
@@ -523,14 +527,20 @@ pub fn apply_edit(world: &mut World, pos: IVec3, block: Block) -> bool {
     if !outcome.changed {
         return false;
     }
-    remesh_chunks(world, &outcome.dirty);
+    remesh_chunks(world, &outcome.dirty, &outcome.light_dirty);
     true
 }
 
 /// 重建一组区块的网格与碰撞壳。`MeshStore::update` 原地替换内容，
 /// 区块实体与句柄保持不变。
-pub fn remesh_chunks(world: &mut World, dirty: &[IVec2]) {
-    for &coord in dirty {
+pub fn remesh_chunks(world: &mut World, geometry_dirty: &[IVec2], light_dirty: &[IVec2]) {
+    let mut mesh_dirty = geometry_dirty.to_vec();
+    for &coord in light_dirty {
+        if !mesh_dirty.contains(&coord) {
+            mesh_dirty.push(coord);
+        }
+    }
+    for &coord in &mesh_dirty {
         let data = {
             let world_data = world.resource::<VoxelWorld>();
             build_chunk_mesh(&world_data, coord)
@@ -538,6 +548,8 @@ pub fn remesh_chunks(world: &mut World, dirty: &[IVec2]) {
         if let Some(handle) = world.resource::<ChunkTable>().mesh(coord) {
             world.resource_mut::<MeshStore>().update(handle, data);
         }
+    }
+    for &coord in geometry_dirty {
         let world_data = world.resource::<VoxelWorld>();
         world
             .resource_mut::<ChunkCollisionRes>()

@@ -1,12 +1,17 @@
-//! 固定体素世界：区块划分、方块读写与编辑影响范围。
+//! 固定体素世界：区块划分、方块读写、光照维护与编辑影响范围。
 //!
 //! 世界是 8×8 个区块，每区块 16×16×48，全部常驻。区块数据按
 //! `(y × 16 + z) × 16 + x` 行主序存放。世界坐标越界查询返回空气，
 //! 写入越界被忽略。
+//!
+//! 每次方块写入同步调用 [`LightGrid`] 的增量更新，因此天空光与方块光
+//! 始终与方块数据一致。编辑结果同时给出几何脏区块与光照脏区块：前者
+//! 需要重建网格与碰撞，后者只重建网格。
 
 use glam::{IVec2, IVec3};
 
 use super::block::Block;
+use super::light::LightGrid;
 
 pub const CHUNK_SIZE: usize = 16;
 pub const CHUNK_HEIGHT: usize = 48;
@@ -54,8 +59,11 @@ impl Chunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditOutcome {
     pub changed: bool,
-    /// 自身区块在前，随后按西、东、北、南顺序加入跨边界的相邻区块。
+    /// 几何脏区块：自身在前，随后按西、东、北、南顺序加入跨边界的
+    /// 相邻区块。这些区块需要重建网格与碰撞壳。
     pub dirty: Vec<IVec2>,
+    /// 光照脏区块：光照变化波及的区块，只重建网格，不重建碰撞。
+    pub light_dirty: Vec<IVec2>,
 }
 
 impl EditOutcome {
@@ -63,6 +71,7 @@ impl EditOutcome {
         Self {
             changed: false,
             dirty: Vec::new(),
+            light_dirty: Vec::new(),
         }
     }
 }
@@ -72,20 +81,29 @@ impl EditOutcome {
 pub struct VoxelWorld {
     pub seed: u64,
     chunks: Vec<Chunk>,
+    light: LightGrid,
 }
 
 impl VoxelWorld {
-    /// 生成确定性地形（见 [`super::terrain`]）。
+    /// 生成确定性地形（见 [`super::terrain`]），并重算整世界光照。
     pub fn generate(seed: u64) -> Self {
-        super::terrain::generate(seed)
+        let mut world = super::terrain::generate(seed);
+        world.light = LightGrid::compute(&world.chunks);
+        world
     }
 
-    /// 全空气世界（测试与手工布置用）。
+    /// 全空气世界（测试与手工布置用）。全空气必然全部直接露天。
     pub fn empty(seed: u64) -> Self {
         Self {
             seed,
             chunks: (0..CHUNK_COUNT).map(|_| Chunk::empty()).collect(),
+            light: LightGrid::fully_open(),
         }
+    }
+
+    /// 天空光与方块光网格。
+    pub fn light(&self) -> &LightGrid {
+        &self.light
     }
 
     /// 区块坐标是否在世界内。
@@ -145,6 +163,8 @@ impl VoxelWorld {
     }
 
     /// 写入方块。越界、空气写空气或同值写入都不改变世界。
+    ///
+    /// 写入会同步更新天空光与方块光，并返回几何脏区块与光照脏区块。
     pub fn set_block(&mut self, pos: IVec3, block: Block) -> EditOutcome {
         if !Self::in_bounds(pos) || self.block(pos) == block {
             return EditOutcome::unchanged();
@@ -152,11 +172,19 @@ impl VoxelWorld {
         let coord = Self::chunk_of(pos);
         let local_x = pos.x.rem_euclid(CHUNK_SIZE as i32);
         let local_z = pos.z.rem_euclid(CHUNK_SIZE as i32);
-        if let Some(chunk) = self.chunk_mut(coord) {
+        let old_sky = self.light.sky(pos);
+        let old_block_light = self.light.block_light(pos);
+        let Self {
+            chunks,
+            light: grid,
+            ..
+        } = self;
+        if let Some(chunk) = Self::chunk_mut_in(chunks, coord) {
             chunk.set(local_x as usize, pos.y as usize, local_z as usize, block);
         } else {
             return EditOutcome::unchanged();
         }
+        let light_touched = grid.apply_edit(chunks, pos, block, old_sky, old_block_light);
 
         let mut dirty = vec![coord];
         // 面剔除依赖相邻区块的数据：边界方块的编辑要让邻区块重建。
@@ -173,7 +201,16 @@ impl VoxelWorld {
         EditOutcome {
             changed: true,
             dirty,
+            light_dirty: light_touched
+                .into_iter()
+                .map(|(x, z)| IVec2::new(x, z))
+                .collect(),
         }
+    }
+
+    /// 在切片上按区块坐标写入的可变访问；供 `set_block` 拆分字段借用。
+    fn chunk_mut_in(chunks: &mut [Chunk], coord: IVec2) -> Option<&mut Chunk> {
+        Self::chunk_index(coord).map(|index| &mut chunks[index])
     }
 
     fn push_dirty(dirty: &mut Vec<IVec2>, coord: IVec2) {
@@ -229,6 +266,7 @@ mod tests {
             let outcome = world.set_block(pos, Block::Stone);
             assert!(!outcome.changed);
             assert!(outcome.dirty.is_empty());
+            assert!(outcome.light_dirty.is_empty());
         }
     }
 
@@ -270,6 +308,7 @@ mod tests {
         let outcome = world.set_block(at(3, 3, 3), Block::Dirt);
         assert!(!outcome.changed);
         assert!(outcome.dirty.is_empty());
+        assert!(outcome.light_dirty.is_empty());
     }
 
     /// 表面高度扫描找到最高实心块。
