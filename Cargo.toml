@@ -15,6 +15,8 @@ members = [
     "games/iris-ascent",
     "games/iris-infiltration",
     "games/iris-assault",
+    # 类 Minecraft 体素沙盒：固定世界、区块网格、破坏与放置
+    "games/iris-voxel",
     # 实验性项目：外部 GLB 角色 + Mixamo 重定向动作导入验证
     "games/iris-exp",
 ]
@@ -40,6 +42,7 @@ iris-bastion = { path = "games/iris-bastion", version = "0.1.3" }
 iris-ascent = { path = "games/iris-ascent", version = "0.1.3" }
 iris-infiltration = { path = "games/iris-infiltration", version = "0.1.3" }
 iris-assault = { path = "games/iris-assault", version = "0.1.3" }
+iris-voxel = { path = "games/iris-voxel", version = "0.1.3" }
 iris-exp = { path = "games/iris-exp", version = "0.1.3" }
 iris-editor = { path = "crates/iris-editor", version = "0.1.3" }
 

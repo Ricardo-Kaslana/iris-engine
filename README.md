@@ -264,7 +264,8 @@ iris-engine/
 │   ├── iris-bastion/    # III：塔防 Iris Bastion
 │   ├── iris-ascent/     # IV：3D 平台跳跃 Iris Ascent
 │   ├── iris-infiltration/ # V：第三人称潜入 Iris Infiltration
-│   └── iris-assault/    # VI：写实战斗庭院 Iris Assault
+│   ├── iris-assault/    # VI：写实战斗庭院 Iris Assault
+│   └── iris-voxel/      # VII：可玩体素沙盒 Iris Voxel
 └── ARCHITECTURE.md      # 架构设计文档
 ```
 
@@ -449,7 +450,7 @@ UI 与菜单框架实测（R41，`docs/ui_menu.png`）：3D 背景之上叠加**
 ## 用 Iris 做的游戏
 
 引擎的「真实用户」验证——只用公开 API（`iris-engine` 门面 + glam）拼完整游戏，
-**引擎侧零改动**。三作递进：Iris Collect 验证「能不能拼出来」，Iris Arena
+**引擎侧零改动**。多作递进：Iris Collect 验证「能不能拼出来」，Iris Arena
 压榨「蒙皮动画 × 对象池 × 弹道 × 多游戏状态」的高强度真实用法，Iris Bastion
 把 R21–R25 的五个新能力（射线拾取 / 蒙皮剔除统计 / 透明材质 / 粒子 / 空间
 音频）当载荷整体压榨一轮。
@@ -920,10 +921,34 @@ cargo run -p iris-assault --example assault_snapshot --release   # 战斗中段�
 cargo run -p iris-assault --example gen_assault_assets --release # 重新生成 GLB + pack
 ```
 
+### VII. Iris Voxel（`games/iris-voxel`）——可玩体素沙盒首版
+
+**Dogfooding VII**——类 Minecraft 的固定体素世界：8×8 个区块，每区块
+16×16×48 方块并全部常驻；确定性地形、面剔除区块网格、程序化纹理图集、
+第一人称胶囊碰撞、DDA 方块拾取、左键破坏与右键放置、目标框与快捷栏 HUD。
+
+纯逻辑在 `logic/`（只依赖 glam）：方块调色板、世界与区块、splitmix64
+地形、视角数学与 Amanatides–Woo DDA；`VoxelPlugin` 负责 ECS 接线。区块
+编辑后走 `MeshStore::update` 原地重建，句柄不增长；碰撞按区块只缓存
+暴露于空气的实心壳，玩家每步合并所在区块及 8 邻区块。渲染使用无光照
+材质与逐面顶点色明暗（复用顶点色扩展），避免 Lit 材质在方块表面产生
+镜面高光；程序化图集带 2 像素 gutter，mip 与各向异性通过 `MipSettings`
+开启。
+
+首版边界：没有天空光与方块光传播、没有存档、没有区块流式加载，也没有
+洞穴、树木、水体与生物；后续路线见 `MINECRAFT-GAPS.md`。
+
+![体素世界验收](docs/voxel.png)
+
+```sh
+cargo run -p iris-voxel --release                  # 左键捕获/挖掘，右键放置，1-6 或滚轮选块，Esc 释放后再退出
+cargo run -p iris-voxel --example voxel_snapshot --release   # 三视角离屏验收图
+```
+
 ## 测试
 
 ```sh
-cargo test --workspace   # 1854 项测试（release 1851 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
+cargo test --workspace   # 1907 项测试（release 1904 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
 
 集成测试在真实 GPU 上离屏渲染并校验像素（无 GPU 环境自动跳过），覆盖：

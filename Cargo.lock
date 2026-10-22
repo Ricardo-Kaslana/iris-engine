@@ -1169,6 +1169,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-voxel"
+version = "0.1.3"
+dependencies = [
+ "glam",
+ "iris-core",
+ "iris-engine",
+ "log",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

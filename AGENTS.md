@@ -17,7 +17,7 @@ crate 布局（依赖自上而下）：
 | `iris-render` | wgpu 渲染：PBR + 法线/ORM、CSM + 点光预算化阴影、TAA、烘焙 GI（光照贴图）、反射探针 + SSR、heightmap 地形、粒子、贴花、后处理链（DOF/MB/泛光/FXAA）、动画 v4、GLB、RTT、遮挡剔除 |
 | `iris-engine` | 插件编排（DefaultPlugins）/ App / 场景与**关卡格式 v2** / GltfBuilder / pack 打包 / AssetMount / manifest 优先级异步加载 / 演出时间线 / UI 菜单 / Settings / GLB 动画注册表 |
 | `iris-editor` | 关卡摆放编辑器（**编辑命令层 + 交互壳分离**——命令层全部可 headless 单测；undo / 光源编辑 / 烘焙入口 / 导航可视化） |
-| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` `iris-assault` | 六个 dogfooding 游戏，位于根级 `games/`（引擎 crate 在 `crates/`，目录分离）（结构范式：`logic.rs` 纯核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example） |
+| `iris-game` `iris-arena` `iris-bastion` `iris-ascent` `iris-infiltration` `iris-assault` `iris-voxel` | 七个 dogfooding 游戏，位于根级 `games/`（引擎 crate 在 `crates/`，目录分离）（结构范式：纯逻辑核心 + `plugin.rs` 插件层 + headless 测试 + 快照 example；iris-voxel 的逻辑在 `src/logic/`） |
 
 **架构与特性全景唯一权威是 `ARCHITECTURE.md`**（§1–§8），改任何子系统前先读对应章节；`§8 已知限制` 是诚实清单，别把已声明的限制当 bug 修。历史脉络（逐轮做了什么）在 `CHANGELOG.md` 与 git log，不依赖会话记忆。
 
@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1854 / release 1851**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1907 / release 1904**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
 
 ### 门禁执行铁律（实测案例全文见 PLAYBOOK §1/§2）
 

@@ -1,0 +1,16 @@
+[package]
+name = "iris-voxel"
+description = "Iris 引擎下游体素沙盒：固定世界、区块面剔除网格、第一人称挖掘与放置（dogfooding——只用引擎公开 API）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# 依赖纪律：纯逻辑只依赖 glam，插件层只依赖引擎门面 iris-engine
+# 与 iris-core 的公开类型；不直接依赖 iris-render / winit。
+[dependencies]
+iris-core = { workspace = true }
+iris-engine = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }

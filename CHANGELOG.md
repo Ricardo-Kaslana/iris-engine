@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+### Added（游戏：iris-voxel 可玩体素核心）
+
+新增 dogfooding 游戏 crate `games/iris-voxel`，并登记为 workspace 成员与
+workspace 依赖。世界固定为 8×8 个区块，每区块 16×16×48 方块且全部常驻；
+确定性地形使用 splitmix64 派生的两倍频值噪声，出生点周围压平出平台并
+向自然高度过渡，低海拔表层为沙，其余为草。
+
+纯逻辑放在 `src/logic/`（只依赖 glam）：方块调色板与六面图集槽位、区块
+存储与跨界编辑脏列表、地形生成、玩家视角与移动数学、Amanatides–Woo
+体素 DDA。`VoxelPlugin` 负责引擎接线：启动时生成世界、纹理图集、共享
+材质、64 个区块实体、目标框与 HUD；左键请求鼠标捕获，捕获后读取原始
+鼠标位移控制视角；WASD 与空格经 `move_and_slide_statics` 驱动胶囊；
+左键破坏、右键在命中面相邻格放置，数字键与滚轮切换快捷栏。
+
+区块网格按面剔除生成，跨区块相邻面读取邻区块数据；编辑后按脏区块列表
+调用 `MeshStore::update` 原地重建网格与碰撞壳，句柄不增长，边界编辑会
+同时重建相邻区块。碰撞按区块只缓存暴露于空气的实心方块，玩家每步合并
+3×3 邻域，世界四周有不可见边界墙。渲染使用无光照材质与逐面顶点色
+明暗，避免 Lit 材质在方块表面产生镜面高光；程序化图集每槽带 2 像素
+gutter，并开启 `MipSettings` 的 mip 与各向异性过滤。
+
+测试新增 45 项纯逻辑与网格单测、8 项 headless 集成测试；门禁对账基线
+为 debug 1907 / release 1904，较上一基线各增 53 项。离屏验收图
+`docs/voxel.png` 由 `examples/voxel_snapshot.rs` 生成，包含出生点远景、
+编辑后的木板墙近景与空中俯瞰。首版边界（无光照传播、存档、流式加载、
+洞穴与生物）记录在 ARCHITECTURE §8.78 与 `MINECRAFT-GAPS.md`。
+
 ### Added（引擎：第一人称鼠标捕获与原始输入）
 
 `iris_platform::input` 新增 `MouseCapture` 资源，作为游戏侧的光标捕获
