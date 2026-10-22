@@ -1,7 +1,7 @@
 //! 插件系统：以可组合的方式向 `App` 注入资源与配置。
 
 use iris_core::prelude::Time;
-use iris_platform::input::Input;
+use iris_platform::input::{Input, MouseCapture};
 use iris_platform::window::WindowConfig;
 use iris_render::prelude::{Camera, DirectionalLight, MaterialStore, MeshStore, TextureStore};
 
@@ -75,13 +75,14 @@ impl Plugin for TimePlugin {
     }
 }
 
-/// 输入资源插件。
+/// 输入资源插件：插入 [`Input`] 与 [`MouseCapture`]。
 #[derive(Default)]
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.world.insert_resource(Input::new());
+        app.world.insert_resource(MouseCapture::new());
     }
 }
 

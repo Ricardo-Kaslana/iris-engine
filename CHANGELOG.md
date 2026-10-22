@@ -5,6 +5,34 @@
 
 ## [Unreleased]
 
+### Added（引擎：第一人称鼠标捕获与原始输入）
+
+`iris_platform::input` 新增 `MouseCapture` 资源，作为游戏侧的光标捕获
+请求。系统调用 `request(true)` 表达捕获意图，主循环在帧末结算：先尝试
+`CursorGrabMode::Locked`，失败再尝试 `Confined`，成功后隐藏指针；两种
+模式都不可用时保持绝对鼠标模式并记录告警。请求按代际结算，重复设置
+相同目标状态不会重复抓取，`retry` 用于捕获被浏览器等外部原因中断后
+重新尝试。窗口失焦与挂起释放抓取并恢复指针显示，焦点恢复后若请求仍在
+则自动重新抓取。
+
+`Input` 新增相对模式。捕获生效期间，`mouse_delta` 改由
+`DeviceEvent::MouseMotion` 的原始设备运动累积，`CursorMoved` 只更新
+光标位置，不再折算位移，同一段移动不会被计两次；未捕获时仍按光标
+位置差分，单位是物理像素。两个模式切换会清空本帧待消费位移与光标
+差分基准，捕获瞬间的指针归位不产生视角跳变，释放后第一次光标事件只
+重建基准。主循环以 `DeviceEvents::WhenFocused` 接收原始运动，并在
+捕获生效时把事件写入 `Input`。
+
+`InputPlugin` 与 `DefaultPlugins` 自动插入 `MouseCapture`。该资源缺省
+不请求捕获，既有游戏与 headless 测试的输入行为、像素输出与引入前
+逐位一致。新增 `crates/iris-engine/examples/first_person.rs` 示范左键
+捕获、WASD 相对移动、Esc 释放后再按退出的完整第一人称控制。
+
+测试新增 5 项平台输入单测：相对模式只消费原始运动、进入与退出相对
+模式清空位移基准、失焦清空保持相对模式、捕获请求代际与重试语义。
+门禁对账基线为 debug 1854 / release 1851，较上一基线各增 5 项。
+实现与边界见 ARCHITECTURE §6.1 与 §8.77。
+
 ### Added（引擎：网格与纹理动态生命周期）
 
 `MeshStore` 与 `TextureStore` 从只增目录改为槽位表，支持逐句柄原地更新与

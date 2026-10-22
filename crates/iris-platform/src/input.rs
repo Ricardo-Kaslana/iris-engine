@@ -23,12 +23,23 @@
 //! 玩法状态，如 grounded / 冷却 / 弹匣），否则边沿。电平 + 门控还天然
 //! 解耦了「输入采集」与「动作判定」：纯逻辑核心只收 `bool` 字段，不
 //! 依赖边沿的帧序约定，headless 测试与回放注入更简单。
+//!
+//! # 第一人称鼠标捕获
+//!
+//! [`MouseCapture`] 是游戏侧发起、主循环结算的光标捕获请求。捕获生效
+//! 期间指针被锁定或限制在窗口内并隐藏，[`Input`] 进入相对模式：
+//! `mouse_delta` 只累积原始设备运动（winit `DeviceEvent::MouseMotion`），
+//! 不再由光标位置差分产生；释放后首次光标事件只重建差分基准，不产生
+//! 视角跳变。两个模式切换的入口仅由主循环调用
+//! [`Input::set_relative`]，游戏系统读 [`Input::is_relative`] 即可区分
+//! 位移口径。
 
 use std::collections::HashSet;
 
 use iris_core::Resource;
 use winit::event::{ElementState, MouseButton};
 use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::CursorGrabMode;
 
 /// 键鼠输入状态（World 资源）。
 #[derive(Default, Resource)]
@@ -43,6 +54,9 @@ pub struct Input {
     wheel_delta: f32,
     cursor: Option<(f64, f64)>,
     last_cursor: Option<(f64, f64)>,
+    /// 相对模式（捕获生效期间由主循环置位）：位移只来自原始设备运动，
+    /// 光标位置差分停用。见模块文档「第一人称鼠标捕获」。
+    relative: bool,
 }
 
 impl Input {
@@ -89,9 +103,15 @@ impl Input {
         self.mouse_released.contains(&button)
     }
 
-    /// 本帧累计鼠标位移（物理像素）。
+    /// 本帧累计鼠标位移。未捕获时是光标位置差分的物理像素；捕获时是
+    /// 原始设备运动计数（单位依设备而定，游戏侧自行乘灵敏度）。
     pub fn mouse_delta(&self) -> (f64, f64) {
         self.mouse_delta
+    }
+
+    /// 是否处于相对鼠标模式（[`MouseCapture`] 捕获生效期间为真）。
+    pub fn is_relative(&self) -> bool {
+        self.relative
     }
 
     /// 本帧累计滚轮滚动量（像素模式为像素，行模式按每行 40 归一）。
@@ -105,6 +125,18 @@ impl Input {
     }
 
     // ---- 事件注入（由平台事件循环调用） ----
+
+    /// 切换相对鼠标模式（主循环在捕获状态变化时调用；游戏系统不应
+    /// 直接调用）。切换瞬间清空本帧位移与光标差分基准：捕获时指针的
+    /// 瞬移不产生视角跳变，释放后首次光标事件只重建基准。
+    pub fn set_relative(&mut self, relative: bool) {
+        if self.relative == relative {
+            return;
+        }
+        self.relative = relative;
+        self.mouse_delta = (0.0, 0.0);
+        self.last_cursor = None;
+    }
 
     /// 便捷注入：按下键。等价 `on_key(key.into(), ElementState::Pressed)`，
     /// 测试与工具脚本无须手构 winit 事件类型（`KeyCode` 可直接传入，
@@ -150,6 +182,9 @@ impl Input {
         }
     }
 
+    /// 注入原始设备位移（winit `DeviceEvent::MouseMotion`）。主循环只在
+    /// 相对模式下行调用它；headless 测试可随时注入以模拟拖拽。单位依
+    /// 设备而定，通常为鼠标计数而非物理像素。
     pub fn on_mouse_motion(&mut self, delta: (f64, f64)) {
         self.mouse_delta.0 += delta.0;
         self.mouse_delta.1 += delta.1;
@@ -160,16 +195,20 @@ impl Input {
     }
 
     pub fn on_cursor_moved(&mut self, position: (f64, f64)) {
-        // 相对位移由光标位置差分得出（与上一事件位置比较）
-        if let Some(last) = self.last_cursor {
-            self.mouse_delta.0 += position.0 - last.0;
-            self.mouse_delta.1 += position.1 - last.1;
+        // 未捕获：相对位移由光标位置差分得出（与上一事件位置比较）。
+        // 捕获：同一段移动已由原始运动事件计入，差分必须停用否则翻倍。
+        if !self.relative {
+            if let Some(last) = self.last_cursor {
+                self.mouse_delta.0 += position.0 - last.0;
+                self.mouse_delta.1 += position.1 - last.1;
+            }
         }
         self.last_cursor = Some(position);
         self.cursor = Some(position);
     }
 
-    /// 帧末清除一次性状态。「按住」集合、光标位置与差分基准保留。
+    /// 帧末清除一次性状态。「按住」集合、光标位置、差分基准与相对模式
+    /// 保留（相对模式由主循环随捕获状态显式切换）。
     pub fn end_frame(&mut self) {
         self.keys_pressed.clear();
         self.keys_released.clear();
@@ -179,7 +218,8 @@ impl Input {
         self.wheel_delta = 0.0;
     }
 
-    /// 窗口失焦时清空全部状态（防止按键卡死、位移跳变）。
+    /// 窗口失焦时清空全部状态（防止按键卡死、位移跳变）。相对模式
+    /// 保持不变——主循环在释放捕获时显式关闭它。
     pub fn clear_all(&mut self) {
         self.keys_held.clear();
         self.keys_pressed.clear();
@@ -190,6 +230,80 @@ impl Input {
         self.mouse_delta = (0.0, 0.0);
         self.wheel_delta = 0.0;
         self.last_cursor = None;
+    }
+}
+
+/// 第一人称鼠标捕获请求（World 资源，`InputPlugin` / `DefaultPlugins`
+/// 自动插入）。
+///
+/// 游戏系统调用 [`MouseCapture::request`] 表达意图，主循环在本帧渲染后
+/// 结算：按 `Locked` → `Confined` 顺序尝试光标抓取，成功则隐藏指针并
+/// 把 [`Input`] 切到相对模式；两者都失败（平台不支持或浏览器拒绝指针
+/// 锁定）时保持未生效状态，输入留在绝对模式，游戏可据
+/// [`MouseCapture::is_active`] 自行降级。重复调用 `request` 只在目标
+/// 状态变化时生效；捕获被外部原因中断后（典型是浏览器强制退出指针
+/// 锁定）可用 [`MouseCapture::retry`] 重新尝试。
+///
+/// 窗口失焦时主循环释放抓取并恢复指针显示，焦点回来后若请求仍在则
+/// 重新结算；因此游戏只需表达「我现在想捕获」，不必追踪焦点。
+///
+/// 捕获状态在帧末结算，当帧的系统写入要到下一帧才对输入生效（约一帧
+/// 延迟，肉眼不可见）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
+pub struct MouseCapture {
+    requested: bool,
+    active: bool,
+    mode: Option<CursorGrabMode>,
+    generation: u64,
+}
+
+impl MouseCapture {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 请求或撤销捕获。目标状态与当前请求一致时不产生新代际
+    /// （避免每帧重复抓取）；`true` 表示希望捕获，是否成功读
+    /// [`MouseCapture::is_active`]。
+    pub fn request(&mut self, capture: bool) {
+        if self.requested != capture {
+            self.requested = capture;
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    /// 强制重新结算当前请求：用于捕获被平台外部中断后（web 指针锁定
+    /// 被浏览器退出）重新尝试，同样适用于切换全屏 / 窗口模式后。
+    /// 未请求捕获时调用只会重新结算一次释放状态，不会进入捕获。
+    pub fn retry(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// 是否希望捕获（主循环据此结算）。
+    pub fn is_requested(&self) -> bool {
+        self.requested
+    }
+
+    /// 捕获是否实际生效（光标已抓取且 [`Input`] 处于相对模式）。
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// 实际生效的抓取模式；未捕获或平台不支持时为 `None`。
+    pub fn grab_mode(&self) -> Option<CursorGrabMode> {
+        self.mode
+    }
+
+    /// 请求代际（主循环据此判断是否需要重新结算）。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 主循环写回实际生效状态（游戏系统不应调用）。`None` 表示释放或
+    /// 抓取失败。
+    pub fn set_applied(&mut self, mode: Option<CursorGrabMode>) {
+        self.active = mode.is_some();
+        self.mode = mode;
     }
 }
 
@@ -305,5 +419,111 @@ mod tests {
         // 失焦后重新移动鼠标：从新位置重新建立基准，不产生跳变
         input.on_cursor_moved((200.0, 200.0));
         assert_eq!(input.mouse_delta(), (0.0, 0.0));
+    }
+
+    /// 相对模式：光标位置照常记录，但不折算位移；位移只来自原始运动
+    /// 事件，避免同一段移动被差分与原始输入计两次。
+    #[test]
+    fn relative_mode_uses_raw_motion_not_cursor_deltas() {
+        let mut input = Input::new();
+        input.set_relative(true);
+        input.on_cursor_moved((100.0, 100.0));
+        input.on_cursor_moved((160.0, 130.0));
+        assert_eq!(
+            input.mouse_delta(),
+            (0.0, 0.0),
+            "捕获期间光标位置不再折算位移"
+        );
+        assert_eq!(
+            input.cursor_position(),
+            Some((160.0, 130.0)),
+            "光标位置照常记录"
+        );
+
+        input.on_mouse_motion((6.0, -4.0));
+        input.on_mouse_motion((-2.0, 1.0));
+        assert_eq!(input.mouse_delta(), (4.0, -3.0), "原始运动逐事件累加");
+        input.end_frame();
+        assert_eq!(input.mouse_delta(), (0.0, 0.0));
+    }
+
+    /// 退出相对模式：本帧待消费位移清空，光标差分基准重建
+    /// （释放捕获后指针的瞬移不产生视角跳变）。
+    #[test]
+    fn leaving_relative_mode_rebuilds_cursor_baseline() {
+        let mut input = Input::new();
+        input.set_relative(true);
+        input.on_cursor_moved((100.0, 100.0));
+        input.on_mouse_motion((8.0, 2.0));
+        input.set_relative(false);
+        assert_eq!(input.mouse_delta(), (0.0, 0.0), "模式切换清空待消费位移");
+
+        input.on_cursor_moved((400.0, 400.0));
+        assert_eq!(input.mouse_delta(), (0.0, 0.0), "首次光标事件只重建基准");
+        input.on_cursor_moved((410.0, 404.0));
+        assert_eq!(input.mouse_delta(), (10.0, 4.0), "之后恢复光标差分");
+    }
+
+    /// 进入相对模式：未消费的光标差分与旧基准一并清空，捕获瞬间的
+    /// 指针归位不计入视角。
+    #[test]
+    fn entering_relative_mode_clears_pending_delta() {
+        let mut input = Input::new();
+        input.on_cursor_moved((100.0, 100.0));
+        input.on_cursor_moved((110.0, 105.0));
+        assert_eq!(input.mouse_delta(), (10.0, 5.0));
+
+        input.set_relative(true);
+        assert_eq!(input.mouse_delta(), (0.0, 0.0));
+        input.on_cursor_moved((900.0, 900.0));
+        assert_eq!(input.mouse_delta(), (0.0, 0.0), "捕获后光标事件不产生位移");
+        input.on_mouse_motion((3.0, 3.0));
+        assert_eq!(input.mouse_delta(), (3.0, 3.0));
+    }
+
+    /// 失焦清空不改变相对模式：主循环先释放捕获再清空输入，顺序由
+    /// App 负责；Input 自身不擅自退出捕获口径。
+    #[test]
+    fn focus_clear_keeps_relative_mode() {
+        let mut input = Input::new();
+        input.set_relative(true);
+        input.on_mouse_motion((5.0, 5.0));
+        input.clear_all();
+        assert!(input.is_relative());
+        assert_eq!(input.mouse_delta(), (0.0, 0.0));
+    }
+
+    /// 捕获请求的代际语义：目标状态变化才换代；重复请求幂等；
+    /// `retry` 强制换代以重新结算；`set_applied` 只写生效态。
+    #[test]
+    fn mouse_capture_request_lifecycle() {
+        let mut capture = MouseCapture::new();
+        assert!(!capture.is_requested());
+        assert!(!capture.is_active());
+        assert_eq!(capture.grab_mode(), None);
+        let base = capture.generation();
+
+        capture.request(true);
+        assert!(capture.is_requested());
+        assert!(!capture.is_active(), "请求不等于生效");
+        assert_eq!(capture.generation(), base + 1);
+
+        capture.request(true);
+        assert_eq!(capture.generation(), base + 1, "重复请求不换代");
+
+        capture.retry();
+        assert_eq!(capture.generation(), base + 2, "retry 强制重新结算");
+
+        capture.set_applied(Some(CursorGrabMode::Locked));
+        assert!(capture.is_active());
+        assert_eq!(capture.grab_mode(), Some(CursorGrabMode::Locked));
+
+        capture.set_applied(None);
+        assert!(!capture.is_active(), "抓取失败或释放后不生效");
+        assert_eq!(capture.grab_mode(), None);
+
+        capture.request(false);
+        assert!(!capture.is_requested());
+        assert_eq!(capture.generation(), base + 3);
     }
 }

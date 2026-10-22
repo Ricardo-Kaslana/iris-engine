@@ -22,12 +22,13 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 use iris_core::prelude::{AppExit, Instant, Schedule, Stage, System, Time, World};
-use iris_platform::input::Input;
+use iris_platform::input::{Input, MouseCapture};
 use iris_platform::window::{WindowConfig, WindowHandle};
 use iris_render::surface::SurfaceKit;
 use winit::application::ApplicationHandler;
-use winit::event::{MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event::{DeviceEvent, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, DeviceEvents, EventLoop};
+use winit::window::CursorGrabMode;
 
 use crate::plugin::{Plugin, Viewport};
 
@@ -110,6 +111,10 @@ impl App {
             window: None,
             surface: None,
             startup_done: false,
+            // 初始视为聚焦：部分平台在窗口创建后不派发 Focused(true)，
+            // 由首个失焦事件纠正。
+            focused: true,
+            capture_generation: None,
             // 平台原因（wasm32）：GPU 初始化改走逐帧驱动的异步未来
             #[cfg(target_arch = "wasm32")]
             surface_init: None,
@@ -123,6 +128,11 @@ struct Runner {
     window: Option<WindowHandle>,
     surface: Option<SurfaceKit>,
     startup_done: bool,
+    /// 窗口是否聚焦。失焦时释放鼠标捕获，恢复后按当前请求重新结算。
+    focused: bool,
+    /// 已结算的 [`MouseCapture`] 请求代际；`None` 表示需要重新结算
+    /// （首次运行 / 焦点变化 / 捕获被外部释放）。
+    capture_generation: Option<u64>,
     /// 平台原因（wasm32）：GPU 适配器 / 设备请求是 JS Promise，无法阻塞
     /// 等待，`SurfaceKit` 的初始化只能异步进行。这里暂存待驱动的初始化
     /// 未来，由每帧 `tick` 推进一步（Promise 在帧间由 JS 微任务队列 resolve）。
@@ -158,39 +168,131 @@ impl Runner {
         #[cfg(target_arch = "wasm32")]
         self.poll_surface_init();
 
-        let Some(surface) = &mut self.surface else {
+        if self.surface.is_none() {
             return;
-        };
-        let world = &mut self.app.world;
-
-        // 1. 帧首事件轮换（上帧事件降级为仍可读的上一代、更早一代丢弃
-        //    ——PostUpdate 产出的事件本帧 Update 全程可读，见 event 生命周期）
-        world.clear_all_events();
-
-        // 2. 时间推进（时间资源缺失时按无时间模式运行）
-        if let Some(mut time) = world.try_resource_mut::<Time>() {
-            // 跨平台封装 Instant：wasm 上 std::time::Instant 运行时 panic
-            time.begin_frame(Instant::now());
         }
 
-        // 3. FixedUpdate × N -> Update -> PostUpdate（见 run_update_stages）
-        run_update_stages(&mut self.app.schedule, world);
+        // 世界与表面分开借用（`self.app.world` 与 `self.surface` 是
+        // 不相交字段）；块结束时世界借用归还，供捕获结算与退出检查使用。
+        {
+            let world = &mut self.app.world;
 
-        // 4. 渲染 + 呈现
-        surface.render(world);
+            // 1. 帧首事件轮换（上帧事件降级为仍可读的上一代、更早一代丢弃
+            //    ——PostUpdate 产出的事件本帧 Update 全程可读，见 event 生命周期）
+            world.clear_all_events();
 
-        // 5. 帧收尾：输入一次性状态清零
-        if let Some(mut input) = world.try_resource_mut::<Input>() {
-            input.end_frame();
+            // 2. 时间推进（时间资源缺失时按无时间模式运行）
+            if let Some(mut time) = world.try_resource_mut::<Time>() {
+                // 跨平台封装 Instant：wasm 上 std::time::Instant 运行时 panic
+                time.begin_frame(Instant::now());
+            }
+
+            // 3. FixedUpdate × N -> Update -> PostUpdate（见 run_update_stages）
+            run_update_stages(&mut self.app.schedule, world);
+
+            // 4. 渲染 + 呈现
+            if let Some(surface) = &mut self.surface {
+                surface.render(world);
+            }
+
+            // 5. 帧收尾：输入一次性状态清零
+            if let Some(mut input) = world.try_resource_mut::<Input>() {
+                input.end_frame();
+            }
         }
+
+        // 5.5 鼠标捕获结算：本帧系统写入的请求在渲染后生效，下一帧
+        //     输入即处于对应模式（见 sync_mouse_capture 注释）。
+        self.sync_mouse_capture();
 
         // 6. 退出检查：读本帧产出的事件（Update 与 PostUpdate 发出的
         //    AppExit 都能被读到——调序前退出检查在清空之后、恒读空）。
         //    下一帧帧首的轮换会再给一次读取机会（双代窗口），正常路径
         //    本帧即可退出。
-        if world.try_events::<AppExit>().is_some_and(|e| !e.is_empty()) {
+        if self
+            .app
+            .world
+            .try_events::<AppExit>()
+            .is_some_and(|e| !e.is_empty())
+        {
             event_loop.exit();
         }
+    }
+
+    /// 结算 [`MouseCapture`] 请求：请求代际变化时先尝试 `Locked`，失败
+    /// 再尝试 `Confined`，两者都失败则保持绝对鼠标模式并告警。成功时隐藏指针并把
+    /// [`Input`] 切到相对模式；释放时恢复指针并退回光标差分。
+    ///
+    /// 代际相同即跳过，避免每帧重复系统调用。抓取失败同样记为已结算：
+    /// 游戏可用 [`MouseCapture::retry`]（或再次 `request`）重新尝试。
+    fn sync_mouse_capture(&mut self) {
+        let Some(mut capture) = self.app.world.try_resource_mut::<MouseCapture>() else {
+            return;
+        };
+        let generation = capture.generation();
+        if self.capture_generation == Some(generation) {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        self.capture_generation = Some(generation);
+
+        let requested = capture.is_requested() && self.focused;
+        let mode = if requested {
+            Self::grab_cursor(&window)
+        } else {
+            None
+        };
+        if mode.is_some() {
+            window.set_cursor_visible(false);
+        } else {
+            // 释放与抓取失败共用：确保不残留抓取或隐藏指针。
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+        capture.set_applied(mode);
+        drop(capture);
+
+        if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
+            input.set_relative(mode.is_some());
+        }
+    }
+
+    /// 先尝试 `Locked`，失败再尝试 `Confined`。前者在 Windows、macOS 与
+    /// web（Pointer Lock）可用，后者覆盖 X11 等 `Locked` 不可用的平台；
+    /// 两者都失败时返回 `None`（移动端与无权限的浏览器）。
+    fn grab_cursor(window: &WindowHandle) -> Option<CursorGrabMode> {
+        match window.set_cursor_grab(CursorGrabMode::Locked) {
+            Ok(()) => Some(CursorGrabMode::Locked),
+            Err(locked) => match window.set_cursor_grab(CursorGrabMode::Confined) {
+                Ok(()) => Some(CursorGrabMode::Confined),
+                Err(confined) => {
+                    log::warn!(
+                        "鼠标捕获不可用（Locked: {locked}; Confined: {confined}），\
+                         保持绝对鼠标模式"
+                    );
+                    None
+                }
+            },
+        }
+    }
+
+    /// 释放抓取并恢复指针显示、绝对输入口径与待结算代际（焦点恢复后
+    /// 重新按请求抓取）。
+    fn release_mouse_capture(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
+        if let Some(mut capture) = self.app.world.try_resource_mut::<MouseCapture>() {
+            capture.set_applied(None);
+        }
+        if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
+            input.set_relative(false);
+        }
+        self.capture_generation = None;
     }
 
     /// 平台原因（wasm32）：逐帧驱动异步 GPU 初始化未来。
@@ -229,6 +331,12 @@ impl Runner {
 
 impl ApplicationHandler for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // 原始设备运动只在窗口聚焦时派发（捕获期间的 `mouse_delta`
+        // 数据源；`WhenFocused` 与 winit 缺省一致，显式声明契约）。
+        event_loop.listen_device_events(DeviceEvents::WhenFocused);
+        // 从挂起 / 最小化恢复：按当前请求重新结算捕获
+        self.focused = true;
+        self.capture_generation = None;
         if self.window.is_some() {
             return;
         }
@@ -274,6 +382,9 @@ impl ApplicationHandler for Runner {
         if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
             input.clear_all();
         }
+        // 挂起期间不保留光标抓取；恢复后由代际重置重新结算
+        self.focused = false;
+        self.release_mouse_capture();
     }
 
     fn window_event(
@@ -327,13 +438,43 @@ impl ApplicationHandler for Runner {
                     input.on_cursor_moved((position.x, position.y));
                 }
             }
-            WindowEvent::Focused(false) => {
-                if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
-                    input.clear_all();
+            WindowEvent::Focused(focused) => {
+                if is_main {
+                    self.focused = focused;
+                    if focused {
+                        // 焦点回来后按当前请求重新结算（alt-tab 往返
+                        // 不丢失捕获意图）
+                        self.capture_generation = None;
+                    } else {
+                        if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
+                            input.clear_all();
+                        }
+                        self.release_mouse_capture();
+                    }
                 }
             }
             WindowEvent::RedrawRequested if is_main => self.tick(event_loop),
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        // 原始鼠标运动只在捕获（相对模式）期间计入位移：未捕获的窗口
+        // 里同一段移动已由 CursorMoved 差分计入，再累加会翻倍。
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.window.is_none() {
+                return;
+            }
+            if let Some(mut input) = self.app.world.try_resource_mut::<Input>() {
+                if input.is_relative() {
+                    input.on_mouse_motion(delta);
+                }
+            }
         }
     }
 
