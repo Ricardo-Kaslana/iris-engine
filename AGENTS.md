@@ -4,7 +4,7 @@
 
 ## 项目是什么
 
-Rust 游戏引擎（workspace 版本 0.1.3），核心卖点：**跨平台（native + wasm32）、内存安全（全库零 unsafe）、确定性（物理/模拟/渲染 bit 级可复现）、低占用、中文文档**。技术栈：wgpu 30 + winit 0.30 + 自研稀疏集 ECS + glam 0.33。
+Rust 游戏引擎（workspace 版本 0.1.4），核心卖点：**跨平台（native + wasm32）、内存安全（全库零 unsafe）、确定性（物理/模拟/渲染 bit 级可复现）、低占用、中文文档**。技术栈：wgpu 30 + winit 0.30 + 自研稀疏集 ECS + glam 0.33。
 
 crate 布局（依赖自上而下）：
 

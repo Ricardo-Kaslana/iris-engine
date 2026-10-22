@@ -32,6 +32,8 @@ gutter，并开启 `MipSettings` 的 mip 与各向异性过滤。
 编辑后的木板墙近景与空中俯瞰。首版边界（无光照传播、存档、流式加载、
 洞穴与生物）记录在 ARCHITECTURE §8.78 与 `MINECRAFT-GAPS.md`。
 
+## [0.1.4] - 2026-10-22
+
 ### Added（引擎：第一人称鼠标捕获与原始输入）
 
 `iris_platform::input` 新增 `MouseCapture` 资源，作为游戏侧的光标捕获
