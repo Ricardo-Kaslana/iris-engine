@@ -1,21 +1,26 @@
 //! 区块网格生成与目标框网格。
 //!
-//! 逐方块检查六个面，只有相邻格非实心时才发射该面。相邻查询走
-//! [`VoxelWorld::block`]，因此区块边界处会读取邻区块数据，接缝不会
-//! 多出一层面。顶点使用区块局部坐标，实体的 `Transform` 放在区块
-//! 原点。
+//! 逐方块检查六个面，只有相邻格不遮蔽时才发射该面。遮蔽的判据是
+//! [`Block::is_opaque`] 而不是 `is_solid`：树叶是裁切方块，树叶与树叶
+//! 之间不互相剔除，树叶旁边的石头也照常发射面——否则透过叶隙会看到
+//! 背面剔除留下的空洞。相邻查询走 [`VoxelWorld::block`]，因此区块边界
+//! 处会读取邻区块数据，接缝不会多出一层面。顶点使用区块局部坐标，
+//! 实体的 `Transform` 放在区块原点。
+//!
+//! 方块分两套网格：不透明方块进 [`ChunkMeshes::opaque`]，树叶进
+//! [`ChunkMeshes::cutout`]，后者用带 alpha 测试的材质绘制。
 //!
 //! 每个面的四个顶点独立采样平滑光照与 AO：在面外一格取前向格、两个
-//! 切向边格与对角格，环境光遮蔽由后三格的实心性决定，光照只平均空气
-//! 格（不透明格不参与，避免与 AO 双重变暗），再与逐面明暗一起经整数
-//! 查表合成顶点色。
+//! 切向边格与对角格，环境光遮蔽由后三格的不透明性决定，光照只平均
+//! 透光格（空气与树叶；不透明格不参与，避免与 AO 双重变暗），再与
+//! 逐面明暗一起经整数查表合成顶点色。
 
 use glam::{IVec2, IVec3};
 use iris_engine::prelude::{MeshData, Vertex, VertexColor};
 
 use crate::atlas::tile_uv;
 use crate::logic::block::{Block, Face, Tile};
-use crate::logic::light::vertex_rgb;
+use crate::logic::light::{block_tint, tint_rgb, vertex_rgb};
 use crate::logic::world::{CHUNK_HEIGHT, CHUNK_SIZE, VoxelWorld};
 
 struct FaceDef {
@@ -105,11 +110,21 @@ const FACES: [FaceDef; 6] = [
     },
 ];
 
-/// 生成一个区块的可见面网格（局部坐标）。区块坐标越界时返回空网格。
-pub fn build_chunk_mesh(world: &VoxelWorld, coord: IVec2) -> MeshData {
-    let mut mesh = MeshData::default();
+/// 一个区块的两套网格：不透明方块与裁切方块（树叶）。
+///
+/// 空分区是常态：多数区块没有树，`cutout` 会是空网格，接线层据此把
+/// 对应的实体隐藏掉，不产生空绘制。
+#[derive(Default)]
+pub struct ChunkMeshes {
+    pub opaque: MeshData,
+    pub cutout: MeshData,
+}
+
+/// 生成一个区块的两套可见面网格（局部坐标）。区块坐标越界时返回空网格。
+pub fn build_chunk_meshes(world: &VoxelWorld, coord: IVec2) -> ChunkMeshes {
+    let mut meshes = ChunkMeshes::default();
     let Some(chunk) = world.chunk(coord) else {
-        return mesh;
+        return meshes;
     };
     let origin_x = coord.x * CHUNK_SIZE as i32;
     let origin_z = coord.y * CHUNK_SIZE as i32;
@@ -123,6 +138,11 @@ pub fn build_chunk_mesh(world: &VoxelWorld, coord: IVec2) -> MeshData {
                 }
                 let world_x = origin_x + x as i32;
                 let world_z = origin_z + z as i32;
+                let target = if block.is_cutout() {
+                    &mut meshes.cutout
+                } else {
+                    &mut meshes.opaque
+                };
                 for face in &FACES {
                     let n = face.normal;
                     let neighbour = glam::IVec3::new(
@@ -130,11 +150,11 @@ pub fn build_chunk_mesh(world: &VoxelWorld, coord: IVec2) -> MeshData {
                         y as i32 + n[1] as i32,
                         world_z + n[2] as i32,
                     );
-                    if world.block(neighbour).is_solid() {
+                    if world.block(neighbour).is_opaque() {
                         continue;
                     }
                     push_face(
-                        &mut mesh,
+                        target,
                         IVec3::new(world_x, y as i32, world_z),
                         [x as f32, y as f32, z as f32],
                         block,
@@ -145,7 +165,7 @@ pub fn build_chunk_mesh(world: &VoxelWorld, coord: IVec2) -> MeshData {
             }
         }
     }
-    mesh
+    meshes
 }
 
 fn push_face(
@@ -170,6 +190,7 @@ fn push_face(
     let tangent_b = (axis + 2) % 3;
     let front = block_pos + IVec3::new(normal[0] as i32, normal[1] as i32, normal[2] as i32);
     let light = world.light();
+    let tint = block_tint(block, block_pos);
 
     for (corner, uv) in face.corners.into_iter().zip(UVS) {
         let mut offset_a = [0i32; 3];
@@ -185,35 +206,36 @@ fn push_face(
                 offset_a[2] + offset_b[2],
             ]);
 
-        let blocked_a = world.block(side_a).is_solid();
-        let blocked_b = world.block(side_b).is_solid();
-        let blocked_corner = world.block(corner_cell).is_solid();
+        let blocked_a = world.block(side_a).is_opaque();
+        let blocked_b = world.block(side_b).is_opaque();
+        let blocked_corner = world.block(corner_cell).is_opaque();
         let ao = if blocked_a && blocked_b {
             0
         } else {
             3 - (blocked_a as u8 + blocked_b as u8 + blocked_corner as u8)
         };
 
-        // 前向格由面剔除保证是空气，至少有一个采样；不透明格不参与
-        // 平均，AO 已经单独表达了它们的遮蔽。
+        // 前向格由面剔除保证是透光格，至少有一个采样；不透明格不参与
+        // 平均，AO 已经单独表达了它们的遮蔽。树叶算透光格——它自己有
+        // 天空光等级，树冠内部的面才不会塌成全黑。
         let mut sky_sum = 0u16;
         let mut block_sum = 0u16;
         let mut samples = 0u16;
         for sample in [front, side_a, side_b, corner_cell] {
-            if !world.block(sample).is_solid() {
+            if world.block(sample).light_cost().is_some() {
                 sky_sum += light.sky(sample) as u16;
                 block_sum += light.block_light(sample) as u16;
                 samples += 1;
             }
         }
-        debug_assert!(samples > 0, "面的前向格必须是空气");
+        debug_assert!(samples > 0, "面的前向格必须透光");
         let sky = ((sky_sum + samples / 2) / samples) as u8;
         let mut block_light = ((block_sum + samples / 2) / samples) as u8;
         if block.emission() > 0 {
             // 光源自身面的亮度不应比邻格低一档。
             block_light = block_light.max(block.emission());
         }
-        let [r, g, b] = vertex_rgb(sky, block_light, face.shade, ao);
+        let [r, g, b] = tint_rgb(vertex_rgb(sky, block_light, face.shade, ao), tint);
 
         mesh.vertices.push(Vertex {
             position: [min[0] + corner[0], min[1] + corner[1], min[2] + corner[2]],
@@ -274,6 +296,11 @@ mod tests {
     use crate::logic::block::Block;
     use glam::IVec3;
 
+    /// 测试默认只看不透明分区；树叶分区由专门的用例读取。
+    fn opaque_mesh(world: &VoxelWorld, coord: IVec2) -> MeshData {
+        build_chunk_meshes(world, coord).opaque
+    }
+
     fn count_faces(mesh: &MeshData) -> usize {
         mesh.indices.len() / 6
     }
@@ -307,7 +334,7 @@ mod tests {
         let world = VoxelWorld::empty(1);
         for cz in 0..4 {
             for cx in 0..4 {
-                let mesh = build_chunk_mesh(&world, IVec2::new(cx, cz));
+                let mesh = opaque_mesh(&world, IVec2::new(cx, cz));
                 assert!(mesh.vertices.is_empty());
                 assert!(mesh.indices.is_empty());
             }
@@ -319,7 +346,7 @@ mod tests {
     fn single_block_has_six_faces() {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(5, 5, 5), Block::Stone);
-        let mesh = build_chunk_mesh(&world, IVec2::ZERO);
+        let mesh = opaque_mesh(&world, IVec2::ZERO);
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
         assert_eq!(count_faces(&mesh), 6);
@@ -331,8 +358,102 @@ mod tests {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(5, 5, 5), Block::Stone);
         world.set_block(IVec3::new(6, 5, 5), Block::Stone);
-        let mesh = build_chunk_mesh(&world, IVec2::ZERO);
+        let mesh = opaque_mesh(&world, IVec2::ZERO);
         assert_eq!(count_faces(&mesh), 10);
+    }
+
+    /// 树叶之间**不**互相剔除：树冠内部要留一层内表面，透过叶隙才看得
+    /// 到层叠的叶片而不是直穿过去的天空。矿石之间照旧剔除。
+    #[test]
+    fn leaves_do_not_cull_each_other() {
+        let mut world = VoxelWorld::empty(1);
+        world.set_block(IVec3::new(5, 5, 5), Block::Leaves);
+        world.set_block(IVec3::new(6, 5, 5), Block::Leaves);
+        let meshes = build_chunk_meshes(&world, IVec2::ZERO);
+        assert!(meshes.opaque.vertices.is_empty(), "树叶不进入不透明分区");
+        assert_eq!(
+            count_faces(&meshes.cutout),
+            12,
+            "相邻树叶的两个共享面都应发射"
+        );
+
+        let mut ores = VoxelWorld::empty(1);
+        ores.set_block(IVec3::new(5, 5, 5), Block::CoalOre);
+        ores.set_block(IVec3::new(6, 5, 5), Block::IronOre);
+        let mesh = opaque_mesh(&ores, IVec2::ZERO);
+        assert_eq!(count_faces(&mesh), 10, "相邻矿石的共享面应被剔除");
+    }
+
+    /// 不透明方块紧贴树叶时照常发射面：叶隙里能看到后面的石头。
+    #[test]
+    fn opaque_faces_are_not_culled_by_leaves() {
+        let mut world = VoxelWorld::empty(1);
+        world.set_block(IVec3::new(5, 5, 5), Block::Stone);
+        world.set_block(IVec3::new(6, 5, 5), Block::Leaves);
+        let meshes = build_chunk_meshes(&world, IVec2::ZERO);
+        assert_eq!(count_faces(&meshes.opaque), 6, "石头六面都要发射");
+        assert_eq!(
+            count_faces(&meshes.cutout),
+            5,
+            "树叶贴石头的那一面仍被石头遮蔽"
+        );
+    }
+
+    /// 独立树叶方块进裁切分区，且六面都在。
+    #[test]
+    fn leaves_go_to_the_cutout_partition() {
+        let mut world = VoxelWorld::empty(1);
+        world.set_block(IVec3::new(5, 5, 5), Block::Leaves);
+        let meshes = build_chunk_meshes(&world, IVec2::ZERO);
+        assert!(meshes.opaque.vertices.is_empty());
+        assert_eq!(count_faces(&meshes.cutout), 6);
+        assert_eq!(
+            meshes.cutout.colors.as_ref().map(Vec::len),
+            Some(meshes.cutout.vertices.len()),
+            "裁切网格同样带顶点色"
+        );
+    }
+
+    /// 树冠内部的面不能塌成纯黑：叶格自己带天空光，采样把它算进来。
+    #[test]
+    fn interior_leaf_faces_keep_their_light() {
+        let mut world = VoxelWorld::empty(1);
+        for x in 4..=8 {
+            for z in 4..=8 {
+                for y in 6..=8 {
+                    world.set_block(IVec3::new(x, y, z), Block::Leaves);
+                }
+            }
+        }
+        let meshes = build_chunk_meshes(&world, IVec2::ZERO);
+        let colors = meshes.cutout.colors.as_ref().expect("裁切网格应带顶点色");
+        let darkest = colors
+            .iter()
+            .map(|color| color.r)
+            .min()
+            .expect("应有裁切面");
+        // 树冠内部只有环境底光时红通道是 24 上下；叶格透光后应明显更亮。
+        assert!(darkest > 40, "树冠内部的面过暗：{darkest}");
+    }
+
+    /// 新方块的图集槽位确实进入各自分区的网格 UV。
+    #[test]
+    fn new_block_tiles_reach_mesh_uvs() {
+        let mut world = VoxelWorld::empty(1);
+        world.set_block(IVec3::new(2, 2, 2), Block::Leaves);
+        world.set_block(IVec3::new(4, 2, 2), Block::GoldOre);
+        let meshes = build_chunk_meshes(&world, IVec2::ZERO);
+        let expected = [
+            (&meshes.cutout, Tile::Leaves),
+            (&meshes.opaque, Tile::GoldOre),
+        ];
+        for (mesh, tile) in expected {
+            let uv = tile_uv(tile, 0.0, 0.0);
+            let found = mesh.vertices.iter().any(|vertex| {
+                (vertex.uv[0] - uv[0]).abs() < 1e-6 && (vertex.uv[1] - uv[1]).abs() < 1e-6
+            });
+            assert!(found, "{tile:?} 的 UV 没有进入对应分区：{uv:?}");
+        }
     }
 
     /// 跨区块相邻：西侧区块的 +X 面被东侧区块的方块剔除。
@@ -341,8 +462,8 @@ mod tests {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(15, 5, 5), Block::Stone);
         world.set_block(IVec3::new(16, 5, 5), Block::Stone);
-        let west = build_chunk_mesh(&world, IVec2::ZERO);
-        let east = build_chunk_mesh(&world, IVec2::new(1, 0));
+        let west = opaque_mesh(&world, IVec2::ZERO);
+        let east = opaque_mesh(&world, IVec2::new(1, 0));
         assert_eq!(count_faces(&west), 5);
         assert_eq!(count_faces(&east), 5);
     }
@@ -352,7 +473,7 @@ mod tests {
     fn open_sky_faces_follow_face_shades() {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(5, 5, 5), Block::Stone);
-        let mesh = build_chunk_mesh(&world, IVec2::ZERO);
+        let mesh = opaque_mesh(&world, IVec2::ZERO);
         assert_eq!(
             mesh.colors.as_ref().map(Vec::len),
             Some(mesh.vertices.len())
@@ -380,7 +501,7 @@ mod tests {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(5, 5, 5), Block::Stone);
         world.set_block(IVec3::new(6, 6, 5), Block::Stone);
-        let mesh = build_chunk_mesh(&world, IVec2::ZERO);
+        let mesh = opaque_mesh(&world, IVec2::ZERO);
         let top = top_face(&mesh, 5, 5, 5);
         assert_eq!(top.len(), 4);
         for (position, color) in top {
@@ -397,7 +518,7 @@ mod tests {
     fn roof_shadow_darkens_top_face() {
         let mut open = VoxelWorld::empty(1);
         open.set_block(IVec3::new(5, 5, 5), Block::Stone);
-        let open_mesh = build_chunk_mesh(&open, IVec2::ZERO);
+        let open_mesh = opaque_mesh(&open, IVec2::ZERO);
         let open_color = top_face(&open_mesh, 5, 5, 5)
             .into_iter()
             .find(|(position, _)| position[0] == 5.0 && position[2] == 5.0)
@@ -412,7 +533,7 @@ mod tests {
                 roofed.set_block(IVec3::new(x, 7, z), Block::Stone);
             }
         }
-        let roofed_mesh = build_chunk_mesh(&roofed, IVec2::ZERO);
+        let roofed_mesh = opaque_mesh(&roofed, IVec2::ZERO);
         let roofed_color = top_face(&roofed_mesh, 5, 5, 5)
             .into_iter()
             .find(|(position, _)| position[0] == 5.0 && position[2] == 5.0)
@@ -434,7 +555,7 @@ mod tests {
     fn triangle_winding_matches_normals() {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(2, 2, 2), Block::Grass);
-        let mesh = build_chunk_mesh(&world, IVec2::ZERO);
+        let mesh = opaque_mesh(&world, IVec2::ZERO);
         for triangle in mesh.indices.chunks_exact(3) {
             let a = glam::Vec3::from_array(mesh.vertices[triangle[0] as usize].position);
             let b = glam::Vec3::from_array(mesh.vertices[triangle[1] as usize].position);
@@ -453,7 +574,7 @@ mod tests {
     fn uvs_stay_in_atlas() {
         let mut world = VoxelWorld::empty(1);
         world.set_block(IVec3::new(1, 1, 1), Block::Grass);
-        let mesh = build_chunk_mesh(&world, IVec2::ZERO);
+        let mesh = opaque_mesh(&world, IVec2::ZERO);
         for vertex in &mesh.vertices {
             assert!((0.0..=1.0).contains(&vertex.uv[0]));
             assert!((0.0..=1.0).contains(&vertex.uv[1]));

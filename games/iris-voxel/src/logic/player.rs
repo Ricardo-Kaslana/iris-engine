@@ -1,5 +1,7 @@
-//! 第一人称玩家状态与纯数学。碰撞与重力由引擎角色控制器负责，
-//! 这里只定义尺寸、朝向换算与视角积分。
+//! 第一人称玩家状态与纯数学。碰撞、重力积分与贴地吸附由引擎角色控制器
+//! 负责，这里定义尺寸、移动与跳跃的手感常量、朝向换算与视角积分。
+//! 重力的「重量」由 [`GRAVITY_SCALE`] 交给 `CharacterParams::gravity_scale`，
+//! 下落上限 [`TERMINAL_SPEED`] 由移动系统在积分前钳制。
 
 use glam::Vec3;
 
@@ -9,10 +11,26 @@ pub const PLAYER_RADIUS: f32 = 0.3;
 pub const PLAYER_HALF_HEIGHT: f32 = 0.9;
 /// 脚底到眼睛的高度。
 pub const EYE_HEIGHT: f32 = 1.62;
+/// 行走速度（米/秒）：与 Minecraft 的 4.317 同量级。
 pub const WALK_SPEED: f32 = 4.3;
-pub const JUMP_SPEED: f32 = 5.2;
+/// 奔跑速度（米/秒）：比行走快三成，对应 Minecraft 冲刺的 5.612。
+pub const SPRINT_SPEED: f32 = 5.6;
+/// 重力缩放：引擎按标准重力 9.81 m/s² 积分，真实重力放进方块世界会显得
+/// 飘——每秒只落不到十米。体素沙盒的手感来自「重」：2.8 倍即约
+/// 27.5 m/s²，从三格高处落地约 0.47 秒（标准重力要 0.78 秒）。
+pub const GRAVITY_SCALE: f32 = 2.8;
+/// 跳跃初速（米/秒）。与 [`GRAVITY_SCALE`] 一起定出跳跃高度约 1.24 格、
+/// 滞空约 0.58 秒：起跳 0.31 秒到顶，落回用同样时间。
+pub const JUMP_SPEED: f32 = 8.5;
+/// 下落速度上限（米/秒）：约 16 格后到达，防止高处坠落时单帧位移过大
+/// 与落地速度失真。
+pub const TERMINAL_SPEED: f32 = 30.0;
 pub const LOOK_SENSITIVITY: f32 = 0.0025;
 pub const PITCH_LIMIT: f32 = 89.0_f32 * std::f32::consts::PI / 180.0;
+
+// 编译期守住手感常量之间的关系：下落上限不能压住跳跃初速，否则跑跳的
+// 上升段会被当成「高速下落」钳掉。
+const _: () = assert!(TERMINAL_SPEED > JUMP_SPEED * 2.0);
 
 /// 胶囊中心偏移到眼睛的竖直距离。
 pub const EYE_OFFSET: f32 = EYE_HEIGHT - PLAYER_HALF_HEIGHT;
@@ -25,6 +43,8 @@ pub struct PlayerState {
     pub yaw: f32,
     pub pitch: f32,
     pub grounded: bool,
+    /// 是否处于奔跑状态（按住 Shift 且有前进输入）。
+    pub sprinting: bool,
 }
 
 impl PlayerState {
@@ -36,11 +56,21 @@ impl PlayerState {
             yaw: 0.0,
             pitch: 0.0,
             grounded: false,
+            sprinting: false,
         }
     }
 
     pub fn eye(&self) -> Vec3 {
         self.position + Vec3::Y * EYE_OFFSET
+    }
+
+    /// 当前水平目标速度：奔跑比行走快三成。
+    pub fn speed(&self) -> f32 {
+        if self.sprinting {
+            SPRINT_SPEED
+        } else {
+            WALK_SPEED
+        }
     }
 }
 
@@ -75,6 +105,12 @@ pub fn apply_look(yaw: f32, pitch: f32, delta: (f64, f64)) -> (f32, f32) {
 pub fn wish_direction(yaw: f32, forward_axis: f32, right_axis: f32) -> Vec3 {
     let dir = flat_forward(yaw) * forward_axis + flat_right(yaw) * right_axis;
     dir.normalize_or_zero()
+}
+
+/// 是否进入奔跑：按住奔跑键且有前进分量。横移与后退不算，静止也不算
+/// ——与 Minecraft 一致；松开前进键立即退回行走。
+pub fn wants_sprint(forward_axis: f32, sprint_held: bool) -> bool {
+    sprint_held && forward_axis > 0.0
 }
 
 #[cfg(test)]
@@ -133,8 +169,51 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             grounded: true,
+            sprinting: false,
         };
         assert!((player.eye() - Vec3::new(1.0, 2.0 + 0.72, 3.0)).length() < 1e-6);
         assert!((EYE_OFFSET - 0.72).abs() < 1e-6);
+    }
+
+    /// 奔跑只加在水平速度上：比行走快三成左右，其余状态量不变。
+    #[test]
+    fn sprint_speed_is_about_a_third_faster() {
+        let mut player = PlayerState::spawn();
+        assert_eq!(player.speed(), WALK_SPEED);
+        player.sprinting = true;
+        assert_eq!(player.speed(), SPRINT_SPEED);
+        let ratio = SPRINT_SPEED / WALK_SPEED;
+        assert!(
+            (1.25..=1.35).contains(&ratio),
+            "奔跑应比行走快约三成，实际 {ratio}"
+        );
+    }
+
+    /// 奔跑要求按住键且有前进分量：后退、横移、静止都不算。
+    #[test]
+    fn sprint_needs_forward_input_and_key() {
+        assert!(wants_sprint(1.0, true));
+        assert!(!wants_sprint(1.0, false));
+        assert!(!wants_sprint(0.0, true));
+        assert!(!wants_sprint(-1.0, true));
+        // 前进加斜向（A/D 同时按）仍是前进。
+        assert!(wants_sprint(1.0, true));
+    }
+
+    /// 重力倍率定出的手感：从三格高处落地约半秒，标准重力要接近一秒。
+    /// 这里只校验常量之间的关系，真实积分由引擎角色控制器负责。
+    #[test]
+    fn gravity_and_jump_tuning_stay_in_voxel_range() {
+        let gravity = 9.81 * GRAVITY_SCALE;
+        assert!(gravity > 25.0, "体素重力应明显重于标准重力：{gravity}");
+        // 跳跃顶点高度 v² / 2g，目标是一格出头（能跨上一格台阶）。
+        let apex = JUMP_SPEED * JUMP_SPEED / (2.0 * gravity);
+        assert!(
+            (1.1..=1.4).contains(&apex),
+            "跳跃高度应在一格出头，实际 {apex}"
+        );
+        // 三格自由落体时间。
+        let fall = (2.0 * 3.0 / gravity).sqrt();
+        assert!((0.4..=0.55).contains(&fall), "三格下落应约半秒：{fall}");
     }
 }

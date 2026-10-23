@@ -224,6 +224,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             grounded: true,
+            sprinting: false,
         };
         assert!(
             !can_place(&world, &player, IVec3::new(8, 5, 8)),

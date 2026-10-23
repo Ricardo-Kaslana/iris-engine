@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use glam::{IVec2, IVec3, Vec3};
 use iris_engine::prelude::{
-    App, Camera, DirectionalLight, ElementState, Input, KeyCode, MaterialStore, MeshHandle,
-    MeshStore, MouseButton, MouseCapture, Stage, TextureStore, Time, Transform, UiText, Viewport,
+    App, Camera, DirectionalLight, ElementState, Input, KeyCode, MaterialStore, MeshData,
+    MeshHandle, MeshStore, MouseButton, MouseCapture, Stage, TextureStore, Time, UiText, Viewport,
 };
 use iris_voxel::VoxelPlugin;
-use iris_voxel::logic::{Block, CHUNK_COUNT, PlayerState, VoxelWorld, forward, pick_block};
-use iris_voxel::plugin::{REACH, apply_edit};
+use iris_voxel::atlas::tile_uv;
+use iris_voxel::logic::{
+    Block, CHUNK_COUNT, Inventory, PlayerState, Tile, VoxelWorld, forward, pick_block,
+};
+use iris_voxel::plugin::{REACH, apply_edit, chunk_cutout_visible, chunk_meshes};
 
 struct Harness {
     app: App,
@@ -96,21 +99,18 @@ impl Harness {
             .on_mouse_motion(delta);
     }
 
+    /// 区块的不透明分区网格句柄。
     fn mesh_handle_at(&self, coord: IVec2) -> MeshHandle {
-        let origin = Vec3::new((coord.x * 16) as f32, 0.0, (coord.y * 16) as f32);
-        let mut found = None;
-        // 目标框实体也可能落在区块原点，用「没有 Visibility」区分
-        // 区块实体（目标框恒挂 Visibility）。
-        self.app.world.query::<(
-            &Transform,
-            &MeshHandle,
-            Option<&iris_engine::prelude::Visibility>,
-        )>(|(transform, mesh, visibility)| {
-            if transform.position == origin && visibility.is_none() {
-                found = Some(*mesh);
-            }
-        });
-        found.unwrap_or_else(|| panic!("区块 {coord:?} 没有网格实体"))
+        chunk_meshes(&self.app.world, coord)
+            .unwrap_or_else(|| panic!("区块 {coord:?} 没有网格实体"))
+            .0
+    }
+
+    /// 区块的裁切分区（树叶）网格句柄。
+    fn cutout_mesh_at(&self, coord: IVec2) -> MeshHandle {
+        chunk_meshes(&self.app.world, coord)
+            .unwrap_or_else(|| panic!("区块 {coord:?} 没有网格实体"))
+            .1
     }
 
     fn revision(&self, mesh: MeshHandle) -> u64 {
@@ -124,22 +124,50 @@ impl Harness {
     fn hud_label(&self) -> String {
         let mut label = None;
         self.app.world.query::<&UiText>(|text| {
-            if text.string.starts_with("SELECTED:") {
+            if text.string.contains(" x")
+                && !text.string.starts_with("BAG")
+                && !text.string.starts_with("XYZ")
+            {
                 label = Some(text.string.clone());
             }
         });
-        label.expect("HUD 应存在选择标签")
+        label.expect("HUD 应存在方块标签")
+    }
+
+    fn hud_summary(&self) -> String {
+        let mut summary = None;
+        self.app.world.query::<&UiText>(|text| {
+            if text.string.starts_with("BAG") {
+                summary = Some(text.string.clone());
+            }
+        });
+        summary.expect("HUD 应存在背包汇总")
+    }
+
+    fn inventory_count(&self, block: Block) -> u32 {
+        self.app.world.resource::<Inventory>().count(block)
+    }
+
+    fn grant(&mut self, block: Block, amount: u32) {
+        self.app
+            .world
+            .resource_mut::<Inventory>()
+            .add(block, amount);
     }
 }
 
-/// 启动后 64 个区块网格加一个目标框网格；玩家落在平台上，
-/// 相机与玩家眼睛同步。
+/// 启动后每个区块两套网格（不透明 + 裁切）、目标框与云层各一个；
+/// 玩家落在平台上，相机与玩家眼睛同步。
 #[test]
 fn startup_builds_chunks_and_grounds_player() {
     let mut harness = Harness::new(1);
     let mut meshes = 0;
     harness.app.world.query::<&MeshHandle>(|_| meshes += 1);
-    assert_eq!(meshes, CHUNK_COUNT + 1, "64 个区块 + 目标框");
+    assert_eq!(
+        meshes,
+        CHUNK_COUNT * 2 + 2,
+        "每区块两套网格 + 目标框 + 云层"
+    );
 
     harness.settle();
     let player = harness.player();
@@ -174,7 +202,8 @@ fn walking_moves_forward_on_plateau() {
     assert!((end.position.x - start.position.x).abs() < 1e-3);
 }
 
-/// 跳跃峰值约 v²/2g ≈ 1.38 米，随后落回并恢复 grounded。
+/// 跳跃峰值约 v²/2g ≈ 1.24 米（起跳 8.5 m/s、重力 27.5 m/s²），
+/// 随后落回并恢复 grounded。
 #[test]
 fn jump_peaks_and_lands() {
     let mut harness = Harness::new(3);
@@ -191,11 +220,118 @@ fn jump_peaks_and_lands() {
     let height = peak - ground;
     assert!(
         (1.0..=1.7).contains(&height),
-        "跳跃高度应接近 1.38 米，实际 {height}"
+        "跳跃高度应接近 1.24 米，实际 {height}"
     );
     let player = harness.player();
     assert!(player.grounded, "90 帧后应落地");
     assert!((player.position.y - ground).abs() < 0.05);
+}
+
+/// 自由落体按体素重力加速：0.2 秒后末速约 5.5 m/s、落下约 0.6 米，
+/// 标准重力同期只有 2.0 m/s 与 0.2 米。
+#[test]
+fn falling_accelerates_at_voxel_gravity() {
+    let mut harness = Harness::new(4);
+    harness.settle();
+    let mut airborne = harness.player();
+    airborne.position += Vec3::Y * 12.0;
+    airborne.velocity = Vec3::ZERO;
+    airborne.grounded = false;
+    harness.set_player(airborne);
+
+    harness.frames(12);
+    let player = harness.player();
+    assert!(
+        player.velocity.y < -5.0,
+        "0.2 秒后应明显加速下落，实际 {}",
+        player.velocity.y
+    );
+    assert!(
+        player.velocity.y > -6.2,
+        "不该超过逐帧积分的量级，实际 {}",
+        player.velocity.y
+    );
+    let fallen = airborne.position.y - player.position.y;
+    assert!(
+        (0.5..=0.75).contains(&fallen),
+        "0.2 秒应落下约 0.6 米，实际 {fallen}"
+    );
+    assert!(!player.grounded, "还在空中");
+}
+
+/// 按住 Shift + W 进入奔跑：0.5 秒比行走多走约三成，松开前进键立刻退出。
+#[test]
+fn sprint_outruns_walking_and_stops_on_release() {
+    let mut walk = Harness::new(5);
+    walk.settle();
+    let walk_start = walk.player();
+    walk.press(KeyCode::KeyW);
+    walk.frames(30);
+    walk.release(KeyCode::KeyW);
+    walk.frame();
+    let walked = walk_start.position.z - walk.player().position.z;
+
+    let mut run = Harness::new(5);
+    run.settle();
+    let run_start = run.player();
+    run.press(KeyCode::KeyW);
+    run.press(KeyCode::ShiftLeft);
+    run.frames(30);
+    let sprinting = run.player();
+    assert!(sprinting.sprinting, "按住 Shift 与 W 应进入奔跑");
+    run.release(KeyCode::KeyW);
+    run.release(KeyCode::ShiftLeft);
+    run.frame();
+    let end = run.player();
+    let ran = run_start.position.z - end.position.z;
+    assert!(ran > walked + 0.5, "奔跑应明显快于行走：{ran} 对 {walked}");
+    assert!(
+        (2.6..=3.0).contains(&ran),
+        "奔跑 0.5 秒应前进约 2.8 米，实际 {ran}"
+    );
+    assert!(!end.sprinting, "松开前进键应退回行走");
+}
+
+/// 奔跑要求前进输入：只按 Shift + A 横移仍按行走速度。
+#[test]
+fn sprint_requires_forward_input() {
+    let mut harness = Harness::new(6);
+    harness.settle();
+    let start = harness.player();
+    harness.press(KeyCode::KeyA);
+    harness.press(KeyCode::ShiftLeft);
+    harness.frames(30);
+    let player = harness.player();
+    assert!(!player.sprinting, "横移不进入奔跑");
+    let strafed = (player.position.x - start.position.x).abs();
+    assert!(
+        (1.8..=2.5).contains(&strafed),
+        "横移应保持行走速度，实际 {strafed}"
+    );
+    harness.release(KeyCode::KeyA);
+    harness.release(KeyCode::ShiftLeft);
+}
+
+/// 奔跑时视场角外扩，松开后平滑回到基准角。
+#[test]
+fn sprint_widens_fov_and_settles_back() {
+    let mut harness = Harness::new(7);
+    harness.settle();
+    let base = harness.app.world.resource::<Camera>().fov_y_radians;
+    harness.press(KeyCode::KeyW);
+    harness.press(KeyCode::ShiftLeft);
+    harness.frames(30);
+    let wide = harness.app.world.resource::<Camera>().fov_y_radians;
+    assert!(wide > base + 0.1, "奔跑应外扩视场角：{wide} 对 {base}");
+
+    harness.release(KeyCode::ShiftLeft);
+    harness.frames(30);
+    let settled = harness.app.world.resource::<Camera>().fov_y_radians;
+    assert!(
+        (settled - base).abs() < 0.01,
+        "松开后应回到基准角：{settled} 对 {base}"
+    );
+    harness.release(KeyCode::KeyW);
 }
 
 /// 相对鼠标位移精确换算为 yaw / pitch，俯仰超限被钳制。
@@ -243,6 +379,12 @@ fn breaking_block_updates_world_and_mesh() {
         "脚下方块应被挖掉"
     );
     assert!(harness.revision(mesh) > before, "目标区块网格应重建");
+    assert_eq!(
+        harness.inventory_count(Block::Dirt),
+        1,
+        "挖掉草方块应得到一块泥土"
+    );
+    assert_eq!(harness.hud_summary(), "BAG DIRT 1");
 }
 
 /// 选择石头后右键在命中面上放置；放置目标与玩家不重叠。
@@ -268,6 +410,7 @@ fn placing_block_writes_selected_material() {
     let target = hit.block + hit.normal;
     assert_eq!(harness.world().block(target), Block::Air);
 
+    harness.grant(Block::Stone, 1);
     harness.press(KeyCode::Digit3);
     harness.click(MouseButton::Right);
     harness.frame();
@@ -277,6 +420,46 @@ fn placing_block_writes_selected_material() {
         harness.world().block(target),
         Block::Stone,
         "右键应在命中面相邻格放置选中的石头"
+    );
+    assert_eq!(
+        harness.inventory_count(Block::Stone),
+        0,
+        "放置应消耗一格石头"
+    );
+}
+
+/// 背包没有对应方块时右键不放置。
+#[test]
+fn placing_with_empty_inventory_is_refused() {
+    let mut harness = Harness::new(12);
+    harness.settle();
+    harness.set_relative();
+    let mut player = harness.player();
+    player.yaw = 0.0;
+    player.pitch = -std::f32::consts::FRAC_PI_4;
+    harness.set_player(player);
+    harness.frame();
+
+    let player = harness.player();
+    let hit = pick_block(
+        &harness.world(),
+        player.eye(),
+        forward(player.yaw, player.pitch),
+        REACH,
+    )
+    .expect("俯视前方应命中平台");
+    let target = hit.block + hit.normal;
+    assert_eq!(harness.inventory_count(Block::Stone), 0);
+
+    harness.press(KeyCode::Digit3);
+    harness.click(MouseButton::Right);
+    harness.frame();
+    harness.release(KeyCode::Digit3);
+
+    assert_eq!(
+        harness.world().block(target),
+        Block::Air,
+        "背包为空时不应凭空放置方块"
     );
 }
 
@@ -373,18 +556,121 @@ fn glowstone_relights_surroundings_and_remeshes_cross_chunk() {
     assert_eq!(harness.world().light().block_light(source + IVec3::X), 0);
 }
 
-/// 快捷栏选择改变 HUD 标签。
+/// 快捷栏选择改变 HUD 标签，标签同时显示背包数量。
 #[test]
 fn hotbar_selection_updates_hud_label() {
     let mut harness = Harness::new(8);
     harness.settle();
-    assert_eq!(harness.hud_label(), "SELECTED: GRASS");
+    assert_eq!(harness.hud_label(), "GRASS x0");
+    assert_eq!(harness.hud_summary(), "BAG EMPTY");
+    harness.grant(Block::Stone, 5);
     harness.press(KeyCode::Digit3);
     harness.frame();
     harness.release(KeyCode::Digit3);
-    assert_eq!(harness.hud_label(), "SELECTED: STONE");
+    assert_eq!(harness.hud_label(), "STONE x5");
+    assert_eq!(harness.hud_summary(), "BAG STONE 5");
     harness.press(KeyCode::Digit7);
     harness.frame();
     harness.release(KeyCode::Digit7);
-    assert_eq!(harness.hud_label(), "SELECTED: GLOWSTONE");
+    assert_eq!(harness.hud_label(), "GLOWSTONE x0");
+    harness.press(KeyCode::Digit8);
+    harness.frame();
+    harness.release(KeyCode::Digit8);
+    assert_eq!(harness.hud_label(), "LEAVES x0");
+}
+
+/// 生成的世界内容确实进入渲染网格：裁切分区里有树叶槽位，不透明分区
+/// 里有矿石槽位，说明分区、图集与实体接线对新增方块生效。
+#[test]
+fn generated_trees_and_ores_reach_chunk_meshes() {
+    let harness = Harness::new(11);
+    let mut leaves = false;
+    let mut ores = false;
+    for cz in 0..8 {
+        for cx in 0..8 {
+            let coord = IVec2::new(cx, cz);
+            let (opaque, cutout) =
+                chunk_meshes(&harness.app.world, coord).expect("区块应有网格句柄");
+            let store = harness.app.world.resource::<MeshStore>();
+            let cutout_mesh = store.get(cutout).expect("裁切网格句柄应有效");
+            leaves |= has_tile(cutout_mesh, Tile::Leaves);
+            let opaque_mesh = store.get(opaque).expect("不透明网格句柄应有效");
+            ores |= [Tile::CoalOre, Tile::IronOre, Tile::GoldOre]
+                .into_iter()
+                .any(|tile| has_tile(opaque_mesh, tile));
+        }
+    }
+    assert!(leaves, "裁切分区里应出现树叶面");
+    assert!(ores, "不透明分区里应出现矿石面");
+}
+
+fn has_tile(mesh: &MeshData, tile: Tile) -> bool {
+    let corner = tile_uv(tile, 0.0, 0.0);
+    mesh.vertices.iter().any(|vertex| {
+        (vertex.uv[0] - corner[0]).abs() < 1e-6 && (vertex.uv[1] - corner[1]).abs() < 1e-6
+    })
+}
+
+/// 每个区块的裁切实体可见性都与分区内容一致：空分区隐藏，不产生绘制。
+#[test]
+fn chunk_cutout_visibility_follows_mesh_content() {
+    let harness = Harness::new(13);
+    let mut hidden = 0;
+    for cz in 0..8 {
+        for cx in 0..8 {
+            let coord = IVec2::new(cx, cz);
+            let (_, cutout) = chunk_meshes(&harness.app.world, coord).expect("区块应有网格");
+            let empty = harness
+                .app
+                .world
+                .resource::<MeshStore>()
+                .get(cutout)
+                .expect("裁切网格句柄应有效")
+                .indices
+                .is_empty();
+            assert_eq!(
+                chunk_cutout_visible(&harness.app.world, coord),
+                !empty,
+                "区块 {coord:?} 的可见性与网格内容不一致"
+            );
+            if empty {
+                hidden += 1;
+            }
+        }
+    }
+    println!("空裁切分区 {hidden} 个");
+}
+
+/// 在树冠之外的空中补一片树叶：裁切分区多出六面，句柄原地更新。
+#[test]
+fn placing_leaves_grows_the_cutout_mesh() {
+    let mut harness = Harness::new(14);
+    harness.settle();
+    let coord = IVec2::new(3, 3);
+    let spot = IVec3::new(56, 40, 56);
+    assert_eq!(harness.world().block(spot), Block::Air);
+    let cutout = harness.cutout_mesh_at(coord);
+    let before = harness.revision(cutout);
+    let faces_before = harness
+        .app
+        .world
+        .resource::<MeshStore>()
+        .get(cutout)
+        .expect("裁切网格句柄应有效")
+        .indices
+        .len()
+        / 6;
+
+    assert!(apply_edit(&mut harness.app.world, spot, Block::Leaves));
+    assert!(harness.revision(cutout) > before, "裁切网格应重建");
+    let mesh = harness.app.world.resource::<MeshStore>();
+    let mesh = mesh.get(cutout).expect("裁切网格句柄应有效");
+    assert_eq!(
+        mesh.indices.len() / 6,
+        faces_before + 6,
+        "孤立叶块应新增六个面"
+    );
+    assert!(has_tile(mesh, Tile::Leaves));
+    // 叶格自己也有天空光：15 减去「距离 1 + 透光代价 1」= 13。石头格是 0。
+    assert_eq!(harness.world().light().sky(spot), 13, "叶格的天空光应为 13");
 }

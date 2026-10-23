@@ -9,8 +9,10 @@ fn main() {
     // 摩擦记录见 ARCHITECTURE §8.78 第 ⑩ 条。
     App::new()
         .add_plugins(
-            DefaultPlugins::new("Iris Voxel · 左键捕获/挖掘，右键放置，Esc 释放后再退出")
-                .with_size(1152, 648),
+            DefaultPlugins::new(
+                "Iris Voxel · 左键捕获/挖掘，右键放置，Shift 奔跑，Esc 释放后再退出",
+            )
+            .with_size(1152, 648),
         )
         .add_plugin(VoxelPlugin::default())
         .run();

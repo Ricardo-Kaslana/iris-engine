@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 ```
 
-**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1921 / release 1918**（每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
+**`cargo test` 不构建 examples/benches**——先 build 后 test 才不会把 release 编译两轮。当前基线 **debug 1969 / release 1966**（按 iris-voxel 各轮新增 48 项累计，待下一次全量门禁复核；每轮收官顺手更新本行数字；逐轮测试明细与排障教训前史见 PLAYBOOK §3）。
 
 ### 门禁执行铁律（实测案例全文见 PLAYBOOK §1/§2）
 

@@ -2,18 +2,22 @@
 //!
 //! 天空光与方块光各存一份 0..=15 的整世界数组，下标与方块数组一致。
 //! 天空光从所有直接露天的空气格以 15 起步，方块光从发光方块以自身
-//! 发光等级起步，两者都沿六个轴向每步衰减 1。实心方块视为不透明，
+//! 发光等级起步，两者都沿六个轴向每步衰减 1。不透明方块视为完全阻挡，
 //! 光照不会进入；发光方块自身格保留光源等级，它的光从邻格开始传播。
+//!
+//! 树叶是半透方块（[`Block::light_cost`] 为 `Some(1)`）：光可以进叶格，
+//! 但每穿一层要多损失一级。穿过一层树冠的天空光是 13 而不是 0——树冠
+//! 内部因此有可读的绿色，也不会像不透明方块那样把整根柱截断。
 //!
 //! **天空光不变量**：因为衰减每步至少为 1，空气格的天空光等于 15
 //! 当且仅当它当前直接露天。增量更新依赖这条性质：在露天柱中放下一块
 //! 不透明方块时，整根柱内原本为 15 的空气格必须显式失效，不能只从
 //! 编辑格按每步减 1 传递；反之挖开遮挡后，重新露天的整段空气柱要
-//! 直接置为 15。
+//! 直接置为 15。放下树叶同样要截断柱内 15，但叶格自身由邻格回填。
 //!
-//! 已知限制：不做半透明衰减（树叶、玻璃、水都按实心不透明处理），
-//! 不做彩色光源与方向性光照，也没有逐像素光照贴图；光照等级最终只能
-//! 烘进网格顶点色，光场每变化一格就要重建受影响的区块网格。
+//! 已知限制：只有树叶做半透明衰减（玻璃与水仍未实现），不做彩色光源
+//! 与方向性光照，也没有逐像素光照贴图；光照等级最终只能烘进网格顶点色，
+//! 光场每变化一格就要重建受影响的区块网格。
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -207,6 +211,22 @@ impl LightGrid {
                     }
                 }
             }
+        } else if new_block.light_cost().is_some() {
+            // 半透方块（树叶）：新格自己没有直接露天，必须由邻格回填，
+            // 否则整根柱会停在 0。回填后的叶格会继续按 `light_cost`
+            // 向柱内传播。
+            for offset in NEIGHBOURS {
+                let neighbour = pos + offset;
+                if in_bounds(neighbour) {
+                    let level = self.sky(neighbour);
+                    if level > 1 {
+                        add_sky.push_back((neighbour, level));
+                    }
+                }
+            }
+        }
+
+        if new_block.light_cost().is_some() {
             for offset in NEIGHBOURS {
                 let neighbour = pos + offset;
                 if in_bounds(neighbour) {
@@ -268,7 +288,8 @@ impl LightGrid {
         }
     }
 
-    /// 添加 BFS：只写入空气格，目标等级为源等级减 1，严格变大才写入。
+    /// 添加 BFS：只写入透光格（空气与树叶），目标等级为源等级减去
+    /// 「距离 1 + 方块自身的透光代价」，严格变大才写入。
     fn add_light(
         &mut self,
         chunks: &[Chunk],
@@ -285,10 +306,15 @@ impl LightGrid {
                 if !in_bounds(neighbour) {
                     continue;
                 }
-                if block_at(chunks, neighbour).is_solid() {
+                let Some(cost) = block_at(chunks, neighbour).light_cost() else {
+                    continue;
+                };
+                let Some(target) = level.checked_sub(1 + cost) else {
+                    continue;
+                };
+                if target == 0 {
                     continue;
                 }
-                let target = level - 1;
                 if self.get(channel, neighbour) < target {
                     self.set(channel, neighbour, target);
                     mark_chunk(touched, neighbour);
@@ -390,6 +416,54 @@ pub fn vertex_rgb(sky: u8, block: u8, shade: u8, ao: u8) -> [u8; 3] {
         rgb[channel] = (base * shade as u32 * ao_scale as u32 / (255 * 255)) as u8;
     }
     rgb
+}
+
+/// 方块级颜色扰动系数。128 是中性值；草地与树叶按十二格周期的平滑
+/// 区域噪声在 118 到 138 之间染色，模拟 Minecraft 的生物群系色调，
+/// 相邻方块不会出现逐块跳变的补丁。其余方块返回中性值，既有精确颜色
+/// 断言因此逐位不变。
+pub fn block_tint(block: Block, pos: IVec3) -> u8 {
+    if !matches!(block, Block::Grass | Block::Leaves) {
+        return 128;
+    }
+    const SCALE: f32 = 12.0;
+    let fx = pos.x as f32 / SCALE;
+    let fz = pos.z as f32 / SCALE;
+    let x0 = fx.floor() as i32;
+    let z0 = fz.floor() as i32;
+    let tx = smooth_fraction(fx - x0 as f32);
+    let tz = smooth_fraction(fz - z0 as f32);
+    let v00 = region_tint(x0, z0) as f32;
+    let v10 = region_tint(x0 + 1, z0) as f32;
+    let v01 = region_tint(x0, z0 + 1) as f32;
+    let v11 = region_tint(x0 + 1, z0 + 1) as f32;
+    let top = v00 + (v10 - v00) * tx;
+    let bottom = v01 + (v11 - v01) * tx;
+    (top + (bottom - top) * tz).round().clamp(118.0, 138.0) as u8
+}
+
+fn smooth_fraction(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 一个区域格点的色调值（118 到 138）。
+fn region_tint(x: i32, z: i32) -> u8 {
+    let key = (x as i64 as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        ^ (z as i64 as u64).wrapping_mul(0xA24B_AED4_963E_E407)
+        ^ 0x7A11_57EE_0000_0002;
+    let noise = (super::mix64(key) >> 56) as u32;
+    (118 + noise * 20 / 255) as u8
+}
+
+/// 把色调系数乘进 8 位颜色。128 是恒等变换，用于草地与树叶的逐方块
+/// 明暗抖动。
+pub fn tint_rgb(rgb: [u8; 3], tint: u8) -> [u8; 3] {
+    let tint = tint as u32;
+    [
+        (rgb[0] as u32 * tint / 128).min(255) as u8,
+        (rgb[1] as u32 * tint / 128).min(255) as u8,
+        (rgb[2] as u32 * tint / 128).min(255) as u8,
+    ]
 }
 
 #[cfg(test)]
@@ -508,6 +582,51 @@ mod tests {
         assert_eq!(world.light().block_light(at(15, 12, 12)), 0);
     }
 
+    /// 树叶按「距离 1 + 透光代价 1」衰减天空光：9×9 叶冠的中心正下方
+    /// 是 12 而不是 0，树冠内部因此有可读的绿色。
+    #[test]
+    fn leaves_attenuate_sky_light_instead_of_blocking_it() {
+        let mut world = VoxelWorld::empty(21);
+        for z in 10..=18 {
+            for x in 10..=18 {
+                world.set_block(at(x, 20, z), Block::Leaves);
+            }
+        }
+        assert_eq!(world.light().sky(at(14, 20, 14)), 13, "叶格应比露天低两级");
+        assert_eq!(
+            world.light().sky(at(14, 19, 14)),
+            12,
+            "叶冠正下方应再低一级（侧向回填更低）"
+        );
+        assert!(
+            world.light().sky(at(14, 14, 14)) > 0,
+            "树冠下方不能像不透明方块那样归零"
+        );
+        assert!(
+            world.light().sky(at(14, 14, 14)) < world.light().sky(at(8, 14, 14)),
+            "树冠下应比冠外暗"
+        );
+        assert_eq!(world.light().sky(at(9, 20, 14)), MAX_LIGHT, "冠外仍是满值");
+    }
+
+    /// 树叶的增删同样满足「增量 = 全量重算」。
+    #[test]
+    fn leaf_edits_match_full_recompute() {
+        let mut world = VoxelWorld::empty(23);
+        for z in 12..=16 {
+            for x in 12..=16 {
+                world.set_block(at(x, 18, z), Block::Leaves);
+            }
+        }
+        world.set_block(at(14, 17, 14), Block::Glowstone);
+        world.set_block(at(14, 18, 14), Block::Air);
+        world.set_block(at(15, 18, 15), Block::Air);
+        world.set_block(at(13, 17, 13), Block::Stone);
+        let fresh = LightGrid::compute(world.chunks());
+        assert_eq!(world.light().raw_sky(), fresh.raw_sky(), "天空光不一致");
+        assert_eq!(world.light().raw_block(), fresh.raw_block(), "方块光不一致");
+    }
+
     /// 固定编辑序列后，增量光场必须与全量重算逐元素一致。
     #[test]
     fn incremental_light_matches_full_recompute() {
@@ -556,6 +675,33 @@ mod tests {
         );
         assert!(!outcome.light_dirty.contains(&glam::IVec2::new(5, 5)));
         assert!(!outcome.light_dirty.contains(&glam::IVec2::new(6, 4)));
+    }
+
+    /// 石头与矿石不受色调抖动影响；草地与树叶的扰动在范围内、对坐标
+    /// 确定，并且确实产生多个不同值。
+    #[test]
+    fn block_tint_is_neutral_for_stone_and_varies_for_grass() {
+        let pos = at(10, 20, 30);
+        assert_eq!(block_tint(Block::Stone, pos), 128);
+        assert_eq!(block_tint(Block::GoldOre, pos), 128);
+        let mut seen = BTreeSet::new();
+        for x in 0..32 {
+            let tint = block_tint(Block::Grass, at(x, 10, 5));
+            assert!((118..=138).contains(&tint), "色调越界：{tint}");
+            assert_eq!(tint, block_tint(Block::Grass, at(x, 10, 5)));
+            seen.insert(tint);
+        }
+        assert!(seen.len() >= 6, "草地色调应有明显变化：{}", seen.len());
+        let leaves = block_tint(Block::Leaves, at(1, 2, 3));
+        assert!((118..=138).contains(&leaves));
+    }
+
+    /// 色调系数 128 是恒等变换，其他系数按比例缩放并钳制到 255。
+    #[test]
+    fn tint_scales_rgb() {
+        assert_eq!(tint_rgb([12, 200, 255], 128), [12, 200, 255]);
+        assert_eq!(tint_rgb([100, 100, 100], 64), [50, 50, 50]);
+        assert_eq!(tint_rgb([200, 200, 200], 200), [255, 255, 255]);
     }
 
     /// 顶点色查表：环境底光、满天空光、满方块光与 AO 档位的精确值。
