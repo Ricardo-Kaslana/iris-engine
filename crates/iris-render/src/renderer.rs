@@ -575,6 +575,10 @@ pub struct Renderer {
     /// RGBA8 路径上传 CPU mip 链 + 三线性 + 各向异性 `min(a, 适配器上限)`。
     /// 生效时机 = 纹理首次上传（句柄值缓存不追溯，见 `ensure_texture`）。
     mip_anisotropy: Option<u8>,
+    /// `TextureFilterSettings` 的上传期快照：`draw` 开头从 World 读取，
+    /// 本帧内的全部纹理懒上传用同一组放大与缩小过滤。缺省双线性，与
+    /// 引入本资源之前逐字段一致。
+    texture_filter: crate::texture::TextureFilterSettings,
     /// 材质绑定组缓存（R52c 起键为 [`material_key`] 的复合值 =
     /// `(材质句柄 << 32) | 图集槽位`——同一材质配不同图集时掩码与图集
     /// 纹理都不同，必须分组；无光照贴图槽位恒 0，与旧键一一对应）。
@@ -4443,6 +4447,7 @@ impl Renderer {
             mesh_store_epoch: None,
             texture_store_epoch: None,
             mip_anisotropy: None,
+            texture_filter: crate::texture::TextureFilterSettings::default(),
             material_gpu: HashMap::new(),
             neutral_normal_tex,
             neutral_normal_view,
@@ -6611,6 +6616,11 @@ impl Renderer {
         self.mip_anisotropy = world
             .try_resource::<crate::texture::MipSettings>()
             .map(|m| m.anisotropy);
+        // TextureFilterSettings：与 MipSettings 同口径，上传期生效。
+        self.texture_filter = world
+            .try_resource::<crate::texture::TextureFilterSettings>()
+            .map(|settings| *settings)
+            .unwrap_or_default();
         // 动态资源同步（网格 / 纹理的更新与删除）：必须在任何 pass 编码
         // 与懒上传之前完成，否则陈旧缓冲会被本帧直接索引。
         self.sync_resource_caches(world);
@@ -12312,21 +12322,7 @@ impl Renderer {
             );
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mips_on = self.mip_anisotropy.is_some();
-        let sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("iris.sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: if mips_on {
-                wgpu::MipmapFilterMode::Linear
-            } else {
-                wgpu::MipmapFilterMode::Nearest
-            },
-            anisotropy_clamp: self.mip_anisotropy.map_or(1, |a| (a as u16).clamp(1, 16)),
-            ..Default::default()
-        });
+        let sampler = self.texture_sampler();
         self.texture_gpu.insert(
             handle.0,
             GpuTexture {
@@ -12523,6 +12519,38 @@ impl Renderer {
                 .iter()
                 .any(|handle| changed.contains(handle))
         });
+    }
+
+    /// 普通纹理采样器：放大与缩小过滤取 `TextureFilterSettings` 的上传期
+    /// 快照，mip 过滤与各向异性取 `MipSettings` 快照。寻址模式与标签保持
+    /// 与引入过滤资源之前一致，默认双线性下逐字段不变。
+    ///
+    /// WebGPU 规定各向异性大于 1 时放大、缩小与 mip 过滤必须全为线性，
+    /// 因此任一过滤取最近邻时把各向异性压到 1；像素画本来也不需要
+    /// 各向异性。
+    fn texture_sampler(&self) -> wgpu::Sampler {
+        let mips_on = self.mip_anisotropy.is_some();
+        let nearest = self.texture_filter.mag == crate::texture::TextureFilter::Nearest
+            || self.texture_filter.min == crate::texture::TextureFilter::Nearest;
+        let anisotropy = if nearest {
+            1
+        } else {
+            self.mip_anisotropy.map_or(1, |a| (a as u16).clamp(1, 16))
+        };
+        self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("iris.sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: self.texture_filter.mag.to_wgpu(),
+            min_filter: self.texture_filter.min.to_wgpu(),
+            mipmap_filter: if mips_on {
+                wgpu::MipmapFilterMode::Linear
+            } else {
+                wgpu::MipmapFilterMode::Nearest
+            },
+            anisotropy_clamp: anisotropy,
+            ..Default::default()
+        })
     }
 
     fn ensure_texture(&mut self, store: Option<&TextureStore>, handle: TextureHandle) {
@@ -12774,21 +12802,7 @@ impl Renderer {
         // 三线性 + 各向异性（u8 值夹到 wgpu hal 接口的 [1, 16]；适配器
         // 不支持各向异性时 wgpu-core 内部再收敛为 1）。随纹理缓存按
         // 句柄持有，上传时生效、运行中修改资源不追溯。
-        let mips_on = self.mip_anisotropy.is_some();
-        let sampler = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("iris.sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: if mips_on {
-                wgpu::MipmapFilterMode::Linear
-            } else {
-                wgpu::MipmapFilterMode::Nearest
-            },
-            anisotropy_clamp: self.mip_anisotropy.map_or(1, |a| (a as u16).clamp(1, 16)),
-            ..Default::default()
-        });
+        let sampler = self.texture_sampler();
         self.texture_gpu.insert(
             handle.0,
             GpuTexture {

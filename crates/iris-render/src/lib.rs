@@ -323,8 +323,8 @@ pub mod prelude {
         generate_hills, grass_textures, terrain_statics,
     };
     pub use crate::texture::{
-        CpuTexture, MipSettings, TextureHandle, TextureStore, downsample_rgba8, mip_chain_bc,
-        mip_chain_rgba8, mip_level_count,
+        CpuTexture, MipSettings, TextureFilter, TextureFilterSettings, TextureHandle, TextureStore,
+        downsample_rgba8, mip_chain_bc, mip_chain_rgba8, mip_level_count,
     };
     pub use crate::texture_bc7::{
         BC7_BLOCK_BYTES, bc7_eligible, decode_bc7_mode6, encode_bc7, encoded_len_bc7,

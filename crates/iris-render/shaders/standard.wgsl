@@ -1394,7 +1394,27 @@ fn weather_ripple_gradient(p: vec2<f32>, t: f32) -> vec2<f32> {
 // OIT gather 入口都是它的薄壳——算术逐式同序不改（R78 双路径位等价
 // 先例），既有全部像素基线即共享体的逐位锁。
 fn fs_shaded(in: VertexOutput) -> vec4<f32> {
-    let base = material.base_color * textureSample(base_texture, base_sampler, in.uv);
+    var base_sample = textureSample(base_texture, base_sampler, in.uv);
+    // 像素画放大吸附（extensions.z）：采样足迹小于一个纹素时把 UV 吸到
+    // 纹素中心，放大保持硬边；足迹更大时仍用原 UV 与显式梯度，缩小继续
+    // 走采样器的 mip 与各向异性。开关关闭时分支不进入，采样语句与引入
+    // 本扩展前逐位一致。
+    if (material.extensions.z > 0.5) {
+        let tex_size = vec2<f32>(textureDimensions(base_texture));
+        let scaled = in.uv * tex_size;
+        let grad_x = dpdx(scaled) / tex_size;
+        let grad_y = dpdy(scaled) / tex_size;
+        let footprint = max(length(dpdx(scaled)), length(dpdy(scaled)));
+        var uv = in.uv;
+        // 阈值取 0.5 而不是 1：一个纹素只覆盖一两个像素时，最近邻采样
+        // 本身就在 Nyquist 边缘，会重新引入摩尔纹；覆盖到两像素以上
+        // 才吸附，硬边才既清晰又稳定。
+        if (footprint < 0.5) {
+            uv = (floor(scaled) + vec2<f32>(0.5)) / tex_size;
+        }
+        base_sample = textureSampleGrad(base_texture, base_sampler, uv, grad_x, grad_y);
+    }
+    let base = material.base_color * base_sample;
     // alpha cutout 统一判定（R90）：有效阈值 = max(材质 cutoff, 壳层层比
     // fur_aux.x)。两个开关都关闭（= 0）时分支整段不执行——既有像素不
     // 引入任何算术（R63「把逐位不变交给语言语义」铁律）。Mask 模式与

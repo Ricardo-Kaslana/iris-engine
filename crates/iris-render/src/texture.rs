@@ -86,6 +86,51 @@ impl Default for MipSettings {
     }
 }
 
+/// 纹理过滤模式（[`TextureFilterSettings`] 的取值）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureFilter {
+    /// 双线性过滤。引擎既有默认，适合照片与平滑贴图。
+    #[default]
+    Linear,
+    /// 最近邻过滤。像素画与体素材质需要它保持硬边。
+    Nearest,
+}
+
+impl TextureFilter {
+    pub(crate) fn to_wgpu(self) -> wgpu::FilterMode {
+        match self {
+            TextureFilter::Linear => wgpu::FilterMode::Linear,
+            TextureFilter::Nearest => wgpu::FilterMode::Nearest,
+        }
+    }
+}
+
+/// 纹理放大与缩小过滤（可选资源）。
+///
+/// **资源缺席语义**：未注册时按 [`Self::default`] 的双线性处理，与引入
+/// 本资源之前逐字段一致。生效时机与 [`MipSettings`] 相同：纹理首次上传
+/// 时创建采样器，运行中修改本资源只影响之后新上传的纹理。
+///
+/// 像素画通常把 `mag` 设为 [`TextureFilter::Nearest`]，`min` 保持线性，
+/// 让远处 mip 过渡平滑；两者都设为最近邻会得到最硬的像素边缘，代价是
+/// 远处闪烁更明显。mip 过滤与各向异性仍由 [`MipSettings`] 决定。
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureFilterSettings {
+    /// 放大过滤。
+    pub mag: TextureFilter,
+    /// 缩小过滤。
+    pub min: TextureFilter,
+}
+
+impl Default for TextureFilterSettings {
+    fn default() -> Self {
+        Self {
+            mag: TextureFilter::Linear,
+            min: TextureFilter::Linear,
+        }
+    }
+}
+
 /// 完整 mip 链的级数（含第 0 级原图）：`1 + floor(log2(max(w, h)))`，
 /// 每级维数 `max(1, dim / 2)` 直到 1×1。1×1 纹理链长恒 1（渲染器白色
 /// 兜底纹理无需特判的依据）。
@@ -797,6 +842,16 @@ impl TextureStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 纹理过滤资源缺省双线性，枚举到 wgpu 的映射逐值对应。
+    #[test]
+    fn texture_filter_defaults_to_linear_and_maps_to_wgpu() {
+        let settings = TextureFilterSettings::default();
+        assert_eq!(settings.mag, TextureFilter::Linear);
+        assert_eq!(settings.min, TextureFilter::Linear);
+        assert_eq!(TextureFilter::Linear.to_wgpu(), wgpu::FilterMode::Linear);
+        assert_eq!(TextureFilter::Nearest.to_wgpu(), wgpu::FilterMode::Nearest);
+    }
 
     #[test]
     fn checkerboard_dimensions_and_colors() {

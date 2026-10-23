@@ -176,6 +176,11 @@ pub struct MaterialExtensions {
     pub vertex_color: VertexColorMode,
     /// 着色模式（见 [`ShadingMode`]）。
     pub shading: ShadingMode,
+    /// 像素画放大吸附：采样足迹小于一个纹素时，把基础色 UV 吸附到
+    /// 纹素中心（显式传入原梯度，纹理缩小仍走采样器的 mip 与各向异性）。
+    /// 用于「放大要硬边、缩小要稳定」的像素画材质——最近邻放大与各向
+    /// 异性过滤在 WebGPU 里不能共存，本开关用着色器补回放大侧的硬边。
+    pub pixel_snap: bool,
 }
 
 impl MaterialExtensions {
@@ -184,12 +189,13 @@ impl MaterialExtensions {
         *self == Self::default()
     }
 
-    /// 写入材质 uniform 扩展槽的旗标：x = 顶点色乘入，y = unlit，z/w 保留。
+    /// 写入材质 uniform 扩展槽的旗标：x = 顶点色乘入，y = unlit，
+    /// z = 像素画放大吸附，w 保留。
     pub(crate) fn shader_flags(self) -> [f32; 4] {
         [
             f32::from(self.vertex_color == VertexColorMode::Multiply),
             f32::from(self.shading == ShadingMode::Unlit),
-            0.0,
+            f32::from(self.pixel_snap),
             0.0,
         ]
     }
@@ -365,6 +371,14 @@ impl MaterialDef {
     /// 全部场景光照与间接项。见 [`ShadingMode::Unlit`]。
     pub fn with_unlit(mut self) -> Self {
         self.extensions.shading = ShadingMode::Unlit;
+        self
+    }
+
+    /// 开启像素画放大吸附（builder 风格）。与各向异性过滤配合时，
+    /// 放大保持纹素硬边、缩小保持稳定，见
+    /// [`MaterialExtensions::pixel_snap`]。
+    pub fn with_pixel_snap(mut self) -> Self {
+        self.extensions.pixel_snap = true;
         self
     }
 }
@@ -662,6 +676,12 @@ mod tests {
             .with_unlit();
         assert_eq!(both.extensions.shader_flags(), [1.0, 1.0, 0.0, 0.0]);
         assert!(!both.extensions.is_default());
+
+        // 像素画吸附单独占 z 位，且不影响其他旗标。
+        let snapped = MaterialDef::solid(1.0, 1.0, 1.0, 1.0).with_pixel_snap();
+        assert!(snapped.extensions.pixel_snap);
+        assert_eq!(snapped.extensions.shader_flags(), [0.0, 0.0, 1.0, 0.0]);
+        assert!(!snapped.extensions.is_default());
     }
 
     /// 修订号：`add` 给新材质分配新值且不扰动既有材质；`get_mut` 只推进
