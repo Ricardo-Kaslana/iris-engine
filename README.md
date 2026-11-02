@@ -1,5 +1,31 @@
 # Iris Engine
 
+![Status: archived](https://img.shields.io/badge/status-archived-lightgrey.svg)
+![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)
+![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+
+> **已归档（2026-11-02）**：本项目已完成归档，不再维护，也不再接受功能请求、
+> 问题反馈或合并请求。代码按现状提供，不提供支持或兼容性承诺。开发期间的
+> 私有设计档（`docs/private/`）与外部版权角色模型未随仓库发布；其余代码与
+> 文档按 MIT OR Apache-2.0 提供，资产例外见
+> [ASSET-LICENSES.md](ASSET-LICENSES.md)。
+>
+> **Archived (2026-11-02).** This repository is no longer maintained. Issues,
+> pull requests, and feature requests are not monitored. The code and
+> documentation are provided as-is, without support. Private design notes and
+> the external copyrighted character model used by the experimental project are
+> not part of this repository. Other code and documentation are licensed under
+> MIT OR Apache-2.0; see [ASSET-LICENSES.md](ASSET-LICENSES.md) for asset
+> exceptions.
+
+[架构设计](ARCHITECTURE.md) · [变更日志](CHANGELOG.md) · [开发规约](AGENTS.md) · [资产声明](ASSET-LICENSES.md)
+
+Iris Engine is a cross-platform 3D game engine written in Rust. It uses wgpu
+for rendering, winit for windowing, and a custom sparse-set ECS. The codebase
+forbids unsafe, targets native and wasm32, and treats deterministic simulation
+and rendering as first-class requirements. The seven demo games under `games/`
+double as end-to-end tests.
+
 一个用 Rust 编写的现代 3D 游戏引擎：**跨平台 · 内存安全 · 高性能 · 低占用 · 现代化**。
 
 ```rust
@@ -33,7 +59,7 @@ fn gameplay(world: &mut World) {
 |------|----------|
 | **跨平台** | wgpu 统一封装 Vulkan / DirectX 12 / Metal（WebGPU 标准 API），winit 跨平台窗口；同一份代码编译 Windows / macOS / Linux，并可交叉编译至 ARM64 与 wasm32 |
 | **内存安全** | Rust 所有权系统；实体「索引 + 代数」防悬垂引用；组件与资源运行期借用检查——错误访问立刻 panic 而非未定义行为；**引擎全部代码零 `unsafe`** |
-| **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（普通包围球 + **蒙皮关节变换保守并集 AABB**——凸组合保证只多画不漏画）；**FrameStats 帧统计**（draw calls / 可见实例 / 剔除数 / 三角形数 / 实例上传字节）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交；**criterion 性能基准 + release 预算测试**（R33：CPU 热路径正式基准 `cargo bench` + CI 门禁，基线数字见 ARCHITECTURE §7.1） |
+| **高性能** | 稀疏集 ECS（遍历内存连续、缓存友好）；SIMD 数学库 glam；GPU 侧自动实例化批处理；**实例缓冲跨帧持久：静态场景零上传，动态实体仅传变化段**；**视锥剔除**（普通包围球 + **蒙皮关节变换保守并集 AABB**——凸组合保证只多画不漏画）；**FrameStats 帧统计**（draw calls / 可见实例 / 剔除数 / 三角形数 / 实例上传字节）；**并行系统调度**（声明组件读写集，无冲突系统多线程并发）；wgpu 流水线异步提交；**criterion 性能基准 + release 预算测试**（R33：CPU 热路径正式基准 `cargo bench` + release 预算断言，基线数字见 ARCHITECTURE §7.1） |
 | **低占用** | 无 GC、无反射、无运行时；组件销毁即时确定性归还内存；发布构建 `lto="thin"` + `codegen-units=1`；**纹理 BC1 GPU 压缩**（确定性编码器 + 「特性 + 尺寸对齐 + 全不透明」决策树，显存 8 倍节省实测 64 MiB → 8 MiB，wasm / 无特性自动回退 RGBA8）+ **网格距离 LOD**（`LodMesh` 组件：近 high / 远 low，远景三角形 64x 削减实测，`triangles_drawn` 即验收口径）+ **内存占用统计**（`memory_bytes` 源数据 / `gpu_bytes_estimate` 显存估算，基准示例输出真实对比数字） |
 | **动态资源生命周期** | `MeshStore` 与 `TextureStore` 支持逐句柄 `update` 与 `remove`；槽位修订号与目录纪元驱动渲染器失效并驱逐 GPU 缓存，纹理变化连带失效材质与贴花绑定组；删除后的网格句柄不参与绘制、纹理回退白色兜底；未调用更新或删除的场景逐位不变。完整边界见 ARCHITECTURE §8.75。 |
 | **顶点色与受控材质扩展** | `MeshData.colors` 提供逐顶点颜色侧表（线性 RGB，8 位 unorm，独立顶点缓冲），用于烘焙方块光照、环境光遮蔽与染色；`MaterialDef.extensions` 提供顶点色乘入与无光照输出两个受控开关，标准静态、蒙皮、OIT、探针、RT 与水面捕获管线全部接线；材质逐槽位修订号让运行期修改在下一帧重建绑定组。两个开关缺省关闭，默认路径逐位不变。完整边界见 ARCHITECTURE §4.3 与 §8.76。 |
@@ -92,7 +118,7 @@ cargo run --example orbit --release
 # 4096 个实例自动合批：8 种材质 → 8 个 draw call
 cargo run --example instanced --release
 
-# 无窗口离屏渲染（CI 友好），双点光照明，输出 iris_offscreen.bmp
+# 无窗口离屏渲染（无 GPU 环境自动跳过），双点光照明，输出 iris_offscreen.bmp
 cargo run --example offscreen --release
 
 # glTF 资产离屏快照（验收用），输出 iris_gltf_preview.bmp
@@ -209,9 +235,17 @@ cargo bench --workspace
 
 ### 添加为依赖
 
-```sh
-cargo add iris-engine
+本仓库未发布到 crates.io。请把仓库放在本地，然后以路径依赖接入：
+
+```toml
+[dependencies]
+iris-engine = { path = "path/to/iris-engine/crates/iris-engine" }
 ```
+
+`iris-engine` 门面会经由 workspace 内部依赖带入 `iris-core`、`iris-render`、
+`iris-platform`、`iris-audio` 与 `iris-macros`。
+
+crates.io 上的同名 `iris-engine` 是另一个项目，与本仓库无关，请勿按名称安装。
 
 ## 架构总览
 
@@ -988,6 +1022,8 @@ cargo run -p iris-voxel --example voxel_snapshot --release   # 森林、洞口�
 
 ## 测试
 
+> 项目已归档，下列测试命令和计数是开发期记录；归档后未再运行完整测试或 CI。
+
 ```sh
 cargo test --workspace   # 1969 项测试（release 1966 + 预算断言）：单元 + headless 集成 + GPU 端到端离屏渲染
 ```
@@ -1054,7 +1090,7 @@ glTF 引用挂载子实体树 + GltfMounted 标记、GLB 容器引用、方向�
 
 | 平台 | 图形后端 | 状态 |
 |------|----------|------|
-| Windows x64 / ARM64 | DirectX 12 / Vulkan | ✅ 已验证（本机 DX12） |
+| Windows x64 / ARM64 | DirectX 12 / Vulkan | ✅ 已验证（DX12） |
 | Linux x64 / ARM64 | Vulkan | ✅ wgpu 官方支持 |
 | macOS / iOS | Metal | ✅ wgpu 官方支持 |
 | Web (wasm32) | WebGPU | ✅ **端到端验证通过**：全 workspace 编译零警告 + 真实浏览器渲染确认（点光场景 + HUD 完整成像，见 `docs/web_preview.png` 与下方「Web 构建」） |
@@ -1151,7 +1187,7 @@ npx serve web-demo    # 或 python -m http.server -d web-demo
 - [x] 闭合战役 C4·动画役（诚实声明清账批次五，池 #8 形变目标 / #9 状态机 v2 + 运行时重定向 交付；#10 动画压缩按三门「需要闭合」偏弱——无近痛纯内存收益——走计划预授权的裁出口子改期回池，不阻塞收官）：**C4a 形变目标 v1 ✅**（`iris-render/morph`：`MeshData.morph` 侧表 + `MorphWeights` 逐实体组件 + `blend_morph_vertices` 纯函数——CPU 混合（表序固定累加、法线参与时重归一化、`w == 0` 整体跳过保 `-0.0` 逐位透传）+ 逐实体 `COPY_DST` 动态 VBO 换绑蒙皮绘制分支 11 个 slot 0 绑定点，**零着色器 / 零管线布局改动**；glTF `primitives[].targets` + `extras.targetNames` 加载；组件缺席 = 绑定姿势 = 现路径逐位不变（像素级锚）；查询元组扩至 8 项补 `iris-core` 一档实例化；v1 仅蒙皮路径生效、大网格 GPU 全量形变缓行，闭合 §8.9/§8.24「形变目标在路线图」，诚实边界新立 §8.61）；**C4b 状态机 v2 + 运行时重定向 ✅**（`AnimationPlayer` 参数黑板 `params` + 条件转移表 `transitions`——守卫 `AnimGuard` 封闭枚举（浮点阈值/布尔/`ClipFinished`/And·Or·Not 组合），`step_state_machine` 由 `update_animations` 每帧步检：声明序首条命中、一帧至多一条、空表 = v1 逐位不变；`retarget_by_name` 按归一骨名（剥 mixamorig 等前缀）把 `node_entities` 重绑到另一具骨架——不猜语义改名、未命中断绑、无名保留，兑现 §8.35⑨ 的运行期对偶，替代离线烘焙重定向路线；诚实边界 §8.62）；C4c 动画压缩（可裁出）待裁定
 - [x] 闭合战役 C5·格式役（批次六，池 #11 BC7+KTX2 / #12 热重载局部 全数交付）：**C5a-1 BC7 Mode 6 ✅**（`iris-render/texture_bc7`：全整数确定性编码器 + DirectXTex 逐式移植的 Mode 6 CPU 解码镜像——CPU 往返解析锁 + **GPU 硬件解码保真**双闸（自洽位序错误的唯一兜底）；`TextureStore::declare_bc7` 侧表 + 决策树最高优先 BC 分支三口径同步；manifest `compression` 枚举 + 旧 `bc3` 读兼容择新；BC7 永不自动，§8.63 六条边界）；**C5a-2 KTX2 容器 ✅**（`iris-render/texture_ktx2`：仅未压缩载荷 + mip 级 × 2D 单面 BC1/BC3/BC7（用户裁定，vkFormat 白名单以 vk.xml 为准）；`add_ktx2` 侧表 + `upload_compressed` 免编码直传 + 场景 `.ktx2` 扩展名接线；无 BC 设备/非 4 对齐白图兜底；`build_ktx2` 产侧对偶（非通用导出器）；§8.64 五条边界）；**C5b 热重载局部 ✅**（`iris-engine/hot_reload`：场景 JSON 材质数值 / 点光 / 方向光**参数子集**开发期热应用——`SceneHotReload` 资源缺席 = 零文件读取、FNV 内容指纹轮询（std-only 不引 notify，免疫 mtime 粒度噪声）、按 `Name` 匹配、基线轮不应用、坏内容一次消费；结构级编辑明确不吃（§8.4 句柄不可变边界的机理使然）；§8.65 六条边界）
 - [x] 闭合战役 C6·音频役（诚实声明清账批次七，池 #13 空间化 v3；用户三裁定：HRTF 裁出回池 / 遮挡二值 / 多普勒双向径向钳 [⅓,3] 常速 343 可配）：**多普勒 ✅**（`doppler_factor` 纯函数：双向径向合成 `f=(c+v_o)/(c−v_s)`、声学时不对称如实保留、超音速病理钳界、静止 = 精确 1.0 逐位锚；因子乘进重采样播放步长；组件源速度由 `update_spatial_audio` **帧间位置差分**自动推估含听者——游戏零改动）；**遮挡 × 逐声音低通 ✅**（引擎侧「听者→源」线段 × `effective_static` 静态碰撞体二值判定（守卫视线同一事实源、源自身豁免），混音器只吃 [0,1] 强度：一阶低通 `y += k(x−y)` 作用于增益前源值、逐声道状态持久槽位（实时零分配）、`muffle=0` 整体旁路三型逐位锁；`add_frame` 以 Option 接入，音乐恒 None ⇒ R44 逐位锁原值通过）；全 opt-in `with_doppler`/`with_occlusion` 缺席 = 与 v1/v2 逐位不变；顺手校准 §8.11 三行 R44 过期陈述（流式/OGG/总线混响早已上线）；§8.66 六条边界）
-- [x] 闭合战役 C7·大裁决役（批次八收官，池 #5 OIT + #21 DDGI 动态光源与天空同源；设计稿 `docs/private/c7-design-v1.md` 四点裁定全按推荐，验收口径升级「全部既有基线零改动原值通过」）：**C7a DDGI v3 ✅**（`RelightInputs` 薄壳/_with 双档旁路逐位 = R89；`sky_from_source` 程序化渐变 CPU 镜像 + 源码双看门 / HDR 全景 nearest-texel 逐向采样（`EquirectHdr` Arc 化零拷贝、atmosphere 拒绝冒充、作者覆盖恒胜）；`lights_in_gi` + `point_light_shadows` 点/聚光进命中点入射（逐字段镜像主灯表 + window²/max(d²,.01) 衰减窗 + 共享 `spot_cone_factor` + 逐灯硬影单射线，墙后火把严格零进表）；合并指纹含灯集/generation；§8.57①② 翻转、§8.67 八条、§4.47）；**C7b Weighted Blended OIT ✅**（`OrderedIndependentTransparency` 标记资源 opt-in，缺席 = painter 逐位不变：gather 任意序累进 accum RGBA16F `(ONE,ONE)` + reveal R16F `(ZERO,ONE_MINUS_SRC_COLOR)` 固定功能连乘 Π(1−α)，resolve `out = avg·(1−reveal) + bg·reveal` 写回 HDR MSAA；`fs_main` 提取 `fs_shaded` 共享体双入口薄壳（R78 先例）；遮挡改 scene_depth 副本手动线性测深（副本 pass 前移、内容逐位不变、SSR 读上帧语义保持）；主测 = 顺序无关性精确判别（交换 spawn 序：painter 两帧必不同、OIT 整帧逐位一致）+ 单层兼容锚 + 无覆盖逐位护栏；§8.3 划线翻转、§8.68 八条、§4.48；验收图 `docs/oit.png`）；**闭合战役 C0~C7 就此全部收官**
+- [x] 闭合战役 C7·大裁决役（批次八收官，池 #5 OIT + #21 DDGI 动态光源与天空同源；设计稿四点裁定全按推荐，验收口径升级「全部既有基线零改动原值通过」）：**C7a DDGI v3 ✅**（`RelightInputs` 薄壳/_with 双档旁路逐位 = R89；`sky_from_source` 程序化渐变 CPU 镜像 + 源码双看门 / HDR 全景 nearest-texel 逐向采样（`EquirectHdr` Arc 化零拷贝、atmosphere 拒绝冒充、作者覆盖恒胜）；`lights_in_gi` + `point_light_shadows` 点/聚光进命中点入射（逐字段镜像主灯表 + window²/max(d²,.01) 衰减窗 + 共享 `spot_cone_factor` + 逐灯硬影单射线，墙后火把严格零进表）；合并指纹含灯集/generation；§8.57①② 翻转、§8.67 八条、§4.47）；**C7b Weighted Blended OIT ✅**（`OrderedIndependentTransparency` 标记资源 opt-in，缺席 = painter 逐位不变：gather 任意序累进 accum RGBA16F `(ONE,ONE)` + reveal R16F `(ZERO,ONE_MINUS_SRC_COLOR)` 固定功能连乘 Π(1−α)，resolve `out = avg·(1−reveal) + bg·reveal` 写回 HDR MSAA；`fs_main` 提取 `fs_shaded` 共享体双入口薄壳（R78 先例）；遮挡改 scene_depth 副本手动线性测深（副本 pass 前移、内容逐位不变、SSR 读上帧语义保持）；主测 = 顺序无关性精确判别（交换 spawn 序：painter 两帧必不同、OIT 整帧逐位一致）+ 单层兼容锚 + 无覆盖逐位护栏；§8.3 划线翻转、§8.68 八条、§4.48；验收图 `docs/oit.png`）；**闭合战役 C0~C7 就此全部收官**
 - [x] 毛发 v1（R90：`iris-render/groom`·`fur`·`kajiya_kay` + `hair_vs.wgsl`·`shell_vs.wgsl`，路线图 v5 第三梯队尾巴 1/2；设计四点裁定全按推荐——相机面向展宽带 / fs_shaded 材质 flag / 实例化壳层 / 本轮补 AlphaMask）。**双路线**：壳层 shell fur（`ShellFur { layers, height }` 挂任意 Mesh+Material 实体——单网格 N 实例一次 draw，层比 t=k/N 进实例数据（`ShellInstanceRaw` = InstanceRaw + loc15），VS 沿法线膨胀 t×height，FS 统一 cutout `base.a < max(材质 cutoff, 层比)`——**base 贴图 alpha 即毛长图**（值 d 处毛长 = d×height，毛尖渐隐）；底皮照常走普通不透明路径）× Kajiya-Kay 发带（`HairStrands` 组件 + KK 材质——`hair_vs.wgsl` 相机面向屏幕展宽（投影常量从 view_proj 列长推导，零 Globals 扩容）+ standard.wgsl fs_main 复用（KK 分支 = 材质 uniform 门，`pbr_light`/`point_light_contrib` 本体零触碰——R63 FMA 漂移教训的兑现，shadow_v2/sss 像素锁原值通过）；漫反射 sin(T·L) KK 原式 + 根梢移位高光 sin(T'·H)^e（T' = T + N·shift·(2t−1)）+ 伪法线走 world_normal ⇒ fs_shaded 的 n 零改动；**关节无缝由数据共享保证**（相邻段共享控制点顶点 ⇒ 展宽逐位一致——cutout 语义下无缝是硬要求））。**程序化 groom**：`generate_hair_strands` 纯函数（头皮圆盘面积均匀 + −Y 下垂 + 逐束随机正弦弯曲，mix64 无状态哈希流，逐束随机字消费序即契约——同参数同种子 ⇒ 同网格逐字节）。**AlphaMask（glTF MASK 闭合）**：`AlphaMode::Mask` + `alpha_cutoff`（缺省 0.5 = 规范默认），不透明分区全同 + fs_shaded 开头逐像素 discard（两开关皆 0 ⇒ 分支整段不进）；glTF `alphaMode:"MASK"`/`alphaCutoff` + 场景 JSON + 热重载补丁接线；阴影实心近似（§8.69③）。**VertexOutput 影子契约四方扩展**：`fur_aux` @location(6) 于 standard/meshlet_draw/hair_vs/shell_vs 并行声明 + 源码层看门。**缺席 = 逐位不变**（GPU 锁）。测试 CPU 17 + GPU 5（`fur_render.rs`：缺席逐位/发带可见性/壳层毛高单调 + **毛高 0 零点锚**（与不挂壳层整帧逐位）/ Mask 三档阈值（纯垫板参考渲染法）/ 复合双会话逐位）；快照 `examples/fur_snapshot.rs` → `docs/fur.png`（左：16 层绿毛 + 8 层蓝毛 + 无毛红对照；右：KK 发帘 160 束真实着色）；诚实限制 §8.69 九条（蒙皮不跟随/单级高光/间接项各向同性/阴影实心/缓存不可变/GI 载荷恒零/RT 不画/密度即 alpha 通道/跨适配器不可保）；**排障教训入档：`MeshStore::add` 从 0 起（与 MaterialStore 不同）——判别位不得借用句柄值**（首版 mesh==0 哨兵与合法网格句柄 0 相撞，改显式 FurKind）
 - [x] 毛发 v2（R91：`iris-render/fur`·`groom` + `shadow_hair_vs.wgsl`·`shadow_shell_vs.wgsl`，路线图 v5 第三梯队尾巴 2/2 收官；设计四点裁定全按推荐——CPU Verlet / 阴影全接 alpha 感知 / 交叉卡片 LOD / 蒙皮继续不做）。**风场摆动**（`HairDynamics` opt-in）：`update_hair_dynamics`（ParticlePlugin 同层）——半隐式 Verlet + 根部钉扎（rest[0] 随实体变换）+ 刚度回弹 + 从根到梢单遍距离约束；`wind_sample` 发根单点采样（R80 同源，粒子 v2 同口径）× mix64 逐束去相关（±33%）；**世界空间模拟局部写回**（实体移动发梢惯性自然）；`points_per_strand` 显式声明布局（分解有歧义不猜）；动态实体每帧重传 VBO（morph 范式）、静态零触碰。**alpha 感知毛发阴影**（**§8.69③ 闭合**）：`shadow_hair_vs`（光空间屏幕展宽——主 pass 同式换 CascadeParams）+ `shadow_shell_vs`（膨胀同式）+ `fs_fur`（`base.a < max(cutoff, 层比)` discard——与 fs_shaded 同一判定语义 ⇒ 毛形阴影 + Mask 阴影孔洞一并闭合；组 1 复用主 pass 材质 bind group；只接 CSM，点光不接 §8.70④）；`ShadowFurVertexOutput` 三方影子契约看门。**远景卡片 LOD**：`generate_hair_cards`（60° 交叉卡片，标准顶点格式走标准管线 KK 照常）——**与发带同一随机字消费序**（切换不跳变）+ 距离滞回 20%（`hair_lod_memory` 范式）。**测试 CPU +8 / GPU +3**（Verlet 稳态/段长守恒 1e-5/确定性双跑/写回往返；GPU：摆动差分+缺席双帧逐位/阴影差分 >200px/LOD 档位可判别）。基线 debug 1707→1715 / release 1704→1712，六门禁全绿；验收图 `docs/fur.png` 三面板（壳层毛+毛影 | 静止发帘 | 恒风吹 1.5 s 偏摆）；诚实限制 §8.70 八条；**排障记录：验收图「全画布雪崩」= PPM 合成行字节数错位（每行多一个 GAP），非 GPU 病灶（阴影开关两轮 FNV 一致为旁证）**
 - [x] 降水（R92：`iris-render/weather`·`particles_v2` 扩展 + `standard.wgsl`/`water.wgsl`/`particles_v2_sim.wgsl` 天气分支，路线图 v5 第三梯队天气 1/2；设计四点裁定全按推荐——扩展 v2 发射器 / 全局资源+程序化涟漪 / 全局量+坡度遮罩 / v1 无溅射）。**雨雪发射器**：`ParticleEmitterV2` 三新旋钮——`spawn_extent`（盒形体积出生，全零=点发射逐位不变）/ `spawn_axis`（默认 +Y；雨雪 −Y）/ `linear_damping`（速度 /(1+k·dt) 指数衰减精确离散，终端速度 = g/k：雨 9.8 / 雪 1.5 m/s），模拟着色器三门全 select 形态（体积门吸收 `0·x=±0` 符号歧义、阻尼不进既有算术收缩决策——R63 教训公式层变体）；`rain()`/`snow()` 预设（体积 20×12×20 m、稳态存活 ≤ 4096 池容量、雨 = 3 点拖尾运动方向雨丝 alpha 暗剪影、雪 = billboard），**挂相机实体即得跟随相机的降水体积**。**湿表面**：粗糙度向 0.08 + 反照率按 (1−metallic) ×0.7（f0 用干 albedo），混合全**重心形式** `x·(1−a)+y·a` 展开（端点逐位精确；线性插值式 a=1 处实测 2 ULP 残差；不写 WGSL mix——实现形式非规范保证，CPU↔GPU 同式镜像）。**积雪坡度遮罩**：世界几何法线 y smoothstep(0.45,0.8) 门（朝上满雪 / 垂直面露原材质，GPU 墙地增量比 ~7%）× 全局量。**程序化涟漪**：XZ 哈希网格（0.4 m 格 / 1.3 s 周期落点 / 0.85 m/s 环形波 A=0.01 m 衰减 0.6 s），3×3 邻域固定序求和——无状态纯函数同输入逐位确定，格取整走 f32→i32→u32 位重解释（负格坐标）；消费点两处 = 湿地表（standard，强度×湿度、只湿的朝上面）+ 雨打水面（water，Fresnel/反射扰动/太阳镜面全吃到，时间源与波形同钟两处同相），WGSL 双份镜像 + 源码看门。**接线**：binding 21 = 16 B uniform（不扩 Globals 先例延续，uniform 不占 storage 上限），主相机/探针捕获/水面反射/RT **共享同一缓冲**（天气是世界状态——反射里的湿地也该湿）；`WaterParamsRaw` 240→256 B；meshlet/蒙皮/发带/OIT 共享 fs_shaded ⇒ 自动覆盖，阴影 pass 不感知（深度不变）。**兼容**：`Weather` 缺席/全零 = 天气分支死码（GPU FNV 锁）；三旋钮缺席 = R82 逐位不变（particle_v2/water/shadow_v2/normal/transparent/sss/fur 像素锁全部原值通过）。测试 CPU weather 8 + particles_v2 +5 / GPU weather_render 6（缺席全零同构 / 湿 0-0.5-1 单调暗化非默认中点 / 坡度墙地比 / 雨雪双会话逐位 / 涟漪 wave_speed=0 隔离判别）；验收图 `docs/precipitation.png` 三面板 960×540（雨+湿地+水面 | 积雪+降雪 | 干燥对照）；诚实限制 §8.71 九条（无溅射 / 涟漪与雨滴位置解耦 / 全局量无空间变化 / 无时间累积 / 涟漪常数固定 / 金属湿感不建模 / 不写 scene_depth / 跟随=组合用法 / 涟漪只动着色法线））
@@ -1168,4 +1204,11 @@ WebGPU 适配器/设备 → 全渲染栈 → HUD 叠加）在浏览器主线程�
 
 ## License
 
-MIT OR Apache-2.0
+除 [ASSET-LICENSES.md](ASSET-LICENSES.md) 中列明的资产外，本仓库的代码与文档按
+MIT OR Apache-2.0 双许可发布，使用者可以任选其一：
+
+- [LICENSE-MIT](LICENSE-MIT)
+- [LICENSE-APACHE](LICENSE-APACHE)
+
+`docs/exp*.png` 包含未随仓库发布的外部角色模型截图，其版权与使用条件归原权利人
+所有，详见资产声明。

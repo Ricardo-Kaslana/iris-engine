@@ -43,8 +43,7 @@ use glam::Vec3;
 pub struct OrderedIndependentTransparency;
 
 /// 权重公式的 CPU 镜像（`standard.wgsl::oit_weight` 逐式同序，两侧
-/// 必须同步修改——禁凭记忆纪律：公式原文照抄 `docs/private/c7-design-v1.md`
-/// 第 5 节存档）。`z` = 窗口深度 ∈ [0,1]（DirectX 约定）。
+/// 必须同步修改——禁凭记忆纪律）。`z` = 窗口深度 ∈ [0,1]（DirectX 约定）。
 pub fn oit_weight(color: Vec3, alpha: f32, z: f32) -> f32 {
     let lum = color.x.max(color.y).max(color.z);
     let scale = (0.03f32 / (1e-5 + (z / 200.0f32).powi(4))).clamp(1e-2, 3e3);

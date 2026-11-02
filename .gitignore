@@ -26,3 +26,15 @@ infiltration_settings.json
 
 
 docs/private
+
+# 操作系统与编辑器本地文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# 本地环境与密钥（仓库不包含任何密钥）
+.env
+.env.*
+*.log

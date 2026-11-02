@@ -1,5 +1,7 @@
 # Iris Engine 架构设计
 
+> **归档说明（2026-11-02）**：项目已归档，本文保留归档时的架构设计。开发期私有设计档（`docs/private/`）未随仓库发布，文中引用仅作历史线索；构建与 CI 命令为开发期记录。
+
 本文档阐述 Iris 引擎的设计决策、内存模型、渲染管线与跨平台策略。
 
 ## 1. 设计目标
@@ -5882,7 +5884,7 @@ release 构建，2026-09-03；**仅供量级参考**——CI 虚拟机数字不�
 | `mix_32_voices_1s` | 92.6 µs | 32 声道（8 空间）44100 Hz 单次 1024 帧块（回调粒度） |
 | `spatial_gain_10k` | 190 µs | 空间增益纯函数 1 万次 |
 
-**预算测试（`crates/*/tests/budgets.rs`，CI `test-release` job 生效）**
+**预算测试（`crates/*/tests/budgets.rs`，release 模式生效；开发期由 CI `test-release` job 运行）**
 是「防突然 10 倍劣化」的**烟雾报警**，不是精确基准：预算 = 上表 mean
 × 约 5（写死数值 + 测量机器与日期注释），断言 N 次实测的中位数不超
 预算。5 倍裕度吸收 CI 与本地机器差距与噪声——目标是误报率接近零，
@@ -5916,12 +5918,13 @@ build 后 test 则 test 的全部编译单元命中缓存，只剩纯运行时�
 验收图，同名时更是互相抹掉对方的验收结果。引擎侧无修法（改 cargo 的
 产物布局不归我们管），故记为约定。
 
-**sccache 编译缓存**（`.cargo/config.toml` 的 `rustc-wrapper`，仓库级
-自动生效）：新机器先 `cargo install sccache`（否则一切 cargo 命令失败，
-见 config 注释）。诚实预期：**workspace 内部源码变更的重编无法避免**
-（源码变 → 哈希变 → 必重编），sccache 的收益在依赖树——`cargo clean`、
-target 目录丢失、profile 切换时依赖工件直接命中缓存；构建脚本与
-proc-macro 本身不可缓存。观察统计：`sccache --show-stats`。
+**sccache 编译缓存（开发期可选）**：开发期仓库曾通过 `.cargo/config.toml`
+的 `rustc-wrapper` 自动启用 sccache；归档时移除了该强制配置，克隆后可以直接
+运行 cargo。需要本地加速时，安装 sccache 后设置 `RUSTC_WRAPPER=sccache`，
+或在本地 `.cargo/config.toml` 中自行配置。workspace 内部源码变更仍然需要
+重编，sccache 的收益主要来自依赖树：执行 `cargo clean`、丢失 target 目录或
+切换 profile 时，依赖工件可以直接命中缓存。构建脚本与 proc-macro 本身不可
+缓存。统计用 `sccache --show-stats` 查看。
 
 ### 7.3 资产管线：pack 打包 / mount 挂载 / 异步加载（R45）
 

@@ -1,5 +1,7 @@
 # AGENTS.md — iris-engine 智能体工作指南
 
+> **归档说明（2026-11-02）**：项目已归档，本文与 `AGENTS-PLAYBOOK.md` 记录的是开发期的智能体工作流与门禁基线；命令、测试数字和协作流程仅作历史参考，不再维护。
+
 面向在本仓库工作的 AI 智能体（与人类贡献者）。逐条都是实战沉淀，违反过会付出真实代价的条目加粗。本文件只保留**每次开工都要用的高频规约**；规则背后的实测案例、长篇操作协议与测试基线前史收在同仓库根的 **`AGENTS-PLAYBOOK.md`**（按需查阅——本文每处「见 PLAYBOOK §N」都有落点）。
 
 ## 项目是什么
@@ -28,7 +30,7 @@ crate 布局（依赖自上而下）：
 ## 环境硬约束（Windows / Git Bash）
 
 - **所有 cargo 命令必须加前缀 `CARGO_HTTP_CHECK_REVOKE=false`**（本机镜像 SSL 吊销检查问题，不加必挂）。
-- `.cargo/config.toml` 已配 `rustc-wrapper = "sccache"`：新机器先 `cargo install sccache`，否则一切 cargo 命令失败。
+- 开发期本地构建曾用 sccache 做编译缓存；仓库归档时移除了强制的 `.cargo/config.toml`，克隆后可以直接运行 cargo。需要本地加速时自行安装 sccache 并设置 `RUSTC_WRAPPER=sccache`。
 - ffmpeg 在 PATH（验收图 BMP/PPM→PNG 转换用）。
 
 ## 门禁命令序（每轮收官，顺序有讲究——详见 ARCHITECTURE §7.2）

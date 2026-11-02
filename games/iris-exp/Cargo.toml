@@ -1,6 +1,6 @@
 [package]
 name = "iris-exp"
-description = "Iris 引擎实验性项目：外部 GLB 角色（Mixamo 重定向动作）导入验证——渲染 / 蒙皮动画 / 动作切换的最小实弹环境（经验沉淀见 docs/private/04.md）"
+description = "Iris 引擎实验性项目：外部 GLB 角色（Mixamo 重定向动作）导入验证——渲染 / 蒙皮动画 / 动作切换的最小实弹环境"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

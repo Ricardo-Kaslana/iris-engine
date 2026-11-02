@@ -3,6 +3,8 @@
 本文件记录 Iris 引擎的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵守 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+> **归档说明（2026-11-02）**：项目已归档，本文件保留 0.1.0 至归档前的变更记录。开发期私有设计档（`docs/private/`）未随仓库发布，文中对它们的引用仅作历史线索。
+
 ## [Unreleased]
 
 ### Added（游戏：iris-voxel 可玩体素核心）

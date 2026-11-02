@@ -7,3 +7,11 @@
 *.sh text eol=lf
 *.png binary
 *.bmp binary
+*.jpg binary
+*.jpeg binary
+*.glb binary
+*.bin binary
+*.ipak binary
+*.hdr binary
+*.ogg binary
+*.wav binary
